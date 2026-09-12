@@ -1,20 +1,21 @@
-# Navigator Product API and Desktop Contract
+# Navigator Product API Contract
 
-Navigator is an active Product that owns the desktop workspace, client-side
-session state, persistence service, and user-triggered handoffs. It is a
-horizontal client rather than a payload-processing hub.
+Navigator is an active Product that owns durable session state, its persistence
+service, native host, and user-triggered handoffs. Optional client interfaces
+consume this contract without becoming a second Product authority.
 
 ## Authority and request paths
 
 ```mermaid
 flowchart LR
-    User --> Navigator
+    User --> UI["Optional client UI"]
+    UI --> Navigator
     Navigator --> Catalyst
     Navigator --> Yield
     Navigator --> Echo
     Navigator --> Reactor
     Navigator --> Exchange
-    Navigator --> Plugins["Installed Product or Plugin adapters"]
+    UI --> Plugins["Optional UI bundle and installed adapters"]
     Platform["Platform substrate (installation/compatibility)"] -. "installation and compatibility" .-> Navigator
 ```
 
@@ -33,8 +34,6 @@ contract remains unchanged.
 - `native/crates/cyrene-native-host`: Navigator-owned Codex rollout import over
   the versioned NDJSON protocol.
 - `harness`: replaceable DeepSeek Harness adapters and profile integration.
-- `apps/desktop`: the standalone browser WebUI.
-- `apps/windows`: the native Windows client surface.
 
 The Artifact adapter publishes immutable content-addressed bytes and returns the
 standard transparent fields: `uri`, `digest`, `size_bytes`, and producer-owned
@@ -48,19 +47,12 @@ registration, Platform source dependency, or Platform executable bootstrap.
 Optional Platform management is outside the request path and communicates only
 through published compatibility contracts.
 
-`apps/windows` is an `API_CONNECTED_PROTOTYPE`: reads (session list, committed
-events, run trace) come from the Navigator persistence API through `Core/Ports`,
-and control actions that need the Harness control route fail closed with
-`NAVIGATOR_CONTROL_NOT_CONNECTED`. Preview fixtures in `Core/Mock` are Debug-only
-and excluded from Release builds. The WinUI surface remains unpackaged until its
-signing policy is complete.
+The browser and WinUI clients are owned by
+`Cyrene-Plugins-Official/plugins/ui/navigator`. Their Product-client adapters
+consume this published API; they must not persist authoritative session state
+or copy Navigator lifecycle logic. Packaging and signing status are reported by
+that bundle, not by this contract repository.
 
-The browser WebUI is intentionally smaller than the native surface at this
-stage. `apps/desktop/ui` performs an HTTP API availability probe and links to
-the API documentation; it does not yet render conversations or send/control
-Harness turns. This repository therefore has no packaged or signed desktop
-release, and the source-preview status must remain visible in release notes.
-
-当前阶段浏览器 WebUI 有意比原生界面更小。`apps/desktop/ui` 只做 HTTP API 可用性探测并链接
-API 文档，尚未渲染会话或发送/控制 Harness turn。因此本仓库没有已打包或已签名的桌面发布物，
-release notes 必须保留源代码预览状态。
+浏览器与 WinUI 客户端归属 `Cyrene-Plugins-Official/plugins/ui/navigator`。其中的 Product
+客户端适配器消费本公开 API，不得持久化权威会话状态或复制 Navigator 生命周期逻辑。打包与
+签名状态由该 UI 包报告，不由本契约仓库声明。

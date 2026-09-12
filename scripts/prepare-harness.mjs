@@ -28,6 +28,16 @@ function run(command, args, cwd, capture = false) {
   return result.stdout?.trim() ?? '';
 }
 
+/** Invoke pnpm without asking Node to execute a Windows command shim. */
+function runPnpm(args, cwd) {
+  if (process.platform !== 'win32') return run('pnpm', args, cwd);
+  const pnpmHome = process.env.PNPM_HOME;
+  if (!pnpmHome) throw new Error('PNPM_HOME is required on Windows');
+  const cli = resolve(pnpmHome, '..', 'pnpm', 'bin', 'pnpm.cjs');
+  if (!existsSync(cli)) throw new Error(`pnpm CLI is missing: ${cli}`);
+  return run(process.execPath, [cli, ...args], cwd);
+}
+
 if (!existsSync(upstream)) {
   mkdirSync(dirname(upstream), { recursive: true });
   run('git', ['clone', '--depth', '1', '--branch', lock.tag, lock.repository, upstream], repository);
@@ -48,8 +58,8 @@ const manifest = JSON.parse(readFileSync(join(upstream, 'package.json'), 'utf8')
 if (manifest.version !== lock.version || manifest.packageManager !== lock.packageManager) {
   throw new Error('Upstream version or package manager differs from the lock');
 }
-if (values.install) run('pnpm', ['install', '--frozen-lockfile'], upstream);
-if (values.build) run('pnpm', ['run', 'build:official'], upstream);
+if (values.install) runPnpm(['install', '--frozen-lockfile'], upstream);
+if (values.build) runPnpm(['run', 'build:official'], upstream);
 
 /** Bind build-time imports to the same upstream package instances used by dsh. */
 function linkPackage(name, target) {

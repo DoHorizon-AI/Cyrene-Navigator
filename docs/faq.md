@@ -2,32 +2,29 @@
 
 ## Is Navigator's runtime in this repository? / Navigator 的运行时在本仓库吗？
 
-Yes. The active surface is the client implementation:
+Yes. The active Product and host implementation is:
 
-- `apps/desktop` — the standalone browser WebUI (Vite package, talks to the Navigator API over HTTP).
-- `apps/windows` — the native WinUI client surface (`API_CONNECTED_PROTOTYPE`), reading through the Navigator API ports.
 - `harness/` — Navigator-owned adapters on the pinned DeepSeek Harness profile.
 - `native/` — the Rust `cyrene-native-host` process/integration host.
 - `src/cyrene_navigator/` — the Python session persistence and Product read service.
 
-是。活跃范围是客户端实现：`apps/desktop`（独立浏览器 WebUI）、`apps/windows`
-（原生 WinUI 客户端界面，`API_CONNECTED_PROTOTYPE`，经 Navigator API 端口读取）、
-`harness/`（固定 DeepSeek Harness profile 上的 Navigator 适配器）、`native/`
+是。活跃的 Product 与宿主实现包括 `harness/`（固定 DeepSeek Harness profile 上的
+Navigator 适配器）、`native/`
 （Rust `cyrene-native-host` 进程/集成宿主）、`src/cyrene_navigator/`（Python 会话
 持久化与产品读取服务）。
 
 ## How does the Windows client get its data? / Windows 客户端的数据从哪里来？
 
-`apps/windows` is marked `API_CONNECTED_PROTOTYPE`. Its reads come from the
-workspace-scoped Harness persistence service through the `Core/Ports` adapters
+The WinUI client now lives in `cyrene.ui.navigator`. Its reads come from the
+workspace-scoped Navigator persistence service through its client adapters
 (`CYRENE_NAVIGATOR_API_URL`, `CYRENE_NAVIGATOR_API_TOKEN`,
 `CYRENE_NAVIGATOR_WORKSPACE`). Actions that require the Harness control route
 (send, cancel, approve) fail closed with `NAVIGATOR_CONTROL_NOT_CONNECTED`. When
 no API is configured the client says so; `CYRENE_NAVIGATOR_UI_PREVIEW=mock` is a
 Debug-only preview mode, and Release builds do not compile the fixtures at all.
 
-`apps/windows` 标记为 `API_CONNECTED_PROTOTYPE`。其读取路径经 `Core/Ports` 适配器
-来自工作区级 Harness 持久化服务（通过 `CYRENE_NAVIGATOR_API_URL`、
+WinUI 客户端现位于 `cyrene.ui.navigator`。其读取路径经客户端适配器来自工作区级
+Navigator 持久化服务（通过 `CYRENE_NAVIGATOR_API_URL`、
 `CYRENE_NAVIGATOR_API_TOKEN`、`CYRENE_NAVIGATOR_WORKSPACE` 配置）。需要 Harness 控制
 通道的动作（发送、取消、审批）以 `NAVIGATOR_CONTROL_NOT_CONNECTED` fail closed。未配置
 API 时客户端会如实说明；`CYRENE_NAVIGATOR_UI_PREVIEW=mock` 是仅 Debug 的预览模式，

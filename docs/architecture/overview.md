@@ -2,36 +2,27 @@
 
 ## Role and boundary / 角色与边界
 
-Navigator is a horizontal client workspace rather than a terminal stage in a product pipeline. It presents user-facing workflows, calls Cyrene Product APIs directly, and hosts client-side session state.
+Navigator is a horizontal Product API and local host rather than a terminal stage in a product pipeline. Optional clients present user-facing workflows through this API, while Navigator owns durable session state and Product handoffs.
 
-Navigator 是横向客户端工作区，而不是产品流水线中的终端阶段。它承载面向用户的工作流，直连 Cyrene 产品 API，并承载客户端会话状态。
+Navigator 是横向 Product API 与本地宿主，而不是产品流水线中的终端阶段。可选客户端通过该 API 呈现用户工作流，Navigator 拥有持久会话状态与 Product handoff。
 
-The active repository surface is the client implementation: the browser WebUI
-(`apps/desktop`), the WinUI client (`apps/windows`, `API_CONNECTED_PROTOTYPE`
-whose reads come from the Navigator persistence API), the pinned DeepSeek Harness
-adapters (`harness/`), the Rust native host (`native/`), and the Python session
-persistence and Product read service (`src/cyrene_navigator`).
+The active repository surface is the pinned DeepSeek Harness adapters
+(`harness/`), the Rust native host (`native/`), and the Python session
+persistence and Product read service (`src/cyrene_navigator`). The optional
+browser and WinUI clients live in `cyrene.ui.navigator` and consume the
+published Navigator API without owning durable Product state.
 
-The browser surface is currently an API availability probe and documentation
-preview. The native surface is an independent WinUI presentation mode: it reads
-through `Core/Ports`, while send, cancel, and approve remain fail-closed until
-the Harness control route is exposed. Neither surface is a packaged or signed
-binary release.
-
-当前仓库的活跃范围是客户端实现：浏览器 WebUI（`apps/desktop`）、WinUI 客户端
-（`apps/windows`，`API_CONNECTED_PROTOTYPE`，读取路径来自 Navigator 持久化 API）、
-固定版本 DeepSeek Harness 适配器（`harness/`）、Rust 原生宿主（`native/`）与 Python
-会话持久化及产品读取服务（`src/cyrene_navigator`）。
-
-当前浏览器界面仅做 API 可用性探测并预览文档。原生界面是独立的 WinUI 呈现模式：经
-`Core/Ports` 读取；Harness 控制通道开放前，发送、取消和审批保持 fail-closed。两个界面
-目前都不是已打包或已签名的二进制发布物。
+当前仓库的活跃范围是固定版本 DeepSeek Harness 适配器（`harness/`）、Rust 原生宿主
+（`native/`）与 Python 会话持久化及 Product 读取服务（`src/cyrene_navigator`）。可选的
+浏览器与 WinUI 客户端位于 `cyrene.ui.navigator`，通过公开 Navigator API 读取数据，不拥有
+持久 Product 状态。
 
 ## Workspace topology / 工作区拓扑
 
 ```mermaid
 flowchart LR
-    User["User\n用户"] --> Workspace["Navigator workspace\nNavigator 工作区"]
+    User["User\n用户"] --> UI["cyrene.ui.navigator\nOptional client UI"]
+    UI --> Workspace["Navigator Product API\nNavigator 产品 API"]
     Workspace --> Catalyst["Catalyst\nDatasets"]
     Workspace --> Yield["Yield\nTraining"]
     Workspace --> Echo["Echo\nEvaluation"]
@@ -52,19 +43,22 @@ is not connected in V1 and must wait for accepted Plugins-owned contracts.
 
 ## Client flow / 客户端流程
 
-1. The user selects a workspace action.
-2. Navigator calls the owning Product API directly (or resolves client-side session state).
-3. The owning authority performs the domain operation.
-4. Navigator renders progress, results, approvals, and errors without taking ownership of remote domain state.
+1. The user selects an action in an optional client.
+2. The client calls Navigator's published Product API.
+3. Navigator calls the owning Product API directly or resolves durable session state.
+4. The owning authority performs the domain operation.
+5. The client renders progress, results, approvals, and errors without taking ownership of remote domain state.
 
-1. 用户选择工作区操作。
-2. Navigator 直连对应产品 API（或解析客户端会话状态）。
-3. 对应权威执行领域操作。
-4. Navigator 呈现进度、结果、审批与错误，但不接管远程领域状态。
+1. 用户在可选客户端中选择操作。
+2. 客户端调用 Navigator 公开 Product API。
+3. Navigator 直连对应 Product API 或解析持久会话状态。
+4. 对应权威执行领域操作。
+5. 客户端呈现进度、结果、审批与错误，但不接管远程领域状态。
 
 ## Ownership boundaries / 归属边界
 
-- Navigator owns workspace state, presentation, local-host coordination, session persistence, and client preferences.
+- Navigator owns Product APIs, local-host coordination, session persistence, and handoffs.
+- `cyrene.ui.navigator` owns optional presentation and Product-client adapters.
 - Catalyst owns dataset management and lineage.
 - Yield owns training runs and model artifacts.
 - Echo owns evaluation reports and comparisons.
@@ -72,7 +66,8 @@ is not connected in V1 and must wait for accepted Plugins-owned contracts.
 - Exchange owns standardized gateway and chat transport behavior.
 - Platform provides optional installation, compatibility, and control-plane services; capability payload contracts and implementations belong to their Product or Plugin repositories.
 
-- Navigator 负责工作区状态、呈现、本地主机协调、会话持久化与客户端偏好。
+- Navigator 负责 Product API、本地主机协调、会话持久化与 handoff。
+- `cyrene.ui.navigator` 负责可选展示层与 Product 客户端适配器。
 - Catalyst 负责数据集管理与血缘。
 - Yield 负责训练运行与模型制品。
 - Echo 负责评估报告与对比。
