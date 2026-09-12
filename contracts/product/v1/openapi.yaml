@@ -1,0 +1,50 @@
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │  Navigator aggregation API v1                                       │
+# │  Returns observed views and never becomes Product state authority.  │
+# └─────────────────────────────────────────────────────────────────────┘
+openapi: 3.1.2
+x-cyrene-contract-profile: product-http-v1
+info:
+  title: Cyrene Navigator Aggregation API
+  version: 1.0.0
+  license: {name: Apache-2.0}
+paths:
+  /api/v1/workspace-snapshots:
+    post:
+      operationId: observeWorkspaceSnapshot
+      description: Safe non-mutating aggregation query
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SnapshotRequest'}
+      responses:
+        '200':
+          description: Complete, partial, or failed observed view
+          content:
+            application/json:
+              schema: {$ref: './workspace-snapshot.schema.json'}
+        '422':
+          description: RFC 9457 invalid aggregation request
+          content:
+            application/problem+json:
+              schema: {$ref: './generated/common/problem-details.schema.json'}
+components:
+  schemas:
+    SnapshotRequest:
+      type: object
+      required: [workspaceId, reads]
+      properties:
+        workspaceId: {type: string, minLength: 1, maxLength: 200}
+        reads:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            type: object
+            required: [product, path]
+            properties:
+              product: {enum: [CATALYST, ECHO, REACTOR, EXCHANGE, YIELD]}
+              path: {type: string, pattern: '^/api/v1/', maxLength: 1000}
+            additionalProperties: false
+      additionalProperties: false

@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/cyrene-native-host"]
+resolver = "2"

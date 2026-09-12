@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Headless API-adapter behaviour check / 无头 API 适配器行为检查。
+
+    The WinUI app cannot run without Windows, but the API adapter layer is plain .NET. This
+    console project links the real Core/Api sources, drives them with scripted HTTP responses
+    and event fixtures, and asserts the projections the native client depends on. It runs on
+    Linux, macOS and CI — the same idea as the type-check harness, one level deeper.
+
+    这个工程不产出产品程序，只用来在没有 Windows 时对适配层做真实行为验证。
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <!-- Targets net8.0 like the app, but runs on whatever newer shared runtime is installed. -->
+    <RollForward>LatestMajor</RollForward>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+    <AppSource>$(MSBuildThisFileDirectory)../../src/Cyrene.Navigator.Windows</AppSource>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="$(AppSource)/Core/Models.cs" />
+    <Compile Include="$(AppSource)/Core/StreamingScript.cs" />
+    <Compile Include="$(AppSource)/Core/PresentationLabels.cs" />
+    <Compile Include="$(AppSource)/Core/Ports/**/*.cs" />
+    <Compile Include="$(AppSource)/Core/Api/**/*.cs" />
+  </ItemGroup>
+
+</Project>

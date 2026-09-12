@@ -1,0 +1,48 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Headless type-check harness / 无头类型检查工程。
+
+    The WinUI XAML compiler is Windows-only, but the Windows App SDK managed projections are
+    ordinary .NET assemblies. With `EnableWindowsTargeting` this project compiles every
+    non-XAML source file of the app on Linux/macOS/CI, so the whole control and view layer is
+    genuinely type-checked even when no Windows machine is reachable.
+
+    Excluded: `App.xaml.cs` only, because it depends on the XAML-generated partial.
+
+    这个工程不产出可运行程序，只用来在没有 Windows 机器时对全部 C# UI 代码做真实编译校验。
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows10.0.26100.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.19041.0</TargetPlatformMinVersion>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <OutputType>Library</OutputType>
+    <RootNamespace>Cyrene.Navigator.Windows</RootNamespace>
+    <AssemblyName>Cyrene.Navigator.Windows.TypeCheck</AssemblyName>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <!-- MakePri.exe / MSIX resource tooling is Windows-only and irrelevant to type checking. -->
+    <EnableMsixTooling>false</EnableMsixTooling>
+    <EnableCoreMrtTooling>false</EnableCoreMrtTooling>
+    <NoWarn>$(NoWarn);CA1416;CS8305</NoWarn>
+    <AppSource>$(MSBuildThisFileDirectory)../../src/Cyrene.Navigator.Windows</AppSource>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.260804001" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="$(AppSource)/**/*.cs" Exclude="$(AppSource)/App.xaml.cs;$(AppSource)/bin/**/*.cs;$(AppSource)/obj/**/*.cs">
+      <Link>app/%(RecursiveDir)%(Filename)%(Extension)</Link>
+    </Compile>
+  </ItemGroup>
+
+  <!-- Mirror the app's Release contract: fixtures are not part of a Release build. -->
+  <ItemGroup Condition="'$(Configuration)' == 'Release'">
+    <Compile Remove="$(AppSource)/Core/Mock/**/*.cs" />
+  </ItemGroup>
+
+</Project>

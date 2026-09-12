@@ -1,0 +1,9 @@
+{"timestamp":"2026-09-05T12:00:00Z","type":"session_meta","payload":{"session_id":"thread-01","id":"thread-01","timestamp":"2026-09-05T12:00:00Z","cwd":"C:\\work\\demo","originator":"codex_cli_rs","cli_version":"0.1.0","source":"cli","model_provider":"exchange"}}
+{"timestamp":"2026-09-05T12:00:01Z","type":"response_item","payload":{"type":"message","id":"msg-user-01","role":"user","content":[{"type":"input_text","text":"Inspect the manifest."}]}}
+{"timestamp":"2026-09-05T12:00:02Z","type":"response_item","payload":{"type":"function_call","id":"fc-01","call_id":"call-01","name":"cy_manifest","arguments":"{\"path\":\"artifact.json\"}"}}
+{"timestamp":"2026-09-05T12:00:03Z","type":"response_item","payload":{"type":"function_call_output","id":"fco-01","call_id":"call-01","output":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+{"timestamp":"2026-09-05T12:00:04Z","type":"response_item","payload":{"type":"message","id":"msg-assistant-01","role":"assistant","content":[{"type":"output_text","text":"The manifest is valid."}]}}
+{"timestamp":"2026-09-05T12:00:04Z","type":"event_msg","payload":{"type":"user_message","message":"Inspect the manifest."}}
+{"timestamp":"2026-09-05T12:00:05Z","type":"turn_context","payload":{"cwd":"C:\\work\\demo"}}
+{"timestamp":"2026-09-05T12:00:06Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":12,"output_tokens":8}}}}
+{"timestamp":"2026-09-05T12:00:07Z","type":"future_record","payload":{"secret":"kept in raw archive"}}

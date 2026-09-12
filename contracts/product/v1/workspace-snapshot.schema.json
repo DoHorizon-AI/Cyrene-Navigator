@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.cyrene.dev/navigator/product/v1/workspace-snapshot.schema.json",
+  "title": "Navigator WorkspaceSnapshot v1",
+  "type": "object",
+  "required": ["workspaceId", "status", "views", "observedAt"],
+  "properties": {
+    "workspaceId": {"type": "string", "minLength": 1, "maxLength": 200},
+    "status": {"enum": ["COMPLETE", "PARTIAL", "FAILED"]},
+    "views": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/productView"}
+    },
+    "observedAt": {"type": "string", "format": "date-time"}
+  },
+  "$defs": {
+    "productView": {
+      "type": "object",
+      "required": ["product", "sourceUrl", "observedAt", "status"],
+      "properties": {
+        "product": {"enum": ["CATALYST", "ECHO", "REACTOR", "EXCHANGE", "YIELD"]},
+        "sourceUrl": {"type": "string", "format": "uri"},
+        "observedAt": {"type": "string", "format": "date-time"},
+        "status": {"enum": ["AVAILABLE", "UNAVAILABLE"]},
+        "resource": {"type": "object"},
+        "problem": {"$ref": "#/$defs/observationProblem"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"status": {"const": "AVAILABLE"}}},
+          "then": {"required": ["resource"]}
+        },
+        {
+          "if": {"properties": {"status": {"const": "UNAVAILABLE"}}},
+          "then": {"required": ["problem"]}
+        }
+      ],
+      "additionalProperties": false
+    },
+    "observationProblem": {
+      "type": "object",
+      "required": ["code", "detail", "retryable"],
+      "properties": {
+        "code": {"type": "string"},
+        "detail": {"type": "string"},
+        "retryable": {"type": "boolean"},
+        "upstreamStatus": {"type": "integer", "minimum": 400, "maximum": 599}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,2018 @@
+{
+  "schema": "cyrene.navigator.profile-inventory.v1",
+  "observedAt": "2026-09-06T03:49:39.992186+00:00",
+  "platform": "linux",
+  "upstreamTag": "dsh-v0.1.3-alpha.1",
+  "upstreamCommit": "d347e703908d0406b7a7ef80e3a0e594d86b2215",
+  "observation": "Authenticated pluginInventory/list on actual Web Profile; fiber state is activation evidence, not complete plugin behavior acceptance.",
+  "counts": {
+    "active": 121,
+    "inactive": 32
+  },
+  "entries": [
+    {
+      "entryId": "include",
+      "moduleName": "cordis:include",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/cordis-plugin-loader",
+        "version": "1.0.3",
+        "source": "vendor/loader/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:timer",
+      "moduleName": "@deepseek-ai/cordis-plugin-timer",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/cordis-plugin-timer",
+        "version": "1.1.4",
+        "source": "vendor/timer/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:hmr",
+      "moduleName": "@deepseek-ai/cordis-plugin-hmr",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/cordis-plugin-hmr",
+        "version": "1.0.17",
+        "source": "vendor/hmr/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:llm",
+      "moduleName": "@deepseek-ai/dsh-llm",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-llm",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/llm/llm/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:deepseek-llm-api-extensions",
+      "moduleName": "@deepseek-ai/dsh-deepseek-llm-api-extensions",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-deepseek-llm-api-extensions",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/llm/deepseek-llm-api-extensions/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:session",
+      "moduleName": "@deepseek-ai/dsh-session",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-session",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/core/session/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:session-log-deepseek",
+      "moduleName": "@deepseek-ai/dsh-session-log-deepseek",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-session-log-deepseek",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/session/session-log-deepseek/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:typert",
+      "moduleName": "@deepseek-ai/dsh-typert-registry",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-typert-registry",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/typert/registry/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:typert-loader",
+      "moduleName": "@deepseek-ai/dsh-typert-loader",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-typert-loader",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/typert/loader/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:typert-gateway",
+      "moduleName": "@deepseek-ai/dsh-api-gateway",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-api-gateway",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/api/gateway/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:session-title",
+      "moduleName": "@deepseek-ai/dsh-session-title",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-session-title",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/session/session-title/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:session-title-llm",
+      "moduleName": "@deepseek-ai/dsh-session-title-first-prompt-llm",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-session-title-first-prompt-llm",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/session/session-title-first-prompt-llm/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:user-questions",
+      "moduleName": "@deepseek-ai/dsh-user-questions",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-user-questions",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/interaction/user-questions/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:agent",
+      "moduleName": "@deepseek-ai/dsh-agent",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-agent",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/core/agent/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:plugin-package-inventory-deepseek",
+      "moduleName": "@deepseek-ai/dsh-plugin-package-inventory-deepseek",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-plugin-package-inventory-deepseek",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/llm/plugin-package-inventory-deepseek/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:agent-default-model",
+      "moduleName": "@deepseek-ai/dsh-agent-default-model",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-agent-default-model",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/core/agent-default-model/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:jobs",
+      "moduleName": "@deepseek-ai/dsh-jobs-local",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-jobs-local",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/jobs/jobs-local/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:llm-retry",
+      "moduleName": "@deepseek-ai/dsh-llm-retry",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-llm-retry",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/llm/llm-retry/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:settings",
+      "moduleName": "@deepseek-ai/dsh-settings-file",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-settings-file",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/settings/settings-file/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:credentials",
+      "moduleName": "@deepseek-ai/dsh-credentials-local",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-credentials-local",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/credentials/credentials-local/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:llm-pi-ai",
+      "moduleName": "@deepseek-ai/dsh-llm-pi-ai",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-llm-pi-ai",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/llm/llm-pi-ai/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:session-persistence-jsonl",
+      "moduleName": "@deepseek-ai/dsh-session-persistence-jsonl",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-session-persistence-jsonl",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/session/session-persistence-jsonl/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:attachment-local",
+      "moduleName": "@deepseek-ai/dsh-attachment-local",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-attachment-local",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/attachment/attachment-local/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:session-query-sqlite",
+      "moduleName": "@deepseek-ai/dsh-session-query-sqlite",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-session-query-sqlite",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/session-query/session-query-sqlite/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:session-projection",
+      "moduleName": "@deepseek-ai/dsh-session-projection",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-session-projection",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/session/session-projection/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:storage",
+      "moduleName": "@deepseek-ai/dsh-storage",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-storage",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/storage/storage/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:storage-json",
+      "moduleName": "@deepseek-ai/dsh-storage-json",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-storage-json",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/storage/storage-json/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:storage-domain",
+      "moduleName": "@deepseek-ai/dsh-storage-domain",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-storage-domain",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/storage/storage-domain/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:session-projection-cache",
+      "moduleName": "@deepseek-ai/dsh-session-projection-cache",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-session-projection-cache",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/session/session-projection-cache/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:session-telemetry-otel",
+      "moduleName": "@deepseek-ai/dsh-session-telemetry-otel",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-session-telemetry-otel",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/session/session-telemetry-otel/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:subprocess",
+      "moduleName": "@deepseek-ai/dsh-subprocess-local",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-subprocess-local",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/subprocess/subprocess-local/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:sandbox",
+      "moduleName": "@deepseek-ai/dsh-sandbox-local",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-sandbox-local",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/sandbox/sandbox-local/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:sandbox-policy",
+      "moduleName": "@deepseek-ai/dsh-sandbox-policy",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-sandbox-policy",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/sandbox/sandbox-policy/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:bash-sandbox",
+      "moduleName": "@deepseek-ai/dsh-bash-sandbox",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-bash-sandbox",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/shell/bash-sandbox/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:pwsh-sandbox",
+      "moduleName": "@deepseek-ai/dsh-pwsh-sandbox",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-pwsh-sandbox",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/shell/pwsh-sandbox/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:approval",
+      "moduleName": "@deepseek-ai/dsh-user-approval",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-user-approval",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/interaction/user-approval/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:permission",
+      "moduleName": "@deepseek-ai/dsh-permission-presets",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-permission-presets",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/interaction/permission-presets/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:shell-env",
+      "moduleName": "@deepseek-ai/dsh-shell-env",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-shell-env",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/shell/shell-env/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:tool-bash",
+      "moduleName": "@deepseek-ai/dsh-tool-bash",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-tool-bash",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/shell/tool-bash/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:tool-pwsh",
+      "moduleName": "@deepseek-ai/dsh-tool-pwsh",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-tool-pwsh",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/shell/tool-pwsh/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:tool-jobs",
+      "moduleName": "@deepseek-ai/dsh-tool-jobs",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-tool-jobs",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/jobs/tool-jobs/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:fs-observation-policy",
+      "moduleName": "@deepseek-ai/dsh-fs-observation-policy",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-fs-observation-policy",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/fs/fs-observation-policy/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:tool-fs",
+      "moduleName": "@deepseek-ai/dsh-tool-fs",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-tool-fs",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/fs/tool-fs/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:tool-fs-search",
+      "moduleName": "@deepseek-ai/dsh-tool-fs-search",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-tool-fs-search",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/fs/tool-fs-search/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:agent-instructions",
+      "moduleName": "@deepseek-ai/dsh-agent-instructions",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-agent-instructions",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/context/agent-instructions/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:skill",
+      "moduleName": "@deepseek-ai/dsh-skill",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-skill",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/skill/skill/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:skill-filesystem",
+      "moduleName": "@deepseek-ai/dsh-skill-filesystem",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-skill-filesystem",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/skill/skill-filesystem/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:skill-badge",
+      "moduleName": "@deepseek-ai/dsh-skill-badge",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-skill-badge",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/skill/skill-badge/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:tool-skill",
+      "moduleName": "@deepseek-ai/dsh-tool-skill",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-tool-skill",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/skill/tool-skill/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:commands",
+      "moduleName": "@deepseek-ai/dsh-commands",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-commands",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/interaction/commands/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:command-feedback",
+      "moduleName": "@deepseek-ai/dsh-command-feedback",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-command-feedback",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/feedback/command-feedback/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:goal",
+      "moduleName": "@deepseek-ai/dsh-goal",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-goal",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/goal/goal/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:goal-round-driver",
+      "moduleName": "@deepseek-ai/dsh-goal-round-driver",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-goal-round-driver",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/goal/goal-round-driver/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:command-goal",
+      "moduleName": "@deepseek-ai/dsh-command-goal",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-command-goal",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/goal/command-goal/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:plan-mode",
+      "moduleName": "@deepseek-ai/dsh-plan-mode",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-plan-mode",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/plan/plan-mode/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:token-meter",
+      "moduleName": "@deepseek-ai/dsh-token-meter",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-token-meter",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/llm/token-meter/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:compaction-basic",
+      "moduleName": "@deepseek-ai/dsh-compaction-basic",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-compaction-basic",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/compaction/compaction-basic/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:command-compact",
+      "moduleName": "@deepseek-ai/dsh-command-compact",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-command-compact",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/compaction/command-compact/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:subagent",
+      "moduleName": "@deepseek-ai/dsh-subagent",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-subagent",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/subagent/subagent/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:subagent-spawn-in-process",
+      "moduleName": "@deepseek-ai/dsh-subagent-spawn-in-process",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-subagent-spawn-in-process",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/subagent/subagent-spawn-in-process/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:subagent-fork-in-process",
+      "moduleName": "@deepseek-ai/dsh-subagent-fork-in-process",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-subagent-fork-in-process",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/subagent/subagent-fork-in-process/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:tool-subagent-control",
+      "moduleName": "@deepseek-ai/dsh-tool-subagent-control",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-tool-subagent-control",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/subagent/tool-subagent-control/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:tool-subagent-list-agents",
+      "moduleName": "@deepseek-ai/dsh-tool-subagent-control/list-agents",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-tool-subagent-control",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/subagent/tool-subagent-control/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:tool-subagent",
+      "moduleName": "@deepseek-ai/dsh-tool-subagent",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-tool-subagent",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/subagent/tool-subagent/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:tool-subagent-fork",
+      "moduleName": "@deepseek-ai/dsh-tool-subagent",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-tool-subagent",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/subagent/tool-subagent/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:workflow-worker-thread",
+      "moduleName": "@deepseek-ai/dsh-workflow-worker-thread",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-workflow-worker-thread",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/workflow/workflow-worker-thread/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:tool-workflow",
+      "moduleName": "@deepseek-ai/dsh-tool-workflow",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-tool-workflow",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/workflow/tool-workflow/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:timeout-policy",
+      "moduleName": "@deepseek-ai/dsh-tool-call-timeout-policy",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-tool-call-timeout-policy",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/guard/timeout-policy/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:spill-local",
+      "moduleName": "@deepseek-ai/dsh-spill-local",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-spill-local",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/spill/spill-local/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:spill-policy",
+      "moduleName": "@deepseek-ai/dsh-spill-policy",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-spill-policy",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/spill/spill-policy/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:session-checkpoint-policy",
+      "moduleName": "@deepseek-ai/dsh-session-checkpoint-policy",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-session-checkpoint-policy",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/session/session-checkpoint-policy/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:tool-result-pruner",
+      "moduleName": "@deepseek-ai/dsh-compaction-tool-result-pruner",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-compaction-tool-result-pruner",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/compaction/compaction-tool-result-pruner/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:tool-todo",
+      "moduleName": "@deepseek-ai/dsh-tool-todo",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-tool-todo",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/todo/tool-todo/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:tool-goal",
+      "moduleName": "@deepseek-ai/dsh-tool-goal",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-tool-goal",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/goal/tool-goal/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:tool-ralph",
+      "moduleName": "@deepseek-ai/dsh-tool-ralph",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-tool-ralph",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/workflow/tool-ralph/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:tool-str-replace-editor",
+      "moduleName": "@deepseek-ai/dsh-tool-str-replace-editor",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-tool-str-replace-editor",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/fs/tool-str-replace-editor/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:repeat-tool-reminder",
+      "moduleName": "@deepseek-ai/dsh-repeat-tool-reminder",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-repeat-tool-reminder",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/guard/repeat-tool-reminder/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:web",
+      "moduleName": "@deepseek-ai/dsh-web",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-web",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/web/web/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:web-search-deepseek",
+      "moduleName": "@deepseek-ai/dsh-web-search-deepseek",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-web-search-deepseek",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/web/web-search-deepseek/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:web-fetch-http",
+      "moduleName": "@deepseek-ai/dsh-web-fetch-http",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-web-fetch-http",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/web/web-fetch-http/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:tool-web",
+      "moduleName": "@deepseek-ai/dsh-tool-web",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-tool-web",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/web/tool-web/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:tools",
+      "moduleName": "@deepseek-ai/dsh-tools",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-tools",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/core/tools/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:system-prompt",
+      "moduleName": "@deepseek-ai/dsh-system-prompt",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-system-prompt",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/core/system-prompt/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:agent-loop",
+      "moduleName": "@deepseek-ai/dsh-agent-loop",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-agent-loop",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/core/agent-loop/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:fs-sandbox",
+      "moduleName": "@deepseek-ai/dsh-fs-sandbox",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-fs-sandbox",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/fs/fs-sandbox/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:llm-deepseek",
+      "moduleName": "@deepseek-ai/dsh-llm-deepseek",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-llm-deepseek",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/llm/llm-deepseek/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:subagent-model-selection-settings",
+      "moduleName": "@deepseek-ai/dsh-tool-subagent/model-selection-settings",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-tool-subagent",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/subagent/tool-subagent/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:code-runtime",
+      "moduleName": "@deepseek-ai/dsh-code-runtime-worker-thread",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-code-runtime-worker-thread",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/code-runtime/code-runtime-worker-thread/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:message-feedback",
+      "moduleName": "@deepseek-ai/dsh-message-feedback",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-message-feedback",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/feedback/message-feedback/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:session-log-download",
+      "moduleName": "@deepseek-ai/dsh-session-log-export",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-session-log-export",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/session-query/session-log-export/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:workspace",
+      "moduleName": "@deepseek-ai/dsh-workspace",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-workspace",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/workspace/workspace/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:session-reference",
+      "moduleName": "@deepseek-ai/dsh-session-reference",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-session-reference",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/context/session-reference/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:file-reference-local",
+      "moduleName": "@deepseek-ai/dsh-file-reference-local",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-file-reference-local",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/context/file-reference-local/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:session-stats",
+      "moduleName": "@deepseek-ai/dsh-session-stats",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-session-stats",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/session/session-stats/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:session-turn-outline",
+      "moduleName": "@deepseek-ai/dsh-session-turn-outline",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-session-turn-outline",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/session/session-turn-outline/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:directory-picker",
+      "moduleName": "@deepseek-ai/dsh-host-directory-picker-auto",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-host-directory-picker-auto",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/host/directory-picker-auto/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:plugin-inventory",
+      "moduleName": "@deepseek-ai/dsh-host-plugin-inventory",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-host-plugin-inventory",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/host/plugin-inventory/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:session-controller",
+      "moduleName": "@deepseek-ai/dsh-api-session-controller",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-api-session-controller",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/api/session-controller/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:settings-controller",
+      "moduleName": "@deepseek-ai/dsh-api-settings-controller",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-api-settings-controller",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/api/settings-controller/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:workspace-controller",
+      "moduleName": "@deepseek-ai/dsh-api-workspace-controller",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-api-workspace-controller",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/api/workspace-controller/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:cordis-host-runner",
+      "moduleName": "@deepseek-ai/dsh-cordis-host-runner",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-cordis-host-runner",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/extensions/cordis-host-runner/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:web-startup",
+      "moduleName": "@deepseek-ai/dsh-web-app/startup",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-web-app",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/bundle/web-app/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:webserver",
+      "moduleName": "@deepseek-ai/dsh-host-webserver",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-host-webserver",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/host/webserver/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:web-runtime",
+      "moduleName": "@deepseek-ai/dsh-web-app",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-web-app",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/bundle/web-app/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:client-hmr",
+      "moduleName": "@deepseek-ai/dsh-client-hmr",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-hmr",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/hmr/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:modules",
+      "moduleName": "@deepseek-ai/dsh-client-modules",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-modules",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/modules/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:connection",
+      "moduleName": "@deepseek-ai/dsh-client-connection",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-connection",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/connection/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:file-upload",
+      "moduleName": "@deepseek-ai/dsh-client-file-upload",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-file-upload",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/file-upload/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:api-remotes",
+      "moduleName": "@deepseek-ai/dsh-api-remotes",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-api-remotes",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/api/remotes/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:cordis-client-runner",
+      "moduleName": "@deepseek-ai/dsh-cordis-client-runner",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-cordis-client-runner",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/extensions/cordis-client-runner/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-theme",
+      "moduleName": "@deepseek-ai/dsh-client-ui-theme",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-theme",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-theme/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:locale",
+      "moduleName": "@deepseek-ai/dsh-client-locale",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-locale",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/locale/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-layout",
+      "moduleName": "@deepseek-ai/dsh-client-ui-layout",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-layout",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-layout/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-renderer",
+      "moduleName": "@deepseek-ai/dsh-client-ui-renderer",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-renderer",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-renderer/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-session",
+      "moduleName": "@deepseek-ai/dsh-client-ui-session",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-session",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-session/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-sidebar",
+      "moduleName": "@deepseek-ai/dsh-client-ui-sidebar",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-sidebar",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-sidebar/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-settings",
+      "moduleName": "@deepseek-ai/dsh-client-ui-settings",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-settings",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-settings/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-settings-general",
+      "moduleName": "@deepseek-ai/dsh-client-ui-settings-general",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-settings-general",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-settings-general/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-settings-models",
+      "moduleName": "@deepseek-ai/dsh-client-ui-settings-models",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-settings-models",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-settings-models/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-settings-plugin-inventory",
+      "moduleName": "@deepseek-ai/dsh-client-ui-settings-plugin-inventory",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-settings-plugin-inventory",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-settings-plugin-inventory/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-conversation",
+      "moduleName": "@deepseek-ai/dsh-client-ui-conversation",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-conversation",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-conversation/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-approval",
+      "moduleName": "@deepseek-ai/dsh-client-ui-approval",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-approval",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-approval/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-chat",
+      "moduleName": "@deepseek-ai/dsh-client-ui-chat",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-chat",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-chat/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-brand-official",
+      "moduleName": "@deepseek-ai/dsh-client-ui-brand-official",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-brand-official",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-brand-official/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-attachment",
+      "moduleName": "@deepseek-ai/dsh-client-ui-attachment",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-attachment",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-attachment/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-tool",
+      "moduleName": "@deepseek-ai/dsh-client-ui-tool",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-tool",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-tool/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-cordis",
+      "moduleName": "@deepseek-ai/dsh-client-ui-cordis",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-cordis",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/extensions/ui-cordis/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-workflow-run",
+      "moduleName": "@deepseek-ai/dsh-client-ui-workflow-run",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-workflow-run",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-workflow-run/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-deliverables",
+      "moduleName": "@deepseek-ai/dsh-client-ui-deliverables",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-deliverables",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-deliverables/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-workspace",
+      "moduleName": "@deepseek-ai/dsh-client-ui-workspace",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-workspace",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-workspace/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-input-trigger",
+      "moduleName": "@deepseek-ai/dsh-client-ui-input-trigger",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-input-trigger",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-input-trigger/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-commands",
+      "moduleName": "@deepseek-ai/dsh-client-ui-commands",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-commands",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-commands/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-skill",
+      "moduleName": "@deepseek-ai/dsh-client-ui-skill",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-skill",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-skill/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-subagent",
+      "moduleName": "@deepseek-ai/dsh-client-ui-subagent",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-subagent",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-subagent/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-reference",
+      "moduleName": "@deepseek-ai/dsh-client-ui-reference",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-reference",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-reference/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-schedule",
+      "moduleName": "@deepseek-ai/dsh-client-ui-schedule",
+      "enabled": false,
+      "fiberPhase": null,
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-schedule",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-schedule/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-jobs",
+      "moduleName": "@deepseek-ai/dsh-client-ui-jobs",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-jobs",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-jobs/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-goal",
+      "moduleName": "@deepseek-ai/dsh-client-ui-goal",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-goal",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-goal/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-message-feedback",
+      "moduleName": "@deepseek-ai/dsh-client-ui-message-feedback",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-message-feedback",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-message-feedback/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-model-selection",
+      "moduleName": "@deepseek-ai/dsh-client-ui-model-selection",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-model-selection",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-model-selection/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-permission",
+      "moduleName": "@deepseek-ai/dsh-client-ui-permission-presets",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-permission-presets",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-permission-presets/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-agent-preset",
+      "moduleName": "@deepseek-ai/dsh-client-ui-agent-preset",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-agent-preset",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-agent-preset/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-settings-plugins",
+      "moduleName": "@deepseek-ai/dsh-client-ui-settings-plugins",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-settings-plugins",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-settings-plugins/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-plan",
+      "moduleName": "@deepseek-ai/dsh-client-ui-plan",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-plan",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-plan/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-user-questions",
+      "moduleName": "@deepseek-ai/dsh-client-ui-user-questions",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-user-questions",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-user-questions/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:ui-trajectory",
+      "moduleName": "@deepseek-ai/dsh-client-ui-trajectory",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-trajectory",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-trajectory/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:agent-presets",
+      "moduleName": "@deepseek-ai/dsh-agent-presets",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-agent-presets",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/preset/agent-presets/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "include:cyrene-persistence",
+      "moduleName": "@cyrene/navigator-harness/persistence",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@cyrene/navigator-harness",
+        "version": "0.1.0",
+        "source": "harness/package.json",
+        "commit": null
+      }
+    },
+    {
+      "entryId": "include:cyrene-session-control",
+      "moduleName": "@cyrene/navigator-harness/session-control",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@cyrene/navigator-harness",
+        "version": "0.1.0",
+        "source": "harness/package.json",
+        "commit": null
+      }
+    },
+    {
+      "entryId": "include:cyrene-codex-import",
+      "moduleName": "@cyrene/navigator-harness/import",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@cyrene/navigator-harness",
+        "version": "0.1.0",
+        "source": "harness/package.json",
+        "commit": null
+      }
+    },
+    {
+      "entryId": "38d3db4a",
+      "moduleName": "@deepseek-ai/dsh-host-directory-picker-browse",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-host-directory-picker-browse",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/host/directory-picker-browse/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    },
+    {
+      "entryId": "0abb76e5",
+      "moduleName": "@deepseek-ai/dsh-client-ui-directory-picker-browse",
+      "enabled": true,
+      "fiberPhase": "active",
+      "package": {
+        "name": "@deepseek-ai/dsh-client-ui-directory-picker-browse",
+        "version": "0.1.3-alpha.1",
+        "source": "packages/client/ui-directory-picker-browse/package.json",
+        "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+      }
+    }
+  ],
+  "navigatorPresets": [
+    {
+      "id": "cyrene-navigator",
+      "trust": "system",
+      "name": "Navigator",
+      "isDefault": true,
+      "rows": [
+        {
+          "entryId": "include:agent-presets:persona",
+          "moduleName": "@deepseek-ai/dsh-persona",
+          "enabled": true,
+          "fiberPhase": "active",
+          "package": {
+            "name": "@deepseek-ai/dsh-persona",
+            "version": "0.1.3-alpha.1",
+            "source": "packages/preset/persona/package.json",
+            "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+          }
+        },
+        {
+          "entryId": "include:agent-presets:tool-fs",
+          "moduleName": "@deepseek-ai/dsh-tool-fs",
+          "enabled": true,
+          "fiberPhase": "active",
+          "package": {
+            "name": "@deepseek-ai/dsh-tool-fs",
+            "version": "0.1.3-alpha.1",
+            "source": "packages/fs/tool-fs/package.json",
+            "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+          }
+        },
+        {
+          "entryId": "include:agent-presets:tool-fs-search",
+          "moduleName": "@deepseek-ai/dsh-tool-fs-search",
+          "enabled": true,
+          "fiberPhase": "active",
+          "package": {
+            "name": "@deepseek-ai/dsh-tool-fs-search",
+            "version": "0.1.3-alpha.1",
+            "source": "packages/fs/tool-fs-search/package.json",
+            "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+          }
+        },
+        {
+          "entryId": "include:agent-presets:tool-bash",
+          "moduleName": "@deepseek-ai/dsh-tool-bash",
+          "enabled": true,
+          "condition": "process.platform === 'win32'",
+          "fiberPhase": "active",
+          "package": {
+            "name": "@deepseek-ai/dsh-tool-bash",
+            "version": "0.1.3-alpha.1",
+            "source": "packages/shell/tool-bash/package.json",
+            "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+          }
+        },
+        {
+          "entryId": "include:agent-presets:tool-pwsh",
+          "moduleName": "@deepseek-ai/dsh-tool-pwsh",
+          "enabled": false,
+          "condition": "process.platform !== 'win32'",
+          "fiberPhase": null,
+          "package": {
+            "name": "@deepseek-ai/dsh-tool-pwsh",
+            "version": "0.1.3-alpha.1",
+            "source": "packages/shell/tool-pwsh/package.json",
+            "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+          }
+        },
+        {
+          "entryId": "include:agent-presets:tool-jobs",
+          "moduleName": "@deepseek-ai/dsh-tool-jobs",
+          "enabled": true,
+          "fiberPhase": "active",
+          "package": {
+            "name": "@deepseek-ai/dsh-tool-jobs",
+            "version": "0.1.3-alpha.1",
+            "source": "packages/jobs/tool-jobs/package.json",
+            "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+          }
+        },
+        {
+          "entryId": "include:agent-presets:skill-filesystem",
+          "moduleName": "@deepseek-ai/dsh-skill-filesystem",
+          "enabled": true,
+          "fiberPhase": "active",
+          "package": {
+            "name": "@deepseek-ai/dsh-skill-filesystem",
+            "version": "0.1.3-alpha.1",
+            "source": "packages/skill/skill-filesystem/package.json",
+            "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+          }
+        },
+        {
+          "entryId": "include:agent-presets:tool-skill",
+          "moduleName": "@deepseek-ai/dsh-tool-skill",
+          "enabled": true,
+          "fiberPhase": "active",
+          "package": {
+            "name": "@deepseek-ai/dsh-tool-skill",
+            "version": "0.1.3-alpha.1",
+            "source": "packages/skill/tool-skill/package.json",
+            "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+          }
+        },
+        {
+          "entryId": "include:agent-presets:tool-ask-user",
+          "moduleName": "@deepseek-ai/dsh-tool-ask-user",
+          "enabled": true,
+          "fiberPhase": "active",
+          "package": {
+            "name": "@deepseek-ai/dsh-tool-ask-user",
+            "version": "0.1.3-alpha.1",
+            "source": "packages/interaction/tool-ask-user/package.json",
+            "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+          }
+        },
+        {
+          "entryId": "include:agent-presets:workflow-worker-thread",
+          "moduleName": "@deepseek-ai/dsh-workflow-worker-thread",
+          "enabled": true,
+          "fiberPhase": "active",
+          "package": {
+            "name": "@deepseek-ai/dsh-workflow-worker-thread",
+            "version": "0.1.3-alpha.1",
+            "source": "packages/workflow/workflow-worker-thread/package.json",
+            "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+          }
+        },
+        {
+          "entryId": "include:agent-presets:tool-workflow",
+          "moduleName": "@deepseek-ai/dsh-tool-workflow",
+          "enabled": true,
+          "fiberPhase": "active",
+          "package": {
+            "name": "@deepseek-ai/dsh-tool-workflow",
+            "version": "0.1.3-alpha.1",
+            "source": "packages/workflow/tool-workflow/package.json",
+            "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+          }
+        },
+        {
+          "entryId": "include:agent-presets:compaction-basic",
+          "moduleName": "@deepseek-ai/dsh-compaction-basic",
+          "enabled": true,
+          "fiberPhase": "active",
+          "package": {
+            "name": "@deepseek-ai/dsh-compaction-basic",
+            "version": "0.1.3-alpha.1",
+            "source": "packages/compaction/compaction-basic/package.json",
+            "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+          }
+        },
+        {
+          "entryId": "include:agent-presets:command-compact",
+          "moduleName": "@deepseek-ai/dsh-command-compact",
+          "enabled": true,
+          "fiberPhase": "active",
+          "package": {
+            "name": "@deepseek-ai/dsh-command-compact",
+            "version": "0.1.3-alpha.1",
+            "source": "packages/compaction/command-compact/package.json",
+            "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+          }
+        },
+        {
+          "entryId": "include:agent-presets:tool-result-pruner",
+          "moduleName": "@deepseek-ai/dsh-compaction-tool-result-pruner",
+          "enabled": true,
+          "fiberPhase": "active",
+          "package": {
+            "name": "@deepseek-ai/dsh-compaction-tool-result-pruner",
+            "version": "0.1.3-alpha.1",
+            "source": "packages/compaction/compaction-tool-result-pruner/package.json",
+            "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215"
+          }
+        }
+      ]
+    }
+  ]
+}

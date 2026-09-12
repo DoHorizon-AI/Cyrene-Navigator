@@ -1,0 +1,25 @@
+name: Product contract and MVP
+
+on:
+  pull_request:
+  push:
+    branches: [main, develop, 'feat/**', 'fix/**']
+
+permissions:
+  contents: read
+
+jobs:
+  product-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install uv==0.12.3
+      - run: uv sync --frozen --group dev
+      - run: uv run ruff check src tests
+      - run: uv run ruff format --check src tests
+      - run: uv run mypy
+      - run: uv run pytest -q
+      - run: uv run openapi-spec-validator contracts/product/v1/openapi.yaml

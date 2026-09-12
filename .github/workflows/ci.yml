@@ -1,0 +1,126 @@
+name: ci
+
+on:
+  push:
+    branches: [main, develop, 'feat/**', 'fix/**']
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-quality:
+    name: ci / python-quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install locked Python tool
+        run: python -m pip install --disable-pip-version-check uv==0.12.3
+      - name: Install locked Python environment
+        run: uv sync --frozen --group dev
+      - name: Ruff lint
+        run: uv run ruff check src tests scripts/serve-persistence.py
+      - name: Ruff format
+        run: uv run ruff format --check src tests scripts/serve-persistence.py
+      - name: Mypy strict type check
+        run: uv run mypy src/cyrene_navigator scripts/serve-persistence.py
+      - name: Python tests
+        run: uv run pytest -q
+      - name: Product boundary guard
+        run: uv run python scripts/ci/check-platform-boundary.py
+
+  native-rust:
+    name: ci / native-rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.97.1'
+          components: rustfmt, clippy
+      - name: Verify Rust toolchain
+        run: |
+          rustc --version | grep -F '1.97.1'
+          cargo --version
+      - name: Rust format
+        run: |
+          cargo fmt --manifest-path native/Cargo.toml --all -- --check
+          rustfmt --edition 2021 --check harness/tests/fixtures/native-matrix-host.rs
+      - name: Rust clippy
+        run: cargo clippy --manifest-path native/Cargo.toml --workspace --all-targets --locked -- -D warnings
+      - name: Rust tests
+        run: cargo test --manifest-path native/Cargo.toml --workspace --all-targets --locked
+
+  phase0-integration:
+    name: ci / phase0-integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: '1'
+      CI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install locked Python tool
+        run: python -m pip install --disable-pip-version-check uv==0.12.3
+      - name: Install locked Python environment
+        run: uv sync --frozen --group dev
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.13.0'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '11.7.0'
+      - name: Verify Node and pnpm pins
+        run: |
+          test "$(node --version)" = 'v24.13.0'
+          test "$(pnpm --version)" = '11.7.0'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.97.1'
+      - name: Prepare and build exact DeepSeek Harness
+        run: node scripts/prepare-harness.mjs --root "$RUNNER_TEMP/deepseek-harness" --install --build --link
+      - name: Build Navigator Harness adapters with strict TypeScript
+        run: |
+          node "$RUNNER_TEMP/deepseek-harness/node_modules/typescript/bin/tsc" -p harness/tsconfig.json
+          node "$RUNNER_TEMP/deepseek-harness/node_modules/typescript/bin/tsc" -p harness/tsconfig.client.json
+          node scripts/windows/build-harness-client.mjs
+          node --check harness/dist/client.js
+      - name: Verify browser delivery feedback
+        run: node --test harness/tests/delivery-feedback.test.mjs
+      - name: Build Navigator native host
+        run: cargo build --manifest-path native/Cargo.toml --package cyrene-native-host --locked
+      - name: Export integration process paths
+        run: |
+          echo "CYRENE_DSH_ROOT=$RUNNER_TEMP/deepseek-harness" >> "$GITHUB_ENV"
+          echo "CYRENE_TEST_PYTHON=$GITHUB_WORKSPACE/.venv/bin/python" >> "$GITHUB_ENV"
+          echo "CYRENE_NATIVE_HOST=$GITHUB_WORKSPACE/native/target/debug/cyrene-native-host" >> "$GITHUB_ENV"
+          test -d "$RUNNER_TEMP/deepseek-harness"
+          test -x "$GITHUB_WORKSPACE/native/target/debug/cyrene-native-host"
+      - name: Run real persistence, Rust IPC, Codex import and Web Profile integration
+        run: |
+          node --test \
+            harness/tests/persistence.integration.test.mjs \
+            harness/tests/import-codex.integration.test.mjs \
+            harness/tests/input-receipts.integration.test.mjs \
+            harness/tests/compaction.test.mjs \
+            harness/tests/session-titles.test.mjs \
+            harness/tests/profile.integration.test.mjs \
+            harness/tests/native.integration.test.mjs

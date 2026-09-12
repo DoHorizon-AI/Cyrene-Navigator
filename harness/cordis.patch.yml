@@ -1,0 +1,67 @@
+# Navigator composition over the exact upstream base and application bundle.
+# Navigator 通过组合复用上游；会话只有 Cyrene persistence 一个可写真源。
+- id: session-persistence-jsonl
+  disabled: true
+
+- id: session-telemetry-otel
+  disabled: true
+
+- id: llm-deepseek
+  disabled: true
+
+- id: session-title-llm
+  disabled: true
+
+- id: agent-presets
+  config:
+    default: cyrene-navigator
+    includeShippedRoot: true
+    includeUserRoot: true
+    roots:
+      - path: !!js process.env.CYRENE_NAVIGATOR_PRESETS
+        trust: system
+
+- id: agent-default-model
+  config:
+    provider: cyrene-exchange
+    model: !!js process.env.CYRENE_HARNESS_MODEL
+
+# Reuse the upstream provider adapter. Personal profiles may add external
+# providers through its existing settings UI; the adoption proof uses Exchange.
+# 复用成熟 Provider 插件；个人配置可添加外部 Provider，验收固定经过 Exchange。
+- id: llm-pi-ai
+  config:
+    providers:
+      cyrene-exchange:
+        displayName: Cyrene Exchange
+        api: openai-completions
+        baseURL: !!js process.env.CYRENE_EXCHANGE_URL
+        apiKeyEnv: CYRENE_EXCHANGE_TOKEN
+        models:
+          - id: !!js process.env.CYRENE_HARNESS_MODEL
+            contextWindow: !!js Number(process.env.CYRENE_HARNESS_CONTEXT_WINDOW || 8192)
+            maxTokens: !!js Number(process.env.CYRENE_HARNESS_MAX_TOKENS || 2048)
+            input: [text]
+
+- insert:
+    - id: cyrene-navigator-bundle
+      name: '@cyrene/navigator-harness'
+
+    - id: cyrene-persistence
+      name: '@cyrene/navigator-harness/persistence'
+      config:
+        baseUrl: !!js process.env.CYRENE_PERSISTENCE_URL
+        workspaceId: !!js process.env.CYRENE_WORKSPACE_ID
+        tokenEnv: CYRENE_SESSION_TOKEN
+        clientId: !!js process.env.CYRENE_DEVICE_ID || 'navigator'
+
+    - id: cyrene-session-control
+      name: '@cyrene/navigator-harness/session-control'
+
+    - id: cyrene-session-titles
+      name: '@cyrene/navigator-harness/session-titles'
+
+    - id: cyrene-codex-import
+      name: '@cyrene/navigator-harness/import'
+      config:
+        binary: !!js process.env.CYRENE_NATIVE_HOST

@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "repository": "https://github.com/deepseek-ai/deepseek-harness.git",
+  "tag": "dsh-v0.1.3-alpha.1",
+  "commit": "d347e703908d0406b7a7ef80e3a0e594d86b2215",
+  "version": "0.1.3-alpha.1",
+  "packageManager": "pnpm@11.7.0",
+  "proofNodeVersion": "24.13.0",
+  "sha256": {
+    "pnpm-lock.yaml": "2c903ab870f821ee2db62fa9417d11b1c2b9c65fbeec30e851ddc53c4cc8c383",
+    "package.json": "7177f05af3a57a4ba6ddb81ce28a686eeede647b9b1b9ccb9ef2fc0892e9c941"
+  },
+  "corePatches": []
+}

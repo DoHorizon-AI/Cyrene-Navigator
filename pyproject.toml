@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling==1.32.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cyrene-navigator"
+version = "0.1.0"
+description = "Cyrene Navigator desktop Harness integration and authoritative Session persistence"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+dependencies = [
+  "fastapi==0.141.1",
+  "httpx==0.28.1",
+  "pydantic==2.13.5",
+  "uvicorn==0.52.4",
+]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[dependency-groups]
+dev = [
+  "jsonschema==4.26.0",
+  "mypy==2.3.1",
+  "openapi-spec-validator==0.9.0",
+  "pytest==9.1.1",
+  "ruff==0.16.5",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cyrene_navigator"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+filterwarnings = [
+  "ignore:Using `httpx` with `starlette.testclient` is deprecated:starlette.exceptions.StarletteDeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["RUF002"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src/cyrene_navigator"]

@@ -1,0 +1,16 @@
+[package]
+name = "cyrene-native-host"
+version = "0.1.0"
+edition = "2021"
+description = "Cyrene Navigator's supervised stdio bridge for native tools and conversation imports."
+license = "Apache-2.0"
+
+[[bin]]
+name = "cyrene-native-host"
+path = "src/main.rs"
+
+[dependencies]
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"

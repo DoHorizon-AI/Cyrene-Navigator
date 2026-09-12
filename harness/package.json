@@ -1,0 +1,47 @@
+{
+  "name": "@cyrene/navigator-harness",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cyrene Navigator profile bundle and upstream Harness adapters",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": "./dist/index.js",
+    "./persistence": "./dist/persistence.js",
+    "./import": "./dist/import-codex.js",
+    "./session-control": "./dist/session-control.js",
+    "./session-titles": "./dist/session-titles.js",
+    "./compaction": "./dist/compaction.js",
+    "./client": "./dist/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": { "patch": "cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-session"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "4.0.2",
+    "@deepseek-ai/dsh-agent": "0.1.3-alpha.1",
+    "@deepseek-ai/dsh-api-session-controller": "0.1.3-alpha.1",
+    "@deepseek-ai/dsh-compaction-basic": "0.1.3-alpha.1",
+    "@deepseek-ai/dsh-client-connection": "0.1.3-alpha.1",
+    "@deepseek-ai/dsh-client-ui-conversation": "0.1.3-alpha.1",
+    "@deepseek-ai/dsh-llm": "0.1.3-alpha.1",
+    "@deepseek-ai/dsh-session": "0.1.3-alpha.1",
+    "@deepseek-ai/dsh-session-persistence": "0.1.3-alpha.1",
+    "@deepseek-ai/dsh-session-query": "0.1.3-alpha.1",
+    "@deepseek-ai/dsh-session-title": "0.1.3-alpha.1",
+    "@deepseek-ai/dsh-tools": "0.1.3-alpha.1",
+    "@deepseek-ai/dsh-util-values": "0.1.3-alpha.1",
+    "@deepseek-ai/dsh-subprocess": "0.1.3-alpha.1",
+    "@deepseek-ai/schemastery": "3.18.2"
+  }
+}

@@ -1,0 +1,1061 @@
+# Generated from implemented Product actions; ArtifactRef is a transparent cross-product identity.
+openapi: 3.1.2
+x-cyrene-contract-profile: product-http-v1
+info:
+  title: Cyrene Navigator Harness Persistence API
+  version: 1.0.0
+paths:
+  /api/v1/harness/workspaces/{workspace_id}/sessions/{session_id}/actions/send-to-echo:
+    post:
+      summary: Send To Echo
+      operationId: send_to_echo_api_v1_harness_workspaces__workspace_id__sessions__session_id__actions_send_to_echo_post
+      parameters:
+      - name: workspace_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Workspace Id
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendToEcho'
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EchoReceipt'
+        '422':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '404':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '409':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '502':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '503':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+  /api/v1/harness/workspaces/{workspace_id}/sessions:
+    post:
+      summary: Create Session
+      description: Create and own one session. | 创建并持有一个会话。
+      operationId: create_session_api_v1_harness_workspaces__workspace_id__sessions_post
+      parameters:
+      - name: workspace_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Workspace Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionCreateRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HandleView'
+        '422':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '404':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '409':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '502':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '503':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+    get:
+      summary: List Sessions
+      description: List Workspace sessions without write capabilities. | 列出 Workspace 会话。
+      operationId: list_sessions_api_v1_harness_workspaces__workspace_id__sessions_get
+      parameters:
+      - name: workspace_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Workspace Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SnapshotList'
+        '422':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '404':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '409':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '502':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '503':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+  /api/v1/harness/workspaces/{workspace_id}/sessions/{session_id}:
+    get:
+      summary: Get Session
+      description: Read one Workspace session snapshot. | 读取一个会话快照。
+      operationId: get_session_api_v1_harness_workspaces__workspace_id__sessions__session_id__get
+      parameters:
+      - name: workspace_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Workspace Id
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Snapshot'
+        '422':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '404':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '409':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '502':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '503':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+  /api/v1/harness/workspaces/{workspace_id}/sessions/{session_id}/metadata:
+    get:
+      summary: Get Product Metadata
+      description: 'Read Product metadata independently of the Harness header and writer lease.
+
+
+        独立读取产品元数据；不把 Harness header 或可变 writer lease 当作产品身份。'
+      operationId: get_product_metadata_api_v1_harness_workspaces__workspace_id__sessions__session_id__metadata_get
+      parameters:
+      - name: workspace_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Workspace Id
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductMetadata'
+        '422':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '404':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '409':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '502':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '503':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+  /api/v1/harness/workspaces/{workspace_id}/sessions/{session_id}/handles:
+    post:
+      summary: Open Handle
+      description: Open a read handle or an explicitly fenced write handle. | 打开读写句柄。
+      operationId: open_handle_api_v1_harness_workspaces__workspace_id__sessions__session_id__handles_post
+      parameters:
+      - name: workspace_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Workspace Id
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HandleOpenRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HandleView'
+        '422':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '404':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '409':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '502':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '503':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+  /api/v1/harness/workspaces/{workspace_id}/sessions/{session_id}/events:
+    get:
+      summary: Read Events
+      description: Read a committed event slice. | 读取已提交事件片段。
+      operationId: read_events_api_v1_harness_workspaces__workspace_id__sessions__session_id__events_get
+      parameters:
+      - name: workspace_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Workspace Id
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      - name: offset
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+          default: 0
+          title: Offset
+      - name: length
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 10000
+          minimum: 0
+          default: 10000
+          title: Length
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventsView'
+        '422':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '404':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '409':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '502':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '503':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+  /api/v1/harness/workspaces/{workspace_id}/sessions/{session_id}/append:
+    post:
+      summary: Append Events
+      description: Append an atomically committed event batch. | 原子提交事件批次。
+      operationId: append_events_api_v1_harness_workspaces__workspace_id__sessions__session_id__append_post
+      parameters:
+      - name: workspace_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Workspace Id
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AppendRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MutationView'
+        '422':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '404':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '409':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '502':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '503':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+  /api/v1/harness/workspaces/{workspace_id}/sessions/{session_id}/flush:
+    post:
+      summary: Flush
+      description: Confirm the durable event prefix. | 确认已持久化事件前缀。
+      operationId: flush_api_v1_harness_workspaces__workspace_id__sessions__session_id__flush_post
+      parameters:
+      - name: workspace_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Workspace Id
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MutationRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MutationView'
+        '422':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '404':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '409':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '502':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '503':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+  /api/v1/harness/workspaces/{workspace_id}/sessions/{session_id}/heartbeat:
+    post:
+      summary: Heartbeat
+      description: Renew a current write lease. | 续期当前写租约。
+      operationId: heartbeat_api_v1_harness_workspaces__workspace_id__sessions__session_id__heartbeat_post
+      parameters:
+      - name: workspace_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Workspace Id
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MutationRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MutationView'
+        '422':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '404':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '409':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '502':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '503':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+  /api/v1/harness/workspaces/{workspace_id}/sessions/{session_id}/release:
+    post:
+      summary: Release
+      description: Release the current write lease after fencing. | 释放当前写租约。
+      operationId: release_api_v1_harness_workspaces__workspace_id__sessions__session_id__release_post
+      parameters:
+      - name: workspace_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Workspace Id
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Session Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MutationRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MutationView'
+        '422':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '404':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '409':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '502':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '503':
+          description: Product action rejected (RFC 9457)
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+components:
+  schemas:
+    AppendRequest:
+      properties:
+        writerToken:
+          type: string
+          maxLength: 512
+          minLength: 1
+          title: Writertoken
+        epoch:
+          type: integer
+          minimum: 0.0
+          title: Epoch
+        batchId:
+          type: string
+          maxLength: 512
+          minLength: 1
+          title: Batchid
+        events:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          maxItems: 10000
+          minItems: 1
+          title: Events
+      additionalProperties: false
+      type: object
+      required:
+      - writerToken
+      - epoch
+      - batchId
+      - events
+      title: AppendRequest
+      description: Request one idempotent append batch. | 请求一个幂等追加批次。
+    EchoReceipt:
+      properties:
+        targetResource:
+          $ref: '#/components/schemas/TargetResource'
+        status:
+          type: string
+          enum:
+          - DRAFT
+          - STARTED
+          title: Status
+        openIn:
+          type: string
+          title: Openin
+      additionalProperties: false
+      type: object
+      required:
+      - targetResource
+      - status
+      - openIn
+      title: EchoReceipt
+    EventsView:
+      properties:
+        events:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          title: Events
+        nextSeq:
+          type: integer
+          minimum: 0.0
+          title: Nextseq
+      additionalProperties: false
+      type: object
+      required:
+      - events
+      - nextSeq
+      title: EventsView
+      description: Contiguous event slice and its committed end cursor. | 连续事件片段。
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            $ref: '#/components/schemas/ValidationError'
+          type: array
+          title: Detail
+      type: object
+      title: HTTPValidationError
+    HandleOpenRequest:
+      properties:
+        access:
+          type: string
+          enum:
+          - read
+          - write
+          title: Access
+        clientId:
+          type: string
+          maxLength: 200
+          minLength: 1
+          title: Clientid
+        takeoverExpectedEpoch:
+          anyOf:
+          - type: integer
+            minimum: 0.0
+          - type: 'null'
+          title: Takeoverexpectedepoch
+      additionalProperties: false
+      type: object
+      required:
+      - access
+      - clientId
+      title: HandleOpenRequest
+      description: Request a read or write handle for an existing session. | 打开读写句柄。
+    HandleView:
+      properties:
+        id:
+          type: string
+          title: Id
+        header:
+          additionalProperties: true
+          type: object
+          title: Header
+        inheritedEventCount:
+          type: integer
+          minimum: 0.0
+          title: Inheritedeventcount
+        access:
+          type: string
+          enum:
+          - read
+          - write
+          title: Access
+        nextSeq:
+          type: integer
+          minimum: 0.0
+          title: Nextseq
+        epoch:
+          type: integer
+          minimum: 0.0
+          title: Epoch
+        writerToken:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Writertoken
+        leaseExpiresAt:
+          anyOf:
+          - type: integer
+            minimum: 0.0
+          - type: 'null'
+          title: Leaseexpiresat
+      additionalProperties: false
+      type: object
+      required:
+      - id
+      - header
+      - inheritedEventCount
+      - access
+      - nextSeq
+      - epoch
+      title: HandleView
+      description: Wire representation of a server-authorized persistence handle. | 服务端句柄。
+    MutationRequest:
+      properties:
+        writerToken:
+          type: string
+          maxLength: 512
+          minLength: 1
+          title: Writertoken
+        epoch:
+          type: integer
+          minimum: 0.0
+          title: Epoch
+      additionalProperties: false
+      type: object
+      required:
+      - writerToken
+      - epoch
+      title: MutationRequest
+      description: Authenticate a writer mutation. | 认证写入变更。
+    MutationView:
+      properties:
+        nextSeq:
+          type: integer
+          minimum: 0.0
+          title: Nextseq
+        leaseExpiresAt:
+          anyOf:
+          - type: integer
+            minimum: 0.0
+          - type: 'null'
+          title: Leaseexpiresat
+      additionalProperties: false
+      type: object
+      required:
+      - nextSeq
+      title: MutationView
+      description: Mutation acknowledgement with an optional renewed lease. | 变更确认。
+    ProductMetadata:
+      properties:
+        workspaceId:
+          type: string
+          maxLength: 512
+          minLength: 1
+          title: Workspaceid
+        sessionId:
+          type: string
+          maxLength: 512
+          minLength: 1
+          title: Sessionid
+        creatorActorId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Creatoractorid
+        ownerActorId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Owneractorid
+        ownerState:
+          type: string
+          enum:
+          - known
+          - unknown
+          title: Ownerstate
+        metadataVersion:
+          type: integer
+          minimum: 1.0
+          title: Metadataversion
+        source:
+          type: string
+          enum:
+          - cyrene
+          - legacy
+          title: Source
+        createdAt:
+          anyOf:
+          - type: integer
+            minimum: 0.0
+          - type: 'null'
+          title: Createdat
+      additionalProperties: false
+      type: object
+      required:
+      - workspaceId
+      - sessionId
+      - ownerState
+      - metadataVersion
+      - source
+      title: ProductMetadata
+      description: 'Read-only Navigator metadata separate from the Harness event log.
+
+
+        The creator and owner are Product identities, while the persistence writer
+
+        lease remains an independent mutable capability. Legacy rows deliberately
+
+        expose an unknown owner instead of inferring one from an old writer.
+
+
+        Navigator 产品元数据与 Harness 事件日志分离；旧记录无法可靠判断 owner 时明确标记
+
+        unknown/legacy，不从可变的 writer lease 倒推身份。'
+    SendToEcho:
+      properties:
+        expectedRevision:
+          type: string
+          minLength: 1
+          title: Expectedrevision
+        selectedEventSeqs:
+          anyOf:
+          - items:
+              type: integer
+            type: array
+            maxItems: 2000
+            minItems: 1
+          - type: 'null'
+          title: Selectedeventseqs
+        provenanceRefs:
+          items:
+            type: string
+          type: array
+          maxItems: 100
+          title: Provenancerefs
+      additionalProperties: false
+      type: object
+      required:
+      - expectedRevision
+      title: SendToEcho
+      description: Explicit selection at a read-back revision; external lineage is optional.
+    SessionCreateRequest:
+      properties:
+        header:
+          additionalProperties: true
+          type: object
+          title: Header
+        inheritedEventCount:
+          type: integer
+          minimum: 0.0
+          title: Inheritedeventcount
+        clientId:
+          type: string
+          maxLength: 200
+          minLength: 1
+          title: Clientid
+      additionalProperties: false
+      type: object
+      required:
+      - header
+      - inheritedEventCount
+      - clientId
+      title: SessionCreateRequest
+      description: Request a new v2 session and its initial write handle. | 创建 v2 会话。
+    Snapshot:
+      properties:
+        meta:
+          additionalProperties: true
+          type: object
+          title: Meta
+        productMetadata:
+          $ref: '#/components/schemas/ProductMetadata'
+        revision:
+          type: string
+          minLength: 1
+          title: Revision
+        eventCount:
+          type: integer
+          minimum: 0.0
+          title: Eventcount
+        lastActivityAt:
+          anyOf:
+          - type: integer
+            minimum: 0.0
+          - type: 'null'
+          title: Lastactivityat
+      additionalProperties: false
+      type: object
+      required:
+      - meta
+      - productMetadata
+      - revision
+      - eventCount
+      title: Snapshot
+      description: Durable Harness and Product metadata observation. | 持久 Harness 与产品元数据快照。
+    SnapshotList:
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/Snapshot'
+          type: array
+          title: Items
+      additionalProperties: false
+      type: object
+      required:
+      - items
+      title: SnapshotList
+      description: Workspace-scoped session listing. | Workspace 会话列表。
+    TargetResource:
+      properties:
+        uri:
+          type: string
+          pattern: ^cyrene://echo/evaluation-inputs/
+          title: Uri
+        id:
+          type: string
+          title: Id
+        resourceVersion:
+          type: integer
+          minimum: 1.0
+          title: Resourceversion
+      additionalProperties: false
+      type: object
+      required:
+      - uri
+      - id
+      - resourceVersion
+      title: TargetResource
+      description: Identity returned by Echo, with no imported evaluation authority.
+    ValidationError:
+      properties:
+        loc:
+          items:
+            anyOf:
+            - type: string
+            - type: integer
+          type: array
+          title: Location
+        msg:
+          type: string
+          title: Message
+        type:
+          type: string
+          title: Error Type
+        input:
+          title: Input
+        ctx:
+          type: object
+          title: Context
+      type: object
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError

@@ -1,0 +1,60 @@
+schema_version: cyrene.repository-policy.v1
+repository:
+  logical_name: cyrene-navigator
+  lifecycle_class: PUBLIC_PRODUCT
+  visibility: public
+  source_owner: Client Applications Team
+  remote_default_branch: main
+  integration_branch: develop
+  release_branch: main
+  default_branch: main
+ownership:
+  owns:
+  - Desktop GUI, Harness adapters, and application frontend
+  - Session persistence and explicit Product handoffs
+  - Navigator local Artifact publication adapter
+  - Codex rollout import native host
+  does_not_own:
+  - Server-side training, serving, evaluation, or dataset execution
+  - Product capability payload contracts or Plugin implementations
+  - Platform installation, compatibility, or control-plane authority
+build:
+  independent: true
+  build_systems:
+  - python
+  - cargo
+  - npm
+  - dotnet
+artifacts:
+  package_units:
+  - navigator-python-service
+  - navigator-harness
+  - navigator-desktop
+  native_binaries:
+  - cyrene-native-host
+  - cyrene-navigator-desktop
+  packaging:
+    browser_webui: source_preview_only
+    windows_client: unpackaged_framework_dependent
+    windows_signed: false
+    windows_packable: false
+    release_artifacts: false
+distribution:
+  role: COMPONENT_RELEASE
+  profiles:
+  - client_desktop
+  standalone_user_product: false
+integration:
+  multi_repo_required: true
+authorities:
+  ci: github
+  release: manual_github_release
+  deployment: community
+trust:
+  public_requires_private: false
+versioning:
+  scheme: semver
+  scope: repository
+  tag_strategy: repository
+  tag_pattern: v{version}
+  automated_release: false
