@@ -19,6 +19,7 @@ const { values } = parseArgs({ options: {
   link: { type: 'boolean', default: false },
 } });
 const upstream = resolve(values.root ?? join(repository, '.upstream/deepseek-harness'));
+const pnpmCommand = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
 
 /** Run an explicit argv; never interpret paths or arguments through a shell. */
 function run(command, args, cwd, capture = false) {
@@ -48,8 +49,8 @@ const manifest = JSON.parse(readFileSync(join(upstream, 'package.json'), 'utf8')
 if (manifest.version !== lock.version || manifest.packageManager !== lock.packageManager) {
   throw new Error('Upstream version or package manager differs from the lock');
 }
-if (values.install) run('pnpm', ['install', '--frozen-lockfile'], upstream);
-if (values.build) run('pnpm', ['run', 'build:official'], upstream);
+if (values.install) run(pnpmCommand, ['install', '--frozen-lockfile'], upstream);
+if (values.build) run(pnpmCommand, ['run', 'build:official'], upstream);
 
 /** Bind build-time imports to the same upstream package instances used by dsh. */
 function linkPackage(name, target) {
