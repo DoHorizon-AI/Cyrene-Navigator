@@ -1,13 +1,13 @@
 # Security policy / 安全策略
 
-Navigator is a public source-preview repository. The browser WebUI, Python
-persistence API, Harness adapters, Rust native host, and native Windows client
-have different trust and deployment boundaries. A report should name the
-affected surface and the commit where it was observed.
+Navigator is a public repository. Its Python persistence API, Harness adapters,
+and Rust native host have different trust and deployment boundaries. A report
+should name the affected surface and the commit where it was observed. Browser
+and WinUI findings belong to the `cyrene.ui.navigator` Plugin repository scope.
 
-Navigator 是公开的源代码预览仓库。浏览器 WebUI、Python 持久化 API、Harness 适配器、
-Rust 原生宿主和原生 Windows 客户端具有不同的信任与部署边界。报告应说明受影响的交付
-面以及观察问题时使用的 commit。
+Navigator 是公开仓库。Python 持久化 API、Harness 适配器与 Rust 原生宿主具有不同的信任
+与部署边界。报告应说明受影响的交付面以及观察问题时使用的 commit。浏览器与 WinUI 问题
+归属 Plugins 仓库中的 `cyrene.ui.navigator` 范围。
 
 ## Reporting a vulnerability / 报告漏洞
 
@@ -39,21 +39,16 @@ Include, when safe to share privately:
 
 ## Scope notes / 范围说明
 
-- `Core/Mock` is a local Debug preview and is not compiled into the Windows
-  Release path. It still must not contain real personal data or credentials.
-- The browser WebUI currently performs an API availability probe; it is not a
-  complete chat client or an authentication authority.
-- The Windows client reads through `Core/Ports`, while send, cancel, and approve
-  control actions fail closed until an owning Harness control route is exposed.
-- `apps/windows` is unpackaged and unsigned. Do not treat a locally built `.exe`
-  as a trusted release artifact.
+- The persistence API owns durable session state and must enforce workspace and
+  principal boundaries.
+- Harness and native-host inputs are untrusted protocol data; validate them
+  before persistence or process execution.
+- UI source, preview fixtures, packaging, and signing are outside this
+  repository after extraction.
 
-- `Core/Mock` 是本地 Debug 预览，Windows Release 路径不会编译它；即便如此也不能放入
-  真实个人数据或凭据。
-- 当前浏览器 WebUI 只做 API 可用性探测，不是完整聊天客户端，也不是身份认证权威。
-- Windows 客户端通过 `Core/Ports` 读取；在所属 Harness 控制通道开放前，发送、取消、审批
-  动作会 fail closed。
-- `apps/windows` 目前不打包且未签名；本地生成的 `.exe` 不能视为可信发布产物。
+- 持久化 API 拥有持久会话状态，必须执行 workspace 与 principal 边界。
+- Harness 与 native-host 输入是不可信协议数据，必须在持久化或启动进程前校验。
+- UI 源码、预览 fixture、打包与签名在迁出后不属于本仓库范围。
 
 Security fixes should preserve the repository's public API boundaries and must
 not silently add a second Product, Plugin, or Platform authority.

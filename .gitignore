@@ -22,17 +22,6 @@ venv/
 .ruff_cache/
 *.egg-info/
 
-# .NET / WinUI output
-bin/
-obj/
-**/bin/
-**/obj/
-*.user
-*.suo
-.vs/
-.mono/
-**/.mono/
-
 # Rust, JVM, frontend, and mobile output
 target/
 **/target/

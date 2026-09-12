@@ -1,7 +1,7 @@
 name: $(Date:yyyyMMdd)$(Rev:.r)
 
-# Navigator is public: GitHub Actions owns automatic source, desktop, and contract checks.
-# Keep this Azure definition manual for deployment or private integration work.
+# GitHub Actions owns automatic source, native-host, and contract checks after
+# publication. Keep this Azure definition manual for private integration work.
 trigger: none
 pr: none
 
@@ -175,27 +175,13 @@ jobs:
       CYRENE_NATIVE_HOST: $(Build.SourcesDirectory)/native/target/debug/cyrene-native-host
     displayName: 'Run real persistence, native import and Profile integration'
 
-- job: desktop_windows
-  displayName: 'Navigator / Windows Desktop Build'
+- job: native_windows
+  displayName: 'Navigator / Windows Native Host'
   pool:
     vmImage: windows-latest
   timeoutInMinutes: 120
-  variables:
-    GRADLE_USER_HOME: '$(Pipeline.Workspace)/.gradle'
   steps:
   - checkout: self
-  - pwsh: |
-      $ErrorActionPreference = 'Stop'
-      New-Item -ItemType Directory -Force -Path "$env:PIPELINE_WORKSPACE/.cache/pnpm" | Out-Null
-      New-Item -ItemType Directory -Force -Path "$env:PIPELINE_WORKSPACE/.gradle" | Out-Null
-    displayName: 'Prepare Node and Gradle cache directories'
-  - task: Cache@2
-    inputs:
-      key: 'pnpm | "$(Agent.OS)" | "$(Build.Repository.Name)" | apps/desktop/pnpm-lock.yaml'
-      restoreKeys: |
-        pnpm | "$(Agent.OS)" | "$(Build.Repository.Name)"
-      path: '$(Pipeline.Workspace)/.cache/pnpm'
-    displayName: 'Restore pnpm store cache'
   - task: NodeTool@0
     inputs:
       versionSpec: '24.13.0'
@@ -212,19 +198,10 @@ jobs:
       $PSNativeCommandUseErrorActionPreference = $true
       node scripts/prepare-harness.mjs --root (Join-Path $env:AGENT_TEMPDIRECTORY 'deepseek-harness') --install --build --link
       if ($LASTEXITCODE -ne 0) { throw 'Harness source verification failed.' }
-      Push-Location apps/desktop
-      try {
-        pnpm config set store-dir (Join-Path $env:PIPELINE_WORKSPACE '.cache/pnpm')
-        pnpm install --frozen-lockfile
-        pnpm build
-      } finally {
-        Pop-Location
-      }
       cargo +1.97.1-x86_64-pc-windows-msvc fmt --manifest-path native/Cargo.toml --all -- --check
       cargo +1.97.1-x86_64-pc-windows-msvc clippy --manifest-path native/Cargo.toml --workspace --all-targets --locked -- -D warnings
       cargo +1.97.1-x86_64-pc-windows-msvc test --manifest-path native/Cargo.toml --workspace --all-targets --locked
-      powershell -ExecutionPolicy Bypass -File apps/windows/build.ps1 -TypeCheckOnly
-    displayName: 'Build browser WebUI, native host and Windows client type-check'
+    displayName: 'Build Harness adapters and check the Windows native host'
   - pwsh: |
       $ErrorActionPreference = 'Stop'
       $PSNativeCommandUseErrorActionPreference = $true
@@ -263,7 +240,7 @@ jobs:
     - product_contract
     - native_host
     - harness_integration
-    - desktop_windows
+    - native_windows
     - architecture_boundary
   condition: succeeded()
   steps:

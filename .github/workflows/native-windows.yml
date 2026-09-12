@@ -1,32 +1,26 @@
-name: desktop-windows
+name: native-windows
 
 on:
   pull_request:
-    branches: [main, develop]
+    branches: [main]
     paths:
-      - '.github/workflows/desktop-windows.yml'
-      - 'apps/desktop/**'
-      - 'apps/windows/**'
+      - '.github/workflows/native-windows.yml'
       - 'harness/**'
       - 'native/**'
       - 'scripts/prepare-harness.mjs'
       - 'scripts/windows/build-native-host.ps1'
       - 'scripts/windows/native-imports.mjs'
       - 'THIRD_PARTY_NOTICES.md'
-      - 'docs/desktop/README.md'
   push:
-    branches: [main, develop, 'feat/**', 'fix/**']
+    branches: [main, 'feat/**', 'fix/**', 'refactor/**']
     paths:
-      - '.github/workflows/desktop-windows.yml'
-      - 'apps/desktop/**'
-      - 'apps/windows/**'
+      - '.github/workflows/native-windows.yml'
       - 'harness/**'
       - 'native/**'
       - 'scripts/prepare-harness.mjs'
       - 'scripts/windows/build-native-host.ps1'
       - 'scripts/windows/native-imports.mjs'
       - 'THIRD_PARTY_NOTICES.md'
-      - 'docs/desktop/README.md'
   workflow_dispatch:
 
 permissions:
@@ -42,61 +36,6 @@ env:
   RUST_TOOLCHAIN: '1.97.1-x86_64-pc-windows-msvc'
 
 jobs:
-  windows-quality:
-    name: windows / web-ui-native-quality
-    runs-on: windows-2025
-    timeout-minutes: 60
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: ${{ env.PNPM_VERSION }}
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: pnpm
-          cache-dependency-path: apps/desktop/pnpm-lock.yaml
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          components: rustfmt, clippy
-
-      - name: Verify pinned tools
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          if ((node --version).Trim() -ne "v${env:NODE_VERSION}") { throw 'Node pin mismatch.' }
-          if ((pnpm --version).Trim() -ne $env:PNPM_VERSION) { throw 'pnpm pin mismatch.' }
-          if ((rustc --version).Trim() -notmatch '1\.97\.1') { throw 'Rust 1.97.1 is required.' }
-
-      - name: Build browser WebUI
-        working-directory: apps/desktop
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          pnpm install --frozen-lockfile
-          pnpm build
-
-      - name: Check native host and Windows client
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          cargo fmt --manifest-path native/Cargo.toml --all -- --check
-          cargo clippy --manifest-path native/Cargo.toml --workspace --all-targets --locked -- -D warnings
-          cargo test --manifest-path native/Cargo.toml --workspace --all-targets --locked
-          pwsh -NoProfile -ExecutionPolicy Bypass -File apps/windows/build.ps1 -TypeCheckOnly
-
-      - name: Type-check the Release path (preview fixtures excluded)
-        working-directory: apps/windows
-        run: dotnet build tools/typecheck/TypeCheck.csproj -c Release -t:Build -v q --nologo
-
-      - name: Check the Navigator API adapters headlessly
-        working-directory: apps/windows
-        run: dotnet run --project tools/adaptercheck/ApiAdapterCheck.csproj -v q --nologo
-
   native-integration:
     name: windows / native-supervisor
     runs-on: windows-2025

@@ -5,12 +5,12 @@ repository:
   visibility: public
   source_owner: Client Applications Team
   remote_default_branch: main
-  integration_branch: develop
+  integration_branch: main
   release_branch: main
   default_branch: main
 ownership:
   owns:
-  - Desktop GUI, Harness adapters, and application frontend
+  - Harness adapters and Product-facing service APIs
   - Session persistence and explicit Product handoffs
   - Navigator local Artifact publication adapter
   - Codex rollout import native host
@@ -18,31 +18,25 @@ ownership:
   - Server-side training, serving, evaluation, or dataset execution
   - Product capability payload contracts or Plugin implementations
   - Platform installation, compatibility, or control-plane authority
+  - Browser WebUI or native Windows presentation; those live in the optional cyrene.ui.navigator Plugin
 build:
   independent: true
   build_systems:
   - python
   - cargo
   - npm
-  - dotnet
 artifacts:
   package_units:
   - navigator-python-service
   - navigator-harness
-  - navigator-desktop
   native_binaries:
   - cyrene-native-host
-  - cyrene-navigator-desktop
   packaging:
-    browser_webui: source_preview_only
-    windows_client: unpackaged_framework_dependent
-    windows_signed: false
-    windows_packable: false
     release_artifacts: false
 distribution:
   role: COMPONENT_RELEASE
   profiles:
-  - client_desktop
+  - navigator_core
   standalone_user_product: false
 integration:
   multi_repo_required: true
