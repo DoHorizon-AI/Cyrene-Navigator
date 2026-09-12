@@ -64,6 +64,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Harness source verification failed.' }
           "CYRENE_DSH_ROOT=$upstream" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
+      - name: Build Navigator Harness adapters
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $tsc = Join-Path $env:CYRENE_DSH_ROOT 'node_modules/typescript/bin/tsc'
+          node $tsc -p harness/tsconfig.json
+          if ($LASTEXITCODE -ne 0) { throw 'Navigator Harness adapter build failed.' }
+
       - name: Build static native host
         run: |
           $ErrorActionPreference = 'Stop'
