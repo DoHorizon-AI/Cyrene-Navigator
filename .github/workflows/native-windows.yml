@@ -2,7 +2,7 @@ name: native-windows
 
 on:
   pull_request:
-    branches: [main]
+    branches: [develop, main, release]
     paths:
       - '.github/workflows/native-windows.yml'
       - 'harness/**'
@@ -12,7 +12,7 @@ on:
       - 'scripts/windows/native-imports.mjs'
       - 'THIRD_PARTY_NOTICES.md'
   push:
-    branches: [main, 'feat/**', 'fix/**', 'refactor/**']
+    branches: [develop, main, release, 'feat/**', 'fix/**', 'refactor/**']
     paths:
       - '.github/workflows/native-windows.yml'
       - 'harness/**'
