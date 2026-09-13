@@ -4,10 +4,10 @@ repository:
   lifecycle_class: PUBLIC_PRODUCT
   visibility: public
   source_owner: Client Applications Team
-  remote_default_branch: main
-  integration_branch: main
-  release_branch: main
-  default_branch: main
+  remote_default_branch: develop
+  integration_branch: develop
+  release_branch: release
+  default_branch: develop
 ownership:
   owns:
   - Harness adapters and Product-facing service APIs

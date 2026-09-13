@@ -2,8 +2,9 @@ name: Product contract and MVP
 
 on:
   pull_request:
+    branches: [develop, main, release]
   push:
-    branches: [main, 'feat/**', 'fix/**', 'refactor/**']
+    branches: [develop, main, release, 'feat/**', 'fix/**', 'refactor/**']
 
 permissions:
   contents: read
