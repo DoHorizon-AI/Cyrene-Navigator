@@ -3,24 +3,8 @@ name: native-windows
 on:
   pull_request:
     branches: [develop, main, release]
-    paths:
-      - '.github/workflows/native-windows.yml'
-      - 'harness/**'
-      - 'native/**'
-      - 'scripts/prepare-harness.mjs'
-      - 'scripts/windows/build-native-host.ps1'
-      - 'scripts/windows/native-imports.mjs'
-      - 'THIRD_PARTY_NOTICES.md'
   push:
     branches: [develop, main, release, 'feat/**', 'fix/**', 'refactor/**']
-    paths:
-      - '.github/workflows/native-windows.yml'
-      - 'harness/**'
-      - 'native/**'
-      - 'scripts/prepare-harness.mjs'
-      - 'scripts/windows/build-native-host.ps1'
-      - 'scripts/windows/native-imports.mjs'
-      - 'THIRD_PARTY_NOTICES.md'
   workflow_dispatch:
 
 permissions:
