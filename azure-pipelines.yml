@@ -1,263 +1,206 @@
-name: $(Date:yyyyMMdd)$(Rev:.r)
+# GitHub Actions owns automatic source/contract CI and builds the immutable artifact.
+# Azure owns only this CD handoff: download by explicit run ID, verify the commit
+# and SHA-256 manifest, then promote the verified bytes to the next Azure stage.
+# Self-hosted GPU, private-credential, and exact cross-repository acceptance lanes
+# remain in azure-pipelines-supplemental.yml and are never implicit CI/CD checks.
+# GitHub Actions artifacts retain for 30 days; configure the secret variable
+# githubArtifactReadToken with a GitHub token that has Actions: read access.
 
-# GitHub Actions owns automatic source, native-host, and contract checks after
-# publication. Keep this Azure definition manual for private integration work.
+name: Cyrene-Navigator CD artifact promotion
+
 trigger: none
 pr: none
 
-pool:
-  vmImage: ubuntu-latest
+parameters:
+- name: githubRepository
+  displayName: 'GitHub repository (owner/name)'
+  type: string
+  default: DoHorizon-AI/Cyrene-Navigator
+- name: githubRunId
+  displayName: 'Successful GitHub Actions run ID'
+  type: string
+  default: ''
+- name: expectedCommitSha
+  displayName: 'Expected GitHub commit SHA'
+  type: string
+  default: ''
+- name: githubArtifactName
+  displayName: 'GitHub artifact name (optional; defaults to cyrene-repo-SHA)'
+  type: string
+  default: ''
+- name: githubArtifactSlug
+  displayName: 'GitHub artifact slug used for the default name'
+  type: string
+  default: cyrene-navigator
+- name: deploymentEnvironment
+  displayName: 'CD target label'
+  type: string
+  default: staging
 
 jobs:
-- job: product_contract
-  displayName: 'Navigator / Product Contract and Persistence'
-  timeoutInMinutes: 20
-  variables:
-    UV_CACHE_DIR: '$(Pipeline.Workspace)/.cache/uv'
-  steps:
-  - checkout: self
-  - bash: |
-      set -euo pipefail
-      mkdir -p "$(Pipeline.Workspace)/.cache/uv"
-    displayName: 'Prepare uv cache directory'
-  - task: Cache@2
-    inputs:
-      key: 'uv | "$(Agent.OS)" | "$(Build.Repository.Name)" | uv.lock'
-      restoreKeys: |
-        uv | "$(Agent.OS)" | "$(Build.Repository.Name)"
-      path: '$(Pipeline.Workspace)/.cache/uv'
-    displayName: 'Restore uv dependency cache'
-
-  - task: UsePythonVersion@0
-    inputs:
-      versionSpec: '3.12'
-    displayName: 'Setup Python 3.12'
-
-  - bash: |
-      set -euo pipefail
-      python -m pip install --disable-pip-version-check uv==0.12.3
-      uv sync --locked --group dev
-    displayName: 'Install locked dependencies'
-
-  - bash: |
-      set -euo pipefail
-      uv run ruff check src tests scripts
-      uv run ruff format --check src tests scripts
-      uv run mypy src/cyrene_navigator scripts/serve-persistence.py
-      uv run pytest -q --junitxml=test-results.xml
-      uv run python - <<'PY'
-      from pathlib import Path
-      from openapi_spec_validator import validate
-      from openapi_spec_validator.readers import read_from_filename
-
-      for path in Path("contracts/product/v1").glob("*openapi.yaml"):
-          document, base = read_from_filename(str(path.resolve()))
-          validate(document, base_uri=base)
-          print("Validated", path.name)
-      PY
-    displayName: 'Lint, type, unit and OpenAPI checks'
-
-  - task: PublishTestResults@2
-    condition: succeededOrFailed()
-    inputs:
-      testResultsFormat: JUnit
-      testResultsFiles: test-results.xml
-      failTaskOnFailedTests: true
-      failTaskOnMissingResultsFile: true
-
-- job: native_host
-  displayName: 'Navigator / Native Host'
-  timeoutInMinutes: 20
-  variables:
-    CARGO_HOME: '$(Pipeline.Workspace)/.cargo'
-  steps:
-  - checkout: self
-  - bash: |
-      set -euo pipefail
-      mkdir -p "$(Pipeline.Workspace)/.cargo"
-      mkdir -p "$(Pipeline.Workspace)/s/Cyrene-Navigator/native/target"
-    displayName: 'Prepare Cargo cache directories'
-  - task: Cache@2
-    inputs:
-      key: 'cargo | "$(Agent.OS)" | "$(Build.Repository.Name)" | native/Cargo.lock'
-      restoreKeys: |
-        cargo | "$(Agent.OS)" | "$(Build.Repository.Name)"
-      path: '$(Pipeline.Workspace)/.cargo'
-    displayName: 'Restore Cargo registry cache'
-  - task: Cache@2
-    inputs:
-      key: 'cargo-target | "$(Agent.OS)" | "$(Build.Repository.Name)" | native/Cargo.lock'
-      restoreKeys: |
-        cargo-target | "$(Agent.OS)" | "$(Build.Repository.Name)"
-      path: '$(Pipeline.Workspace)/s/Cyrene-Navigator/native/target'
-    displayName: 'Restore native Cargo target cache'
-
-  - bash: |
-      set -euo pipefail
-      export RUSTUP_HOME="$HOME/.rustup"
-      mkdir -p "$RUSTUP_HOME"
-      rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
-      rustup override set 1.97.1
-      rustc --version | grep -F '1.97.1'
-    displayName: 'Install pinned Rust toolchain'
-
-  - bash: |
-      set -euo pipefail
-      cargo fmt --manifest-path native/Cargo.toml --all -- --check
-      rustfmt --edition 2021 --check harness/tests/fixtures/native-matrix-host.rs
-      cargo clippy --manifest-path native/Cargo.toml --workspace --all-targets --locked -- -D warnings
-      cargo test --manifest-path native/Cargo.toml --workspace --all-targets --locked
-    displayName: 'Format, lint and test native host'
-
-- job: harness_integration
-  displayName: 'Navigator / Exact Harness Integration'
-  timeoutInMinutes: 60
-  variables:
-    UV_CACHE_DIR: '$(Pipeline.Workspace)/.cache/uv'
-    CARGO_HOME: '$(Pipeline.Workspace)/.cargo'
-  steps:
-  - checkout: self
-  - bash: |
-      set -euo pipefail
-      mkdir -p "$(Pipeline.Workspace)/.cache/uv"
-      mkdir -p "$(Pipeline.Workspace)/.cargo"
-    displayName: 'Prepare dependency and Cargo cache directories'
-  - task: Cache@2
-    inputs:
-      key: 'uv | "$(Agent.OS)" | "$(Build.Repository.Name)" | uv.lock'
-      restoreKeys: |
-        uv | "$(Agent.OS)" | "$(Build.Repository.Name)"
-      path: '$(Pipeline.Workspace)/.cache/uv'
-    displayName: 'Restore uv dependency cache'
-  - task: Cache@2
-    inputs:
-      key: 'cargo | "$(Agent.OS)" | "$(Build.Repository.Name)" | native/Cargo.lock'
-      restoreKeys: |
-        cargo | "$(Agent.OS)" | "$(Build.Repository.Name)"
-      path: '$(Pipeline.Workspace)/.cargo'
-    displayName: 'Restore Cargo registry cache'
-  - task: UsePythonVersion@0
-    inputs:
-      versionSpec: '3.12'
-  - task: NodeTool@0
-    inputs:
-      versionSpec: '24.13.0'
-  - bash: |
-      set -euo pipefail
-      python -m pip install --disable-pip-version-check uv==0.12.3
-      uv sync --locked --group dev
-      corepack enable
-      corepack prepare pnpm@11.7.0 --activate
-      export RUSTUP_HOME="$HOME/.rustup"
-      mkdir -p "$RUSTUP_HOME"
-      rustup toolchain install 1.97.1 --profile minimal
-      rustup override set 1.97.1
-      node scripts/prepare-harness.mjs --install --build --link
-      node .upstream/deepseek-harness/node_modules/typescript/bin/tsc -p harness/tsconfig.json
-      node .upstream/deepseek-harness/node_modules/typescript/bin/tsc -p harness/tsconfig.client.json
-      node scripts/windows/build-harness-client.mjs
-      cargo build --manifest-path native/Cargo.toml --package cyrene-native-host --locked
-    displayName: 'Build exact Harness, adapters and native host'
-  - bash: |
-      set -euo pipefail
-      node --test \
-        harness/tests/delivery-feedback.test.mjs \
-        harness/tests/persistence.integration.test.mjs \
-        harness/tests/import-codex.integration.test.mjs \
-        harness/tests/input-receipts.integration.test.mjs \
-        harness/tests/compaction.test.mjs \
-        harness/tests/session-titles.test.mjs \
-        harness/tests/profile.integration.test.mjs \
-        harness/tests/native.integration.test.mjs
-    env:
-      CYRENE_DSH_ROOT: $(Build.SourcesDirectory)/.upstream/deepseek-harness
-      CYRENE_TEST_PYTHON: $(Build.SourcesDirectory)/.venv/bin/python
-      CYRENE_NATIVE_HOST: $(Build.SourcesDirectory)/native/target/debug/cyrene-native-host
-    displayName: 'Run real persistence, native import and Profile integration'
-
-- job: native_windows
-  displayName: 'Navigator / Windows Native Host'
+- job: verify_github_artifact
+  displayName: 'CD / Download and verify GitHub artifact'
   pool:
-    vmImage: windows-latest
-  timeoutInMinutes: 120
-  steps:
-  - checkout: self
-  - task: NodeTool@0
-    inputs:
-      versionSpec: '24.13.0'
-  - pwsh: |
-      $ErrorActionPreference = 'Stop'
-      $PSNativeCommandUseErrorActionPreference = $true
-      npm install --global pnpm@11.7.0
-      rustup toolchain install 1.97.1-x86_64-pc-windows-msvc --profile minimal --component rustfmt,clippy
-      if ((node --version).Trim() -ne 'v24.13.0') { throw 'Node pin mismatch.' }
-      if ((pnpm --version).Trim() -ne '11.7.0') { throw 'pnpm pin mismatch.' }
-    displayName: 'Install pinned Windows tools'
-  - pwsh: |
-      $ErrorActionPreference = 'Stop'
-      $PSNativeCommandUseErrorActionPreference = $true
-      node scripts/prepare-harness.mjs --root (Join-Path $env:AGENT_TEMPDIRECTORY 'deepseek-harness') --install --build --link
-      if ($LASTEXITCODE -ne 0) { throw 'Harness source verification failed.' }
-      cargo +1.97.1-x86_64-pc-windows-msvc fmt --manifest-path native/Cargo.toml --all -- --check
-      cargo +1.97.1-x86_64-pc-windows-msvc clippy --manifest-path native/Cargo.toml --workspace --all-targets --locked -- -D warnings
-      cargo +1.97.1-x86_64-pc-windows-msvc test --manifest-path native/Cargo.toml --workspace --all-targets --locked
-    displayName: 'Build Harness adapters and check the Windows native host'
-  - pwsh: |
-      $ErrorActionPreference = 'Stop'
-      $PSNativeCommandUseErrorActionPreference = $true
-      $upstream = Join-Path $env:AGENT_TEMPDIRECTORY 'deepseek-harness'
-      $nativeRoot = Join-Path $env:AGENT_TEMPDIRECTORY 'cyrene-native-host'
-      node scripts/prepare-harness.mjs --root $upstream --link
-      if ($LASTEXITCODE -ne 0) { throw 'Harness source verification failed.' }
-      pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/windows/build-native-host.ps1 -OutputRoot $nativeRoot
-      if ($LASTEXITCODE -ne 0) { throw 'Static native host build failed.' }
-      $fixture = Join-Path $env:AGENT_TEMPDIRECTORY 'native-matrix-host.exe'
-      rustc +1.97.1-x86_64-pc-windows-msvc --edition 2021 -C opt-level=2 `
-        harness/tests/fixtures/native-matrix-host.rs -o $fixture
-      if ($LASTEXITCODE -ne 0) { throw 'Native matrix fixture build failed.' }
-      $env:CYRENE_NATIVE_MATRIX_BINARY = $fixture
-      $env:CYRENE_NATIVE_HOST = Join-Path $nativeRoot 'cyrene-native-host.exe'
-      $env:CYRENE_DSH_ROOT = $upstream
-      node --test harness/tests/native.integration.test.mjs
-      if ($LASTEXITCODE -ne 0) { throw 'Windows native supervisor matrix failed.' }
-      node --test harness/tests/windows-native-imports.test.mjs
-    displayName: 'Run native supervisor matrix without a desktop shell'
-
-- job: architecture_boundary
-  displayName: 'Governance / Platform Independence'
-  timeoutInMinutes: 10
-  steps:
-  - checkout: self
-  - task: UsePythonVersion@0
-    inputs:
-      versionSpec: '3.12'
-  - bash: python scripts/ci/check-platform-boundary.py
-    displayName: 'Reject Platform source coupling and mock leakage'
-
-- job: evidence
-  displayName: 'Navigator / Assemble Evidence'
-  dependsOn:
-    - product_contract
-    - native_host
-    - harness_integration
-    - native_windows
-    - architecture_boundary
-  condition: succeeded()
+    vmImage: ubuntu-latest
+  timeoutInMinutes: 15
   steps:
   - checkout: none
   - bash: |
       set -euo pipefail
-      mkdir -p ci/evidence
-      cat > ci/evidence/navigator-summary.json <<EOF
-      {
-        "suite": "Cyrene-Navigator",
-        "commit": "$(Build.SourceVersion)",
-        "build_id": "$(Build.BuildId)",
-        "status": "PASS",
-        "timestamp": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+      : "${GITHUB_TOKEN:?Configure the secret Azure variable githubArtifactReadToken.}"
+      [[ "$GH_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
+        echo 'githubRepository must be owner/name.' >&2
+        exit 1
       }
-      EOF
-    displayName: 'Generate sanitized evidence'
-  - publish: ci/evidence
-    artifact: navigator-evidence
-    displayName: 'Publish evidence artifact'
+      [[ "$GH_RUN_ID" =~ ^[0-9]+$ ]] || {
+        echo 'githubRunId must be a numeric GitHub Actions run ID.' >&2
+        exit 1
+      }
+      [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+        echo 'expectedCommitSha must be a 40-character lowercase commit SHA.' >&2
+        exit 1
+      }
+
+      artifact_name="$REQUESTED_ARTIFACT"
+      if [[ -z "$artifact_name" ]]; then
+        artifact_name="${ARTIFACT_SLUG}-${EXPECTED_SHA}"
+      fi
+      [[ "$artifact_name" =~ ^[A-Za-z0-9_.-]+$ ]] || {
+        echo 'githubArtifactName contains unsupported characters.' >&2
+        exit 1
+      }
+
+      artifact_root="$(Pipeline.Workspace)/github-artifact"
+      run_metadata_file="$(mktemp)"
+      metadata_file="$(mktemp)"
+      archive_file="$(mktemp --suffix=.zip)"
+      trap 'rm -f "$run_metadata_file" "$metadata_file" "$archive_file"' EXIT
+      rm -rf "$artifact_root"
+      mkdir -p "$artifact_root"
+
+      curl --fail-with-body --silent --show-error --location \
+        --header 'Accept: application/vnd.github+json' \
+        --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+        --header 'X-GitHub-Api-Version: 2022-11-28' \
+        "https://api.github.com/repos/${GH_REPOSITORY}/actions/runs/${GH_RUN_ID}" \
+        > "$run_metadata_file"
+      test "$(jq -r '.repository.full_name' "$run_metadata_file")" = "$GH_REPOSITORY"
+      test "$(jq -r '.head_sha' "$run_metadata_file")" = "$EXPECTED_SHA"
+      test "$(jq -r '.status' "$run_metadata_file")" = 'completed'
+      test "$(jq -r '.conclusion' "$run_metadata_file")" = 'success'
+
+      curl --fail-with-body --silent --show-error --location \
+        --header 'Accept: application/vnd.github+json' \
+        --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+        --header 'X-GitHub-Api-Version: 2022-11-28' \
+        "https://api.github.com/repos/${GH_REPOSITORY}/actions/runs/${GH_RUN_ID}/artifacts?per_page=100" \
+          > "$metadata_file"
+
+      artifact_json="$(jq -e --arg name "$artifact_name" '
+        [.artifacts[] | select(.name == $name)] |
+        if length == 1 then .[0] else error("expected exactly one matching artifact") end
+      ' "$metadata_file")"
+      [[ "$(jq -r '.expired' <<<"$artifact_json")" == 'false' ]] || {
+        echo 'The selected GitHub artifact is expired.' >&2
+        exit 1
+      }
+      download_url="$(jq -er '.archive_download_url' <<<"$artifact_json")"
+      api_digest="$(jq -r '.digest // empty' <<<"$artifact_json")"
+
+      curl --fail-with-body --silent --show-error --location \
+        --header 'Accept: application/vnd.github+json' \
+        --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+        --header 'X-GitHub-Api-Version: 2022-11-28' \
+        "$download_url" \
+        --output "$archive_file"
+
+      zip_sha="$(sha256sum "$archive_file" | awk '{print $1}')"
+      if [[ -n "$api_digest" ]]; then
+        expected_zip_sha="${api_digest#sha256:}"
+        [[ "$expected_zip_sha" =~ ^[0-9a-f]{64}$ ]] || {
+          echo 'GitHub returned an invalid artifact digest.' >&2
+          exit 1
+        }
+        test "$zip_sha" = "$expected_zip_sha"
+      fi
+
+      unzip -q "$archive_file" -d "$artifact_root"
+      manifest_file="$(find "$artifact_root" -type f -name artifact-manifest.json -print -quit)"
+      test -n "$manifest_file"
+      manifest_root="$(dirname "$manifest_file")"
+
+      test "$(jq -r '.schema_version' "$manifest_file")" = '1'
+      test "$(jq -r '.repository' "$manifest_file")" = "$GH_REPOSITORY"
+      test "$(jq -r '.commit_sha' "$manifest_file")" = "$EXPECTED_SHA"
+      test "$(jq -r '.workflow_run_id' "$manifest_file")" = "$GH_RUN_ID"
+      test "$(jq -r '.artifact_name' "$manifest_file")" = "$artifact_name"
+      jq -e '.payload | type == "array" and length > 0' "$manifest_file" >/dev/null
+
+      while IFS=$'\t' read -r relative_path expected_sha; do
+        case "$relative_path" in
+          ''|/*|../*|*/../*|*../*) echo "Unsafe artifact path: $relative_path" >&2; exit 1 ;;
+        esac
+        [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]] || {
+          echo "Invalid SHA-256 in manifest for $relative_path." >&2
+          exit 1
+        }
+        payload_path="$manifest_root/$relative_path"
+        test -f "$payload_path"
+      actual_sha="$(sha256sum "$payload_path" | awk '{print $1}')"
+        test "$actual_sha" = "$expected_sha"
+      done < <(jq -r '.payload[] | [.file, .sha256] | @tsv' "$manifest_file")
+
+      evidence_root="$(Pipeline.Workspace)/cd-evidence"
+      mkdir -p "$evidence_root"
+      jq -n \
+        --arg repository "$GH_REPOSITORY" \
+        --arg run_id "$GH_RUN_ID" \
+        --arg commit_sha "$EXPECTED_SHA" \
+        --arg artifact_name "$artifact_name" \
+        --arg zip_sha256 "$zip_sha" \
+        --arg target "$TARGET_ENVIRONMENT" \
+        '{
+          schema_version: 1,
+          status: "VERIFIED_GITHUB_ARTIFACT",
+          repository: $repository,
+          github_run_id: ($run_id | tonumber),
+          commit_sha: $commit_sha,
+          artifact_name: $artifact_name,
+          downloaded_zip_sha256: $zip_sha256,
+          target_environment: $target
+        }' > "$evidence_root/verification.json"
+      echo "Verified immutable GitHub artifact $artifact_name at $EXPECTED_SHA."
+    displayName: 'Download exact run artifact and verify SHA-256 manifest'
+    env:
+      GITHUB_TOKEN: $(githubArtifactReadToken)
+      GH_REPOSITORY: "${{ parameters.githubRepository }}"
+      GH_RUN_ID: "${{ parameters.githubRunId }}"
+      EXPECTED_SHA: "${{ parameters.expectedCommitSha }}"
+      REQUESTED_ARTIFACT: "${{ parameters.githubArtifactName }}"
+      ARTIFACT_SLUG: "${{ parameters.githubArtifactSlug }}"
+      TARGET_ENVIRONMENT: "${{ parameters.deploymentEnvironment }}"
+  - publish: $(Pipeline.Workspace)/github-artifact
+    artifact: verified-github-artifact
+    displayName: 'Promote verified bytes to Azure CD artifact'
+
+- job: cd_handoff
+  displayName: 'CD / Handoff to deployment target'
+  dependsOn: verify_github_artifact
+  condition: succeeded()
+  pool:
+    vmImage: ubuntu-latest
+  timeoutInMinutes: 10
+  steps:
+  - checkout: none
+  - download: current
+    artifact: verified-github-artifact
+    displayName: 'Download promoted verified artifact'
+  - bash: |
+      set -euo pipefail
+      manifest="$(find "$(Pipeline.Workspace)/verified-github-artifact" -type f -name artifact-manifest.json -print -quit)"
+      test -n "$manifest"
+      test "$(jq -r '.commit_sha' "$manifest")" = "${{ parameters.expectedCommitSha }}"
+      echo "CD handoff ready for ${{ parameters.deploymentEnvironment }} from immutable GitHub bytes."
+      echo 'No source checkout, build, or test is performed in Azure CD.'
+    displayName: 'Expose verified artifact to deployment integration'
