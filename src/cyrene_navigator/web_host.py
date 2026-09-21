@@ -11,10 +11,15 @@ from __future__ import annotations
 import hashlib
 import hmac
 import math
+import os
 import re
 import secrets
+import shutil
+import subprocess
 import time
-from collections.abc import Awaitable, Callable, Mapping
+import urllib.error
+import urllib.request
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from threading import RLock
@@ -622,9 +627,84 @@ class _ConfiguredProxy:
     target: ProxyTarget
 
 
+def _query_gpu() -> dict[str, Any]:
+    """调用 nvidia-smi 查询 GPU 信息，失败时返回 unavailable。"""
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.total,memory.used,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if out.returncode != 0 or not out.stdout.strip():
+            return {"available": False}
+        gpus: list[dict[str, Any]] = []
+        for line in out.stdout.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 4:
+                gpus.append(
+                    {
+                        "name": parts[0],
+                        "totalMib": float(parts[1]) if "." in parts[1] else int(parts[1]),
+                        "usedMib": float(parts[2]) if "." in parts[2] else int(parts[2]),
+                        "utilizationPct": float(parts[3]) if "." in parts[3] else int(parts[3]),
+                    }
+                )
+        return {"available": True, "gpus": gpus}
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError, ValueError):
+        return {"available": False}
+
+
+def _query_disk() -> dict[str, Any]:
+    """查询 Workspace 数据目录的磁盘使用情况。"""
+    try:
+        usage = shutil.disk_usage("/")
+        total = usage.total if usage.total > 0 else 1
+        return {
+            "available": True,
+            "totalGib": round(usage.total / 1024**3, 1),
+            "usedGib": round(usage.used / 1024**3, 1),
+            "freeGib": round(usage.free / 1024**3, 1),
+            "usedPct": round(usage.used / total * 100, 1),
+        }
+    except OSError:
+        return {"available": False}
+
+
+def _query_services(proxies: Sequence[_ConfiguredProxy]) -> list[dict[str, Any]]:
+    """对每个已配置的 proxy target 发送 GET /health，返回 UP/DOWN 状态。"""
+    results: list[dict[str, Any]] = []
+    for entry in proxies:
+        name = entry.prefix.strip("/").split("/")[-1] or entry.prefix
+        url = f"{entry.target.base_url.rstrip('/')}/health"
+        start = time.perf_counter()
+        status = "DOWN"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Cyrene-HealthCheck"})
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                if 200 <= resp.status < 300:
+                    status = "UP"
+        except Exception:
+            status = "DOWN"
+        latency_ms = round((time.perf_counter() - start) * 1000, 1)
+        results.append(
+            {
+                "name": name,
+                "url": url,
+                "status": status,
+                "latencyMs": latency_ms,
+            }
+        )
+    return results
+
+
 def create_web_host_app(
     *,
-    pairing_code: str,
+    pairing_code: str | None = None,
     proxy_targets: Mapping[str, str | ProxyTarget] | None = None,
     credential_store: CredentialStore | None = None,
     app_version: str = "1.0.0",
@@ -640,8 +720,11 @@ def create_web_host_app(
     origin, and proxy responses never set browser cookies from an upstream.
     """
 
+    resolved_pairing_code = (
+        pairing_code or os.environ.get("CYRENE_WEB_HOST_PAIR_CODE") or generate_pairing_code()
+    )
     state = WebHostState(
-        pairing_code,
+        resolved_pairing_code,
         session_ttl_seconds=session_ttl_seconds,
         refresh_ttl_seconds=refresh_ttl_seconds,
         clock=clock,
@@ -844,6 +927,9 @@ def create_web_host_app(
             "authenticated": authenticated,
             "proxyPrefixes": [entry.prefix for entry in configured_proxies],
             "credentials": counts,
+            "gpu": _query_gpu(),
+            "disk": _query_disk(),
+            "services": _query_services(configured_proxies),
             "observedAt": _iso_timestamp(clock()),
         }
 
@@ -984,6 +1070,9 @@ def create_web_host_app(
         )
 
     return app
+
+
+create_app = create_web_host_app
 
 
 def generate_pairing_code() -> str:

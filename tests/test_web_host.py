@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from cyrene_navigator.web_host import create_web_host_app
@@ -197,3 +198,26 @@ def test_web_launcher_emits_one_pairing_banner_on_stdout() -> None:
         process.terminate()
         stdout, _stderr = process.communicate(timeout=5)
     assert stdout == ""
+
+
+def test_web_host_system_status_and_env_pairing_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CYRENE_WEB_HOST_PAIR_CODE", "env-pair-code-123456")
+    app = create_web_host_app(proxy_targets={"/api/v1/test": "http://127.0.0.1:9999"})
+    with TestClient(app) as client:
+        # Pairing code read from env
+        pair_resp = client.post("/api/v1/auth/pair", json={"pairingCode": "env-pair-code-123456"})
+        assert pair_resp.status_code == 200
+
+        # System status contains gpu, disk, and services
+        status_resp = client.get("/api/v1/system/status")
+        assert status_resp.status_code == 200
+        data = status_resp.json()
+        assert data["status"] == "ok"
+        assert "gpu" in data
+        assert "disk" in data
+        assert "services" in data
+        assert len(data["services"]) == 1
+        assert data["services"][0]["name"] == "test"
+        assert data["services"][0]["status"] == "DOWN"
