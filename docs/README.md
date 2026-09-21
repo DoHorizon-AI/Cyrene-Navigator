@@ -14,6 +14,7 @@ Profile、Cyrene 适配器和受监管 Rust 工具；下列文档区分 Alpha �
 | [Harness adoption](adoption/README.md) | Pin, compatibility, plugin inventory and evidence limits / 固定版本、兼容性和证据边界 |
 | [Codex import](import/README.md) | Archive and explicit Continue semantics / 归档及显式 Continue |
 | [Windows desktop](desktop/README.md) | Native client checks and packaging status / 原生客户端检查与打包状态 |
+| [Logging & Error Standards](logging-and-errors.md) | Cross-repository logging, error codes, and diagnostics specification / 跨仓日志、错误码与诊断规范 (草案 v0.1) |
 
 Repository governance and public-source guidance live in the root
 [`CONTRIBUTING.md`](../CONTRIBUTING.md), [`SECURITY.md`](../SECURITY.md),
