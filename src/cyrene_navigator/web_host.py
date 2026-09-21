@@ -30,7 +30,7 @@ from uuid import uuid4
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from pydantic.alias_generators import to_camel
 
@@ -90,6 +90,15 @@ class PairingRequest(WebHostModel):
         """Return the supplied pairing value, preferring the canonical field."""
 
         return self.pairing_code or self.code or ""
+
+
+class ActiveRouteRequest(WebHostModel):
+    """Session-level active route configuration."""
+
+    gateway_endpoint_id: str = Field(min_length=1)
+    model_id: str = Field(min_length=1)
+    base_url: str = Field(min_length=1)
+    api_key_hint: str = Field(default="", max_length=100)
 
 
 class CredentialCreateRequest(WebHostModel):
@@ -444,6 +453,7 @@ class WebHostState:
         self,
         pairing_code: str,
         *,
+        pairing_code_issued_at: float | None = None,
         session_ttl_seconds: float = 3600,
         refresh_ttl_seconds: float = 7 * 24 * 3600,
         clock: Clock = time.time,
@@ -457,6 +467,7 @@ class WebHostState:
         if not math.isfinite(refresh_ttl_seconds) or refresh_ttl_seconds < session_ttl_seconds:
             raise ValueError("refresh_ttl_seconds must be at least the session lifetime")
         self._pairing_hash = _hash_secret(pairing_code)
+        self._pairing_code_issued_at = pairing_code_issued_at
         self.session_ttl_seconds = session_ttl_seconds
         self.refresh_ttl_seconds = refresh_ttl_seconds
         self._clock = clock
@@ -465,14 +476,30 @@ class WebHostState:
         self._sessions: dict[str, _SessionRecord] = {}
         self._access_index: dict[str, str] = {}
         self._refresh_index: dict[str, str] = {}
+        self._active_routes: dict[str, JsonObject] = {}
 
     def pair(self, pairing_code: str) -> _SessionCredentials:
         """Consume the pairing code exactly once and issue a fresh session."""
 
         with self._lock:
-            if self._pairing_consumed or not hmac.compare_digest(
-                self._pairing_hash, _hash_secret(pairing_code)
+            now = self._clock()
+            if (
+                self._pairing_code_issued_at is not None
+                and now - self._pairing_code_issued_at > 900
             ):
+                raise WebHostError(
+                    "NAVIGATOR_PAIR_CODE_EXPIRED",
+                    410,
+                    "The pairing code is invalid or has already been used.",
+                )
+            if self._pairing_consumed:
+                status_code = 410 if self._pairing_code_issued_at is not None else 401
+                raise WebHostError(
+                    "NAVIGATOR_PAIR_CODE_CONSUMED",
+                    status_code,
+                    "The pairing code is invalid or has already been used.",
+                )
+            if not hmac.compare_digest(self._pairing_hash, _hash_secret(pairing_code)):
                 raise WebHostError(
                     "NAVIGATOR_PAIRING_INVALID",
                     401,
@@ -480,6 +507,18 @@ class WebHostState:
                 )
             self._pairing_consumed = True
             return self._issue_session_locked()
+
+    def set_active_route(self, session_id: str, route: JsonObject) -> None:
+        """Set the session-bound active gateway route."""
+
+        with self._lock:
+            self._active_routes[session_id] = route
+
+    def get_active_route(self, session_id: str) -> JsonObject | None:
+        """Get the session-bound active gateway route."""
+
+        with self._lock:
+            return self._active_routes.get(session_id)
 
     def current_session(self, access_token: str | None) -> _SessionRecord | None:
         """Resolve an unexpired access cookie without revealing failure details."""
@@ -702,9 +741,68 @@ def _query_services(proxies: Sequence[_ConfiguredProxy]) -> list[dict[str, Any]]
     return results
 
 
+def _compute_blockers(
+    gpu: dict[str, Any], disk: dict[str, Any], services: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """计算会阻塞用户操作的状态，返回结构化列表。"""
+    blockers: list[dict[str, Any]] = []
+    if not gpu.get("available"):
+        blockers.append(
+            {
+                "code": "GPU_UNAVAILABLE",
+                "message": "No NVIDIA GPU detected. Training and serving require a GPU.",
+            }
+        )
+    elif gpu.get("gpus") and all(g.get("totalMib", 0) < 12000 for g in gpu["gpus"]):
+        blockers.append(
+            {
+                "code": "GPU_VRAM_INSUFFICIENT",
+                "message": "GPU VRAM is less than 12 GiB. Training may fail.",
+            }
+        )
+    if disk.get("available") and disk.get("freeGib", 999) < 50:
+        free_gib = disk.get("freeGib")
+        blockers.append(
+            {
+                "code": "DISK_LOW",
+                "message": f"Free disk space is {free_gib} GiB. At least 50 GiB is recommended.",
+            }
+        )
+    for svc in services:
+        if svc.get("status") != "UP":
+            code_name = svc["name"].upper().replace(" ", "_").replace("-", "_")
+            blockers.append(
+                {
+                    "code": f"SERVICE_DOWN_{code_name}",
+                    "message": f"{svc['name']} is unreachable.",
+                }
+            )
+    return blockers
+
+
+def _query_plugins(services: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """探测已知插件端点，返回 {name, kind, state} 列表。"""
+    service_map = {s["name"]: s.get("status") == "UP" for s in services}
+    yield_up = service_map.get("yield", False)
+    reactor_up = service_map.get("reactor", False)
+    return [
+        {
+            "name": "llama-factory",
+            "kind": "training",
+            "state": "READY" if yield_up else "UNKNOWN",
+        },
+        {
+            "name": "vllm-runtime",
+            "kind": "serving",
+            "state": "READY" if reactor_up else "UNKNOWN",
+        },
+    ]
+
+
 def create_web_host_app(
     *,
     pairing_code: str | None = None,
+    pairing_code_issued_at: float | None = None,
     proxy_targets: Mapping[str, str | ProxyTarget] | None = None,
     credential_store: CredentialStore | None = None,
     app_version: str = "1.0.0",
@@ -723,8 +821,21 @@ def create_web_host_app(
     resolved_pairing_code = (
         pairing_code or os.environ.get("CYRENE_WEB_HOST_PAIR_CODE") or generate_pairing_code()
     )
+    resolved_issued_at = pairing_code_issued_at
+    if resolved_issued_at is None:
+        env_issued = os.environ.get("CYRENE_WEB_HOST_PAIR_CODE_ISSUED_AT")
+        if env_issued:
+            try:
+                resolved_issued_at = float(env_issued)
+            except ValueError:
+                try:
+                    resolved_issued_at = datetime.fromisoformat(env_issued).timestamp()
+                except Exception:
+                    resolved_issued_at = None
+
     state = WebHostState(
         resolved_pairing_code,
+        pairing_code_issued_at=resolved_issued_at,
         session_ttl_seconds=session_ttl_seconds,
         refresh_ttl_seconds=refresh_ttl_seconds,
         clock=clock,
@@ -920,6 +1031,9 @@ def create_web_host_app(
 
         authenticated = state.current_session(request.cookies.get(_SESSION_COOKIE)) is not None
         counts = credentials.counts()
+        gpu_info = _query_gpu()
+        disk_info = _query_disk()
+        svc_info = _query_services(configured_proxies)
         return {
             "service": "cyrene-navigator-web-host",
             "status": "ok",
@@ -927,9 +1041,11 @@ def create_web_host_app(
             "authenticated": authenticated,
             "proxyPrefixes": [entry.prefix for entry in configured_proxies],
             "credentials": counts,
-            "gpu": _query_gpu(),
-            "disk": _query_disk(),
-            "services": _query_services(configured_proxies),
+            "gpu": gpu_info,
+            "disk": disk_info,
+            "services": svc_info,
+            "blockers": _compute_blockers(gpu_info, disk_info, svc_info),
+            "plugins": _query_plugins(svc_info),
             "observedAt": _iso_timestamp(clock()),
         }
 
@@ -992,6 +1108,29 @@ def create_web_host_app(
         require_session(request, mutation=True)
         return credentials.revoke(credential_id).as_dict()
 
+    @app.post("/api/v1/navigator/active-route")
+    def set_active_route(body: ActiveRouteRequest, request: Request) -> JsonObject:
+        """Store the session-level active gateway route."""
+
+        record = require_session(request, mutation=True)
+        route_data = body.model_dump(by_alias=True)
+        state.set_active_route(record.session_id, route_data)
+        return {"status": "ok", **route_data}
+
+    @app.get("/api/v1/navigator/active-route")
+    def get_active_route(request: Request) -> JsonObject:
+        """Read the session-level active gateway route."""
+
+        record = require_session(request)
+        route = state.get_active_route(record.session_id)
+        if route is None:
+            raise WebHostError(
+                "NAVIGATOR_ACTIVE_ROUTE_NOT_FOUND",
+                404,
+                "No active gateway route has been configured in this session.",
+            )
+        return route
+
     @app.api_route(
         "/{proxy_path:path}",
         methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"],
@@ -1020,7 +1159,11 @@ def create_web_host_app(
         headers.setdefault("traceparent", request.state.traceparent)
         if request.state.tracestate:
             headers.setdefault("tracestate", request.state.tracestate)
-        if target.bearer_token is not None:
+        if target_entry.prefix.rstrip("/") == "/api/proxy/exchange-gateway":
+            if "authorization" in request.headers:
+                headers["authorization"] = request.headers["authorization"]
+            upstream_url = re.sub(r"/v1/v1/", "/v1/", upstream_url)
+        elif target.bearer_token is not None:
             headers["authorization"] = f"Bearer {target.bearer_token}"
         elif target.credential_ref is not None:
             secret = credentials.resolve(target.credential_ref)
@@ -1033,6 +1176,31 @@ def create_web_host_app(
                 )
             headers["authorization"] = f"Bearer {secret}"
         body = await request.body()
+        is_stream = "text/event-stream" in request.headers.get("accept", "").lower()
+        if is_stream:
+            try:
+                client = http_client or httpx.AsyncClient(follow_redirects=False)
+                req = client.build_request(
+                    request.method, upstream_url, content=body, headers=headers, timeout=600.0
+                )
+                upstream_stream = await client.send(req, stream=True)
+                return StreamingResponse(
+                    upstream_stream.aiter_raw(),
+                    status_code=upstream_stream.status_code,
+                    headers={
+                        name: value
+                        for name, value in upstream_stream.headers.items()
+                        if name in _PROXY_RESPONSE_HEADERS
+                    },
+                    media_type="text/event-stream",
+                )
+            except httpx.RequestError as exc:
+                raise WebHostError(
+                    "NAVIGATOR_PROXY_UNAVAILABLE",
+                    502,
+                    "The configured upstream is unavailable.",
+                    retryable=True,
+                ) from exc
         try:
             if http_client is None:
                 async with httpx.AsyncClient(follow_redirects=False) as client:
@@ -1174,6 +1342,8 @@ def _validate_proxy_path(path: str) -> None:
         decoded = next_path
     if (
         not decoded.startswith("/")
+        or decoded.startswith("//")
+        or "//" in decoded
         or "\\" in decoded
         or "://" in decoded
         or any(ord(character) < 32 or ord(character) == 127 for character in decoded)
