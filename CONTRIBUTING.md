@@ -43,9 +43,9 @@ evidence of a pass.
 ```bash
 # Python service
 uv sync --frozen --group dev
-uv run ruff check src tests scripts/serve-persistence.py
-uv run ruff format --check src tests scripts/serve-persistence.py
-uv run mypy src/cyrene_navigator scripts/serve-persistence.py
+uv run ruff check src tests scripts/serve-persistence.py scripts/serve-web.py
+uv run ruff format --check src tests scripts/serve-persistence.py scripts/serve-web.py
+uv run mypy src/cyrene_navigator scripts/serve-persistence.py scripts/serve-web.py
 uv run pytest -q
 
 # Rust native host

@@ -29,11 +29,11 @@ jobs:
       - name: Install locked Python environment
         run: uv sync --frozen --group dev
       - name: Ruff lint
-        run: uv run ruff check src tests scripts/serve-persistence.py
+        run: uv run ruff check src tests scripts/serve-persistence.py scripts/serve-web.py
       - name: Ruff format
-        run: uv run ruff format --check src tests scripts/serve-persistence.py
+        run: uv run ruff format --check src tests scripts/serve-persistence.py scripts/serve-web.py
       - name: Mypy strict type check
-        run: uv run mypy src/cyrene_navigator scripts/serve-persistence.py
+        run: uv run mypy src/cyrene_navigator scripts/serve-persistence.py scripts/serve-web.py
       - name: Python tests
         run: uv run pytest -q
       - name: Product boundary guard

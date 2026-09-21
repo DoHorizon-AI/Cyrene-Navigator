@@ -13,6 +13,7 @@ host 的构建或检查；不负责 UI 打包，也不会 checkout 或编译 Pla
 | `prepare-harness.mjs` | Verify and prepare the exact upstream Harness / 校验并准备精确上游 |
 | `launch-harness.mjs` | Launch the Navigator Profile / 启动 Navigator Profile |
 | `serve-persistence.py` | Run the local session authority / 启动本地 Session authority |
+| `serve-web.py` | Run the authenticated same-origin Web Host / 启动认证同源 Web Host |
 | `ci/check-platform-boundary.py` | Reject Platform source coupling and retired Product surfaces / 阻止 Platform 源码耦合与已迁出 Product 表面 |
 | `windows/build-native-host.ps1` | Build the static Navigator native host / 构建静态原生宿主 |
 | `windows/native-imports.mjs` | Verify native-host imports / 验证 native host 导入 |

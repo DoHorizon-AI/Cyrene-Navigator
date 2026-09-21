@@ -1,0 +1,199 @@
+"""Focused Web Host authentication, credential, proxy, and launcher tests."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import httpx
+from fastapi.testclient import TestClient
+
+from cyrene_navigator.web_host import create_web_host_app
+
+PAIRING_CODE = "pairing-code-for-tests"
+SECRET = "hf_test_secret_value"
+
+
+def _login(client: TestClient) -> dict[str, str]:
+    """Pair one test client and return the browser CSRF header."""
+
+    response = client.post("/api/v1/auth/pair", json={"pairingCode": PAIRING_CODE})
+    assert response.status_code == 200, response.text
+    return {"X-CSRF-Token": response.json()["csrfToken"]}
+
+
+def test_pairing_is_one_time_and_session_cookies_are_scoped() -> None:
+    app = create_web_host_app(pairing_code=PAIRING_CODE, secure_cookies=True)
+    with TestClient(app, base_url="https://testserver") as client:
+        first = client.post("/api/v1/auth/pair", json={"pairingCode": PAIRING_CODE})
+        assert first.status_code == 200
+        assert "Secure" in first.headers["set-cookie"]
+        assert "HttpOnly" in first.headers["set-cookie"]
+        assert "SameSite=lax" in first.headers["set-cookie"]
+        assert client.get("/api/v1/auth/session").json()["authenticated"] is True
+
+        second = client.post("/api/v1/auth/pair", json={"pairingCode": PAIRING_CODE})
+        assert second.status_code == 401
+        assert PAIRING_CODE not in second.text
+
+
+def test_refresh_rotates_session_state_and_csrf_token() -> None:
+    app = create_web_host_app(pairing_code=PAIRING_CODE)
+    with TestClient(app) as client:
+        csrf = _login(client)
+        before = client.get("/api/v1/auth/session").json()
+        refreshed = client.post("/api/v1/auth/session/refresh", headers=csrf)
+        assert refreshed.status_code == 200
+        after = refreshed.json()
+        assert after["refreshed"] is True
+        assert after["sessionId"] == before["sessionId"]
+        assert after["csrfToken"] != before["csrfToken"]
+        assert client.get("/api/v1/auth/session").json()["authenticated"] is True
+
+
+def test_expired_access_cookie_can_refresh_until_refresh_deadline() -> None:
+    now = [1_800_000_000.0]
+    app = create_web_host_app(
+        pairing_code=PAIRING_CODE,
+        session_ttl_seconds=10,
+        refresh_ttl_seconds=100,
+        clock=lambda: now[0],
+    )
+    with TestClient(app) as client:
+        csrf = _login(client)
+        now[0] += 11
+        state = client.get("/api/v1/auth/session")
+        assert state.status_code == 200
+        assert state.json()["authenticated"] is False
+        assert state.json()["refreshable"] is True
+
+        refreshed = client.post("/api/v1/auth/session/refresh", headers=csrf)
+        assert refreshed.status_code == 200
+        assert refreshed.json()["authenticated"] is True
+
+
+def test_credentials_never_echo_secret_and_mutations_require_csrf() -> None:
+    app = create_web_host_app(pairing_code=PAIRING_CODE)
+    with TestClient(app) as client:
+        csrf = _login(client)
+        body = {"name": "Hugging Face", "provider": "huggingface", "secret": SECRET}
+        denied = client.post("/api/v1/credentials", json=body)
+        assert denied.status_code == 403
+        assert denied.json()["code"] == "NAVIGATOR_CSRF_INVALID"
+
+        created = client.post("/api/v1/credentials", json=body, headers=csrf)
+        assert created.status_code == 201, created.text
+        metadata = created.json()
+        assert SECRET not in created.text
+        assert "secret" not in metadata
+        assert metadata["state"] == "ACTIVE"
+
+        listed = client.get("/api/v1/credentials")
+        assert listed.status_code == 200
+        assert listed.json() == [metadata]
+        fetched = client.get(f"/api/v1/credentials/{metadata['id']}")
+        assert fetched.json() == metadata
+
+        updated = client.patch(
+            f"/api/v1/credentials/{metadata['id']}",
+            json={"name": "Updated", "secret": "rotated_secret"},
+            headers=csrf,
+        )
+        assert updated.status_code == 200
+        assert "rotated_secret" not in updated.text
+        assert updated.json()["name"] == "Updated"
+
+        revoked = client.delete(f"/api/v1/credentials/{metadata['id']}", headers=csrf)
+        assert revoked.status_code == 200
+        assert revoked.json()["state"] == "REVOKED"
+        assert app.state.web_host_credentials.resolve(metadata["credentialRef"]) is None
+
+
+def test_system_status_is_safe_and_proxy_is_fixed_allowlist_with_csrf() -> None:
+    captured: list[httpx.Request] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"forwarded": True})
+
+    async_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    app = create_web_host_app(
+        pairing_code=PAIRING_CODE,
+        proxy_targets={"/api/v1/exchange": "http://backend.test/root"},
+        http_client=async_client,
+    )
+    try:
+        with TestClient(app) as client:
+            status = client.get("/api/v1/system/status")
+            assert status.status_code == 200
+            assert status.json()["status"] == "ok"
+            assert SECRET not in status.text
+
+            csrf = _login(client)
+            get_response = client.get("/api/v1/exchange/models?scope=local")
+            assert get_response.status_code == 200
+            assert captured[-1].url == "http://backend.test/root/models?scope=local"
+            assert "authorization" not in captured[-1].headers
+            assert captured[-1].headers["traceparent"].startswith("00-")
+
+            denied = client.post("/api/v1/exchange/models", json={"x": 1})
+            assert denied.status_code == 403
+            assert len(captured) == 1
+
+            forwarded = client.post(
+                "/api/v1/exchange/models",
+                json={"x": 1},
+                headers={**csrf, "Idempotency-Key": "proxy-write-1"},
+            )
+            assert forwarded.status_code == 200
+            assert captured[-1].headers["idempotency-key"] == "proxy-write-1"
+            assert len(captured) == 2
+
+            unknown = client.get("/api/v1/not-allowlisted")
+            assert unknown.status_code == 404
+            assert unknown.json()["code"] == "NAVIGATOR_PROXY_NOT_ALLOWED"
+    finally:
+        import asyncio
+
+        asyncio.run(async_client.aclose())
+
+
+def test_web_launcher_emits_one_pairing_banner_on_stdout() -> None:
+    repository = Path(__file__).parents[1]
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(repository / "src"), environment.get("PYTHONPATH", "")]
+    )
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(repository / "scripts" / "serve-web.py"),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--pairing-code",
+            "stdout-pairing-code",
+            "--insecure-http",
+        ],
+        cwd=repository,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdout is not None
+    try:
+        line = process.stdout.readline()
+        assert line
+        banner = json.loads(line)
+        assert banner["service"] == "cyrene-web-host"
+        assert banner["pairingCode"] == "stdout-pairing-code"
+    finally:
+        process.terminate()
+        stdout, _stderr = process.communicate(timeout=5)
+    assert stdout == ""
