@@ -139,3 +139,6 @@ class ProblemDetails(ContractModel):
     code: str
     retryable: bool
     trace_id: str
+    request_id: str | None = None
+    recovery_action: str | None = None
+

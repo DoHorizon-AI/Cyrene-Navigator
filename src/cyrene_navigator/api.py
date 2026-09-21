@@ -24,17 +24,14 @@ from cyrene_navigator.domain import (
     SnapshotRequest,
     WorkspaceSnapshot,
 )
+from cyrene_navigator.errors import map_navigator_error
+from cyrene_navigator.logging import (
+    emit_diagnostic_error,
+    parse_w3c_traceparent,
+    sanitize_request_id,
+)
 from cyrene_navigator.reader import HttpxProductReader, ProductReadPort
 from cyrene_navigator.service import NavigatorService
-
-_TRACEPARENT = re.compile(r"^00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$")
-
-
-def _incoming_trace_id(value: str) -> str | None:
-    match = _TRACEPARENT.fullmatch(value)
-    if match is None or match.group(1) == "0" * 32 or match.group(2) == "0" * 16:
-        return None
-    return match.group(1)
 
 
 def create_app(
@@ -50,34 +47,61 @@ def create_app(
     async def propagate_trace(
         request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
-        incoming = request.headers.get("traceparent", "")
-        trace_id = _incoming_trace_id(incoming)
-        if trace_id is None:
-            trace_id = uuid4().hex
-            traceparent = f"00-{trace_id}-0000000000000001-01"
-        else:
-            traceparent = incoming
-        tracestate = request.headers.get("tracestate") if incoming == traceparent else None
+        parsed_trace = parse_w3c_traceparent(request.headers.get("traceparent"))
+        trace_id = parsed_trace[0] if parsed_trace else uuid4().hex
+        parent_span_id = parsed_trace[1] if parsed_trace else "0000000000000001"
+        traceparent = f"00-{trace_id}-{parent_span_id}-01"
+        request_id = sanitize_request_id(request.headers.get("x-request-id")) or uuid4().hex
+
+        tracestate = request.headers.get("tracestate")
         request.state.trace_id = trace_id
+        request.state.span_id = parent_span_id
         request.state.traceparent = traceparent
         request.state.tracestate = tracestate
+        request.state.request_id = request_id
+
         response = await call_next(request)
         response.headers["traceparent"] = traceparent
+        response.headers["x-request-id"] = request_id
         if tracestate:
             response.headers["tracestate"] = tracestate
         return response
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, _exc: RequestValidationError) -> JSONResponse:
+        mapped = map_navigator_error("NAVIGATOR_REQUEST_INVALID")
+        canonical_code = mapped["code"]
+        recovery_action = mapped.get("recovery_action")
+
+        trace_id = getattr(request.state, "trace_id", None) or uuid4().hex
+        span_id = getattr(request.state, "span_id", None)
+        request_id = getattr(request.state, "request_id", None)
+
+        emit_diagnostic_error(
+            "product.navigator.validation_error",
+            canonical_code,
+            "The request does not conform to the Navigator API v1 contract.",
+            trace_id=trace_id,
+            span_id=span_id,
+            attributes={
+                "request_id": request_id,
+                "cause_kind": mapped.get("cause_kind"),
+                "status": 422,
+                "path": request.url.path,
+            },
+        )
+
         problem = ProblemDetails(
-            type="https://errors.cyrene.dev/navigator/request-invalid",
+            type=f"https://errors.cyrene.dev/navigator/{canonical_code.lower()}",
             title="Request validation failed",
             status=422,
             detail="The request does not conform to the Navigator API v1 contract.",
             instance=request.url.path,
             code="NAVIGATOR_REQUEST_INVALID",
             retryable=False,
-            trace_id=request.state.trace_id,
+            trace_id=trace_id,
+            request_id=request_id,
+            recovery_action=recovery_action,
         )
         return JSONResponse(
             status_code=422,
