@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi.testclient import TestClient
+from openapi_spec_validator.readers import read_from_filename
 
 from cyrene_navigator.persistence import PersistencePrincipal, create_persistence_app
 
@@ -26,6 +27,16 @@ TOKENS = {
     "admin-token": PersistencePrincipal("admin", frozenset({"w1"}), can_takeover=True),
     "other-token": PersistencePrincipal("other", frozenset({"w2"})),
 }
+
+
+def test_runtime_paths_match_frozen_persistence_openapi(tmp_path: Path) -> None:
+    """The published persistence contract covers every implemented route."""
+
+    app = create_persistence_app(tmp_path / "contract.sqlite3", TOKENS)
+    contract, _ = read_from_filename(
+        str(Path(__file__).parents[1] / "contracts/product/v1/persistence.openapi.yaml")
+    )
+    assert set(app.openapi()["paths"]) == set(contract["paths"])
 
 
 def _headers(token: str = "alice-token") -> dict[str, str]:

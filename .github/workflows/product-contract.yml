@@ -24,3 +24,4 @@ jobs:
       - run: uv run mypy
       - run: uv run pytest -q
       - run: uv run openapi-spec-validator contracts/product/v1/openapi.yaml
+      - run: uv run openapi-spec-validator contracts/product/v1/persistence.openapi.yaml
