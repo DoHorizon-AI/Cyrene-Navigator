@@ -666,6 +666,33 @@ class _ConfiguredProxy:
     target: ProxyTarget
 
 
+# Gateway base URL used when neither an override nor an Exchange proxy target is
+# configured. Matches the development stack that serves Exchange on port 8000.
+DEFAULT_GATEWAY_BASE_URL = "http://127.0.0.1:8000/v1"
+_GATEWAY_PROXY_PREFIX = "/api/proxy/exchange-gateway"
+
+
+def _gateway_base_url(configured: Sequence[_ConfiguredProxy]) -> str:
+    """Resolve the Exchange OpenAI-compatible base URL for client snippets.
+
+    The port differs between the development stack and packaged deployments and
+    can be HTTPS behind Caddy, so it is resolved here and published to the UI
+    rather than guessed in the browser.
+    """
+
+    override = os.environ.get("CYRENE_GATEWAY_BASE_URL", "").strip()
+    if override:
+        candidate = override
+    else:
+        candidate = DEFAULT_GATEWAY_BASE_URL
+        for entry in configured:
+            if entry.prefix.rstrip("/") == _GATEWAY_PROXY_PREFIX:
+                candidate = entry.target.base_url
+                break
+    base = candidate.rstrip("/")
+    return base if base.endswith("/v1") else f"{base}/v1"
+
+
 def _query_gpu() -> dict[str, Any]:
     """调用 nvidia-smi 查询 GPU 信息，失败时返回 unavailable。"""
     try:
@@ -1046,6 +1073,10 @@ def create_web_host_app(
             "services": svc_info,
             "blockers": _compute_blockers(gpu_info, disk_info, svc_info),
             "plugins": _query_plugins(svc_info),
+            # The Exchange OpenAI-compatible gateway port differs between the
+            # dev stack and packaged deployments, so it is published here
+            # instead of being guessed in the browser.
+            "gatewayBaseUrl": _gateway_base_url(configured_proxies),
             "observedAt": _iso_timestamp(clock()),
         }
 
