@@ -15,7 +15,7 @@ from typing import Any, Literal
 from urllib.parse import quote
 
 import httpx
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from cyrene_navigator.persistence.artifacts import ArtifactPublicationError, LocalArtifactStore
 from cyrene_navigator.persistence.errors import PersistenceError
@@ -58,6 +58,14 @@ class TargetResource(PersistenceModel):
     uri: str = Field(pattern=r"^cyrene://echo/evaluation-inputs/")
     id: str
     resource_version: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def matches_identity(self) -> TargetResource:
+        """Require Echo's URI and id to name the same evaluation input."""
+
+        if self.uri != f"cyrene://echo/evaluation-inputs/{self.id}":
+            raise ValueError("Echo target URI does not match its resource id")
+        return self
 
 
 class EchoReceipt(PersistenceModel):
@@ -263,6 +271,8 @@ class EchoHandoff:
                 headers={"Idempotency-Key": key},
             )
             response.raise_for_status()
+            if response.status_code != 201:
+                raise ValueError("Echo evaluation input did not return HTTP 201")
             result = response.json()
             target = TargetResource.model_validate(result["resourceRef"])
             return EchoReceipt(
@@ -270,7 +280,7 @@ class EchoHandoff:
                 status=result["state"],
                 open_in=self.echo_url + "/api/v1/evaluation-inputs/" + target.id,
             )
-        except (httpx.HTTPError, ArtifactPublicationError, ValueError, KeyError) as exc:
+        except (httpx.HTTPError, ArtifactPublicationError, TypeError, ValueError, KeyError) as exc:
             raise _error(
                 "NAVIGATOR_ECHO_HANDOFF_FAILED",
                 "Echo did not acknowledge an evaluation input. Retry the same selection.",

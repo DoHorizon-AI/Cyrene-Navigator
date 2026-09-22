@@ -77,6 +77,7 @@ def test_reference_selection_rejects_paths_and_malformed_text():
 
 def test_echo_handoff_publishes_navigator_owned_artifact_and_calls_echo(tmp_path: Path):
     captured: dict[str, object] = {}
+    request_headers: dict[str, str] = {}
 
     class Store:
         def get_snapshot(self, workspace_id: str, session_id: str):
@@ -89,6 +90,7 @@ def test_echo_handoff_publishes_navigator_owned_artifact_and_calls_echo(tmp_path
 
     def echo(request: httpx.Request) -> httpx.Response:
         captured.update(json.loads(request.content))
+        request_headers.update(request.headers)
         return httpx.Response(
             201,
             json={
@@ -111,3 +113,48 @@ def test_echo_handoff_publishes_navigator_owned_artifact_and_calls_echo(tmp_path
     assert artifact["kind"] == "navigator-text-jsonl-v1"
     assert artifact["uri"] == "artifact://sha256/" + artifact["digest"].removeprefix("sha256:")
     assert receipt.status == "DRAFT"
+    assert request_headers["idempotency-key"].startswith("navigator-snapshot:")
+
+
+@pytest.mark.parametrize(
+    ("status", "resource_ref"),
+    [
+        (
+            200,
+            {
+                "uri": "cyrene://echo/evaluation-inputs/input-1",
+                "id": "input-1",
+                "resourceVersion": 1,
+            },
+        ),
+        (
+            201,
+            {
+                "uri": "cyrene://echo/evaluation-inputs/another-input",
+                "id": "input-1",
+                "resourceVersion": 1,
+            },
+        ),
+    ],
+)
+def test_echo_handoff_rejects_non_creation_or_mismatched_identity(
+    tmp_path: Path, status: int, resource_ref: dict[str, object]
+) -> None:
+    class Store:
+        def get_snapshot(self, workspace_id: str, session_id: str):
+            return {"revision": "expected", "eventCount": len(events())}
+
+        def read_events(self, workspace_id: str, session_id: str, offset: int, limit: int):
+            values = events()[offset : offset + limit]
+            return values, offset + len(values)
+
+    def echo(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"resourceRef": resource_ref, "state": "DRAFT"})
+
+    with httpx.Client(transport=httpx.MockTransport(echo)) as client:
+        handoff = EchoHandoff(Store(), tmp_path / "artifacts", "https://echo.example", client)
+        with pytest.raises(PersistenceError) as failure:
+            handoff.send("workspace", "session", SendToEcho(expected_revision="expected"))
+
+    assert failure.value.code == "NAVIGATOR_ECHO_HANDOFF_FAILED"
+    assert failure.value.status == 502
