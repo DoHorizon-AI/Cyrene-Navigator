@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import math
 import os
 import re
@@ -22,6 +23,7 @@ import urllib.request
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from threading import RLock
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -768,6 +770,103 @@ def _query_services(proxies: Sequence[_ConfiguredProxy]) -> list[dict[str, Any]]
     return results
 
 
+_INSTALL_ROOT_ENV = "CYRENE_INSTALL_ROOT"
+_BOOTSTRAP_STATE_ENV = "CYRENE_BOOTSTRAP_STATE"
+_CUDA_PROFILE_ENV = "CYRENE_CUDA_PROFILE"
+_BOOTSTRAP_MARKER_NAME = "bootstrap-state.json"
+_RELEASE_LOCK_NAME = "release-lock.json"
+
+
+def _cyrene_roots() -> list[Path]:
+    """Candidate install/workspace roots, most explicit first.
+
+    A packaged host keeps everything under one install root; a development
+    checkout keeps the release lock inside the Workspace repository.
+    """
+
+    roots: list[Path] = []
+    override = os.environ.get(_INSTALL_ROOT_ENV, "").strip()
+    if override:
+        roots.append(Path(override))
+    roots.append(Path("/usr/lib/cyrene"))
+    for parent in Path(__file__).resolve().parents:
+        roots.append(parent / "Cyrene-Workspace")
+    return roots
+
+
+def _locate_release_inputs() -> tuple[Path | None, Path | None]:
+    """Return (release lock, bootstrap marker) from the first root that has one."""
+
+    fallback: tuple[Path | None, Path | None] = (None, None)
+    for root in _cyrene_roots():
+        lock = root / _RELEASE_LOCK_NAME
+        marker = root / _BOOTSTRAP_MARKER_NAME
+        if lock.is_file() or marker.is_file():
+            return (lock if lock.is_file() else None, marker if marker.is_file() else None)
+    return fallback
+
+
+def _query_bootstrap() -> dict[str, Any]:
+    """Report whether the pinned runtime was installed and verified.
+
+    States: READY (bootstrap completed and left its marker), PENDING (pins are
+    present but no completed bootstrap was recorded), UNKNOWN (neither found).
+    """
+
+    override = os.environ.get(_BOOTSTRAP_STATE_ENV, "").strip().upper()
+    lock, marker = _locate_release_inputs()
+    if override:
+        return {"state": override, "source": "environment"}
+    if marker is not None:
+        try:
+            document = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"state": "UNKNOWN", "source": "marker_unreadable"}
+        state = str(document.get("state", "UNKNOWN")).upper()
+        return {
+            "state": state,
+            "source": "marker",
+            "completedAt": document.get("completedAt") or document.get("completed_at"),
+        }
+    if lock is not None:
+        return {"state": "PENDING", "source": "release_lock_only"}
+    return {"state": "UNKNOWN", "source": "not_found"}
+
+
+def _query_runtime() -> dict[str, Any]:
+    """Report the pinned engine versions and the CUDA wheel profile in use."""
+
+    lock, _ = _locate_release_inputs()
+    engines: dict[str, str] = {}
+    if lock is not None:
+        try:
+            document = json.loads(lock.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            document = {}
+        for _key, entry in (document.get("engines") or {}).items():
+            if isinstance(entry, dict) and isinstance(entry.get("package"), str):
+                version = entry.get("acceptedVersion") or entry.get("version")
+                engines[entry["package"]] = str(version) if version else "UNKNOWN"
+    profile = os.environ.get(_CUDA_PROFILE_ENV, "").strip() or "UNKNOWN"
+    return {
+        "releaseLock": str(lock) if lock is not None else None,
+        "engines": engines,
+        "cudaProfile": profile,
+    }
+
+
+def _diagnostics_degraded(services: list[dict[str, Any]], bootstrap: dict[str, Any]) -> bool:
+    """Whether the host's view of the stack is known to be incomplete.
+
+    True when a configured Product is unreachable or the runtime state could not
+    be determined: in both cases any diagnostics shown elsewhere are partial.
+    """
+
+    if any(entry.get("status") != "UP" for entry in services):
+        return True
+    return bootstrap.get("state") == "UNKNOWN"
+
+
 def _compute_blockers(
     gpu: dict[str, Any], disk: dict[str, Any], services: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -1061,6 +1160,8 @@ def create_web_host_app(
         gpu_info = _query_gpu()
         disk_info = _query_disk()
         svc_info = _query_services(configured_proxies)
+        bootstrap_info = _query_bootstrap()
+        runtime_info = _query_runtime()
         return {
             "service": "cyrene-navigator-web-host",
             "status": "ok",
@@ -1073,6 +1174,12 @@ def create_web_host_app(
             "services": svc_info,
             "blockers": _compute_blockers(gpu_info, disk_info, svc_info),
             "plugins": _query_plugins(svc_info),
+            # Whether the pinned runtime is installed, which engine versions it
+            # holds, and whether this host can see the whole stack. A console
+            # cannot decide what to offer without them.
+            "bootstrapState": bootstrap_info,
+            "runtime": runtime_info,
+            "diagnosticsDegraded": _diagnostics_degraded(svc_info, bootstrap_info),
             # The Exchange OpenAI-compatible gateway port differs between the
             # dev stack and packaged deployments, so it is published here
             # instead of being guessed in the browser.

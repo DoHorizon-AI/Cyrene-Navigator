@@ -344,3 +344,65 @@ def test_active_route_session_lifecycle() -> None:
         assert get_resp.status_code == 200
         assert get_resp.json()["modelId"] == "qwen2.5-7b"
         assert get_resp.json()["baseUrl"] == "http://127.0.0.1:8003/v1"
+
+
+def test_system_status_publishes_bootstrap_runtime_and_degradation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A console needs to know the pinned runtime state without guessing."""
+
+    install_root = tmp_path / "cyrene-install"
+    install_root.mkdir()
+    (install_root / "release-lock.json").write_text(
+        json.dumps(
+            {
+                "engines": {
+                    "training.llama-factory.v1": {
+                        "package": "llamafactory",
+                        "acceptedVersion": "0.9.5",
+                    },
+                    "execution.engine.v1": {"package": "vllm", "acceptedVersion": "0.25.1"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CYRENE_INSTALL_ROOT", str(install_root))
+    monkeypatch.setenv("CYRENE_CUDA_PROFILE", "cu130")
+    monkeypatch.delenv("CYRENE_BOOTSTRAP_STATE", raising=False)
+
+    app = create_web_host_app(pairing_code=PAIRING_CODE)
+    with TestClient(app) as client:
+        first = client.get("/api/v1/system/status").json()
+        # Pins are known but no bootstrap marker exists yet.
+        assert first["bootstrapState"]["state"] == "PENDING"
+        assert first["runtime"]["engines"] == {"llamafactory": "0.9.5", "vllm": "0.25.1"}
+        assert first["runtime"]["cudaProfile"] == "cu130"
+        assert first["diagnosticsDegraded"] is False
+
+        (install_root / "bootstrap-state.json").write_text(
+            json.dumps(
+                {
+                    "state": "READY",
+                    "completedAt": "2026-09-22T00:00:00Z",
+                    "digest": "sha256:abc",
+                }
+            ),
+            encoding="utf-8",
+        )
+        second = client.get("/api/v1/system/status").json()
+        assert second["bootstrapState"]["state"] == "READY"
+        assert second["bootstrapState"]["completedAt"] == "2026-09-22T00:00:00Z"
+        # No secrets from the install root are echoed back.
+        assert "digest" not in second["bootstrapState"]
+
+
+def test_unreachable_product_marks_diagnostics_degraded() -> None:
+    app = create_web_host_app(
+        pairing_code=PAIRING_CODE,
+        proxy_targets={"/api/v1/yield": "http://127.0.0.1:59999"},
+    )
+    with TestClient(app) as client:
+        body = client.get("/api/v1/system/status").json()
+    assert [entry["status"] for entry in body["services"]] == ["DOWN"]
+    assert body["diagnosticsDegraded"] is True
