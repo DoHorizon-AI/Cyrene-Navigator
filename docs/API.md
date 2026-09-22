@@ -38,7 +38,10 @@ contract remains unchanged.
 The Artifact adapter publishes immutable content-addressed bytes and returns the
 standard transparent fields: `uri`, `digest`, `size_bytes`, and producer-owned
 `kind`. It does not add a second global registry or duplicate Product lifecycle
-state.
+state. The explicit Echo handoff accepts only Echo's HTTP 201 creation response
+and requires the returned `resourceRef.uri` to identify exactly the same
+evaluation input as `resourceRef.id`; other 2xx responses and mismatched target
+identities fail closed as `NAVIGATOR_ECHO_HANDOFF_FAILED`.
 
 ## Compatibility boundary
 
