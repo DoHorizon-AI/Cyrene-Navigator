@@ -10,8 +10,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 # ════════════════════════════════════════════════════════════════════════
 # Canonical Cyrene Navigator Error Catalog & Mappings
 # ════════════════════════════════════════════════════════════════════════

@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Awaitable, Callable, Mapping
 from uuid import uuid4
 

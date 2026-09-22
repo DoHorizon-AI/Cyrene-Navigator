@@ -6,17 +6,14 @@ from __future__ import annotations
 
 import json
 
-import pytest
 from fastapi.testclient import TestClient
 
 from cyrene_navigator.api import create_app
 from cyrene_navigator.errors import map_navigator_error
 from cyrene_navigator.logging import (
     format_cyrene_log,
-    is_sensitive_key,
     parse_w3c_traceparent,
     redact_attributes,
-    sanitize_correlation_id,
     sanitize_request_id,
 )
 

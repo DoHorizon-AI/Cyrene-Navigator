@@ -141,4 +141,3 @@ class ProblemDetails(ContractModel):
     trace_id: str
     request_id: str | None = None
     recovery_action: str | None = None
-
