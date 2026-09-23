@@ -163,7 +163,9 @@ def test_system_status_is_safe_and_proxy_is_fixed_allowlist_with_csrf() -> None:
         asyncio.run(async_client.aclose())
 
 
-def test_web_launcher_emits_one_pairing_banner_on_stdout() -> None:
+def test_web_launcher_banner_never_carries_the_pairing_secret() -> None:
+    """The launcher's output is redirected into a log file, so it must not leak."""
+
     repository = Path(__file__).parents[1]
     environment = os.environ.copy()
     environment["PYTHONPATH"] = os.pathsep.join(
@@ -194,11 +196,91 @@ def test_web_launcher_emits_one_pairing_banner_on_stdout() -> None:
         assert line
         banner = json.loads(line)
         assert banner["service"] == "cyrene-web-host"
-        assert banner["pairingCode"] == "stdout-pairing-code"
+        assert banner["port"] > 0
+        assert "pairingCode" not in banner
+        assert "pairingCodeFile" in banner
+        assert "stdout-pairing-code" not in line
     finally:
         process.terminate()
-        stdout, _stderr = process.communicate(timeout=5)
+        stdout, stderr = process.communicate(timeout=5)
     assert stdout == ""
+    assert "stdout-pairing-code" not in stderr
+
+
+def test_web_launcher_stores_a_self_generated_code_owner_only(tmp_path: Path) -> None:
+    """A launcher that generates the code itself must not print it."""
+
+    repository = Path(__file__).parents[1]
+    code_file = tmp_path / "nested" / "pair_code.txt"
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(repository / "src"), environment.get("PYTHONPATH", "")]
+    )
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(repository / "scripts" / "serve-web.py"),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--pairing-code-file",
+            str(code_file),
+            "--insecure-http",
+        ],
+        cwd=repository,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdout is not None
+    try:
+        line = process.stdout.readline()
+        assert line
+        banner = json.loads(line)
+        assert banner["pairingCodeFile"] == str(code_file)
+    finally:
+        process.terminate()
+        process.communicate(timeout=5)
+
+    assert code_file.stat().st_mode & 0o777 == 0o600
+    stored = code_file.read_text(encoding="utf-8").strip()
+    assert len(stored) >= 16
+    assert stored not in line
+
+
+def test_web_launcher_refuses_to_generate_a_code_it_cannot_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail closed instead of emitting a secret with nowhere to keep it."""
+
+    repository = Path(__file__).parents[1]
+    environment = os.environ.copy()
+    environment.pop("CYRENE_PAIR_CODE_FILE", None)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(repository / "src"), environment.get("PYTHONPATH", "")]
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(repository / "scripts" / "serve-web.py"),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--insecure-http",
+        ],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode != 0
+    assert "--pairing-code-file" in result.stderr
 
 
 def test_web_host_system_status_and_env_pairing_code(
