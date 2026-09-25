@@ -84,3 +84,9 @@ payload API for capability calls.
 不要在 Navigator 中加入独立控制平面状态、第二套插件架构、重量级训练循环或模型服务。
 Navigator 直连产品 API，并将训练与服务交给 Yield 和 Reactor；不得恢复已退役的服务
 清单、新增 Platform 源码依赖，或假设通过 Platform payload API 调用能力。
+---
+<!-- Chinese Translation / 中文翻译 -->
+
+## 活跃实现位置
+
+是的。当前 Product 和宿主实现位于 `harness/`（固定 DeepSeek Harness Profile 的 Navigator 适配器）、`native/`（Rust `cyrene-native-host` 进程/集成宿主）和 `src/cyrene_navigator/`（Python 会话持久化和 Product 读取服务）。

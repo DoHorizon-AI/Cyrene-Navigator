@@ -16,7 +16,7 @@ export interface NativeConfig {
   maxResponseBytes: number;
 }
 
-/** Run a supervised native request; process exit is part of completion. */
+/** Run a supervised native request; process exit is part of completion.  中文：运行一个受监管的原生请求；进程退出是完成条件的一部分。 */
 export async function runNativeRequest(
   ctx: Context, config: NativeConfig, cwd: string, method: string,
   params: Record<string, unknown>, signal: AbortSignal,
@@ -127,7 +127,7 @@ export async function runNativeRequest(
   }
 }
 
-/** Escalate a host that does not exit after closing its request stream. */
+/** Escalate a host that does not exit after closing its request stream.  中文：请求流关闭后，若宿主仍未退出则升级处理。 */
 async function waitForQuiescence(child: SubprocessHandle, graceMs: number) {
   const timer = setTimeout(() => child.terminate(), graceMs);
   timer.unref();

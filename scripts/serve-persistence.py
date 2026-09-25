@@ -21,7 +21,12 @@ from cyrene_navigator.persistence import PersistencePrincipal, create_persistenc
 
 
 class PrincipalConfig(BaseModel):
-    """Explicit bootstrap identities; enterprise Identity integration follows later."""
+    """Explicit bootstrap identities; enterprise Identity integration follows later.
+
+    中文:显式配置 bootstrap 身份;企业 Identity 集成后续再接入。
+    """
+
+    # 中文:显式配置引导身份;企业 Identity 集成留待后续阶段。
 
     model_config = ConfigDict(extra="forbid", strict=True)
     token_env: str = Field(min_length=1)
@@ -31,14 +36,23 @@ class PrincipalConfig(BaseModel):
 
 
 class ServiceConfig(BaseModel):
-    """Credential references are separate from the durable Session database."""
+    """Credential references are separate from the durable Session database.
+
+    中文:凭据引用与持久化 Session 数据库彼此分开。
+    """
+
+    # 中文:凭据引用与持久化 Session 数据库分开保存。
 
     model_config = ConfigDict(extra="forbid", strict=True)
     principals: list[PrincipalConfig] = Field(min_length=1)
 
 
 def main() -> None:
-    """Start the service on an explicit or OS-selected port and report its address."""
+    """Start the service on an explicit or OS-selected port and report its address.
+
+    中文:在指定端口或操作系统分配的端口上启动服务,并报告地址。
+    """
+    # 中文:在显式指定或由操作系统选择的端口启动服务,并报告监听地址。
 
     parser = argparse.ArgumentParser(description="Cyrene Harness persistence service")
     parser.add_argument("--database", type=Path, required=True)

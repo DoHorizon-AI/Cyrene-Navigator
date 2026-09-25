@@ -32,19 +32,19 @@ import {
 import { record } from './persistence-wire.js';
 import { runNativeRequest, type NativeConfig } from './native-ipc.js';
 
-/** Exact authenticated Host route exposed by the Navigator desktop/server host. */
+/** Exact authenticated Host route exposed by the Navigator desktop/server host.  中文：由 Navigator 桌面/服务端宿主公开的、经过认证的 Host 路由。 */
 export const CODEX_IMPORT_PATH = '/api/cyrene/import/codex';
 
-/** Explicit user action that opens an imported archive in a new live Agent. */
+/** Explicit user action that opens an imported archive in a new live Agent.  中文：显式用户操作：将导入的 archive 作为新的 live Agent 打开。 */
 export const CODEX_CONTINUE_PATH = '/api/cyrene/import/codex/continue';
 
-/** Read-only archive preview served from the authoritative Cyrene Session log. */
+/** Read-only archive preview served from the authoritative Cyrene Session log.  中文：从权威 Cyrene Session log 提供只读 archive 预览。 */
 export const CODEX_PREVIEW_PATH = '/api/cyrene/import/codex/preview';
 
-/** Maximum buffered request body accepted by the Host route. */
+/** Maximum buffered request body accepted by the Host route.  中文：Host 路由接受的缓冲请求体上限。 */
 export const MAX_IMPORT_REQUEST_BYTES = 4 * 1024 * 1024;
 
-/** Maximum uploaded JSONL retained inline in the authoritative Session log. */
+/** Maximum uploaded JSONL retained inline in the authoritative Session log.  中文：在权威 Session log 中内联保留的 JSONL 上传大小上限。 */
 export const MAX_IMPORT_CONTENT_BYTES = 512 * 1024;
 
 const IMPORT_SCHEMA = 'cyrene.navigator.codex-import.v1';
@@ -140,10 +140,10 @@ interface ContinueComposition {
   readonly setup?: AgentSetup;
 }
 
-/** Resolved native-host settings accepted by the import plugin. */
+/** Resolved native-host settings accepted by the import plugin.  中文：导入插件接受的原生宿主解析后配置。 */
 export type Config = NativeConfig;
 
-/** Schema used by the fixed Profile/Bundle to resolve the native host settings. */
+/** Schema used by the fixed Profile/Bundle to resolve the native host settings.  中文：固定 Profile/Bundle 用于解析原生宿主设置的 schema。 */
 export const Config: z<Config> = z.object({
   binary: z.string().required(),
   timeoutMs: z.number().min(100).max(120_000).default(60_000),
@@ -154,7 +154,7 @@ export const Config: z<Config> = z.object({
 export const name = 'cyrene-codex-import';
 export const inject = ['connection', 'sessionPersistence', 'subprocess'];
 
-/** Register the authenticated Host route for Codex rollout imports. */
+/** Register the authenticated Host route for Codex rollout imports.  中文：注册经过认证的 Codex rollout 导入 Host 路由。 */
 export function apply(ctx: Context, config: Config): void {
   if (!isAbsolute(config.binary)) {
     throw new Error('Native executable path must be absolute');
@@ -199,6 +199,7 @@ export function apply(ctx: Context, config: Config): void {
  *
  * The function is exported so integration tests can exercise the exact route
  * handler while mounting the real upstream Session and persistence services.
+ * 中文：处理一条经过认证的导入请求。Connection host 会在调用此路由前完成 Host/Origin/cookie 认证。导出函数用于集成测试挂载真实上游 Session 和持久化服务，并测试完全相同的路由处理器。
  */
 export async function handleCodexImportRequest(
   ctx: Context,
@@ -233,6 +234,7 @@ export async function handleCodexImportRequest(
  * The source remains a read-only archive. Only a balanced completed-turn
  * prefix is copied as a seed; source tool, approval, system and raw-import
  * records are never submitted to the Agent loop for execution.
+ * 中文：将已导入的 archive 作为新建且显式配置的 live Agent 打开。来源始终是只读 archive。仅将完整闭合 turn 的前缀复制为 seed；来源中的 tool、approval、system 和原始导入记录绝不会提交给 Agent loop 执行。
  */
 export async function handleCodexContinueRequest(
   ctx: Context,
@@ -265,6 +267,7 @@ export async function handleCodexContinueRequest(
  * The preview is projected from the same Cyrene persistence events used by
  * Session restore. Historical tool records are returned as data with an
  * explicit non-executable flag; the route never submits them to ToolRuntime.
+ * 中文：读取已导入的 archive，但不创建或恢复 Agent。预览从与 Session restore 相同的 Cyrene 持久化事件投影生成。历史工具记录以数据形式返回，并明确标记为不可执行；此路由绝不会将它们提交给 ToolRuntime。
  */
 export async function handleCodexPreviewRequest(
   ctx: Context,
@@ -838,6 +841,7 @@ function buildPreview(stored: StoredSession, marker: CodexImportMarker): Record<
     // The authoritative event keeps the raw upload. The preview only exposes
     // its digest and retrieval reference, so a large archive is not duplicated
     // into the browser response or rendered accidentally.
+    // 中文：权威事件保留原始上传。预览只公开摘要和可检索引用，因此不会把大型 archive 重复放入浏览器响应或意外渲染。
     raw: {
       sha256: stringPreviewField(raw.sha256, 'raw.sha256'),
       sizeBytes: rawSizeBytes,
@@ -1104,6 +1108,7 @@ function buildEvents(
   }, fallbackTime, undefined, true);
   // A restored Session uses this marker to distinguish imported seed history
   // from events appended later by a real user prompt.
+  // 中文：恢复后的 Session 使用此标记区分导入的 seed 历史和真实用户 prompt 追加的事件。
   push('session/end-seed', {}, fallbackTime);
   return events;
 }
@@ -1126,6 +1131,7 @@ function eventRecords(native: Record<string, unknown>): Record<string, unknown>[
     const event = record(value);
     if (event.kind === 'message') {
       // Message mirrors are already represented by real upstream message events.
+      // 中文：消息镜像已经由真实的上游 message 事件表示。
       return { kind: 'message', executable: false, skipped: true, sourceIndex: index };
     }
     return event;

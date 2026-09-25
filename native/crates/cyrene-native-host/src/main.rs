@@ -102,6 +102,7 @@ fn run() -> io::Result<()> {
 
     // EOF is a lifecycle boundary: no child process or worker may survive the
     // host that owns its request stream.
+    // 中文：EOF 是生命周期边界：拥有请求流的宿主结束后，不得留下子进程或 worker。
     cancel_pending(&pending);
     for worker in workers {
         let _ = worker.join();
@@ -325,6 +326,7 @@ fn read_line_bounded<R: BufRead>(reader: &mut R) -> io::Result<LineRead> {
         if take < requested {
             // Drain the oversized line so the next call starts at a record
             // boundary, without retaining unbounded attacker-controlled data.
+            // 中文：排空超长行，使下一次调用从记录边界开始，同时不保留无界的攻击者控制数据。
             loop {
                 let buffer = reader.fill_buf()?;
                 if buffer.is_empty() {

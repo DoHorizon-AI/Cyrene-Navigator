@@ -1,4 +1,8 @@
-"""Enforce Navigator's product-owned adapter and Platform independence boundary."""
+"""Enforce Navigator's product-owned adapter and Platform independence boundary.
+
+中文:检查 Navigator 自有 Product adapter 与 Platform 解耦边界。
+"""
+# 中文:强制执行 Navigator 的 Product 所有适配器边界,并确保其独立于 Platform。
 
 from __future__ import annotations
 

@@ -36,7 +36,7 @@ import type {
 import { decodeHandle, decodeSnapshot, integer, PersistenceHttp, record } from './persistence-wire.ts';
 import type { PersistenceConnection, RemoteHandle } from './persistence-wire.ts';
 
-/** Deployment controls for remote persistence, batching and writer renewal. */
+/** Deployment controls for remote persistence, batching and writer renewal.  中文：远端持久化、批处理和 writer 续租的部署控制参数。 */
 export interface Config extends PersistenceConnection {
   clientId: string;
   heartbeatMs: number;
@@ -45,7 +45,7 @@ export interface Config extends PersistenceConnection {
   batchSize: number;
 }
 
-/** One provider implements the actual upstream service; it never opens a local database. */
+/** One provider implements the actual upstream service; it never opens a local database.  中文：一个 Provider 实现实际的上游服务；不会打开本地数据库。 */
 export default class CyreneSessionPersistence extends SessionPersistence {
   static Config: z<Config> = z.object({
     baseUrl: z.string().required(),
@@ -83,6 +83,7 @@ export default class CyreneSessionPersistence extends SessionPersistence {
         const writer = this.writers.get(execution.agent.id);
         if (!writer) throw new SessionOwnershipLostError(execution.agent.id);
         // A tool must not start while its owning call exists only in volatile memory.
+        // 中文：当所属调用仅存在于易失内存中时，不得启动工具。
         await writer.flush({ signal: execution.signal });
       }
       return next();
@@ -117,7 +118,7 @@ export default class CyreneSessionPersistence extends SessionPersistence {
     return this.adopt(decodeHandle(value, id));
   }
 
-  /** Explicit product action; the server checks actor, observed epoch and fencing. */
+  /** Explicit product action; the server checks actor, observed epoch and fencing.  中文：显式 Product 操作；服务端会校验 actor、观测到的 epoch 和 fencing。 */
   async takeover(id: SessionId, expectedEpoch: number, signal?: AbortSignal): Promise<CyreneSessionHandle> {
     const value = await this.http.request(`/${encodeURIComponent(id)}/handles`, {
       access: 'write', clientId: this.clientId,
@@ -126,7 +127,7 @@ export default class CyreneSessionPersistence extends SessionPersistence {
     return this.adopt(decodeHandle(value, id));
   }
 
-  /** Reserve the fenced handle for the upstream resume path's next write open. */
+  /** Reserve the fenced handle for the upstream resume path's next write open.  中文：为上游 resume 路径的下一次写入 open 预留 fenced handle。 */
   async resumeWithTakeover<T>(id: SessionId, expectedEpoch: number, resume: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     if (this.writers.has(id) || this.takeoverRequests.has(id)) {
       throw new Error('This Navigator runtime already owns or is acquiring the Session');
@@ -148,7 +149,7 @@ export default class CyreneSessionPersistence extends SessionPersistence {
     }
   }
 
-  /** Local ownership is a UI observation; the backend remains the authority. */
+  /** Local ownership is a UI observation; the backend remains the authority.  中文：本地所有权只是 UI 观测；后端仍是权威。 */
   owns(id: SessionId, observedEpoch?: number): boolean { return this.writers.get(id)?.ownsEpoch(observedEpoch) ?? false; }
 
   override async flush(): Promise<void> {
@@ -172,19 +173,19 @@ export default class CyreneSessionPersistence extends SessionPersistence {
     return value.items.map(decodeSnapshot);
   }
 
-  /** Release only this exact handle; an older handle cannot remove its successor. */
+  /** Release only this exact handle; an older handle cannot remove its successor.  中文：只释放这个精确 handle；旧 handle 不能移除它的后继者。 */
   release(handle: CyreneSessionHandle): void {
     this.handles.delete(handle);
     if (this.writers.get(handle.id) === handle) this.writers.delete(handle.id);
     if (this.takeovers.get(handle.id) === handle) this.takeovers.delete(handle.id);
   }
 
-  /** Report lifecycle failure without placing credentials or session content in logs. */
+  /** Report lifecycle failure without placing credentials or session content in logs.  中文：报告生命周期失败时，不得把凭据或 Session 内容写入日志。 */
   report(id: SessionId): void {
     this.ctx.logger.error(`Cyrene persistence failed for session ${id}; no local fallback was used`);
   }
 
-  /** Stop live work through the upstream Agent API after the backend fences it. */
+  /** Stop live work through the upstream Agent API after the backend fences it.  中文：后端完成 fencing 后，通过上游 Agent API 停止在线工作。 */
   ownershipLost(id: SessionId): void {
     this.ctx.get('agents')?.get(id)?.cancel({ kind: 'hook', reason: 'Cyrene Session writer ownership was lost' });
   }
@@ -197,7 +198,7 @@ export default class CyreneSessionPersistence extends SessionPersistence {
   }
 }
 
-/** Ordered handle with a bounded volatile batch and backend-enforced write fencing. */
+/** Ordered handle with a bounded volatile batch and backend-enforced write fencing.  中文：有序 handle，带有有界易失批次和由后端强制执行的写入 fencing。 */
 export class CyreneSessionHandle implements SessionHandle {
   readonly id: SessionId;
   readonly header: SessionHeader;
@@ -246,6 +247,7 @@ export class CyreneSessionHandle implements SessionHandle {
       this.observedLength = end;
       if (!Array.isArray(response.events)) throw new TypeError('Missing Session events');
       // The upstream validator owns event vocabulary, payload validation and freezing.
+      // 中文：上游校验器拥有事件词汇、负载校验和冻结处理。
       const batch = validateStoredEvents(this.header, response.events as SessionEvent[]);
       assertContiguous(this.id, batch, cursor);
       events.push(...batch);
@@ -283,6 +285,7 @@ export class CyreneSessionHandle implements SessionHandle {
     this.closing = this.queue(async () => {
       try {
         // Join renewal before release so a late heartbeat cannot fence a closed handle.
+        // 中文：先等待续租结束再释放，避免迟到的 heartbeat fence 已关闭的 handle。
         await this.heartbeat;
         if (this.access === 'write') {
           await this.drain();
@@ -300,13 +303,13 @@ export class CyreneSessionHandle implements SessionHandle {
 
   [Symbol.asyncDispose](): Promise<void> { return this.close(); }
 
-  /** Compare a UI observation with this handle without granting new authority. */
+  /** Compare a UI observation with this handle without granting new authority.  中文：将 UI 观测与此 handle 比较，但不授予新权威。 */
   ownsEpoch(epoch?: number): boolean {
     return this.access === 'write' && !this.lost && !this.closing
       && (epoch === undefined || epoch === this.remote.epoch);
   }
 
-  /** Route a committed live event into the same ordered backend channel. */
+  /** Route a committed live event into the same ordered backend channel.  中文：将已提交的在线事件路由到同一个有序后端通道。 */
   enqueue(event: SessionEvent): void {
     this.assertOpen('append');
     this.assertWriter('append');
@@ -333,6 +336,7 @@ export class CyreneSessionHandle implements SessionHandle {
   private queue(operation: () => Promise<void>): Promise<void> {
     const result = this.chain.then(operation);
     // Each caller observes its own rejection; later flushes can retry retained events.
+    // 中文：每个调用方分别观察自身的拒绝；后续 flush 可重试保留的事件。
     this.chain = result.catch(() => {});
     return result;
   }

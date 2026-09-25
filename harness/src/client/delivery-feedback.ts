@@ -51,6 +51,7 @@ interface ReactFace {
 }
 
 // The CJS factory receives a browser module resolver, not Node's require.
+// 中文：CJS factory 收到的是浏览器模块解析器，不是 Node 的 require。
 declare function require(id: 'react'): ReactFace
 declare const module: { exports: unknown }
 const React = require('react')
@@ -77,7 +78,7 @@ interface Attempt {
   readonly text: string
   turn: number | null
   failure: FailureKind | null
-  /** Native-backed terminal attempts wait for a durable completion receipt. */
+  /** Native-backed terminal attempts wait for a durable completion receipt.  中文：原生端产生的终态尝试必须等待持久化完成回执。  中文：原生端产生的终态尝试必须等待持久化完成回执。 */
   // native 终态必须等待持久化回执，不能因页面事件直接删除本地副本。
   terminal: boolean
 }
@@ -148,6 +149,7 @@ function observeEvents(
       const queue = queues.get(data.target) ?? []
       // An incomplete historical window cannot establish the omitted queue.
       // Preserve uncertainty instead of guessing which RPC an index removed.
+      // 中文：不完整的历史窗口无法确定被省略的队列内容。保留不确定性，不猜测某个 index 删除了哪个 RPC。
       if (start > queue.length || start + (count as number) > queue.length) {
         queues.delete(data.target)
         continue
@@ -251,7 +253,7 @@ class DeliveryTracker {
     }
   }
 
-  /** Dismissing a retained input is an explicit client action, not a resend. */
+  /** Dismissing a retained input is an explicit client action, not a resend.  中文：关闭保留输入是显式客户端操作，不会重新发送请求。  中文：关闭保留输入是显式客户端操作，不会重新发送请求。 */
   dismiss(requestId: string | null): void {
     if (requestId === null) this.generic = null
     else if (!this.hasNativeCapability()) {
@@ -269,7 +271,7 @@ class DeliveryTracker {
     this.publish()
   }
 
-  /** Retry only local input storage; this never resubmits a model request. */
+  /** Retry only local input storage; this never resubmits a model request.  中文：只重试本地输入存储，绝不会重新提交模型请求。  中文：只重试本地输入存储，绝不会重新提交模型请求。 */
   retrySaving(): void {
     if (!this.nativeFailed) return
     this.nativeFailed = false
@@ -282,7 +284,7 @@ class DeliveryTracker {
     }
   }
 
-  /** Re-read durable receipts without sending or taking over the Session. */
+  /** Re-read durable receipts without sending or taking over the Session.  中文：重新读取持久化回执；不发送请求，也不接管 Session。  中文：重新读取持久化回执；不发送请求，也不接管 Session。 */
   checkDelivery(): void {
     if (this.nativeFailed) { this.retrySaving(); return }
     this.nativeSignature = undefined
@@ -308,6 +310,7 @@ class DeliveryTracker {
           || this.attempts.has(row.requestId)) continue
         // A new explicit retry may already exist while the local read completes.
         // Do not revive its earlier failed copy behind that newer request.
+        // 中文：本地读取完成时，新的显式重试可能已经存在。不要在较新的请求后面恢复更早的失败副本。
         if ([...this.attempts.values()].some(attempt => attempt.text === row.text)) {
           this.supersededIds.add(row.requestId)
           continue
@@ -329,7 +332,7 @@ class DeliveryTracker {
     return this.native !== undefined || nativeRetainedInputs() !== undefined
   }
 
-  /** Serialize immutable input writes and removals independently of Session events. */
+  /** Serialize immutable input writes and removals independently of Session events.  中文：与 Session 事件相互独立地串行化不可变输入的写入和删除。  中文：与 Session 事件相互独立地串行化不可变输入的写入和删除。 */
   private syncNative(): void {
     const native = this.native
     const sessionId = this.sessionId
@@ -339,6 +342,7 @@ class DeliveryTracker {
         && !this.pendingDismissals.has(attempt.requestId)
         // Once a terminal attempt has a local copy, the receipt check below is
         // the only authority allowed to remove it.
+        // 中文：终态尝试一旦已有本地副本，只有下方回执检查可以授权删除。
         && (!attempt.terminal || this.nativeRecords.get(attempt.requestId) !== attempt.text))
       .map(attempt => [attempt.requestId, attempt.text]))
     const signature = JSON.stringify([...desired])
@@ -424,6 +428,7 @@ class DeliveryTracker {
   private capture(submission: PendingSubmission): void {
     if (submission.text === '') return
     // Explicitly retrying the same retained input creates a new RPC identity.
+    // 中文：显式重试同一保留输入会创建新的 RPC identity。
     for (const prior of this.attempts.values()) {
       if (prior.failure !== null && prior.text === submission.text) {
         this.pendingDismissals.delete(prior.requestId)
@@ -455,6 +460,7 @@ class DeliveryTracker {
     this.pendingIds = currentIds
 
     // Durable terminal evidence takes precedence over sticky global errors.
+    // 中文：持久化终态证据优先于粘滞的全局错误。
     observeEvents(this.attempts, this.events.getSnapshot(), this.hasNativeCapability())
     if (snapshot.promptError !== this.promptError) {
       this.promptError = snapshot.promptError
@@ -586,7 +592,7 @@ function DeliveryFeedback({
   }, ...messages)
 }
 
-/** Register a thin per-Session slot using only public client service faces. */
+/** Register a thin per-Session slot using only public client service faces.  中文：仅使用公开客户端服务接口注册轻量的逐 Session 插槽。  中文：仅使用公开客户端服务接口注册轻量的逐 Session 插槽。 */
 const inject = ['slots', 'connection', 'sessions'] as const
 
 function apply(ctx: object): void {
@@ -616,4 +622,5 @@ function apply(ctx: object): void {
 }
 
 // The build entry wraps this face in the upstream Loader's CJS factory.
+// 中文：构建入口会把此接口包装进上游 Loader 的 CJS factory。
 module.exports = { inject, apply, DeliveryFeedback, DeliveryTracker }
