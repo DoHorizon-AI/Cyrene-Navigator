@@ -2,9 +2,9 @@ name: package-msix
 
 on:
   push:
-    branches: [main, release]
+    branches: [develop, main, release, 'feat/**', 'fix/**', 'refactor/**']
   pull_request:
-    branches: [main, release]
+    branches: [develop, main, release]
   workflow_dispatch:
 
 permissions:
