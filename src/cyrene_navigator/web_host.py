@@ -5,7 +5,7 @@ The host owns browser-facing session state only. Product APIs remain behind
 explicitly configured proxy prefixes, and credential values are write-only at
 the HTTP boundary.
 
-Navigator 同源 Web Host 的身份验证、凭据和代理边界。主机只拥有面向浏览器的会话状态。Product API 始终位于显式配置的代理前缀之后；凭据值在 HTTP 边界上只写不读。
+Navigator 同源 Web Host 的身份验证、凭据和代理边界。主机只拥有面向浏览器的会话状态。Product API 始终位于显式配置的代理前缀之后;凭据值在 HTTP 边界上只写不读。
 """
 
 from __future__ import annotations
@@ -82,7 +82,7 @@ class WebHostModel(BaseModel):
 class PairingRequest(WebHostModel):
     """Accept the documented pairingCode and a short code compatibility alias.
 
-    接受文档规定的 pairingCode，并兼容较短的 code 别名。
+    接受文档规定的 pairingCode,并兼容较短的 code 别名。
     """
 
     pairing_code: str | None = Field(default=None, min_length=1, max_length=512)
@@ -92,7 +92,7 @@ class PairingRequest(WebHostModel):
     def require_code(self) -> PairingRequest:
         """Require one non-empty pairing value without exposing it in errors.
 
-        要求提供一个非空配对值，且错误信息不得泄露该值。
+        要求提供一个非空配对值,且错误信息不得泄露该值。
         """
 
         if self.pairing_code is None and self.code is None:
@@ -102,7 +102,7 @@ class PairingRequest(WebHostModel):
     def resolved_code(self) -> str:
         """Return the supplied pairing value, preferring the canonical field.
 
-        返回提供的配对值，优先使用规范字段。
+        返回提供的配对值,优先使用规范字段。
         """
 
         return self.pairing_code or self.code or ""
@@ -123,7 +123,7 @@ class ActiveRouteRequest(WebHostModel):
 class CredentialCreateRequest(WebHostModel):
     """Write-only credential input; neither secret field is ever serialized back.
 
-    只写凭据输入；任何密钥字段都不会被序列化返回。
+    只写凭据输入;任何密钥字段都不会被序列化返回。
     """
 
     name: str = Field(min_length=1, max_length=200)
@@ -137,7 +137,7 @@ class CredentialCreateRequest(WebHostModel):
     def require_secret(self) -> CredentialCreateRequest:
         """Require a value while keeping validation responses value-free.
 
-        要求字段有值，同时确保校验响应不包含该值。
+        要求字段有值,同时确保校验响应不包含该值。
         """
 
         if self.secret is None and self.token is None:
@@ -189,7 +189,7 @@ class CredentialUpdateRequest(WebHostModel):
     def resolved_secret(self) -> str | None:
         """Return a replacement secret when one was supplied.
 
-        如果提供了替换密钥，则返回该密钥。
+        如果提供了替换密钥,则返回该密钥。
         """
 
         value = self.secret or self.token
@@ -206,7 +206,7 @@ class CredentialUpdateRequest(WebHostModel):
     def resolved_kind(self) -> str | None:
         """Return the requested kind alias, if present.
 
-        如果存在类型别名，则返回请求中的别名。
+        如果存在类型别名,则返回请求中的别名。
         """
 
         return self.kind or self.type
@@ -282,7 +282,7 @@ class CredentialMetadata:
     def as_dict(self) -> JsonObject:
         """Return metadata only; the secret is intentionally absent.
 
-        只返回元数据；密钥会被有意省略。
+        只返回元数据;密钥会被有意省略。
         """
 
         return {
@@ -305,13 +305,13 @@ class CredentialStore:
     contains the stored value. A later encrypted platform store can replace this
     class without changing the Web Host routes.
 
-    供 Web Host 接口使用的进程内只写凭据存储。元数据与内存中的密钥解析器彼此分离。解析器仅对已配置的代理目标开放；HTTP 响应和异常都不包含已存储的值。后续可替换为加密的平台存储，而无需改变 Web Host 路由。
+    供 Web Host 接口使用的进程内只写凭据存储。元数据与内存中的密钥解析器彼此分离。解析器仅对已配置的代理目标开放;HTTP 响应和异常都不包含已存储的值。后续可替换为加密的平台存储,而无需改变 Web Host 路由。
     """
 
     def __init__(self, *, clock: Clock = time.time) -> None:
         """Create an isolated store with an injectable clock for focused tests.
 
-        创建隔离的存储，并允许注入时钟以便进行针对性测试。
+        创建隔离的存储,并允许注入时钟以便进行针对性测试。
         """
 
         self._clock = clock
@@ -331,7 +331,7 @@ class CredentialStore:
     ) -> tuple[CredentialMetadata, bool]:
         """Create metadata and retain the secret only for internal resolution.
 
-        创建元数据，并仅为内部解析保留密钥。
+        创建元数据,并仅为内部解析保留密钥。
         """
 
         _validate_credential_text(name, "name", max_length=200)
@@ -382,7 +382,7 @@ class CredentialStore:
     def get(self, credential_id: str) -> CredentialMetadata:
         """Read one metadata record without returning its secret.
 
-        读取一条元数据记录，但不返回其密钥。
+        读取一条元数据记录,但不返回其密钥。
         """
 
         with self._lock:
@@ -403,7 +403,7 @@ class CredentialStore:
     ) -> CredentialMetadata:
         """Update metadata or replace a secret without echoing either value.
 
-        更新元数据或替换密钥，但不回显任一值。
+        更新元数据或替换密钥,但不回显任一值。
         """
 
         with self._lock:
@@ -524,7 +524,7 @@ class ProxyTarget:
 class _SessionRecord:
     """Server-side session state; raw cookie tokens are never retained.
 
-    服务端会话状态；不会保留原始 cookie token。
+    服务端会话状态;不会保留原始 cookie token。
     """
 
     session_id: str
@@ -565,7 +565,7 @@ class WebHostState:
     ) -> None:
         """Initialize a hashed pairing code and bounded session lifetimes.
 
-        初始化经过哈希的配对码，并限制会话有效期。
+        初始化经过哈希的配对码,并限制会话有效期。
         """
 
         if not isinstance(pairing_code, str) or not pairing_code or len(pairing_code) > 512:
@@ -589,7 +589,7 @@ class WebHostState:
     def pair(self, pairing_code: str) -> _SessionCredentials:
         """Consume the pairing code exactly once and issue a fresh session.
 
-        仅消费一次配对码，并签发新的会话。
+        仅消费一次配对码,并签发新的会话。
         """
 
         with self._lock:
@@ -640,7 +640,7 @@ class WebHostState:
     def current_session(self, access_token: str | None) -> _SessionRecord | None:
         """Resolve an unexpired access cookie without revealing failure details.
 
-        解析未过期的访问 cookie，且不泄露失败细节。
+        解析未过期的访问 cookie,且不泄露失败细节。
         """
 
         if not access_token:
@@ -660,7 +660,7 @@ class WebHostState:
     def current_refresh(self, refresh_token: str | None) -> _SessionRecord | None:
         """Resolve a still-valid refresh cookie for explicit session renewal.
 
-        解析仍有效的 refresh cookie，以便显式续期会话。
+        解析仍有效的 refresh cookie,以便显式续期会话。
         """
 
         if not refresh_token:
@@ -677,7 +677,7 @@ class WebHostState:
     def refresh(self, refresh_token: str) -> _SessionCredentials:
         """Rotate both browser cookies and invalidate the previous refresh token.
 
-        轮换两个浏览器 cookie，并使先前的 refresh token 失效。
+        轮换两个浏览器 cookie,并使先前的 refresh token 失效。
         """
 
         with self._lock:
@@ -741,7 +741,7 @@ class WebHostState:
     def anonymous_payload(self) -> JsonObject:
         """Build a stable unauthenticated session response without an error.
 
-        构建稳定的未认证会话响应，不返回错误。
+        构建稳定的未认证会话响应,不返回错误。
         """
 
         refreshable = False
@@ -809,7 +809,7 @@ class _ConfiguredProxy:
 
 # Gateway base URL used when neither an override nor an Exchange proxy target is
 # configured. Matches the development stack that serves Exchange on port 8000.
-# 当没有覆盖值或 Exchange 代理目标时使用的 Gateway 基础 URL，与开发栈中 Exchange 监听 8000 端口的配置一致。
+# 当没有覆盖值或 Exchange 代理目标时使用的 Gateway 基础 URL,与开发栈中 Exchange 监听 8000 端口的配置一致。
 DEFAULT_GATEWAY_BASE_URL = "http://127.0.0.1:8000/v1"
 _GATEWAY_PROXY_PREFIX = "/api/proxy/exchange-gateway"
 
@@ -821,7 +821,7 @@ def _gateway_base_url(configured: Sequence[_ConfiguredProxy]) -> str:
     can be HTTPS behind Caddy, so it is resolved here and published to the UI
     rather than guessed in the browser.
 
-    解析供客户端示例使用的 Exchange OpenAI 兼容基础 URL。开发栈与打包部署使用的端口不同，且 Caddy 后方可能使用 HTTPS；因此由此处解析后提供给 UI，避免浏览器自行猜测。
+    解析供客户端示例使用的 Exchange OpenAI 兼容基础 URL。开发栈与打包部署使用的端口不同,且 Caddy 后方可能使用 HTTPS;因此由此处解析后提供给 UI,避免浏览器自行猜测。
     """
 
     override = os.environ.get("CYRENE_GATEWAY_BASE_URL", "").strip()
@@ -925,7 +925,7 @@ def _cyrene_roots() -> list[Path]:
     A packaged host keeps everything under one install root; a development
     checkout keeps the release lock inside the Workspace repository.
 
-    按明确程度从高到低排列的候选安装/工作区根目录。打包主机会将所有内容放在一个安装根目录下；开发检出则将 release lock 保存在 Workspace 仓库中。
+    按明确程度从高到低排列的候选安装/工作区根目录。打包主机会将所有内容放在一个安装根目录下;开发检出则将 release lock 保存在 Workspace 仓库中。
     """
 
     roots: list[Path] = []
@@ -959,7 +959,7 @@ def _query_bootstrap() -> dict[str, Any]:
     States: READY (bootstrap completed and left its marker), PENDING (pins are
     present but no completed bootstrap was recorded), UNKNOWN (neither found).
 
-    报告固定版本的运行时是否已安装并验证。状态包括：READY（引导已完成并留下标记）、PENDING（存在版本固定信息，但没有已完成引导的记录）、UNKNOWN（两者都未找到）。
+    报告固定版本的运行时是否已安装并验证。状态包括:READY(引导已完成并留下标记)、PENDING(存在版本固定信息,但没有已完成引导的记录)、UNKNOWN(两者都未找到)。
     """
 
     override = os.environ.get(_BOOTSTRAP_STATE_ENV, "").strip().upper()
@@ -1013,7 +1013,7 @@ def _diagnostics_degraded(services: list[dict[str, Any]], bootstrap: dict[str, A
     True when a configured Product is unreachable or the runtime state could not
     be determined: in both cases any diagnostics shown elsewhere are partial.
 
-    主机对系统栈的视图是否已知不完整。如果某个已配置 Product 无法访问，或无法确定运行时状态，则返回 True；这两种情况下其他位置显示的诊断信息都只是部分信息。
+    主机对系统栈的视图是否已知不完整。如果某个已配置 Product 无法访问,或无法确定运行时状态,则返回 True;这两种情况下其他位置显示的诊断信息都只是部分信息。
     """
 
     if any(entry.get("status") != "UP" for entry in services):
@@ -1097,7 +1097,7 @@ def create_web_host_app(
     ``proxy_targets`` is the complete allowlist. Request data cannot select an
     origin, and proxy responses never set browser cookies from an upstream.
 
-    构建同源 Web Host 边界。``proxy_targets`` 是完整 allowlist。请求数据不能选择 origin，代理响应也不会设置来自上游的浏览器 cookie。
+    构建同源 Web Host 边界。``proxy_targets`` 是完整 allowlist。请求数据不能选择 origin,代理响应也不会设置来自上游的浏览器 cookie。
     """
 
     resolved_pairing_code = (
@@ -1135,7 +1135,7 @@ def create_web_host_app(
     ) -> Response:
         """Propagate a valid W3C trace parent or create a local one.
 
-        传播有效的 W3C traceparent；若无效则创建本地关联标识。
+        传播有效的 W3C traceparent;若无效则创建本地关联标识。
         """
 
         incoming = request.headers.get("traceparent", "")
@@ -1161,7 +1161,7 @@ def create_web_host_app(
     async def web_host_error(request: Request, exc: WebHostError) -> JSONResponse:
         """Render a stable RFC 9457 response without sensitive request data.
 
-        生成稳定的 RFC 9457 响应，不包含敏感请求数据。
+        生成稳定的 RFC 9457 响应,不包含敏感请求数据。
         """
 
         return _problem_response(request, exc.code, exc.status, exc.detail, exc.retryable)
@@ -1170,7 +1170,7 @@ def create_web_host_app(
     async def credential_error(request: Request, exc: CredentialStoreError) -> JSONResponse:
         """Translate internal credential errors without revealing their values.
 
-        转换内部凭据错误，同时不泄露凭据值。
+        转换内部凭据错误,同时不泄露凭据值。
         """
 
         return _problem_response(request, exc.code, exc.status, exc.detail, False)
@@ -1179,7 +1179,7 @@ def create_web_host_app(
     async def validation_error(request: Request, _exc: RequestValidationError) -> JSONResponse:
         """Render generic validation details so secrets never enter error payloads.
 
-        生成通用校验详情，确保密钥不会进入错误载荷。
+        生成通用校验详情,确保密钥不会进入错误载荷。
         """
 
         return _problem_response(
@@ -1193,7 +1193,7 @@ def create_web_host_app(
     def cookie_secure(request: Request) -> bool:
         """Use Secure cookies for HTTPS while permitting explicit local HTTP mode.
 
-        HTTPS 下使用 Secure cookie，同时允许显式启用本地 HTTP 模式。
+        HTTPS 下使用 Secure cookie,同时允许显式启用本地 HTTP 模式。
         """
 
         return secure_cookies or request.url.scheme == "https"
@@ -1203,7 +1203,7 @@ def create_web_host_app(
     ) -> None:
         """Set rotated HttpOnly session/refresh cookies and a readable CSRF cookie.
 
-        设置已轮换的 HttpOnly session/refresh cookie，以及可读取的 CSRF cookie。
+        设置已轮换的 HttpOnly session/refresh cookie,以及可读取的 CSRF cookie。
         """
 
         secure = cookie_secure(request)
@@ -1238,7 +1238,7 @@ def create_web_host_app(
     def clear_session_cookies(response: Response) -> None:
         """Expire all Web Host cookies without returning their previous values.
 
-        使所有 Web Host cookie 过期，但不返回旧值。
+        使所有 Web Host cookie 过期,但不返回旧值。
         """
 
         for cookie_name in (_SESSION_COOKIE, _REFRESH_COOKIE, _CSRF_COOKIE):
@@ -1247,7 +1247,7 @@ def create_web_host_app(
     def require_session(request: Request, *, mutation: bool = False) -> _SessionRecord:
         """Authenticate the access cookie and optionally enforce CSRF.
 
-        验证访问 cookie，并可按需执行 CSRF 校验。
+        验证访问 cookie,并可按需执行 CSRF 校验。
         """
 
         record = state.current_session(request.cookies.get(_SESSION_COOKIE))
@@ -1272,7 +1272,7 @@ def create_web_host_app(
     def require_refresh_csrf(request: Request, record: _SessionRecord) -> None:
         """Apply the same double-submit check when only refresh state remains.
 
-        仅剩 refresh 状态时，也执行相同的 double-submit 校验。
+        仅剩 refresh 状态时,也执行相同的 double-submit 校验。
         """
 
         if not state.csrf_matches(
@@ -1290,7 +1290,7 @@ def create_web_host_app(
     def pair(body: PairingRequest, request: Request) -> Response:
         """Consume the stdout-delivered pairing code and establish browser state.
 
-        消费通过 stdout 传递的配对码，并建立浏览器状态。
+        消费通过 stdout 传递的配对码,并建立浏览器状态。
         """
 
         issued = state.pair(body.resolved_code())
@@ -1302,7 +1302,7 @@ def create_web_host_app(
     def get_session(request: Request) -> JsonObject:
         """Return login/refresh state without turning anonymous access into an error.
 
-        返回登录/刷新状态，不将匿名访问转换为错误。
+        返回登录/刷新状态,不将匿名访问转换为错误。
         """
 
         record = state.current_session(request.cookies.get(_SESSION_COOKIE))
@@ -1317,7 +1317,7 @@ def create_web_host_app(
     def refresh_session(request: Request) -> Response:
         """Rotate a valid refresh cookie and require CSRF when it is used.
 
-        轮换有效的 refresh cookie，并在使用时要求通过 CSRF 校验。
+        轮换有效的 refresh cookie,并在使用时要求通过 CSRF 校验。
         """
 
         old_record = state.current_refresh(request.cookies.get(_REFRESH_COOKIE))
@@ -1375,14 +1375,14 @@ def create_web_host_app(
             # Whether the pinned runtime is installed, which engine versions it
             # holds, and whether this host can see the whole stack. A console
             # cannot decide what to offer without them.
-            # 用于判断固定运行时是否已安装、包含哪些引擎版本，以及主机能否访问完整系统栈。缺少这些信息时，控制台无法确定应提供哪些选项。
+            # 用于判断固定运行时是否已安装、包含哪些引擎版本,以及主机能否访问完整系统栈。缺少这些信息时,控制台无法确定应提供哪些选项。
             "bootstrapState": bootstrap_info,
             "runtime": runtime_info,
             "diagnosticsDegraded": _diagnostics_degraded(svc_info, bootstrap_info),
             # The Exchange OpenAI-compatible gateway port differs between the
             # dev stack and packaged deployments, so it is published here
             # instead of being guessed in the browser.
-            # Exchange OpenAI 兼容网关在开发栈和打包部署中的端口不同，因此在此发布给 UI，避免由浏览器猜测。
+            # Exchange OpenAI 兼容网关在开发栈和打包部署中的端口不同,因此在此发布给 UI,避免由浏览器猜测。
             "gatewayBaseUrl": _gateway_base_url(configured_proxies),
             "observedAt": _iso_timestamp(clock()),
         }
@@ -1391,7 +1391,7 @@ def create_web_host_app(
     def create_credential(body: CredentialCreateRequest, request: Request) -> JsonObject:
         """Create credential metadata without returning the supplied secret.
 
-        创建凭据元数据，但不返回所提供的密钥。
+        创建凭据元数据,但不返回所提供的密钥。
         """
 
         require_session(request, mutation=True)
@@ -1408,7 +1408,7 @@ def create_web_host_app(
     def list_credentials(request: Request) -> list[JsonObject]:
         """List credential metadata while omitting every secret value.
 
-        列出凭据元数据，并省略所有密钥值。
+        列出凭据元数据,并省略所有密钥值。
         """
 
         require_session(request)
@@ -1418,7 +1418,7 @@ def create_web_host_app(
     def get_credential(credential_id: str, request: Request) -> JsonObject:
         """Read one credential metadata record without secret recovery.
 
-        读取一条凭据元数据记录，不提供密钥恢复功能。
+        读取一条凭据元数据记录,不提供密钥恢复功能。
         """
 
         require_session(request)
@@ -1431,7 +1431,7 @@ def create_web_host_app(
     ) -> JsonObject:
         """Update metadata or rotate a secret without echoing the new value.
 
-        更新元数据或轮换密钥，不回显新值。
+        更新元数据或轮换密钥,不回显新值。
         """
 
         require_session(request, mutation=True)
@@ -1448,7 +1448,7 @@ def create_web_host_app(
     def delete_credential(credential_id: str, request: Request) -> JsonObject:
         """Revoke a credential as the deletion operation while retaining metadata.
 
-        通过删除操作撤销凭据，同时保留元数据。
+        通过删除操作撤销凭据,同时保留元数据。
         """
 
         require_session(request, mutation=True)
@@ -1645,7 +1645,7 @@ def _problem_response(
 def _idempotency_key(request: Request) -> str | None:
     """Read and bound an optional mutation idempotency key.
 
-    读取可选的变更幂等键，并限制其长度。
+    读取可选的变更幂等键,并限制其长度。
     """
 
     value = request.headers.get("idempotency-key")
@@ -1683,7 +1683,7 @@ def _match_proxy_target(
 ) -> _ConfiguredProxy | None:
     """Find an exact or slash-delimited prefix without accepting traversal.
 
-    查找精确前缀或以斜杠分隔的前缀，同时拒绝路径穿越。
+    查找精确前缀或以斜杠分隔的前缀,同时拒绝路径穿越。
     """
 
     _validate_proxy_path(path)
@@ -1696,7 +1696,7 @@ def _match_proxy_target(
 def _normalize_prefix(value: str) -> str:
     """Normalize an allowlist prefix and reject URL or traversal syntax.
 
-    规范化 allowlist 前缀，并拒绝 URL 或路径穿越语法。
+    规范化 allowlist 前缀,并拒绝 URL 或路径穿越语法。
     """
 
     if not isinstance(value, str) or not value.startswith("/"):
@@ -1742,7 +1742,7 @@ def _validate_proxy_path(path: str) -> None:
 def _validate_base_url(value: str) -> str:
     """Require a configured HTTP(S) origin without embedded user credentials.
 
-    要求配置 HTTP(S) origin，且不得内嵌用户凭据。
+    要求配置 HTTP(S) origin,且不得内嵌用户凭据。
     """
 
     parsed = urlsplit(value)
@@ -1762,7 +1762,7 @@ def _validate_base_url(value: str) -> str:
 def _validate_credential_text(value: str, field: str, *, max_length: int) -> None:
     """Validate metadata without ever including the supplied value in an error.
 
-    校验元数据，且错误信息绝不包含所提供的值。
+    校验元数据,且错误信息绝不包含所提供的值。
     """
 
     if not isinstance(value, str) or not value.strip() or len(value) > max_length:
@@ -1776,7 +1776,7 @@ def _validate_credential_text(value: str, field: str, *, max_length: int) -> Non
 def _validate_secret(value: str, *, field: str = "secret") -> None:
     """Validate a secret's shape without retaining it in exception text.
 
-    校验密钥格式，但不将密钥保留在异常文本中。
+    校验密钥格式,但不将密钥保留在异常文本中。
     """
 
     if not isinstance(value, str) or not value or len(value) > 10_000:
@@ -1790,7 +1790,7 @@ def _validate_secret(value: str, *, field: str = "secret") -> None:
 def _credential_fingerprint(name: str, provider: str, kind: str, secret: str) -> str:
     """Build an idempotency fingerprint without storing the raw secret.
 
-    生成幂等指纹，不存储原始密钥。
+    生成幂等指纹,不存储原始密钥。
     """
 
     secret_hash = _hash_secret(secret)
@@ -1801,7 +1801,7 @@ def _credential_fingerprint(name: str, provider: str, kind: str, secret: str) ->
 def _hash_secret(value: str) -> str:
     """Hash an opaque pairing, cookie, or credential value for comparisons.
 
-    对不透明的配对码、cookie 或凭据值进行哈希，以供比较使用。
+    对不透明的配对码、cookie 或凭据值进行哈希,以供比较使用。
     """
 
     return hashlib.sha256(value.encode("utf-8")).hexdigest()

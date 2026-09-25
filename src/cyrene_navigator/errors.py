@@ -13,7 +13,7 @@ from __future__ import annotations
 # ════════════════════════════════════════════════════════════════════════
 # Canonical Cyrene Navigator Error Catalog & Mappings
 # ════════════════════════════════════════════════════════════════════════
-# 中文：Cyrene Navigator 规范错误目录与映射。
+# 中文:Cyrene Navigator 规范错误目录与映射。
 NAVIGATOR_ERROR_MAPPINGS: dict[str, dict[str, str]] = {
     "NAVIGATOR_REQUEST_INVALID": {
         "code": "PRODUCT.NAVIGATOR.REQUEST_INVALID",
@@ -61,9 +61,9 @@ NAVIGATOR_ERROR_MAPPINGS: dict[str, dict[str, str]] = {
 def map_navigator_error(raw_code: str) -> dict[str, str]:
     """Map a raw or legacy Navigator error code to canonical PRODUCT.NAVIGATOR.<REASON>.
 
-    中文：将原始或旧版 Navigator 错误码映射为标准的 PRODUCT.NAVIGATOR.<REASON>。
+    中文:将原始或旧版 Navigator 错误码映射为标准的 PRODUCT.NAVIGATOR.<REASON>。
     """
-# 中文：将原始或旧版 Navigator 错误代码映射为规范的 PRODUCT.NAVIGATOR.<REASON>。
+# 中文:将原始或旧版 Navigator 错误代码映射为规范的 PRODUCT.NAVIGATOR.<REASON>。
     if raw_code in NAVIGATOR_ERROR_MAPPINGS:
         return NAVIGATOR_ERROR_MAPPINGS[raw_code]
     normalized = raw_code.upper().replace(" ", "_")

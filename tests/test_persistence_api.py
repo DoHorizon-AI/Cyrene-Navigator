@@ -32,9 +32,9 @@ TOKENS = {
 def test_runtime_paths_match_frozen_persistence_openapi(tmp_path: Path) -> None:
     """The published persistence contract covers every implemented route.
 
-    中文：已发布的 persistence 契约覆盖所有已实现的 route。
+    中文:已发布的 persistence 契约覆盖所有已实现的 route。
     """
-# 中文：已发布的持久化契约覆盖每个已实现路由。
+# 中文:已发布的持久化契约覆盖每个已实现路由。
 
     app = create_persistence_app(tmp_path / "contract.sqlite3", TOKENS)
     contract, _ = read_from_filename(

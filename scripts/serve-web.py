@@ -7,9 +7,9 @@ of the owner-only file holding it. The code itself is never written to stdout or
 stderr: this process runs detached with its output redirected into a log file,
 so printing the secret would leave a working credential on disk.
 
-中文：Navigator Web Host 启动器。启动器先绑定监听器，再输出一行 JSON 启动信息，其中包含已绑定地址；若启动器自行生成 pairing code，还会给出仅所有者可读文件的路径。pairing code 本身不会写入 stdout 或 stderr：该进程以 detached 方式运行，输出重定向到日志文件，因此打印密钥会把可用凭据留在磁盘上。
+中文:Navigator Web Host 启动器。启动器先绑定监听器,再输出一行 JSON 启动信息,其中包含已绑定地址;若启动器自行生成 pairing code,还会给出仅所有者可读文件的路径。pairing code 本身不会写入 stdout 或 stderr:该进程以 detached 方式运行,输出重定向到日志文件,因此打印密钥会把可用凭据留在磁盘上。
 """
-# 中文：Navigator Web Host 启动器。启动器先绑定监听器，再输出一行 JSON，包含实际绑定地址；若需要自行生成 pairing code，还会输出仅 owner 可读的文件路径。代码本身绝不会写入 stdout 或 stderr：该进程以 detached 方式运行，输出会重定向到日志文件，因此打印秘密会把有效凭据留在磁盘上。
+# 中文:Navigator Web Host 启动器。启动器先绑定监听器,再输出一行 JSON,包含实际绑定地址;若需要自行生成 pairing code,还会输出仅 owner 可读的文件路径。代码本身绝不会写入 stdout 或 stderr:该进程以 detached 方式运行,输出会重定向到日志文件,因此打印秘密会把有效凭据留在磁盘上。
 
 from __future__ import annotations
 
@@ -30,9 +30,9 @@ PAIRING_CODE_MODE = 0o600
 def pairing_code_path(explicit: str | None) -> Path | None:
     """Resolve where a self-generated pairing code may be stored, if anywhere.
 
-    中文：查找自生成 pairing code 可以存放的位置；如无安全位置也可返回空。
+    中文:查找自生成 pairing code 可以存放的位置;如无安全位置也可返回空。
     """
-# 中文：解析自行生成的 pairing code 可存放的位置；也可能没有合适位置。
+# 中文:解析自行生成的 pairing code 可存放的位置;也可能没有合适位置。
 
     configured = explicit or os.environ.get(PAIRING_CODE_FILE_ENV)
     return Path(configured).expanduser() if configured else None
@@ -41,9 +41,9 @@ def pairing_code_path(explicit: str | None) -> Path | None:
 def write_pairing_code(path: Path, code: str) -> None:
     """Store the code for the invoking user only.
 
-    中文：仅为发起调用的用户保存 code。
+    中文:仅为发起调用的用户保存 code。
     """
-# 中文：只为调用此操作的用户保存 code。
+# 中文:只为调用此操作的用户保存 code。
 
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PAIRING_CODE_MODE)
@@ -55,9 +55,9 @@ def write_pairing_code(path: Path, code: str) -> None:
 def startup_payload(host: str, port: int, code_file: Path | None) -> dict[str, object]:
     """Describe the bound listener without disclosing the pairing secret.
 
-    中文：描述已绑定的 listener，同时不泄露 pairing secret。
+    中文:描述已绑定的 listener,同时不泄露 pairing secret。
     """
-# 中文：描述已绑定的监听器，但不泄露 pairing secret。
+# 中文:描述已绑定的监听器,但不泄露 pairing secret。
 
     return {
         "service": "cyrene-web-host",
@@ -70,9 +70,9 @@ def startup_payload(host: str, port: int, code_file: Path | None) -> dict[str, o
 def main() -> None:
     """Start the Web Host and publish where its pairing material can be read.
 
-    中文：启动 Web Host，并公布 pairing 信息的读取位置。
+    中文:启动 Web Host,并公布 pairing 信息的读取位置。
     """
-# 中文：启动 Web Host，并报告 pairing 信息的读取位置。
+# 中文:启动 Web Host,并报告 pairing 信息的读取位置。
 
     parser = argparse.ArgumentParser(description="Cyrene Navigator Web Host")
     parser.add_argument("--host", default="127.0.0.1")
@@ -135,9 +135,9 @@ def main() -> None:
 def _parse_proxy_targets(values: list[str], parser: argparse.ArgumentParser) -> dict[str, str]:
     """Parse fixed prefix assignments without accepting arbitrary request origins.
 
-    中文：解析固定前缀赋值，不接受任意 request origin。
+    中文:解析固定前缀赋值,不接受任意 request origin。
     """
-# 中文：解析固定前缀的 assignment，不接受任意请求来源。
+# 中文:解析固定前缀的 assignment,不接受任意请求来源。
 
     result: dict[str, str] = {}
     for value in values:

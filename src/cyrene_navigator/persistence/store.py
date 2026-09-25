@@ -48,7 +48,7 @@ class PersistencePrincipal:
 
 
 # The shorter name is convenient for callers while keeping the API contract explicit.
-# 较短名称便于调用方使用，同时保留明确的 API 契约。
+# 较短名称便于调用方使用,同时保留明确的 API 契约。
 Principal = PersistencePrincipal
 
 
@@ -92,9 +92,9 @@ class PersistenceStore:
     ``BEGIN IMMEDIATE`` so ownership, sequence checks, and event insertion commit
     as one durable unit.
 
-    Cyrene Harness 持久化权威的 SQLite 实现。该存储包含上游 Session header、只追加事件，
+    Cyrene Harness 持久化权威的 SQLite 实现。该存储包含上游 Session header、只追加事件,
     以及小型只读 Product 元数据投影。它不包含自己的消息投影或 AgentLoop 状态。每次变更都以
-    ``BEGIN IMMEDIATE`` 开始，使所有权检查、序列号检查和事件插入作为一个持久化单元一起提交。
+    ``BEGIN IMMEDIATE`` 开始,使所有权检查、序列号检查和事件插入作为一个持久化单元一起提交。
     """
 
     def __init__(self, db_path: Path, lease_seconds: float = 120) -> None:

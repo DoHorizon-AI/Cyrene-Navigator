@@ -105,7 +105,7 @@ def test_api_traceparent_and_validation_error():
     req_id = "req-nav-test-123"
 
     # Send invalid JSON body to trigger RequestValidationError (422)
-    # 发送无效 JSON 请求体以触发 RequestValidationError（422）。
+    # 发送无效 JSON 请求体以触发 RequestValidationError(422)。
     res = client.post(
         "/api/v1/workspace-snapshots",
         json={"invalid": "payload"},
