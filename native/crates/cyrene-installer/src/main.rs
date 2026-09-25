@@ -12,7 +12,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const DEFAULT_EXCHANGE_URL: &str = "https://cyrene-exchange.calmsky-23e48c1c.westus2.azurecontainerapps.io";
+const DEFAULT_EXCHANGE_URL: &str =
+    "https://cyrene-exchange.calmsky-23e48c1c.westus2.azurecontainerapps.io";
 
 struct ServiceTool {
     name: &'static str,
@@ -85,7 +86,10 @@ fn print_usage(prog: &str) {
     println!("\nOptions / 选项:");
     println!("  --silent                以无交互静默模式运行安装");
     println!("  --install-agent         安装/配置本地 DeepSeek Harness Agent 环境");
-    println!("  --exchange-url <URL>    设置 Exchange 网关端点 (默认: {})", DEFAULT_EXCHANGE_URL);
+    println!(
+        "  --exchange-url <URL>    设置 Exchange 网关端点 (默认: {})",
+        DEFAULT_EXCHANGE_URL
+    );
     println!("  --exchange-token <KEY>  设置统一访问 API Key 凭据");
     println!("  --deploy-tools <NAMES>  以逗号分隔下载部署的服务: all 或 exchange,reactor,yield,catalyst,echo");
     println!("  --generate-compose <PATH> 生成统一 docker-compose.yml 部署清单");
@@ -103,8 +107,13 @@ fn run_interactive() {
     loop {
         println!("\n--- [ 安装器功能导航 / Installer Menu ] ---");
         println!("1. [核心功能] 配置并安装 Agent 本地执行环境 (DeepSeek Harness + Native Host)");
-        println!("2. [网关配置] 配置 Exchange 端点与统一认证凭据 (当前: {})", exchange_url);
-        println!("3. [按需选装] 远程下载部署其他五个核心工具 (Exchange, Reactor, Yield, Catalyst, Echo)");
+        println!(
+            "2. [网关配置] 配置 Exchange 端点与统一认证凭据 (当前: {})",
+            exchange_url
+        );
+        println!(
+            "3. [按需选装] 远程下载部署其他五个核心工具 (Exchange, Reactor, Yield, Catalyst, Echo)"
+        );
         println!("4. [一键部署] 生成 docker-compose.yml 并拉取选定服务镜像");
         println!("5. [完成退出] 保存配置并退出安装器");
         print!("\n请选择操作 [1-5]: ");
@@ -175,8 +184,18 @@ fn menu_select_tools(selected: &mut BTreeSet<usize>) {
     loop {
         println!("\n--- [ 可选部署的五个后端工具列表 ] ---");
         for (idx, tool) in TOOLS.iter().enumerate() {
-            let status = if selected.contains(&idx) { "[x] 已勾选" } else { "[ ] 未勾选" };
-            println!("  {}. {} {} (默认端口: {})", idx + 1, status, tool.title, tool.port);
+            let status = if selected.contains(&idx) {
+                "[x] 已勾选"
+            } else {
+                "[ ] 未勾选"
+            };
+            println!(
+                "  {}. {} {} (默认端口: {})",
+                idx + 1,
+                status,
+                tool.title,
+                tool.port
+            );
             println!("     镜像: {}", tool.image);
             println!("     说明: {}", tool.desc);
         }
@@ -222,7 +241,10 @@ fn deploy_selected_tools(app_dir: &Path, selected: &BTreeSet<usize>) {
     let compose_file = app_dir.join("docker-compose.yml");
     let content = generate_docker_compose(selected);
     fs::write(&compose_file, &content).expect("Failed to write docker-compose.yml");
-    println!("\n📄 已在以下位置生成 docker-compose.yml:\n   {}", compose_file.display());
+    println!(
+        "\n📄 已在以下位置生成 docker-compose.yml:\n   {}",
+        compose_file.display()
+    );
 
     println!("\n>> 正在检查本地 Docker 环境...");
     let docker_check = Command::new("docker").arg("info").output();
@@ -300,7 +322,10 @@ fn setup_agent_core(app_dir: &Path, exchange_url: &str, exchange_token: &str) {
     let config_path = agent_dir.join("agent_config.json");
     fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
     println!("   ✅ Agent 配置文件已就绪: {}", config_path.display());
-    println!("   ✅ 默认连接 Exchange 端点: {}/v1/chat/completions", exchange_url.trim_end_matches('/'));
+    println!(
+        "   ✅ 默认连接 Exchange 端点: {}/v1/chat/completions",
+        exchange_url.trim_end_matches('/')
+    );
 }
 
 fn save_exchange_config(app_dir: &Path, exchange_url: &str, exchange_token: &str) {
@@ -310,7 +335,11 @@ fn save_exchange_config(app_dir: &Path, exchange_url: &str, exchange_token: &str
         "updated_at": "2026-09-25T15:50:00Z"
     });
     fs::create_dir_all(app_dir).unwrap();
-    fs::write(app_dir.join("exchange_credentials.json"), serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    fs::write(
+        app_dir.join("exchange_credentials.json"),
+        serde_json::to_string_pretty(&config).unwrap(),
+    )
+    .unwrap();
 }
 
 fn run_silent(args: &[String]) {
