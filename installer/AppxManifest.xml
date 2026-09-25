@@ -6,16 +6,16 @@
   IgnorableNamespaces="uap rescap">
 
   <Identity
-    Name="DoHorizon.Cyrene.Navigator"
+    Name="DoHorizon.Cyrene.Installer"
     Publisher="CN=DoHorizon-AI"
     Version="1.0.0.0"
     ProcessorArchitecture="x64" />
 
   <Properties>
-    <DisplayName>Cyrene Navigator Installer</DisplayName>
+    <DisplayName>Cyrene Installer</DisplayName>
     <PublisherDisplayName>DoHorizon AI</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
-    <Description>Cyrene Navigator: DeepSeek Harness Agent Runtime, Local Execution Environment and Multi-Tool Installer</Description>
+    <Description>Cyrene Modular Multi-Tool Installer, Orchestrator and Clean Uninstaller</Description>
   </Properties>
 
   <Resources>
@@ -32,16 +32,16 @@
   </Capabilities>
 
   <Applications>
-    <Application Id="CyreneNavigatorInstaller"
-      Executable="CyreneNavigatorInstaller.exe"
+    <Application Id="CyreneInstaller"
+      Executable="installer.exe"
       EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
-        DisplayName="Cyrene Navigator"
-        Description="Cyrene Navigator Installer &amp; Agent Environment"
+        DisplayName="Cyrene Installer"
+        Description="Cyrene Modular Installer &amp; Tool Orchestrator"
         BackgroundColor="#0f172a"
         Square150x150Logo="Assets\Square150x150Logo.png"
         Square44x44Logo="Assets\Square44x44Logo.png">
-        <uap:DefaultTile ShortName="Navigator" Wide310x150Logo="Assets\Wide310x150Logo.png" />
+        <uap:DefaultTile ShortName="Installer" Wide310x150Logo="Assets\Wide310x150Logo.png" />
         <uap:SplashScreen Image="Assets\SplashScreen.png" />
       </uap:VisualElements>
     </Application>

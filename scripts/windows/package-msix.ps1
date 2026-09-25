@@ -1,19 +1,19 @@
 <#
 .SYNOPSIS
-    Packages Cyrene Navigator as an MSIX Windows installer package.
-    将 Cyrene Navigator 打包为 MSIX Windows 现代化安装包。
+    Packages Cyrene Installer as an MSIX Windows installer package.
+    将 Cyrene Installer 打包为 MSIX Windows 现代化安装包与独立执行程序。
 #>
 
 param(
     [string]$LayoutDir = "dist/msix-layout",
-    [string]$OutputMsix = "dist/Cyrene-Navigator-Installer.msix",
+    [string]$OutputMsix = "dist/installer.msix",
     [string]$CertSubject = "CN=DoHorizon-AI"
 )
 
 $ErrorActionPreference = "Stop"
 
 Write-Host "==========================================================" -ForegroundColor Cyan
-Write-Host "  Cyrene Navigator MSIX Packaging Automation              " -ForegroundColor Cyan
+Write-Host "  Cyrene Installer Packaging Automation                   " -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Cyan
 
 # 1. Resolve Windows SDK tools
@@ -47,18 +47,21 @@ New-Item -ItemType Directory -Force -Path (Split-Path -Parent $OutputMsix) | Out
 Copy-Item "installer/AppxManifest.xml" -Destination (Join-Path $LayoutDir "AppxManifest.xml")
 Copy-Item "installer/Assets/*" -Destination (Join-Path $LayoutDir "Assets") -Recurse
 
-# Copy compiled binaries (if built, or copy targets)
-$installerBin = "native/target/release/CyreneNavigatorInstaller.exe"
+# Copy compiled binaries
+$installerBin = "native/target/release/installer.exe"
 $nativeHostBin = "native/target/release/cyrene-native-host.exe"
 
 if (Test-Path $installerBin) {
-    Copy-Item $installerBin -Destination (Join-Path $LayoutDir "CyreneNavigatorInstaller.exe")
+    Copy-Item $installerBin -Destination (Join-Path $LayoutDir "installer.exe")
+    # Also copy standalone installer to dist/ for direct portable use
+    Copy-Item $installerBin -Destination (Join-Path (Split-Path -Parent $OutputMsix) "installer.exe")
 } else {
     Write-Warning "Installer binary not found at $installerBin; please build with cargo first."
 }
 
 if (Test-Path $nativeHostBin) {
     Copy-Item $nativeHostBin -Destination (Join-Path $LayoutDir "cyrene-native-host.exe")
+    Copy-Item $nativeHostBin -Destination (Join-Path (Split-Path -Parent $OutputMsix) "cyrene-native-host.exe")
 }
 
 # 3. Create or export code signing certificate
@@ -71,7 +74,7 @@ $cert = New-SelfSignedCertificate `
     -Type Custom `
     -Subject $CertSubject `
     -KeyUsage DigitalSignature `
-    -FriendlyName "Cyrene Navigator Dev Cert" `
+    -FriendlyName "Cyrene Dev Cert" `
     -CertStoreLocation "Cert:\CurrentUser\My" `
     -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3")
 
@@ -94,3 +97,4 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "`n✅ Successfully generated and signed MSIX package:" -ForegroundColor Green
 Write-Host "   $OutputMsix" -ForegroundColor Green
 Write-Host "   Cert: $pfxPath (Password: $pfxPass)" -ForegroundColor Gray
+Write-Host "   Standalone binary: $(Join-Path (Split-Path -Parent $OutputMsix) 'installer.exe')" -ForegroundColor Green

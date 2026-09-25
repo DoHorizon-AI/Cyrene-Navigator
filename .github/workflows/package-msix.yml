@@ -37,9 +37,9 @@ jobs:
 
       - name: Verify compiled binaries
         run: |
-          $installer = "native/target/release/CyreneNavigatorInstaller.exe"
+          $installer = "native/target/release/installer.exe"
           $hostBin = "native/target/release/cyrene-native-host.exe"
-          if (-not (Test-Path $installer)) { throw "CyreneNavigatorInstaller.exe was not built" }
+          if (-not (Test-Path $installer)) { throw "installer.exe was not built" }
           if (-not (Test-Path $hostBin)) { throw "cyrene-native-host.exe was not built" }
           Write-Host "Found compiled binaries: $installer, $hostBin"
 
@@ -47,14 +47,15 @@ jobs:
         run: |
           pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/windows/package-msix.ps1 `
             -LayoutDir "dist/msix-layout" `
-            -OutputMsix "dist/Cyrene-Navigator-Installer.msix"
+            -OutputMsix "dist/installer.msix"
 
-      - name: Upload MSIX Artifact
+      - name: Upload Installer Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cyrene-navigator-msix-installer
+          name: cyrene-installer
           path: |
-            dist/Cyrene-Navigator-Installer.msix
+            dist/installer.msix
+            dist/installer.exe
             dist/cyrene-dev-cert.pfx
           if-no-files-found: error
           retention-days: 14

@@ -6,7 +6,7 @@ description = "Cyrene Navigator Modular Installer & Multi-Tool Deployment Orches
 license = "Apache-2.0"
 
 [[bin]]
-name = "CyreneNavigatorInstaller"
+name = "installer"
 path = "src/main.rs"
 
 [dependencies]
