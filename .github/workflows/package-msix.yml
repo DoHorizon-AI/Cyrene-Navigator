@@ -1,0 +1,60 @@
+name: package-msix
+
+on:
+  push:
+    branches: [main, release]
+  pull_request:
+    branches: [main, release]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-and-package-msix:
+    name: windows / build & package msix installer
+    runs-on: windows-2025
+    timeout-minutes: 60
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout Cyrene-Navigator
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1-x86_64-pc-windows-msvc
+
+      - name: Build Native Host & Installer
+        working-directory: native
+        run: |
+          cargo build --release --workspace
+
+      - name: Verify compiled binaries
+        run: |
+          $installer = "native/target/release/CyreneNavigatorInstaller.exe"
+          $hostBin = "native/target/release/cyrene-native-host.exe"
+          if (-not (Test-Path $installer)) { throw "CyreneNavigatorInstaller.exe was not built" }
+          if (-not (Test-Path $hostBin)) { throw "cyrene-native-host.exe was not built" }
+          Write-Host "Found compiled binaries: $installer, $hostBin"
+
+      - name: Package & Sign MSIX Installer
+        run: |
+          pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/windows/package-msix.ps1 `
+            -LayoutDir "dist/msix-layout" `
+            -OutputMsix "dist/Cyrene-Navigator-Installer.msix"
+
+      - name: Upload MSIX Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cyrene-navigator-msix-installer
+          path: |
+            dist/Cyrene-Navigator-Installer.msix
+            dist/cyrene-dev-cert.pfx
+          if-no-files-found: error
+          retention-days: 14
