@@ -5,7 +5,6 @@
 //! │  模块职责：Cyrene 统一模块化安装器、服务编排器与干净卸载工具。     │
 //! └─────────────────────────────────────────────────────────────────────┘
 //! > 已迁移至 Cyrene-Client/apps/win/crates/cyrene-installer/
-
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
@@ -13,8 +12,21 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const DEFAULT_EXCHANGE_URL: &str =
-    "https://cyrene-exchange.calmsky-23e48c1c.westus2.azurecontainerapps.io";
+/// 编译期注入的默认 Exchange URL，若构建时未设置则回退至本地网关
+const COMPILE_TIME_EXCHANGE_URL: Option<&str> = option_env!("CYRENE_DEFAULT_EXCHANGE_URL");
+const FALLBACK_EXCHANGE_URL: &str = "http://127.0.0.1:8000";
+
+fn get_default_exchange_url() -> String {
+    env::var("CYRENE_EXCHANGE_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            COMPILE_TIME_EXCHANGE_URL
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| FALLBACK_EXCHANGE_URL.to_string())
+}
 
 #[derive(Clone, Copy)]
 enum ToolKind {
@@ -122,7 +134,7 @@ fn print_usage(prog: &str) {
     println!("  --force                 在卸载或部署时不进行二次交互确认");
     println!(
         "  --exchange-url <URL>    设置 Exchange 网关端点 (默认: {})",
-        DEFAULT_EXCHANGE_URL
+        get_default_exchange_url()
     );
     println!("  --exchange-token <KEY>  设置统一访问 API Key 凭据");
     println!("  --deploy-tools <NAMES>  以逗号分隔下载部署的服务: all 或 navigator,exchange,reactor,yield,catalyst,echo");
@@ -133,7 +145,7 @@ fn print_usage(prog: &str) {
 fn run_interactive(app_dir: &Path) {
     println!("📍 Cyrene 环境与数据存储路径: {}", app_dir.display());
 
-    let mut exchange_url = DEFAULT_EXCHANGE_URL.to_string();
+    let mut exchange_url = get_default_exchange_url();
     let mut exchange_token = String::new();
     let mut selected_tools: BTreeSet<usize> = BTreeSet::new();
 
@@ -170,7 +182,7 @@ fn run_interactive(app_dir: &Path) {
             }
             "2" => {
                 println!("\n>> 配置 Exchange 网关端点:");
-                println!("   默认云端端点: {}", DEFAULT_EXCHANGE_URL);
+                println!("   默认端点: {}", get_default_exchange_url());
                 print!("   请输入 Exchange URL (直接回车保持默认): ");
                 io::stdout().flush().unwrap();
                 let mut url_input = String::new();
@@ -538,7 +550,7 @@ fn perform_clean_uninstall(app_dir: &Path, force: bool) {
 }
 
 fn run_silent(args: &[String], app_dir: &Path) {
-    let mut exchange_url = DEFAULT_EXCHANGE_URL.to_string();
+    let mut exchange_url = get_default_exchange_url();
     let mut exchange_token = String::new();
 
     for i in 0..args.len() {
