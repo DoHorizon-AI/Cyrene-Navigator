@@ -63,7 +63,7 @@ def map_navigator_error(raw_code: str) -> dict[str, str]:
 
     中文:将原始或旧版 Navigator 错误码映射为标准的 PRODUCT.NAVIGATOR.<REASON>。
     """
-# 中文:将原始或旧版 Navigator 错误代码映射为规范的 PRODUCT.NAVIGATOR.<REASON>。
+    # 中文:将原始或旧版 Navigator 错误代码映射为规范的 PRODUCT.NAVIGATOR.<REASON>。
     if raw_code in NAVIGATOR_ERROR_MAPPINGS:
         return NAVIGATOR_ERROR_MAPPINGS[raw_code]
     normalized = raw_code.upper().replace(" ", "_")

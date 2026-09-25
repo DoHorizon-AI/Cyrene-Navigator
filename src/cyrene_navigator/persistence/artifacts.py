@@ -21,6 +21,8 @@ class ArtifactPublicationError(RuntimeError):
 
     中文:本地 Artifact 无法提交或校验时抛出该异常。
     """
+
+
 # 中文:本地 Artifact 无法提交或验证时抛出的异常。
 
 
@@ -30,7 +32,8 @@ class ArtifactReference:
 
     中文:返回给 Echo 的 provider-neutral ArtifactRef 投影。
     """
-# 中文:返回给 Echo 的 Provider 无关 ArtifactRef 投影。
+
+    # 中文:返回给 Echo 的 Provider 无关 ArtifactRef 投影。
 
     uri: str
     digest: str
@@ -51,7 +54,8 @@ class LocalArtifactStore:
 
     中文:Navigator 自有的本地不可变内容寻址存储 adapter。
     """
-# 中文:Navigator 所有的本地不可变内容寻址存储适配器。
+
+    # 中文:Navigator 所有的本地不可变内容寻址存储适配器。
 
     def __init__(self, root: Path) -> None:
         if root.is_symlink():
@@ -67,7 +71,7 @@ class LocalArtifactStore:
 
         中文:提交字节内容一次,并返回标准内容标识。
         """
-    # 中文:只提交一次字节,并返回标准内容身份。
+        # 中文:只提交一次字节,并返回标准内容身份。
 
         if not isinstance(payload, bytes):
             raise TypeError("artifact payload must be bytes")

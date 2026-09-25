@@ -48,7 +48,7 @@ def is_sensitive_key(key: str) -> bool:
 
     中文:检查字段名是否匹配敏感密钥字段的命名模式。
     """
-# 中文:检查字段名是否匹配密钥模式。
+    # 中文:检查字段名是否匹配密钥模式。
     lower = key.lower().replace("-", "_")
     if lower == "tokens" or lower.endswith("_tokens") or lower == "token_count":
         return False
@@ -60,7 +60,7 @@ def sanitize_correlation_id(raw: str | None, max_len: int = 128) -> str | None:
 
     中文:清理不可信的 client correlation header,并限制其长度。
     """
-# 中文:清理不可信客户端关联标头并限制其长度。
+    # 中文:清理不可信客户端关联标头并限制其长度。
     if not raw:
         return None
     trimmed = raw.strip()
@@ -89,7 +89,7 @@ def parse_w3c_traceparent(raw: str | None) -> tuple[str, str] | None:
 
     中文:校验并解析 W3C traceparent header,提取 (trace_id, span_id)。
     """
-# 中文:验证 W3C traceparent 标头,并将其解析为 (trace_id, span_id)。
+    # 中文:验证 W3C traceparent 标头,并将其解析为 (trace_id, span_id)。
     if not raw:
         return None
     trimmed = raw.strip()
@@ -107,7 +107,7 @@ def redact_attributes(attrs: Mapping[str, Any]) -> dict[str, Any]:
 
     中文:递归清理 attributes 中敏感键对应的值。
     """
-# 中文:递归脱敏属性中的敏感键值。
+    # 中文:递归脱敏属性中的敏感键值。
     result: dict[str, Any] = {}
     for k, v in attrs.items():
         if is_sensitive_key(k):
@@ -137,7 +137,7 @@ def format_cyrene_log(
 
     中文:按 Cyrene 规范格式化单条 UTF-8 NDJSON 日志记录。
     """
-# 中文:格式化一条符合 Cyrene 规范的 UTF-8 NDJSON 日志记录。
+    # 中文:格式化一条符合 Cyrene 规范的 UTF-8 NDJSON 日志记录。
     now_utc = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
     truncated_msg = message[:MAX_MESSAGE_BYTES] if len(message) > MAX_MESSAGE_BYTES else message
@@ -184,7 +184,7 @@ def emit_diagnostic_error(
 
     中文:直接向 sys.stderr 输出结构化诊断错误记录。
     """
-# 中文:直接向 sys.stderr 输出结构化诊断错误记录。
+    # 中文:直接向 sys.stderr 输出结构化诊断错误记录。
     attrs = dict(attributes or {})
     attrs["error.code"] = error_code
     line = format_cyrene_log(

@@ -28,7 +28,8 @@ class SendToEcho(PersistenceModel):
 
     中文:在回读到的 revision 上显式选择;外部血缘信息为可选。
     """
-# 中文:基于读回 revision 的显式选择;外部沿袭信息可选。
+
+    # 中文:基于读回 revision 的显式选择;外部沿袭信息可选。
 
     expected_revision: str = Field(min_length=1)
     selected_event_seqs: list[int] | None = Field(default=None, min_length=1, max_length=2000)
@@ -61,7 +62,8 @@ class TargetResource(PersistenceModel):
 
     中文:Echo 返回的身份,不导入评估权威。
     """
-# 中文:Echo 返回的身份信息,不导入评估权威。
+
+    # 中文:Echo 返回的身份信息,不导入评估权威。
 
     uri: str = Field(pattern=r"^cyrene://echo/evaluation-inputs/")
     id: str
@@ -73,7 +75,7 @@ class TargetResource(PersistenceModel):
 
         中文:确保 Echo 返回的 URI 与 ID 指向同一个评估输入。
         """
-    # 中文:要求 Echo URI 和 ID 指向同一个评估输入。
+        # 中文:要求 Echo URI 和 ID 指向同一个评估输入。
 
         if self.uri != f"cyrene://echo/evaluation-inputs/{self.id}":
             raise ValueError("Echo target URI does not match its resource id")
@@ -110,7 +112,7 @@ def text_snapshot(
 
     中文:仅投影文本与白名单元数据;工具和原始 replay 状态仍归 DSH 所有。
     """
-# 中文:只投影文本和白名单元数据;工具及原始重放状态保留在 DSH 中。
+    # 中文:只投影文本和白名单元数据;工具及原始重放状态保留在 DSH 中。
     completed: set[int] = set()
     pending: dict[int, list[int]] = {}
     for event in events:
@@ -209,7 +211,8 @@ class EchoHandoff:
 
     中文:通过现有 session store 传输 snapshot,不另建历史存储。
     """
-# 中文:通过现有 Session store 传输快照,绝不创建第二份历史存储。
+
+    # 中文:通过现有 Session store 传输快照,绝不创建第二份历史存储。
 
     def __init__(
         self,

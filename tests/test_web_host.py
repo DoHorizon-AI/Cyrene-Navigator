@@ -28,7 +28,7 @@ def _login(client: TestClient) -> dict[str, str]:
 
     中文:配对一个测试 client 并返回浏览器 CSRF header。
     """
-# 中文:创建一对测试客户端,并返回浏览器 CSRF header。
+    # 中文:创建一对测试客户端,并返回浏览器 CSRF header。
 
     response = client.post("/api/v1/auth/pair", json={"pairingCode": PAIRING_CODE})
     assert response.status_code == 200, response.text
@@ -176,7 +176,7 @@ def test_web_launcher_banner_never_carries_the_pairing_secret() -> None:
 
     中文:启动器的输出已重定向到日志文件,因此不得泄露密钥。
     """
-# 中文:启动器输出会重定向到日志文件,因此不得泄漏 pairing secret。
+    # 中文:启动器输出会重定向到日志文件,因此不得泄漏 pairing secret。
 
     repository = Path(__file__).parents[1]
     environment = os.environ.copy()
@@ -224,7 +224,7 @@ def test_web_launcher_stores_a_self_generated_code_owner_only(tmp_path: Path) ->
 
     中文:启动器自行生成 pairing code 时,绝不能将其打印出来。
     """
-# 中文:启动器自行生成 code 时不得打印它。
+    # 中文:启动器自行生成 code 时不得打印它。
 
     repository = Path(__file__).parents[1]
     code_file = tmp_path / "nested" / "pair_code.txt"
@@ -274,7 +274,7 @@ def test_web_launcher_refuses_to_generate_a_code_it_cannot_store(
 
     中文:无法安全存储密钥时应 fail closed,不能输出密钥。
     """
-# 中文:没有安全存放位置时必须 fail-closed,不能输出秘密。
+    # 中文:没有安全存放位置时必须 fail-closed,不能输出秘密。
 
     repository = Path(__file__).parents[1]
     environment = os.environ.copy()
@@ -460,7 +460,7 @@ def test_system_status_publishes_bootstrap_runtime_and_degradation(
 
     中文:控制台需要读取固定版本的运行时状态,不能靠猜测。
     """
-# 中文:控制台需要获知固定 runtime 的状态,不能靠猜测。
+    # 中文:控制台需要获知固定 runtime 的状态,不能靠猜测。
 
     install_root = tmp_path / "cyrene-install"
     install_root.mkdir()

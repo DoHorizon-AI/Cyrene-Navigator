@@ -37,7 +37,7 @@ def pairing_code_path(explicit: str | None) -> Path | None:
 
     中文:查找自生成 pairing code 可以存放的位置;如无安全位置也可返回空。
     """
-# 中文:解析自行生成的 pairing code 可存放的位置;也可能没有合适位置。
+    # 中文:解析自行生成的 pairing code 可存放的位置;也可能没有合适位置。
 
     configured = explicit or os.environ.get(PAIRING_CODE_FILE_ENV)
     return Path(configured).expanduser() if configured else None
@@ -48,7 +48,7 @@ def write_pairing_code(path: Path, code: str) -> None:
 
     中文:仅为发起调用的用户保存 code。
     """
-# 中文:只为调用此操作的用户保存 code。
+    # 中文:只为调用此操作的用户保存 code。
 
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PAIRING_CODE_MODE)
@@ -62,7 +62,7 @@ def startup_payload(host: str, port: int, code_file: Path | None) -> dict[str, o
 
     中文:描述已绑定的 listener,同时不泄露 pairing secret。
     """
-# 中文:描述已绑定的监听器,但不泄露 pairing secret。
+    # 中文:描述已绑定的监听器,但不泄露 pairing secret。
 
     return {
         "service": "cyrene-web-host",
@@ -77,7 +77,7 @@ def main() -> None:
 
     中文:启动 Web Host,并公布 pairing 信息的读取位置。
     """
-# 中文:启动 Web Host,并报告 pairing 信息的读取位置。
+    # 中文:启动 Web Host,并报告 pairing 信息的读取位置。
 
     parser = argparse.ArgumentParser(description="Cyrene Navigator Web Host")
     parser.add_argument("--host", default="127.0.0.1")
@@ -142,7 +142,7 @@ def _parse_proxy_targets(values: list[str], parser: argparse.ArgumentParser) -> 
 
     中文:解析固定前缀赋值,不接受任意 request origin。
     """
-# 中文:解析固定前缀的 assignment,不接受任意请求来源。
+    # 中文:解析固定前缀的 assignment,不接受任意请求来源。
 
     result: dict[str, str] = {}
     for value in values:
