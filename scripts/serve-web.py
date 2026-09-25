@@ -12,7 +12,7 @@ so printing the secret would leave a working credential on disk.
 pairing code 本身不会写入 stdout 或 stderr:该进程以 detached 方式运行,输出重定向到日志文件,
 因此打印密钥会把可用凭据留在磁盘上。
 """
-# 中文：Navigator Web Host 启动器。启动器先绑定监听器,再输出一行 JSON,包含实际绑定地址;
+# 中文:Navigator Web Host 启动器。启动器先绑定监听器,再输出一行 JSON,包含实际绑定地址;
 # 若需要自行生成 pairing code,还会输出仅 owner 可读的文件路径。代码本身绝不会写入 stdout 或 stderr:
 # 该进程以 detached 方式运行,输出会重定向到日志文件,因此打印秘密会把有效凭据留在磁盘上。
 

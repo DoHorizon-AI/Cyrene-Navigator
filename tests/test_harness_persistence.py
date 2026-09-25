@@ -114,7 +114,7 @@ def test_header_metadata_cannot_cross_workspace_session_authority(tmp_path: Path
 
     # The same upstream Session id is valid in two Workspace partitions. Header
     # hints intentionally point at the other partition and must remain opaque.
-    # 中文：同一个上游 Session ID 在两个 Workspace 分区中都有效。header 提示可以指向另一个分区,
+    # 中文:同一个上游 Session ID 在两个 Workspace 分区中都有效。header 提示可以指向另一个分区,
     # 但必须保持不透明。
     session_a = _create(
         client,
