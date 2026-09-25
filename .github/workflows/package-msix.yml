@@ -1,4 +1,4 @@
-# This workflow has moved to Cyrene-Studio and is retained here for manual dispatch only.
+# This workflow has moved to Cyrene-Client and is retained here for manual dispatch only.
 name: package-msix
 
 on:

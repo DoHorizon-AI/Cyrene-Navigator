@@ -4,7 +4,7 @@
 //! │  Role: Cyrene Modular Installer, Orchestrator & Clean Uninstaller   │
 //! │  模块职责：Cyrene 统一模块化安装器、服务编排器与干净卸载工具。     │
 //! └─────────────────────────────────────────────────────────────────────┘
-//! > 已迁移至 Cyrene-Studio/apps/native-win/crates/cyrene-installer/
+//! > 已迁移至 Cyrene-Client/apps/win/crates/cyrene-installer/
 
 use std::collections::BTreeSet;
 use std::env;
