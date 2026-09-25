@@ -21,16 +21,20 @@ Write-Host ">> Searching for Windows SDK tools (MakeAppx.exe & SignTool.exe)..."
 $makeAppx = (Get-Command "MakeAppx.exe" -ErrorAction SilentlyContinue)?.Source
 $signTool = (Get-Command "SignTool.exe" -ErrorAction SilentlyContinue)?.Source
 
-if (-not $makeAppx -or -not $signTool) {
-    $sdkBins = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin" -Filter "MakeAppx.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($sdkBins) {
-        $sdkDir = $sdkBins.DirectoryName
+if (-not $makeAppx -or -not $signTool -or $makeAppx -like "*\arm64\*") {
+    $x64Tools = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin" -Filter "MakeAppx.exe" -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -like "*\x64\*" } |
+        Sort-Object FullName -Descending |
+        Select-Object -First 1
+
+    if ($x64Tools) {
+        $sdkDir = $x64Tools.DirectoryName
         $env:PATH = "$sdkDir;$env:PATH"
         $makeAppx = Join-Path $sdkDir "MakeAppx.exe"
         $signTool = Join-Path $sdkDir "SignTool.exe"
-        Write-Host "Found SDK tools in: $sdkDir" -ForegroundColor Green
+        Write-Host "Found x64 SDK tools in: $sdkDir" -ForegroundColor Green
     } else {
-        throw "Could not find MakeAppx.exe or SignTool.exe. Please install the Windows SDK."
+        throw "Could not find x64 MakeAppx.exe or SignTool.exe. Please install the Windows SDK."
     }
 }
 
