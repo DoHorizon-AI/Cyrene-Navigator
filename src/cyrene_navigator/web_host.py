@@ -5,7 +5,8 @@ The host owns browser-facing session state only. Product APIs remain behind
 explicitly configured proxy prefixes, and credential values are write-only at
 the HTTP boundary.
 
-Navigator 同源 Web Host 的身份验证、凭据和代理边界。主机只拥有面向浏览器的会话状态。Product API 始终位于显式配置的代理前缀之后;凭据值在 HTTP 边界上只写不读。
+Navigator 同源 Web Host 的身份验证、凭据和代理边界。主机只拥有面向浏览器的会话状态。
+Product API 始终位于显式配置的代理前缀之后;凭据值在 HTTP 边界上只写不读。
 """
 
 from __future__ import annotations
@@ -305,7 +306,9 @@ class CredentialStore:
     contains the stored value. A later encrypted platform store can replace this
     class without changing the Web Host routes.
 
-    供 Web Host 接口使用的进程内只写凭据存储。元数据与内存中的密钥解析器彼此分离。解析器仅对已配置的代理目标开放;HTTP 响应和异常都不包含已存储的值。后续可替换为加密的平台存储,而无需改变 Web Host 路由。
+    供 Web Host 接口使用的进程内只写凭据存储。元数据与内存中的密钥解析器彼此分离。
+    解析器仅对已配置的代理目标开放;HTTP 响应和异常都不包含已存储的值。后续可替换为加密的平台存储,
+    而无需改变 Web Host 路由。
     """
 
     def __init__(self, *, clock: Clock = time.time) -> None:
@@ -809,7 +812,8 @@ class _ConfiguredProxy:
 
 # Gateway base URL used when neither an override nor an Exchange proxy target is
 # configured. Matches the development stack that serves Exchange on port 8000.
-# 当没有覆盖值或 Exchange 代理目标时使用的 Gateway 基础 URL,与开发栈中 Exchange 监听 8000 端口的配置一致。
+# 当没有覆盖值或 Exchange 代理目标时使用的 Gateway 基础 URL,
+# 与开发栈中 Exchange 监听 8000 端口的配置一致。
 DEFAULT_GATEWAY_BASE_URL = "http://127.0.0.1:8000/v1"
 _GATEWAY_PROXY_PREFIX = "/api/proxy/exchange-gateway"
 
@@ -821,7 +825,8 @@ def _gateway_base_url(configured: Sequence[_ConfiguredProxy]) -> str:
     can be HTTPS behind Caddy, so it is resolved here and published to the UI
     rather than guessed in the browser.
 
-    解析供客户端示例使用的 Exchange OpenAI 兼容基础 URL。开发栈与打包部署使用的端口不同,且 Caddy 后方可能使用 HTTPS;因此由此处解析后提供给 UI,避免浏览器自行猜测。
+    解析供客户端示例使用的 Exchange OpenAI 兼容基础 URL。开发栈与打包部署使用的端口不同,
+    且 Caddy 后方可能使用 HTTPS;因此由此处解析后提供给 UI,避免浏览器自行猜测。
     """
 
     override = os.environ.get("CYRENE_GATEWAY_BASE_URL", "").strip()
@@ -925,7 +930,8 @@ def _cyrene_roots() -> list[Path]:
     A packaged host keeps everything under one install root; a development
     checkout keeps the release lock inside the Workspace repository.
 
-    按明确程度从高到低排列的候选安装/工作区根目录。打包主机会将所有内容放在一个安装根目录下;开发检出则将 release lock 保存在 Workspace 仓库中。
+    按明确程度从高到低排列的候选安装/工作区根目录。打包主机会将所有内容放在一个安装根目录下;
+    开发检出则将 release lock 保存在 Workspace 仓库中。
     """
 
     roots: list[Path] = []
@@ -1013,7 +1019,8 @@ def _diagnostics_degraded(services: list[dict[str, Any]], bootstrap: dict[str, A
     True when a configured Product is unreachable or the runtime state could not
     be determined: in both cases any diagnostics shown elsewhere are partial.
 
-    主机对系统栈的视图是否已知不完整。如果某个已配置 Product 无法访问,或无法确定运行时状态,则返回 True;这两种情况下其他位置显示的诊断信息都只是部分信息。
+    主机对系统栈的视图是否已知不完整。如果某个已配置 Product 无法访问,或无法确定运行时状态,
+    则返回 True;这两种情况下其他位置显示的诊断信息都只是部分信息。
     """
 
     if any(entry.get("status") != "UP" for entry in services):
@@ -1097,7 +1104,8 @@ def create_web_host_app(
     ``proxy_targets`` is the complete allowlist. Request data cannot select an
     origin, and proxy responses never set browser cookies from an upstream.
 
-    构建同源 Web Host 边界。``proxy_targets`` 是完整 allowlist。请求数据不能选择 origin,代理响应也不会设置来自上游的浏览器 cookie。
+    构建同源 Web Host 边界。``proxy_targets`` 是完整 allowlist。请求数据不能选择 origin,
+    代理响应也不会设置来自上游的浏览器 cookie。
     """
 
     resolved_pairing_code = (
@@ -1375,14 +1383,16 @@ def create_web_host_app(
             # Whether the pinned runtime is installed, which engine versions it
             # holds, and whether this host can see the whole stack. A console
             # cannot decide what to offer without them.
-            # 用于判断固定运行时是否已安装、包含哪些引擎版本,以及主机能否访问完整系统栈。缺少这些信息时,控制台无法确定应提供哪些选项。
+            # 用于判断固定运行时是否已安装、包含哪些引擎版本,以及主机能否访问完整系统栈。
+            # 缺少这些信息时,控制台无法确定应提供哪些选项。
             "bootstrapState": bootstrap_info,
             "runtime": runtime_info,
             "diagnosticsDegraded": _diagnostics_degraded(svc_info, bootstrap_info),
             # The Exchange OpenAI-compatible gateway port differs between the
             # dev stack and packaged deployments, so it is published here
             # instead of being guessed in the browser.
-            # Exchange OpenAI 兼容网关在开发栈和打包部署中的端口不同,因此在此发布给 UI,避免由浏览器猜测。
+            # Exchange OpenAI 兼容网关在开发栈和打包部署中的端口不同,因此在此发布给 UI,
+            # 避免由浏览器猜测。
             "gatewayBaseUrl": _gateway_base_url(configured_proxies),
             "observedAt": _iso_timestamp(clock()),
         }

@@ -785,7 +785,8 @@ class PersistenceStore:
             # This additive bootstrap is the migration for databases created before
             # Product metadata existed. The old mutable writer is intentionally not
             # copied into the stable Product owner fields.
-            # 此增量初始化用于迁移 Product 元数据引入前创建的数据库。旧的可变写入方不会被复制到稳定的 Product 所有者字段。
+            # 此增量初始化用于迁移 Product 元数据引入前创建的数据库。
+            # 旧的可变写入方不会被复制到稳定的 Product 所有者字段。
             conn.execute(
                 """
                 INSERT OR IGNORE INTO session_product_metadata (
