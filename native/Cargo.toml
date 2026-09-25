@@ -1,3 +1,6 @@
 [workspace]
-members = ["crates/cyrene-native-host"]
+members = [
+    "crates/cyrene-native-host",
+    "crates/cyrene-installer",
+]
 resolver = "2"
