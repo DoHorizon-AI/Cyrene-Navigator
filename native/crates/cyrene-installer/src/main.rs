@@ -193,7 +193,13 @@ fn run_interactive(app_dir: &Path) {
                     println!("\n⚠️ 尚未勾选任何组件。请先在菜单 [1] 中选择要安装的组件。");
                     continue;
                 }
-                deploy_selected_tools(app_dir, &selected_tools, &exchange_url, &exchange_token);
+                deploy_selected_tools(
+                    app_dir,
+                    &selected_tools,
+                    &exchange_url,
+                    &exchange_token,
+                    true,
+                );
             }
             "4" => {
                 show_system_status(app_dir);
@@ -271,6 +277,7 @@ fn deploy_selected_tools(
     selected: &BTreeSet<usize>,
     exchange_url: &str,
     exchange_token: &str,
+    interactive: bool,
 ) {
     println!("\n============================================================");
     println!("  开始部署所选组件 / Deploying Selected Components          ");
@@ -309,11 +316,17 @@ fn deploy_selected_tools(
     match docker_check {
         Ok(out) if out.status.success() => {
             println!("   ✅ Docker 正在运行。");
-            print!("   是否立即拉取并启动服务容器？ (y/n): ");
-            io::stdout().flush().unwrap();
-            let mut run_now = String::new();
-            io::stdin().read_line(&mut run_now).unwrap();
-            if run_now.trim().eq_ignore_ascii_case("y") {
+            let should_run = if interactive {
+                print!("   是否立即拉取并启动服务容器？ (y/n): ");
+                io::stdout().flush().unwrap();
+                let mut run_now = String::new();
+                io::stdin().read_line(&mut run_now).unwrap_or_default();
+                run_now.trim().eq_ignore_ascii_case("y")
+            } else {
+                false
+            };
+
+            if should_run {
                 println!("\n>> 正在执行 docker compose pull (从 GHCR 拉取容器镜像)...");
                 let _ = Command::new("docker")
                     .args(["compose", "-f", compose_file.to_str().unwrap(), "pull"])
@@ -328,6 +341,11 @@ fn deploy_selected_tools(
                         println!("\n🚀 所选服务已成功在后台启动！");
                     }
                 }
+            } else if !interactive {
+                println!(
+                    "   ℹ️ 静默模式：已生成部署清单。启动服务可运行: docker compose -f {} up -d",
+                    compose_file.display()
+                );
             }
         }
         _ => {
@@ -339,7 +357,7 @@ fn deploy_selected_tools(
 }
 
 fn generate_docker_compose(indices: &[usize]) -> String {
-    let mut out = String::from("version: '3.8'\n\nservices:\n");
+    let mut out = String::from("services:\n");
     for &idx in indices {
         let tool = &TOOLS[idx];
         if let (Some(img), Some(port)) = (tool.image, tool.port) {
@@ -553,7 +571,7 @@ fn run_silent(args: &[String], app_dir: &Path) {
     }
 
     if !selected.is_empty() {
-        deploy_selected_tools(app_dir, &selected, &exchange_url, &exchange_token);
+        deploy_selected_tools(app_dir, &selected, &exchange_url, &exchange_token, false);
     }
 
     println!("Silent installation completed successfully.");
