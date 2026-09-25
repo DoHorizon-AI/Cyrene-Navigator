@@ -47,3 +47,13 @@ host paths when attaching P0-21/P0-23 evidence.
 或把 POSIX 结果标成 Windows 通过。`CYRENE_NATIVE_MATRIX_BINARY` 可以指向安装包
 验证目录中的同一构建产物；`LocalSubprocessRuntime` 仍以显式 `argv`、`shell:false`
 启动它，因此包含空格的路径也会走真实 Windows 参数边界。
+---
+<!-- Chinese Translation / 中文翻译 -->
+
+## 协议与运行说明补充
+
+两个 fixture 都使用与 `cyrene-native-host` 相同的换行分隔 JSON 握手和请求信封，同时暴露可控故障模式，以覆盖取消、超时、协议版本错误、EOF/崩溃和有界输出。
+
+`runNativeRequest` 仍通过固定版本 DeepSeek Harness 的 `LocalSubprocessRuntime` 启动 fixture；fixture 不会替换或包装该 runtime。每项测试会在子进程工作目录的任务专属 `.cyrene-native-fixture.json` 中写入模式和状态文件路径。fixture 不执行 shell；只有相应负向测试才会向 stderr 输出诊断或向 stdout 输出无效协议字节。
+
+Windows 专属测试在缺少 `native-matrix-host.exe` 时会明确失败，不会退回 `.mjs`，也不会把 POSIX 结果标记为 Windows 通过。`CYRENE_NATIVE_MATRIX_BINARY` 可以指向安装包验证目录中的同一构建产物；`LocalSubprocessRuntime` 仍使用显式 `argv` 和 `shell:false` 启动它，因此含空格的路径也会经过真实 Windows 参数边界。

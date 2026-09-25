@@ -48,6 +48,7 @@ class PersistencePrincipal:
 
 
 # The shorter name is convenient for callers while keeping the API contract explicit.
+# 较短名称便于调用方使用，同时保留明确的 API 契约。
 Principal = PersistencePrincipal
 
 
@@ -90,6 +91,10 @@ class PersistenceStore:
     projection or AgentLoop state of its own. Every mutation starts with
     ``BEGIN IMMEDIATE`` so ownership, sequence checks, and event insertion commit
     as one durable unit.
+
+    Cyrene Harness 持久化权威的 SQLite 实现。该存储包含上游 Session header、只追加事件，
+    以及小型只读 Product 元数据投影。它不包含自己的消息投影或 AgentLoop 状态。每次变更都以
+    ``BEGIN IMMEDIATE`` 开始，使所有权检查、序列号检查和事件插入作为一个持久化单元一起提交。
     """
 
     def __init__(self, db_path: Path, lease_seconds: float = 120) -> None:
@@ -780,6 +785,7 @@ class PersistenceStore:
             # This additive bootstrap is the migration for databases created before
             # Product metadata existed. The old mutable writer is intentionally not
             # copied into the stable Product owner fields.
+            # 此增量初始化用于迁移 Product 元数据引入前创建的数据库。旧的可变写入方不会被复制到稳定的 Product 所有者字段。
             conn.execute(
                 """
                 INSERT OR IGNORE INTO session_product_metadata (

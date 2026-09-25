@@ -83,3 +83,14 @@ exact upstream pin.
 
 Rust 协议和可执行文件 authority 见 `../../native/`；父目录的 `harness/README.md`
 与 `upstream.lock.json` 定义 Bundle 和精确上游 pin。
+---
+<!-- Chinese Translation / 中文翻译 -->
+
+## 推荐阅读与验证顺序
+
+1. 阅读 `persistence-wire.ts`，了解 HTTP 边界和上游校验。
+2. 阅读 `persistence.ts`，了解 handle 所有权、批处理、heartbeat 和 flush。
+3. 阅读 `native-ipc.ts` 与 `native.ts`，了解 Cordis 到 Rust 的薄桥接。
+4. 阅读 `import-codex.ts`，了解 archive/Continue 语义及真实上游 `AgentRegistry` 集成。
+5. 阅读 `session-titles.ts`，了解只读的冷标题投影路由。
+6. 运行仓库 CI 命令和 `../tests/` 中的集成测试。

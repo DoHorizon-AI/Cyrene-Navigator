@@ -1,4 +1,8 @@
-"""Focused Web Host authentication, credential, proxy, and launcher tests."""
+"""Focused Web Host authentication, credential, proxy, and launcher tests.
+
+中文：验证 Web Host 的认证、凭据、代理与启动器行为。
+"""
+# 中文：针对 Web Host 认证、凭据、代理和启动器的重点测试。
 
 from __future__ import annotations
 
@@ -20,7 +24,11 @@ SECRET = "hf_test_secret_value"
 
 
 def _login(client: TestClient) -> dict[str, str]:
-    """Pair one test client and return the browser CSRF header."""
+    """Pair one test client and return the browser CSRF header.
+
+    中文：配对一个测试 client 并返回浏览器 CSRF header。
+    """
+# 中文：创建一对测试客户端，并返回浏览器 CSRF header。
 
     response = client.post("/api/v1/auth/pair", json={"pairingCode": PAIRING_CODE})
     assert response.status_code == 200, response.text
@@ -164,7 +172,11 @@ def test_system_status_is_safe_and_proxy_is_fixed_allowlist_with_csrf() -> None:
 
 
 def test_web_launcher_banner_never_carries_the_pairing_secret() -> None:
-    """The launcher's output is redirected into a log file, so it must not leak."""
+    """The launcher's output is redirected into a log file, so it must not leak.
+
+    中文：启动器的输出已重定向到日志文件，因此不得泄露密钥。
+    """
+# 中文：启动器输出会重定向到日志文件，因此不得泄漏 pairing secret。
 
     repository = Path(__file__).parents[1]
     environment = os.environ.copy()
@@ -208,7 +220,11 @@ def test_web_launcher_banner_never_carries_the_pairing_secret() -> None:
 
 
 def test_web_launcher_stores_a_self_generated_code_owner_only(tmp_path: Path) -> None:
-    """A launcher that generates the code itself must not print it."""
+    """A launcher that generates the code itself must not print it.
+
+    中文：启动器自行生成 pairing code 时，绝不能将其打印出来。
+    """
+# 中文：启动器自行生成 code 时不得打印它。
 
     repository = Path(__file__).parents[1]
     code_file = tmp_path / "nested" / "pair_code.txt"
@@ -254,7 +270,11 @@ def test_web_launcher_stores_a_self_generated_code_owner_only(tmp_path: Path) ->
 def test_web_launcher_refuses_to_generate_a_code_it_cannot_store(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Fail closed instead of emitting a secret with nowhere to keep it."""
+    """Fail closed instead of emitting a secret with nowhere to keep it.
+
+    中文：无法安全存储密钥时应 fail closed，不能输出密钥。
+    """
+# 中文：没有安全存放位置时必须 fail-closed，不能输出秘密。
 
     repository = Path(__file__).parents[1]
     environment = os.environ.copy()
@@ -290,10 +310,12 @@ def test_web_host_system_status_and_env_pairing_code(
     app = create_web_host_app(proxy_targets={"/api/v1/test": "http://127.0.0.1:9999"})
     with TestClient(app) as client:
         # Pairing code read from env
+        # 中文：从环境变量读取 pairing code。
         pair_resp = client.post("/api/v1/auth/pair", json={"pairingCode": "env-pair-code-123456"})
         assert pair_resp.status_code == 200
 
         # System status contains gpu, disk, and services
+        # 中文：System status 包含 GPU、磁盘和服务信息。
         status_resp = client.get("/api/v1/system/status")
         assert status_resp.status_code == 200
         data = status_resp.json()
@@ -409,9 +431,11 @@ def test_active_route_session_lifecycle() -> None:
     with TestClient(app) as client:
         csrf = _login(client)
         # Not configured yet -> 404
+        # 中文：尚未配置 -> 404。
         assert client.get("/api/v1/navigator/active-route").status_code == 404
 
         # Set active route
+        # 中文：设置活动路由。
         payload = {
             "gatewayEndpointId": "ge-123",
             "modelId": "qwen2.5-7b",
@@ -422,6 +446,7 @@ def test_active_route_session_lifecycle() -> None:
         assert set_resp.status_code == 200
 
         # Read back
+        # 中文：读回验证。
         get_resp = client.get("/api/v1/navigator/active-route")
         assert get_resp.status_code == 200
         assert get_resp.json()["modelId"] == "qwen2.5-7b"
@@ -431,7 +456,11 @@ def test_active_route_session_lifecycle() -> None:
 def test_system_status_publishes_bootstrap_runtime_and_degradation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A console needs to know the pinned runtime state without guessing."""
+    """A console needs to know the pinned runtime state without guessing.
+
+    中文：控制台需要读取固定版本的运行时状态，不能靠猜测。
+    """
+# 中文：控制台需要获知固定 runtime 的状态，不能靠猜测。
 
     install_root = tmp_path / "cyrene-install"
     install_root.mkdir()
@@ -457,6 +486,7 @@ def test_system_status_publishes_bootstrap_runtime_and_degradation(
     with TestClient(app) as client:
         first = client.get("/api/v1/system/status").json()
         # Pins are known but no bootstrap marker exists yet.
+        # 中文：已知上游 pin，但尚无 bootstrap 标记。
         assert first["bootstrapState"]["state"] == "PENDING"
         assert first["runtime"]["engines"] == {"llamafactory": "0.9.5", "vllm": "0.25.1"}
         assert first["runtime"]["cudaProfile"] == "cu130"
@@ -476,6 +506,7 @@ def test_system_status_publishes_bootstrap_runtime_and_degradation(
         assert second["bootstrapState"]["state"] == "READY"
         assert second["bootstrapState"]["completedAt"] == "2026-09-22T00:00:00Z"
         # No secrets from the install root are echoed back.
+        # 中文：不会回显安装根目录中的任何秘密。
         assert "digest" not in second["bootstrapState"]
 
 

@@ -75,3 +75,26 @@ Harness 集成。浏览器/WinUI 源码、打包、签名与交互式检查属�
 
 Published tags follow immutable repository-scoped SemVer (`v{version}`). A
 defective release receives a new patch version.
+---
+<!-- Chinese Translation / 中文翻译 -->
+
+## 所有权补充
+
+本仓库拥有本地 Session 持久化、Navigator Product API、Harness 适配器、Codex 导入宿主和原生进程宿主。不拥有训练、模型服务、评估、数据集处理、Plugin capability 实现、可选 Navigator UI 或 Platform 底座。
+
+Navigator 可独立使用 Python、Cargo 和 npm 构建。构建、测试和打包作业不需要检出其他仓库。
+
+## 交付配置
+
+- **CI 权威**：GitHub Actions（`.github/workflows/`）。Azure Pipelines 仅作为手动、非权威的集成定义保留。
+- **Push 检查**：三个仓库 workflow 覆盖 `main`、`feat/**`、`fix/**` 和 `refactor/**`；Pull Request 筛选按各 workflow 原有配置执行，并保留已声明的 `workflow_dispatch` 行为。
+- **发布权威**：从 `main` 手动准备 GitHub Release。
+- **自动发布**：已禁用，待签名制品和发布 workflow 经审查并验证后再启用。
+- **包单元**：Python 持久化服务与 Harness bundle。
+- **原生二进制**：`cyrene-native-host`。
+- **分发配置**：`navigator_core` 组件发布。
+- **UI 打包和签名**：归可选 `cyrene.ui.navigator` Plugin 所有。
+
+## 版本标签
+
+已发布标签采用仓库范围的不可变 SemVer 格式（`v{version}`）。有缺陷的发布必须递增新的 patch 版本。

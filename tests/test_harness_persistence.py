@@ -114,6 +114,7 @@ def test_header_metadata_cannot_cross_workspace_session_authority(tmp_path: Path
 
     # The same upstream Session id is valid in two Workspace partitions. Header
     # hints intentionally point at the other partition and must remain opaque.
+    # 中文：同一个上游 Session ID 在两个 Workspace 分区中都有效。header 提示可以指向另一个分区，但必须保持不透明。
     session_a = _create(
         client,
         "workspace-a",
@@ -205,6 +206,7 @@ def test_owner_authority_survives_backend_restart_and_ignores_header_claim(tmp_p
 
     # A fresh app instance is the service restart boundary. The raw token is
     # intentionally reused only to prove durable ownership; it is never stored.
+    # 中文：新建 app 实例代表服务重启。原始 token 仅为证明所有权可持久化而重复使用，不会被保存。
     second = TestClient(create_persistence_app(db_path, PRINCIPALS))
     takeover = second.post(
         f"{SESSIONS.format(workspace='workspace-a')}/owned-session/handles",
@@ -288,6 +290,7 @@ def test_product_metadata_survives_writer_takeover_release_and_restart(
     assert product_metadata["source"] == "cyrene"
 
     # Header claims remain opaque, including a forged owner and Workspace hint.
+    # 中文：header 中的声明始终保持不透明，包括伪造的 owner 和 Workspace 提示。
     snapshot = first.get(
         f"{SESSIONS.format(workspace='workspace-a')}/product-session",
         headers=_headers("alice-token"),
@@ -317,6 +320,7 @@ def test_product_metadata_survives_writer_takeover_release_and_restart(
     assert after_release.json() == product_metadata
 
     # A new writer is allowed after release, but it does not become Product owner.
+    # 中文：释放之后允许新 writer 接管，但它不会因此成为 Product owner。
     bob_handle = first.post(
         f"{SESSIONS.format(workspace='workspace-a')}/product-session/handles",
         json={"access": "write", "clientId": "bob-client"},
@@ -417,6 +421,7 @@ def test_legacy_sessions_migrate_with_explicit_unknown_product_owner(tmp_path: P
 
     # Reopening the service is idempotent; the old mutable writer remains only
     # in the lease table and cannot populate Product metadata later.
+    # 中文：重新打开服务是幂等的；旧的可变 writer 只留在 lease 表中，之后不能再写入 Product metadata。
     TestClient(create_persistence_app(db_path, PRINCIPALS))
     with sqlite3.connect(db_path) as connection:
         migrated = connection.execute(

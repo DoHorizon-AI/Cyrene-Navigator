@@ -57,3 +57,15 @@ Session ID 是 `codex-<source SHA-256>`，按 Workspace 隔离。因此同一内
 如果进程在创建空 Session 后退出，下一次导入会返回 `IMPORT_SESSION_INCOMPLETE`，等待拥有者或管理员完成恢复；不会猜测地追加第二份消息。这个状态会保留在 Cyrene persistence，便于审计。
 
 The implementation is intentionally an adapter around the pinned upstream Session API and the existing Rust IPC bridge. It does not implement a second Agent loop, a local conversation database, source permission activation, or an external-provider restriction. External providers remain available through the upstream profile; the adoption proof route uses Exchange separately.
+---
+<!-- Chinese Translation / 中文翻译 -->
+
+## 产品语义
+
+archive 导入和 Continue 具有不同的 Product 语义：导入是持久化、只读的交接；Continue 则在显式指定的工作区路径上创建新的上游 Agent。两者使用同一份 Cyrene event log 和持久化权威。Continue 依赖上游 `AgentRegistry`/`AgentLoop`，绝不会回退到伪造的 SessionStore 或启动并行 Agent loop。
+
+## 幂等与恢复补充
+
+如果进程在创建空 Session 后退出，后续导入会返回 `IMPORT_SESSION_INCOMPLETE`，等待 owner 或管理员完成恢复；系统不会猜测性地追加第二份消息。该状态会保留在 Cyrene 持久化层，以便审计。
+
+此实现刻意作为固定版本上游 Session API 和现有 Rust IPC bridge 的适配器。它不会实现第二套 Agent loop、本地对话数据库、来源权限激活或外部 Provider 限制。外部 Provider 仍由上游 Profile 提供；adoption 验证路径会单独使用 Exchange。

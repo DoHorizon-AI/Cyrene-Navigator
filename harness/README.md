@@ -75,3 +75,11 @@ Windows 也必须执行同一顺序并使用批准的 Node runtime；编译前�
 `Remove-Item harness/dist -Recurse -Force`，再通过该 Node executable 调用 `tsc`
 和 `build-harness-client.mjs`。最终的 `harness/dist/client.js` 是生成的 DSH Loader
 产物，不是源码入口，也不能用来证明已测试安装后的桌面应用。
+---
+<!-- Chinese Translation / 中文翻译 -->
+
+## 上游锁文件与构建适配
+
+应先阅读上游锁文件，再阅读 bundle 和适配器源码。bootstrap 脚本会验证上游树，并使用其精确依赖锁，因为当前选择的预发布版本尚未发布到 npm。脚本不会修改上游 Core。
+
+固定版本的 Session Controller 声明引用 `dsh-util-values`，但没有声明该包依赖。消费者的 TypeScript path 将该引用映射到 bootstrap 准备的同一个固定包。这是消费者构建适配；上游源码和运行时代码保持不变。上游补齐声明后即可移除此映射。

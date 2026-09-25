@@ -16,7 +16,7 @@ import {
 } from '@deepseek-ai/dsh-session-persistence';
 import type { SessionAccess, SessionPersistenceSnapshot } from '@deepseek-ai/dsh-session-persistence';
 
-/** Connection settings are deployment input; credentials never enter Session events. */
+/** Connection settings are deployment input; credentials never enter Session events.  中文：连接设置属于部署输入；凭据绝不进入 Session 事件。 */
 export interface PersistenceConnection {
   baseUrl: string;
   workspaceId: string;
@@ -24,7 +24,7 @@ export interface PersistenceConnection {
   requestTimeoutMs: number;
 }
 
-/** Validated backend handle; its token is a scoped write capability. */
+/** Validated backend handle; its token is a scoped write capability.  中文：经过校验的后端 handle；其中 token 是受限写入能力。 */
 export interface RemoteHandle {
   id: SessionId;
   header: SessionHeader;
@@ -36,7 +36,7 @@ export interface RemoteHandle {
   leaseExpiresAt?: number;
 }
 
-/** Require an object at the HTTP JSON boundary. */
+/** Require an object at the HTTP JSON boundary.  中文：在 HTTP JSON 边界要求输入为 object。 */
 export function record(value: unknown): Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new TypeError('Persistence response must be an object');
@@ -44,7 +44,7 @@ export function record(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-/** Require a lossless non-negative integer from remote storage. */
+/** Require a lossless non-negative integer from remote storage.  中文：要求远端存储使用无损的非负整数。 */
 export function integer(value: unknown, field: string): number {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
     throw new TypeError(`Invalid persistence ${field}`);
@@ -52,7 +52,7 @@ export function integer(value: unknown, field: string): number {
   return value;
 }
 
-/** Validate the wire header's JSON fields; the upstream loop validates replay semantics. */
+/** Validate the wire header's JSON fields; the upstream loop validates replay semantics.  中文：校验线协议 header 中的 JSON 字段；重放语义由上游 loop 校验。 */
 function decodeHeader(value: unknown, expectedId: SessionId): SessionHeader {
   const row = record(value);
   if (row.id !== expectedId || typeof row.isSeeded !== 'boolean') throw new TypeError('Invalid Session header identity');
@@ -70,7 +70,7 @@ function decodeHeader(value: unknown, expectedId: SessionId): SessionHeader {
   return Object.freeze(header);
 }
 
-/** Decode the handle without creating an alternate SessionHeader vocabulary. */
+/** Decode the handle without creating an alternate SessionHeader vocabulary.  中文：解码 handle，不创建另一套 SessionHeader 词汇。 */
 export function decodeHandle(value: unknown, expectedId: SessionId): RemoteHandle {
   const row = record(value);
   if (row.id !== expectedId || (row.access !== 'read' && row.access !== 'write')) {
@@ -91,7 +91,7 @@ export function decodeHandle(value: unknown, expectedId: SessionId): RemoteHandl
   return result;
 }
 
-/** Convert a storage observation to the upstream's read-model cache contract. */
+/** Convert a storage observation to the upstream's read-model cache contract.  中文：将存储观测转换为上游的 read-model cache 契约。 */
 export function decodeSnapshot(value: unknown): SessionPersistenceSnapshot {
   const row = record(value);
   const meta = record(row.meta);
@@ -105,7 +105,7 @@ export function decodeSnapshot(value: unknown): SessionPersistenceSnapshot {
   };
 }
 
-/** HTTP transport for one authorized Workspace. No local durable fallback exists. */
+/** HTTP transport for one authorized Workspace. No local durable fallback exists.  中文：面向一个已授权 Workspace 的 HTTP 传输；不存在本地持久化回退。 */
 export class PersistenceHttp {
   readonly sessionsUrl: string;
 
@@ -118,7 +118,7 @@ export class PersistenceHttp {
     this.sessionsUrl = `${url.href.replace(/\/$/, '')}/api/v1/harness/workspaces/${encodeURIComponent(config.workspaceId)}/sessions`;
   }
 
-  /** Send one bounded request; the backend owns authorization and write fencing. */
+  /** Send one bounded request; the backend owns authorization and write fencing.  中文：发送一个有界请求；后端负责授权和写入 fencing。 */
   async request(path: string, body?: unknown, signal?: AbortSignal): Promise<unknown> {
     const token = process.env[this.config.tokenEnv];
     if (!token) throw new Error(`Missing persistence credential in ${this.config.tokenEnv}`);

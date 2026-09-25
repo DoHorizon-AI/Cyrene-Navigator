@@ -21,3 +21,9 @@ host 的构建或检查；不负责 UI 打包，也不会 checkout 或编译 Pla
 The persistence launcher reads credentials only through configured `token_env`
 names. Its principal file is a development bootstrap mechanism, not a production
 identity provider.
+---
+<!-- Chinese Translation / 中文翻译 -->
+
+## 凭据边界
+
+持久化启动器只通过配置的 `token_env` 名称读取凭据。principal 文件只是开发环境的引导机制，不是生产身份提供方。

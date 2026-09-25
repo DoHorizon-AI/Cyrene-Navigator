@@ -18,27 +18,27 @@ import { decodeHandle, integer, record } from './persistence-wire.ts';
 export const name = 'cyrene-session-control';
 export const inject = ['connection', 'sessionController', 'sessionPersistence', 'agents'];
 
-/** Read-only product route for confirming that a submitted input is durable. */
+/** Read-only product route for confirming that a submitted input is durable.  中文：只读 Product 路由，用于确认已提交输入已持久化。 */
 export const INPUT_RECEIPTS_PATH = '/api/cyrene/session/input-receipts';
 export const MAX_INPUT_RECEIPT_IDS = 8;
 export const MAX_INPUT_RECEIPT_EVENTS = 4096;
 const MAX_INPUT_RECEIPT_REQUEST_BYTES = 8 * 1024;
 const MAX_INPUT_RECEIPT_IDENTIFIER_BYTES = 512;
 
-/** Bounded receipt query accepted by the authenticated Connection route. */
+/** Bounded receipt query accepted by the authenticated Connection route.  中文：经过认证的 Connection 路由接受的有界回执查询。 */
 export interface InputReceiptRequest {
   readonly sessionId: string;
   readonly requestIds: readonly string[];
 }
 
-/** Durable completion facts returned to the mounted client. */
+/** Durable completion facts returned to the mounted client.  中文：返回给已挂载客户端的持久化完成事实。 */
 export interface InputReceiptResponse {
   readonly sessionId: SessionId;
   readonly eventCount: number;
   readonly completedRequestIds: readonly string[];
 }
 
-/** Host Connection supplies cookie/origin authentication for both actions. */
+/** Host Connection supplies cookie/origin authentication for both actions.  中文：Host Connection 为两个操作提供 cookie/origin 认证。 */
 export function apply(ctx: Context): void {
   for (const action of ['observe', 'takeover'] as const) {
     ctx.effect(() => ctx.connection.fetch.register({
@@ -54,6 +54,7 @@ export function apply(ctx: Context): void {
     // Let the bounded handler consume the carrier incrementally. A buffered
     // Connection route would first retain the bridge's much larger generic
     // body cap before this product-specific 8 KiB limit could run.
+    // 中文：让有界 handler 增量读取请求载体。缓冲式 Connection 路由会在 Product 专属 8 KiB 限制执行前保留更大的通用 body 上限。
     requestBody: 'streaming',
     fetch: request => inputReceiptsRequest(ctx.sessionPersistence, request),
   }), 'cyrene-session-control: input receipts');
@@ -67,6 +68,7 @@ export function apply(ctx: Context): void {
  * The read handle is opened after stat and closed on every path; this route
  * never claims ownership, appends events, resumes an Agent, or returns raw
  * history.
+ * 中文：只确认 Cyrene 持久化事件日志中存在的已完成用户输入。刻意排除在线 DSH Session 和 SessionQuery 服务，因为内存事件可能在持久化 flush 确认前到达。Read handle 在 stat 之后打开，并确保每条路径都会关闭；此路由不声明所有权、不追加事件、不恢复 Agent，也不返回原始历史。
  */
 export async function inputReceiptsRequest(
   persistence: SessionPersistence,
@@ -92,6 +94,7 @@ export async function inputReceiptsRequest(
       // `stat` is the snapshot boundary. A concurrent append may grow the
       // backend before this read starts; never classify events beyond the
       // observed prefix as if they belonged to the same receipt observation.
+      // 中文：`stat` 确定快照边界。并发追加可能在读取开始前扩大后端；不要把观测前缀外的事件归为同一份回执观测。
       const length = Math.min(MAX_INPUT_RECEIPT_EVENTS, eventCount - offset);
       const events = await reader.read(offset, length, { signal: request.signal });
       request.signal.throwIfAborted();
@@ -113,7 +116,7 @@ export async function inputReceiptsRequest(
   }
 }
 
-/** Decode and bound receipt input before opening a backend handle. */
+/** Decode and bound receipt input before opening a backend handle.  中文：打开后端 handle 前解码并限制回执请求输入。 */
 async function decodeInputReceiptRequest(request: Request): Promise<InputReceiptRequest> {
   const text = await readBoundedBody(request);
   let body: Record<string, unknown>;
@@ -148,6 +151,7 @@ async function decodeInputReceiptRequest(request: Request): Promise<InputReceipt
  * Consume a streaming request body while retaining at most the product cap.
  * The Connection bridge must register this route as `streaming`; otherwise a
  * generic bridge buffer would run before this guard and defeat the bound.
+ * 中文：增量读取请求 body，并最多保留 Product 上限大小。Connection bridge 必须将此路由注册为 `streaming`；否则在此守卫执行前，通用 bridge buffer 会先读入更大的请求体。
  */
 async function readBoundedBody(request: Request): Promise<string> {
   if (request.body === null) return '';
@@ -164,6 +168,7 @@ async function readBoundedBody(request: Request): Promise<string> {
       if (received > MAX_INPUT_RECEIPT_REQUEST_BYTES) {
         // Do not let a misbehaving body source delay the bounded 413 response;
         // the HTTP bridge closes the unread carrier after the handler returns.
+        // 中文：不要让异常 body source 延迟有界 413 响应；handler 返回后由 HTTP bridge 关闭未读载体。
         void reader.cancel().catch(() => {});
         throw httpError(413, 'REQUEST_TOO_LARGE', 'The input receipt request exceeds 8 KiB.');
       }
@@ -175,7 +180,7 @@ async function readBoundedBody(request: Request): Promise<string> {
   return Buffer.concat(chunks, received).toString('utf8');
 }
 
-/** Match only a durable turn/start, user/message, and completed turn/end. */
+/** Match only a durable turn/start, user/message, and completed turn/end.  中文：只匹配持久化的 turn/start、user/message 和 completed turn/end。 */
 function completedRequestIds(events: readonly SessionEvent[], requested: ReadonlySet<string>): string[] {
   const completed = new Set<string>();
   let active: { turn: number; requestIds: Set<string> } | undefined;
@@ -207,12 +212,13 @@ function completedRequestIds(events: readonly SessionEvent[], requested: Readonl
     }
     // Any terminal event closes the currently tracked turn. A failed,
     // cancelled, or mismatched terminal cannot carry a receipt forward.
+    // 中文：任何终态事件都会关闭当前跟踪的 turn。失败、取消或不匹配的终态无法携带回执。
     active = undefined;
   }
   return [...requested].filter(requestId => completed.has(requestId));
 }
 
-/** Keep malformed opaque event payloads fail-closed during classification. */
+/** Keep malformed opaque event payloads fail-closed during classification.  中文：在分类时对格式错误的不透明事件负载继续 fail-closed。 */
 function object(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -246,7 +252,7 @@ function httpError(status: number, code: string, message: string): HttpError {
   return Object.assign(new Error(message), { status, code });
 }
 
-/** Read ownership or explicitly resume with one backend-fenced writer. */
+/** Read ownership or explicitly resume with one backend-fenced writer.  中文：读取现有所有权，或显式恢复并持有一个由后端 fencing 的 writer。 */
 export async function ownershipAction(ctx: Context, action: 'observe' | 'takeover', request: Request): Promise<Response> {
   try {
     if (request.method !== 'POST') return problem(405, 'METHOD_NOT_ALLOWED', 'Use POST for Session ownership actions.');

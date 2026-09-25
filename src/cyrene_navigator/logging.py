@@ -44,7 +44,11 @@ _INSTANCE_ID = str(uuid4())
 
 
 def is_sensitive_key(key: str) -> bool:
-    """Check whether a field name matches secret key patterns."""
+    """Check whether a field name matches secret key patterns.
+
+    中文：检查字段名是否匹配敏感密钥字段的命名模式。
+    """
+# 中文：检查字段名是否匹配密钥模式。
     lower = key.lower().replace("-", "_")
     if lower == "tokens" or lower.endswith("_tokens") or lower == "token_count":
         return False
@@ -52,7 +56,11 @@ def is_sensitive_key(key: str) -> bool:
 
 
 def sanitize_correlation_id(raw: str | None, max_len: int = 128) -> str | None:
-    """Sanitize and bound an untrusted client correlation header."""
+    """Sanitize and bound an untrusted client correlation header.
+
+    中文：清理不可信的 client correlation header，并限制其长度。
+    """
+# 中文：清理不可信客户端关联标头并限制其长度。
     if not raw:
         return None
     trimmed = raw.strip()
@@ -77,7 +85,11 @@ def sanitize_resource_id(raw: str | None) -> str | None:
 
 
 def parse_w3c_traceparent(raw: str | None) -> tuple[str, str] | None:
-    """Validate and parse a W3C traceparent header into (trace_id, span_id)."""
+    """Validate and parse a W3C traceparent header into (trace_id, span_id).
+
+    中文：校验并解析 W3C traceparent header，提取 (trace_id, span_id)。
+    """
+# 中文：验证 W3C traceparent 标头，并将其解析为 (trace_id, span_id)。
     if not raw:
         return None
     trimmed = raw.strip()
@@ -91,7 +103,11 @@ def parse_w3c_traceparent(raw: str | None) -> tuple[str, str] | None:
 
 
 def redact_attributes(attrs: Mapping[str, Any]) -> dict[str, Any]:
-    """Recursively redact sensitive key-values in attributes."""
+    """Recursively redact sensitive key-values in attributes.
+
+    中文：递归清理 attributes 中敏感键对应的值。
+    """
+# 中文：递归脱敏属性中的敏感键值。
     result: dict[str, Any] = {}
     for k, v in attrs.items():
         if is_sensitive_key(k):
@@ -117,7 +133,11 @@ def format_cyrene_log(
     span_id: str | None = None,
     attributes: Mapping[str, Any] | None = None,
 ) -> str:
-    """Format a single UTF-8 NDJSON log record conforming to Cyrene specification."""
+    """Format a single UTF-8 NDJSON log record conforming to Cyrene specification.
+
+    中文：按 Cyrene 规范格式化单条 UTF-8 NDJSON 日志记录。
+    """
+# 中文：格式化一条符合 Cyrene 规范的 UTF-8 NDJSON 日志记录。
     now_utc = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
     truncated_msg = message[:MAX_MESSAGE_BYTES] if len(message) > MAX_MESSAGE_BYTES else message
@@ -160,7 +180,11 @@ def emit_diagnostic_error(
     span_id: str | None = None,
     attributes: Mapping[str, Any] | None = None,
 ) -> None:
-    """Emit a structured diagnostic error record directly to sys.stderr."""
+    """Emit a structured diagnostic error record directly to sys.stderr.
+
+    中文：直接向 sys.stderr 输出结构化诊断错误记录。
+    """
+# 中文：直接向 sys.stderr 输出结构化诊断错误记录。
     attrs = dict(attributes or {})
     attrs["error.code"] = error_code
     line = format_cyrene_log(
