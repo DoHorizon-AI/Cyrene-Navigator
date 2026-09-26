@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic.alias_generators import to_camel
@@ -133,14 +132,21 @@ class ObservationProblem(ContractModel):
     upstream_status: int | None = Field(default=None, ge=400, le=599)
 
 
+class ProductResourceSummary(ContractModel):
+    """Closed, non-navigable proof that an owner JSON response was observed."""
+
+    json_sha256: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    canonical_json_bytes: int = Field(ge=2, le=4 * 1024 * 1024)
+
+
 class ProductView(ContractModel):
-    """Source-labelled owner resource or observation problem. | 带来源标签的产品视图。"""
+    """Source-labelled Product summary or observation problem. | 带来源标签的摘要视图。"""
 
     product: Product
     source_operation: ProductReadOperation
     observed_at: datetime
     status: ViewStatus
-    resource: dict[str, Any] | None = None
+    resource_summary: ProductResourceSummary | None = None
     problem: ObservationProblem | None = None
 
 

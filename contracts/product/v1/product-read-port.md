@@ -55,8 +55,10 @@ contains only the fixed owner OpenAPI READ operation identifier for the selected
 view (`workspaceListDatasets`, `workspaceGetEvaluationSuite`,
 `listWorkspaceGatewayRoutes`, `workspaceListModelImports`, or
 `workspaceGetDraft`). It contains no URL, path, host, or resource identifier and
-is not a Product resource reference. The owner JSON remains unchanged in
-`resource`.
+is not a Product resource reference. Navigator keeps the owner JSON body inside
+the server process and returns only `resourceSummary`, a SHA-256 digest and the
+byte length of canonical JSON. The snapshot does not forward arbitrary nested
+owner fields.
 
 The internal `scripts/serve-persistence.py` runner mounts this snapshot API on
 the same loopback-default listener as Harness persistence. Its strict config
@@ -65,6 +67,18 @@ credential environment-variable names; it never stores the secret values in
 the config file or command arguments. An absent service map or an absent exact
 scope returns HTTP 503 without making a Product request. The runner does not
 configure public ingress.
+
+## Private Workspace session read
+
+The runner exposes `GET
+/internal/workspace/v1/workspaces/{workspace_id}/sessions/{session_id}` as
+`getWorkspaceSession`. Its service Bearer resolves to a server-owned principal
+bound to an organization and Workspace; both must match the request path and
+persisted session scope. `workspace_id` is the Workspace path parameter and
+`session_id` is the only opaque resource parameter. The response uses the closed
+`WorkspaceSessionSummary` schema with Product metadata, revision, event count,
+and last activity time. It omits the arbitrary Harness header returned by the
+existing persistence snapshot route.
 ---
 <!-- Chinese Translation / 中文翻译 -->
 
@@ -112,10 +126,19 @@ unavailable observation。
 响应字段 `sourceOperation` 是不可导航的来源元数据，仅包含所选视图对应的固定 owner OpenAPI
 READ operation 标识（`workspaceListDatasets`、`workspaceGetEvaluationSuite`、
 `listWorkspaceGatewayRoutes`、`workspaceListModelImports` 或 `workspaceGetDraft`）。它不包含 URL、
-path、host 或 resource identifier，也不是 Product resource reference。`resource` 中的 owner JSON
-保持不变。
+path、host 或 resource identifier，也不是 Product resource reference。Navigator 会将 owner JSON 保留在
+服务进程内，并且只返回 `resourceSummary`：规范 JSON 的 SHA-256 digest 与字节长度。snapshot 不会转发
+任意嵌套 owner 字段。
 
 内部 `scripts/serve-persistence.py` runner 会把 snapshot API 挂到与 Harness persistence
 相同的 listener；默认只绑定 loopback。严格配置只保存 owner URL 和 owner/organization/Workspace
 credential 的环境变量名称，不把 secret 值写入配置文件或命令参数。service map 或精确 scope
 缺失时返回 HTTP 503，且不会请求 Product。runner 不配置公网 ingress。
+
+## 私有 Workspace 会话读取
+
+runner 将 `GET /internal/workspace/v1/workspaces/{workspace_id}/sessions/{session_id}` 暴露为
+`getWorkspaceSession`。service Bearer 映射到服务端 principal，并绑定 organization 与 Workspace；两者必须匹配请求路径和持久化会话 scope。
+`workspace_id` 是 Workspace 路径参数，`session_id` 是唯一的不透明资源参数。响应使用封闭的
+`WorkspaceSessionSummary` schema，包含 Product metadata、revision、事件数和最后活动时间；不返回现有 persistence
+snapshot 路由中的任意 Harness header。

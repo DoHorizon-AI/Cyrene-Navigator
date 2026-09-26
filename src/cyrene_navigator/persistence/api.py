@@ -35,6 +35,7 @@ from cyrene_navigator.persistence.models import (
     SessionCreateRequest,
     Snapshot,
     SnapshotList,
+    WorkspaceSessionSummary,
 )
 from cyrene_navigator.persistence.store import PersistencePrincipal, PersistenceStore
 
@@ -197,6 +198,34 @@ def create_persistence_app(
 
         principal = authenticate(request, workspace_id)
         return {"items": store.list_snapshots(workspace_id, principal.organization_id)}
+
+    @app.get(
+        "/internal/workspace/v1/workspaces/{workspace_id}/sessions/{session_id}",
+        response_model=WorkspaceSessionSummary,
+        response_model_exclude_none=True,
+        operation_id="getWorkspaceSession",
+    )
+    def get_workspace_session(
+        workspace_id: str, session_id: str, request: Request
+    ) -> WorkspaceSessionSummary:
+        """Read a closed session summary for the exact organization and Workspace."""
+
+        principal = authenticate(request, workspace_id)
+        if principal.organization_id is None:
+            raise PersistenceError(
+                WORKSPACE_FORBIDDEN,
+                403,
+                "The private Workspace session read requires an organization-scoped bearer.",
+            )
+        snapshot = Snapshot.model_validate(
+            store.get_snapshot(workspace_id, session_id, principal.organization_id)
+        )
+        return WorkspaceSessionSummary(
+            product_metadata=snapshot.product_metadata,
+            revision=snapshot.revision,
+            event_count=snapshot.event_count,
+            last_activity_at=snapshot.last_activity_at,
+        )
 
     @app.get(
         _SESSIONS_PATH + "/{session_id}",

@@ -11,8 +11,9 @@ durable authority nor an event-sourced projection.
 
 - Configured Product base URLs are operator-owned directory data.
 - Each `ProductView` preserves `product`, the fixed non-navigable
-  `sourceOperation` provenance label, `observedAt`, and the owner's unmodified
-  JSON object. It does not contain a Product URL or resource reference.
+  `sourceOperation` provenance label, `observedAt`, and a closed
+  `resourceSummary` with the canonical JSON digest and byte length. Raw owner
+  JSON remains inside Navigator and is not returned by the snapshot API.
 - Navigator never changes Product state labels, infers readiness, or converts a
   provider/package/binding into Product identity.
 - A remote error becomes an `UNAVAILABLE` view with a typed observation problem;
@@ -52,8 +53,8 @@ Navigator 拥有展示与客户端聚合，不拥有 Product 资源状态。`Wor
 ## 边界
 
 - 已配置的 Product base URL 是由操作员拥有的目录数据。
-- 每个 `ProductView` 都保留 `product`、固定且不可导航的 `sourceOperation` 来源标签、`observedAt` 和
-  owner 未修改的 JSON 对象；其中不含 Product URL 或 resource reference。
+- 每个 `ProductView` 都保留 `product`、固定且不可导航的 `sourceOperation` 来源标签、`observedAt` 和封闭的
+  `resourceSummary`（规范 JSON digest 与字节长度）。snapshot API 不会返回原始 owner JSON。
 - Navigator 不会改变 Product 状态标签、推断就绪状态，也不会把 Provider/包/binding 转换为 Product 身份。
 - 远端错误会成为带类型化观测问题的 `UNAVAILABLE` view；健康的 Product view 仍可使用，snapshot 状态则变为 `PARTIAL`。
 - 不接受变更请求。未来 UI 操作必须把类型化命令转发给所属 Product API。

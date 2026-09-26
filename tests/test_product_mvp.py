@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -89,8 +90,13 @@ def _server(status: int, payload: dict[str, Any]) -> tuple[ThreadingHTTPServer, 
     return server, thread
 
 
-def test_real_http_partial_snapshot_preserves_owner_resource(tmp_path: Path) -> None:
-    catalyst_resource = {"id": "dataset-version-1", "state": "PUBLISHED", "resourceVersion": 2}
+def test_real_http_partial_snapshot_returns_only_owner_resource_digest(tmp_path: Path) -> None:
+    catalyst_resource = {
+        "id": "dataset-version-1",
+        "state": "PUBLISHED",
+        "resourceVersion": 2,
+        "sourceUrl": "https://product.internal.example/private/datasets/one",
+    }
     catalyst, catalyst_thread = _server(200, catalyst_resource)
     echo, echo_thread = _server(
         503,
@@ -136,7 +142,20 @@ def test_real_http_partial_snapshot_preserves_owner_resource(tmp_path: Path) -> 
         assert response.status_code == 200
         snapshot = response.json()
         assert snapshot["status"] == "PARTIAL"
-        assert snapshot["views"][0]["resource"] == catalyst_resource
+        encoded_resource = json.dumps(
+            catalyst_resource,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        assert snapshot["views"][0]["resourceSummary"] == {
+            "jsonSha256": f"sha256:{hashlib.sha256(encoded_resource).hexdigest()}",
+            "canonicalJsonBytes": len(encoded_resource),
+        }
+        assert "resource" not in snapshot["views"][0]
+        assert "dataset-version-1" not in response.text
+        assert "product.internal.example" not in response.text
         assert snapshot["views"][0]["status"] == "AVAILABLE"
         assert snapshot["views"][0]["sourceOperation"] == "workspaceListDatasets"
         assert snapshot["views"][1]["status"] == "UNAVAILABLE"

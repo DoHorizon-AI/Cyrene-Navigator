@@ -48,6 +48,14 @@ runner should construct the app through the factory and pass it to an existing
 ASGI server. The TypeScript Harness adapter remains the owner of upstream event
 vocabulary validation and projects the service's `meta` snapshot field to the
 upstream `header` field.
+
+The internal Product alias `GET
+/internal/workspace/v1/workspaces/{workspace_id}/sessions/{session_id}` uses
+the configured service Bearer principal and requires its organization and
+Workspace assignment to match the path. `session_id` is the single opaque
+resource path parameter. The closed `WorkspaceSessionSummary` omits arbitrary
+Harness header fields; the existing `/api/v1/harness/...` snapshot remains
+available to the Harness adapter.
 ---
 <!-- Chinese Translation / 中文翻译 -->
 
@@ -64,3 +72,8 @@ Product metadata 是同一数据库中的独立读取投影，通过 Session sna
 Metadata 表在现有 SQLite 初始化事务中幂等创建并回填。缺失的历史身份会保持显式状态，必须由未来经过认证的 Product 操作解决。本 Phase 0 接口不会增加标题、共享、标签、RBAC 或 metadata 变更路由。
 
 不会将 `uvicorn` 加为包依赖。部署 runner 应通过 factory 创建 app，并交给现有 ASGI server。TypeScript Harness 适配器仍负责校验上游 event 词汇，并将 service snapshot 的 `meta` 字段投影到上游 `header` 字段。
+
+内部 Product alias `GET
+/internal/workspace/v1/workspaces/{workspace_id}/sessions/{session_id}` 使用已配置的 service Bearer
+principal，并要求其 organization 与 Workspace assignment 和路径匹配。`session_id` 是唯一的不透明资源路径参数。
+封闭的 `WorkspaceSessionSummary` 不包含任意 Harness header；现有 `/api/v1/harness/...` snapshot 仍供 Harness 适配器使用。

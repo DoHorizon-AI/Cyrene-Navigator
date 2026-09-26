@@ -223,6 +223,53 @@ paths:
             application/problem+json:
               schema:
                 $ref: ./generated/common/problem-details.schema.json
+  /internal/workspace/v1/workspaces/{workspace_id}/sessions/{session_id}:
+    get:
+      summary: Get Workspace Session Summary
+      description: Read a closed session summary with a service Bearer bound to the exact organization and Workspace; the session ID is the only resource path parameter.
+      operationId: getWorkspaceSession
+      security:
+      - NavigatorWorkspaceBearer: []
+      parameters:
+      - name: workspace_id
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 512
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 512
+      responses:
+        '200':
+          description: Closed Workspace session summary without the arbitrary Harness header
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceSessionSummary'
+        '403':
+          description: Principal is not bound to this organization and Workspace
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '404':
+          description: Session does not exist in this organization and Workspace
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
+        '422':
+          description: Invalid Workspace or session identifier
+          content:
+            application/problem+json:
+              schema:
+                $ref: ./generated/common/problem-details.schema.json
   /api/v1/harness/workspaces/{workspace_id}/sessions/{session_id}/metadata:
     get:
       summary: Get Product Metadata
@@ -659,6 +706,11 @@ paths:
               schema:
                 $ref: ./generated/common/problem-details.schema.json
 components:
+  securitySchemes:
+    NavigatorWorkspaceBearer:
+      type: http
+      scheme: bearer
+      description: Server-configured service Bearer mapped to one organization and Workspace
   schemas:
     AppendRequest:
       properties:
@@ -1012,6 +1064,29 @@ components:
       - items
       title: SnapshotList
       description: Workspace-scoped session listing. | Workspace 会话列表。
+    WorkspaceSessionSummary:
+      properties:
+        productMetadata:
+          $ref: '#/components/schemas/ProductMetadata'
+        revision:
+          type: string
+          minLength: 1
+        eventCount:
+          type: integer
+          minimum: 0
+        lastActivityAt:
+          anyOf:
+          - type: integer
+            minimum: 0
+          - type: 'null'
+      additionalProperties: false
+      type: object
+      required:
+      - productMetadata
+      - revision
+      - eventCount
+      title: WorkspaceSessionSummary
+      description: Closed service-facing session view; arbitrary Harness header values are withheld.
     TargetResource:
       properties:
         uri:

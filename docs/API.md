@@ -35,11 +35,19 @@ Only the private, fixed Product READ paths in
 [`product-read-port.md`](../contracts/product/v1/product-read-port.md) are
 accepted. The response `sourceOperation` is a fixed OpenAPI operation label for
 non-navigable provenance; it carries no URL, path, host, or resource identifier.
+Each available view returns only a closed `resourceSummary` digest and byte
+length. Raw owner JSON stays inside Navigator.
 The internal persistence runner mounts this endpoint
 on the same loopback-default listener. It loads URL and credential values from
 named environment variables; missing service maps or an exact requested scope
 return 503 without an upstream Product call. The runner does not configure
 public ingress.
+
+The internal session READ alias is `GET
+/internal/workspace/v1/workspaces/{workspace_id}/sessions/{session_id}` with
+operation ID `getWorkspaceSession`. Its service Bearer must resolve to the exact
+organization and Workspace; the session ID is the sole resource path parameter.
+The response is a closed summary and omits arbitrary Harness header metadata.
 
 ## Navigator-owned surfaces
 
@@ -93,9 +101,14 @@ organization，也不向 Product 转发浏览器 bearer。每个下游 Product b
 未认证的 Product 请求。只接受
 [`product-read-port.md`](../contracts/product/v1/product-read-port.md) 中固定的私有 Product READ 路径。
 响应 `sourceOperation` 是不可导航的固定 OpenAPI operation 来源标签，不携带 URL、path、host 或资源 ID。
+每个可用 view 只返回封闭的 `resourceSummary` digest 和字节长度；原始 owner JSON 保留在 Navigator 内部。
 内部 persistence runner 会将此 endpoint 挂到同一个默认绑定 loopback 的 listener。
 它按命名的环境变量读取 URL 和 credential；缺少 service map 或请求的精确 scope 时返回 503，且不会请求
 上游 Product。runner 不配置公网 ingress。
+
+内部会话 READ alias 为 `GET /internal/workspace/v1/workspaces/{workspace_id}/sessions/{session_id}`，
+operation ID 是 `getWorkspaceSession`。service Bearer 必须映射到完全匹配的 organization 与 Workspace；
+session ID 是唯一资源路径参数。响应为封闭摘要，不包含任意 Harness header metadata。
 
 ## Navigator 所有的接口
 

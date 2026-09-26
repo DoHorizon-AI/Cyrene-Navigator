@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from ipaddress import ip_address
@@ -19,6 +20,7 @@ from cyrene_navigator.domain import (
     ObservationProblem,
     Product,
     ProductReadOperation,
+    ProductResourceSummary,
     ProductView,
     SnapshotRequest,
     SnapshotStatus,
@@ -92,44 +94,8 @@ class NavigatorService:
                 tracestate,
                 resource_budget - resource_bytes,
             )
-            if view.resource is not None:
-                try:
-                    encoded_resource_bytes = len(
-                        json.dumps(
-                            view.resource,
-                            ensure_ascii=False,
-                            allow_nan=False,
-                            separators=(",", ":"),
-                        ).encode("utf-8")
-                    )
-                except (TypeError, ValueError, UnicodeError):
-                    view = ProductView(
-                        product=view.product,
-                        source_operation=view.source_operation,
-                        observed_at=view.observed_at,
-                        status=ViewStatus.UNAVAILABLE,
-                        problem=ObservationProblem(
-                            code="NAVIGATOR_PRODUCT_RESPONSE_INVALID",
-                            detail="The Product API response was not valid bounded JSON.",
-                            retryable=False,
-                        ),
-                    )
-                    views.append(view)
-                    continue
-                if encoded_resource_bytes > resource_budget - resource_bytes:
-                    view = ProductView(
-                        product=view.product,
-                        source_operation=view.source_operation,
-                        observed_at=view.observed_at,
-                        status=ViewStatus.UNAVAILABLE,
-                        problem=ObservationProblem(
-                            code="NAVIGATOR_SNAPSHOT_RESPONSE_TOO_LARGE",
-                            detail="The Workspace snapshot exceeded its JSON size limit.",
-                            retryable=False,
-                        ),
-                    )
-                else:
-                    resource_bytes += encoded_resource_bytes
+            if view.resource_summary is not None:
+                resource_bytes += view.resource_summary.canonical_json_bytes
             views.append(view)
         available = sum(view.status == ViewStatus.AVAILABLE for view in views)
         if available == len(views):
@@ -186,6 +152,26 @@ class NavigatorService:
                 bearer_token=service_token,
                 max_json_bytes=max_json_bytes,
             )
+            try:
+                encoded_resource = json.dumps(
+                    resource,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            except (TypeError, ValueError, UnicodeError) as exc:
+                raise ProductReadFailure(
+                    code="NAVIGATOR_PRODUCT_RESPONSE_INVALID",
+                    detail="The Product API response was not valid bounded JSON.",
+                    retryable=False,
+                ) from exc
+            if len(encoded_resource) > max_json_bytes:
+                raise ProductReadFailure(
+                    code="NAVIGATOR_SNAPSHOT_RESPONSE_TOO_LARGE",
+                    detail="The Workspace snapshot exceeded its JSON size limit.",
+                    retryable=False,
+                )
         except ProductReadFailure as exc:
             return ProductView(
                 product=product,
@@ -204,7 +190,10 @@ class NavigatorService:
             source_operation=source_operation,
             observed_at=observed_at,
             status=ViewStatus.AVAILABLE,
-            resource=resource,
+            resource_summary=ProductResourceSummary(
+                json_sha256=f"sha256:{hashlib.sha256(encoded_resource).hexdigest()}",
+                canonical_json_bytes=len(encoded_resource),
+            ),
         )
 
 
