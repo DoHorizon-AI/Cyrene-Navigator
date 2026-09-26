@@ -50,10 +50,21 @@ development. Redirects are not followed. Each upstream JSON response and the
 aggregate snapshot are bounded to 4 MiB; oversized or invalid JSON becomes a
 safe unavailable observation.
 
-The response field `sourceUrl` is a stable logical provenance URI in the form
-`cyrene://product/{owner}{privatePath}` (for example,
-`cyrene://product/catalyst/internal/workspace/v1/datasets`). It does not expose
-the configured service hostname and is not a navigation link.
+The response field `sourceOperation` is non-navigable provenance metadata. It
+contains only the fixed owner OpenAPI READ operation identifier for the selected
+view (`workspaceListDatasets`, `workspaceGetEvaluationSuite`,
+`listWorkspaceGatewayRoutes`, `workspaceListModelImports`, or
+`workspaceGetDraft`). It contains no URL, path, host, or resource identifier and
+is not a Product resource reference. The owner JSON remains unchanged in
+`resource`.
+
+The internal `scripts/serve-persistence.py` runner mounts this snapshot API on
+the same loopback-default listener as Harness persistence. Its strict config
+contains owner URL environment-variable names and owner/org/Workspace
+credential environment-variable names; it never stores the secret values in
+the config file or command arguments. An absent service map or an absent exact
+scope returns HTTP 503 without making a Product request. The runner does not
+configure public ingress.
 ---
 <!-- Chinese Translation / 中文翻译 -->
 
@@ -98,6 +109,13 @@ snapshot POST 要求入站 bearer 由服务端映射到同时具备 organization
 redirect。每个上游 JSON response 和聚合 snapshot 都限制为 4 MiB；超限或无效 JSON 会成为安全的
 unavailable observation。
 
-响应字段 `sourceUrl` 使用稳定的逻辑来源 URI：`cyrene://product/{owner}{privatePath}`（例如
-`cyrene://product/catalyst/internal/workspace/v1/datasets`）。它不会暴露配置的 service hostname，
-也不是导航链接。
+响应字段 `sourceOperation` 是不可导航的来源元数据，仅包含所选视图对应的固定 owner OpenAPI
+READ operation 标识（`workspaceListDatasets`、`workspaceGetEvaluationSuite`、
+`listWorkspaceGatewayRoutes`、`workspaceListModelImports` 或 `workspaceGetDraft`）。它不包含 URL、
+path、host 或 resource identifier，也不是 Product resource reference。`resource` 中的 owner JSON
+保持不变。
+
+内部 `scripts/serve-persistence.py` runner 会把 snapshot API 挂到与 Harness persistence
+相同的 listener；默认只绑定 loopback。严格配置只保存 owner URL 和 owner/organization/Workspace
+credential 的环境变量名称，不把 secret 值写入配置文件或命令参数。service map 或精确 scope
+缺失时返回 HTTP 503，且不会请求 Product。runner 不配置公网 ingress。

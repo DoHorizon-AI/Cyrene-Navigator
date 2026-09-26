@@ -138,13 +138,9 @@ def test_real_http_partial_snapshot_preserves_owner_resource(tmp_path: Path) -> 
         assert snapshot["status"] == "PARTIAL"
         assert snapshot["views"][0]["resource"] == catalyst_resource
         assert snapshot["views"][0]["status"] == "AVAILABLE"
-        assert snapshot["views"][0]["sourceUrl"] == (
-            "cyrene://product/catalyst/internal/workspace/v1/datasets"
-        )
+        assert snapshot["views"][0]["sourceOperation"] == "workspaceListDatasets"
         assert snapshot["views"][1]["status"] == "UNAVAILABLE"
-        assert snapshot["views"][1]["sourceUrl"] == (
-            f"cyrene://product/echo/internal/workspace/v1/evaluation-suites/{_TEST_UUID}"
-        )
+        assert snapshot["views"][1]["sourceOperation"] == "workspaceGetEvaluationSuite"
         assert snapshot["views"][1]["problem"] == {
             "code": "ECHO_UNAVAILABLE",
             "detail": "The Product API returned an error response.",

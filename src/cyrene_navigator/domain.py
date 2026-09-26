@@ -45,6 +45,16 @@ class Product(StrEnum):
     YIELD = "YIELD"
 
 
+class ProductReadOperation(StrEnum):
+    """Fixed owner READ operation labels used only as non-navigable provenance."""
+
+    CATALYST_LIST_DATASETS = "workspaceListDatasets"
+    ECHO_GET_EVALUATION_SUITE = "workspaceGetEvaluationSuite"
+    EXCHANGE_LIST_GATEWAY_ROUTES = "listWorkspaceGatewayRoutes"
+    REACTOR_LIST_MODEL_IMPORTS = "workspaceListModelImports"
+    YIELD_GET_DRAFT = "workspaceGetDraft"
+
+
 class ViewStatus(StrEnum):
     """Transport observation status, not Product state. | 传输观测状态。"""
 
@@ -127,7 +137,7 @@ class ProductView(ContractModel):
     """Source-labelled owner resource or observation problem. | 带来源标签的产品视图。"""
 
     product: Product
-    source_url: str
+    source_operation: ProductReadOperation
     observed_at: datetime
     status: ViewStatus
     resource: dict[str, Any] | None = None

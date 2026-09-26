@@ -36,6 +36,11 @@ paths:
           content:
             application/problem+json:
               schema: {$ref: './generated/common/problem-details.schema.json'}
+        '503':
+          description: Internal service or exact owner/org/Workspace configuration is missing
+          content:
+            application/problem+json:
+              schema: {$ref: './generated/common/problem-details.schema.json'}
         '422':
           description: RFC 9457 invalid aggregation request
           content:

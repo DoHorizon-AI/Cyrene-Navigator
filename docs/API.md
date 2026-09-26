@@ -33,9 +33,13 @@ selected from server configuration by `(Product, organization_id, workspace_id)`
 missing credentials fail closed without an unauthenticated Product request.
 Only the private, fixed Product READ paths in
 [`product-read-port.md`](../contracts/product/v1/product-read-port.md) are
-accepted. The response `sourceUrl` is a stable `cyrene://product/{owner}{path}`
-provenance URI; it never includes the configured private Product hostname and
-is not a navigation link.
+accepted. The response `sourceOperation` is a fixed OpenAPI operation label for
+non-navigable provenance; it carries no URL, path, host, or resource identifier.
+The internal persistence runner mounts this endpoint
+on the same loopback-default listener. It loads URL and credential values from
+named environment variables; missing service maps or an exact requested scope
+return 503 without an upstream Product call. The runner does not configure
+public ingress.
 
 ## Navigator-owned surfaces
 
@@ -88,8 +92,10 @@ organization，也不向 Product 转发浏览器 bearer。每个下游 Product b
 `(Product, organization_id, workspace_id)` 从服务端配置选择；缺少凭据时 fail closed，不会发出
 未认证的 Product 请求。只接受
 [`product-read-port.md`](../contracts/product/v1/product-read-port.md) 中固定的私有 Product READ 路径。
-响应 `sourceUrl` 是稳定的 `cyrene://product/{owner}{path}` 来源 URI，不包含配置的私有 Product 主机名，
-也不是导航链接。
+响应 `sourceOperation` 是不可导航的固定 OpenAPI operation 来源标签，不携带 URL、path、host 或资源 ID。
+内部 persistence runner 会将此 endpoint 挂到同一个默认绑定 loopback 的 listener。
+它按命名的环境变量读取 URL 和 credential；缺少 service map 或请求的精确 scope 时返回 503，且不会请求
+上游 Product。runner 不配置公网 ingress。
 
 ## Navigator 所有的接口
 

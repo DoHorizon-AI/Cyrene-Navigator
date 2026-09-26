@@ -49,12 +49,17 @@ class SnapshotAuthorizationError(Exception):
         self.detail = detail
 
 
+class SnapshotServiceUnavailable(Exception):
+    """The internal snapshot service lacks required server configuration."""
+
+
 def create_app(
     *,
     directory: Mapping[Product, str],
     reader: ProductReadPort | None = None,
     principals: Mapping[str, PersistencePrincipal] | None = None,
     service_credentials: Mapping[ProductCredentialKey, str] | None = None,
+    require_service_configuration: bool = False,
 ) -> FastAPI:
     """Build Navigator with server-owned Product and Workspace identity maps.
 
@@ -185,6 +190,33 @@ def create_app(
             media_type="application/problem+json",
         )
 
+    @app.exception_handler(SnapshotServiceUnavailable)
+    async def snapshot_service_unavailable(
+        request: Request, _exc: SnapshotServiceUnavailable
+    ) -> JSONResponse:
+        """Hide incomplete operator config behind an RFC 9457 503 response."""
+
+        trace_id = getattr(request.state, "trace_id", None) or uuid4().hex
+        request_id = getattr(request.state, "request_id", None)
+        problem = ProblemDetails(
+            type="https://errors.cyrene.dev/navigator/navigator_workspace_service_unavailable",
+            title="Workspace service unavailable",
+            status=503,
+            detail="The internal Workspace snapshot service is not configured for this request.",
+            instance=request.url.path,
+            code="NAVIGATOR_WORKSPACE_SERVICE_UNAVAILABLE",
+            retryable=True,
+            trace_id=trace_id,
+            request_id=request_id,
+            recovery_action="fix_configuration",
+        )
+        return JSONResponse(
+            status_code=503,
+            content=problem.model_dump(by_alias=True, mode="json", exclude_none=True),
+            headers={"Retry-After": "30"},
+            media_type="application/problem+json",
+        )
+
     @app.post(
         "/api/v1/workspace-snapshots",
         response_model=WorkspaceSnapshot,
@@ -192,6 +224,7 @@ def create_app(
         responses={
             401: {"model": ProblemDetails},
             403: {"model": ProblemDetails},
+            503: {"model": ProblemDetails},
         },
     )
     def observe_snapshot(
@@ -202,10 +235,21 @@ def create_app(
             Depends(_PRODUCT_BEARER),
         ],
     ) -> WorkspaceSnapshot:
+        if require_service_configuration and (
+            not principal_digests or not directory or not configured_service_credentials
+        ):
+            raise SnapshotServiceUnavailable
         principal = _authenticate_snapshot_principal(
             credentials, command.workspace_id, principal_digests
         )
         assert principal.organization_id is not None
+        if require_service_configuration and any(
+            read.product not in directory
+            or (read.product, principal.organization_id, command.workspace_id)
+            not in configured_service_credentials
+            for read in command.reads
+        ):
+            raise SnapshotServiceUnavailable
         return service.observe(
             command,
             principal.organization_id,

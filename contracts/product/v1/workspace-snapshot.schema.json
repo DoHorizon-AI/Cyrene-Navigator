@@ -16,14 +16,13 @@
   "$defs": {
     "productView": {
       "type": "object",
-      "required": ["product", "sourceUrl", "observedAt", "status"],
+      "required": ["product", "sourceOperation", "observedAt", "status"],
       "properties": {
         "product": {"enum": ["CATALYST", "ECHO", "REACTOR", "EXCHANGE", "YIELD"]},
-        "sourceUrl": {
+        "sourceOperation": {
           "type": "string",
-          "format": "uri",
-          "description": "Stable logical Product resource URI; never the private configured service URL.",
-          "pattern": "^cyrene://product/(catalyst/internal/workspace/v1/datasets|echo/internal/workspace/v1/evaluation-suites/[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}|exchange/api/v1/workspace/gateway-routes|reactor/internal/workspace/v1/model-imports|yield/internal/workspace/v1/training-drafts/[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$"
+          "description": "Fixed owner OpenAPI operation identifier for non-navigable provenance; not a resource reference.",
+          "enum": ["workspaceListDatasets", "workspaceGetEvaluationSuite", "listWorkspaceGatewayRoutes", "workspaceListModelImports", "workspaceGetDraft"]
         },
         "observedAt": {"type": "string", "format": "date-time"},
         "status": {"enum": ["AVAILABLE", "UNAVAILABLE"]},

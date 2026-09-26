@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 from cyrene_navigator.domain import (
     ObservationProblem,
     Product,
+    ProductReadOperation,
     ProductView,
     SnapshotRequest,
     SnapshotStatus,
@@ -32,6 +33,21 @@ _MAX_SNAPSHOT_JSON_BYTES = 4 * 1024 * 1024
 _MAX_SNAPSHOT_ENVELOPE_BYTES = 8192
 _MAX_VIEW_ENVELOPE_BYTES = 4096
 _MAX_PRODUCT_BASE_URL_CHARS = 2048
+
+_WORKSPACE_READ_OPERATIONS = {
+    Product.CATALYST: (
+        "/internal/workspace/v1/datasets",
+        ProductReadOperation.CATALYST_LIST_DATASETS,
+    ),
+    Product.EXCHANGE: (
+        "/api/v1/workspace/gateway-routes",
+        ProductReadOperation.EXCHANGE_LIST_GATEWAY_ROUTES,
+    ),
+    Product.REACTOR: (
+        "/internal/workspace/v1/model-imports",
+        ProductReadOperation.REACTOR_LIST_MODEL_IMPORTS,
+    ),
+}
 
 
 class NavigatorService:
@@ -89,7 +105,7 @@ class NavigatorService:
                 except (TypeError, ValueError, UnicodeError):
                     view = ProductView(
                         product=view.product,
-                        source_url=view.source_url,
+                        source_operation=view.source_operation,
                         observed_at=view.observed_at,
                         status=ViewStatus.UNAVAILABLE,
                         problem=ObservationProblem(
@@ -103,7 +119,7 @@ class NavigatorService:
                 if encoded_resource_bytes > resource_budget - resource_bytes:
                     view = ProductView(
                         product=view.product,
-                        source_url=view.source_url,
+                        source_operation=view.source_operation,
                         observed_at=view.observed_at,
                         status=ViewStatus.UNAVAILABLE,
                         problem=ObservationProblem(
@@ -140,12 +156,12 @@ class NavigatorService:
         max_json_bytes: int,
     ) -> ProductView:
         base_url = self._directory.get(product)
-        source_url = f"cyrene://product/{product.value.lower()}{path}"
+        source_operation = _workspace_read_operation(product, path)
         observed_at = utc_now()
         if base_url is None:
             return ProductView(
                 product=product,
-                source_url=source_url,
+                source_operation=source_operation,
                 observed_at=observed_at,
                 status=ViewStatus.UNAVAILABLE,
                 problem=ObservationProblem(
@@ -173,7 +189,7 @@ class NavigatorService:
         except ProductReadFailure as exc:
             return ProductView(
                 product=product,
-                source_url=source_url,
+                source_operation=source_operation,
                 observed_at=observed_at,
                 status=ViewStatus.UNAVAILABLE,
                 problem=ObservationProblem(
@@ -185,11 +201,32 @@ class NavigatorService:
             )
         return ProductView(
             product=product,
-            source_url=source_url,
+            source_operation=source_operation,
             observed_at=observed_at,
             status=ViewStatus.AVAILABLE,
             resource=resource,
         )
+
+
+def _workspace_read_operation(product: Product, path: str) -> ProductReadOperation:
+    """Return fixed non-navigable provenance metadata for an approved owner READ."""
+
+    fixed = _WORKSPACE_READ_OPERATIONS.get(product)
+    if fixed is not None and path == fixed[0]:
+        return fixed[1]
+    parameterized = {
+        Product.ECHO: (
+            "/internal/workspace/v1/evaluation-suites/",
+            ProductReadOperation.ECHO_GET_EVALUATION_SUITE,
+        ),
+        Product.YIELD: (
+            "/internal/workspace/v1/training-drafts/",
+            ProductReadOperation.YIELD_GET_DRAFT,
+        ),
+    }.get(product)
+    if parameterized is not None and path.startswith(parameterized[0]):
+        return parameterized[1]
+    raise ValueError("path is not an approved Workspace READ operation")
 
 
 def _validate_product_base_url(value: str) -> str:
