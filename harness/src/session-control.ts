@@ -295,7 +295,14 @@ export async function ownershipAction(ctx: Context, action: 'observe' | 'takeove
       sessionId: id, cwd,
       ...(observation.header.agentPreset === undefined ? {} : { agentPreset: observation.header.agentPreset }),
     }), request.signal);
-    return Response.json({ ...result, ownership: 'writer', previousEpoch: expectedEpoch });
+    // Keep this browser projection allowlisted; persistence writer capabilities stay Host-owned.
+    // 中文：浏览器响应只投影允许字段；持久化 writer capability 始终由 Host 持有。
+    return Response.json({
+      sessionId: result.sessionId,
+      ...(result.agentPreset === undefined ? {} : { agentPreset: result.agentPreset }),
+      ownership: 'writer',
+      previousEpoch: expectedEpoch,
+    });
   } catch (error) {
     if (error instanceof SessionPersistenceNotFoundError) return problem(404, 'SESSION_NOT_FOUND', 'Session not found in this workspace.');
     if (error instanceof SessionAlreadyOwnedError || error instanceof SessionOwnershipLostError) {
