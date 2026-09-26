@@ -13,9 +13,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
-from urllib.parse import unquote, urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic.alias_generators import to_camel
 
 
@@ -53,6 +52,38 @@ class ViewStatus(StrEnum):
     UNAVAILABLE = "UNAVAILABLE"
 
 
+def _is_hyphenated_uuid(value: str) -> bool:
+    """Accept one canonical-length UUID path segment without extra components."""
+
+    return len(value) == 36 and all(
+        character == "-" if index in {8, 13, 18, 23} else character in "0123456789abcdefABCDEF"
+        for index, character in enumerate(value)
+    )
+
+
+def _is_approved_workspace_read(product: Product, path: str) -> bool:
+    """Allow only fixed Product workspace-read operations and UUID parameters."""
+
+    fixed_paths = {
+        Product.CATALYST: "/internal/workspace/v1/datasets",
+        Product.EXCHANGE: "/api/v1/workspace/gateway-routes",
+        Product.REACTOR: "/internal/workspace/v1/model-imports",
+    }
+    if path == fixed_paths.get(product):
+        return True
+
+    uuid_paths = {
+        Product.ECHO: "/internal/workspace/v1/evaluation-suites/",
+        Product.YIELD: "/internal/workspace/v1/training-drafts/",
+    }
+    prefix = uuid_paths.get(product)
+    return (
+        prefix is not None
+        and path.startswith(prefix)
+        and _is_hyphenated_uuid(path.removeprefix(prefix))
+    )
+
+
 class SnapshotStatus(StrEnum):
     """Aggregate availability only. | 仅表示聚合可用性。"""
 
@@ -65,31 +96,15 @@ class ProductRead(ContractModel):
     """One Product resource read requested by the client. | 单个产品资源读取。"""
 
     product: Product
-    path: str = Field(pattern=r"^/api/v1/", max_length=1000)
+    path: str = Field(min_length=1, max_length=100)
 
-    @field_validator("path")
-    @classmethod
-    def safe_relative_path(cls, value: str) -> str:
-        """Reject traversal and embedded authority changes. | 拒绝路径穿越与权威切换。"""
+    @model_validator(mode="after")
+    def approved_read_operation(self) -> ProductRead:
+        """Reject every path outside the fixed Product READ operation map."""
 
-        if any(ord(character) < 32 or ord(character) == 127 for character in value):
-            raise ValueError("path cannot contain control characters")
-        parsed = urlsplit(value)
-        if parsed.scheme or parsed.netloc or parsed.fragment or "://" in value:
-            raise ValueError("path must remain under the configured Product API")
-        decoded_path = parsed.path
-        for _ in range(len(decoded_path)):
-            next_path = unquote(decoded_path)
-            if next_path == decoded_path:
-                break
-            decoded_path = next_path
-        if (
-            "\\" in decoded_path
-            or any(ord(character) < 32 or ord(character) == 127 for character in decoded_path)
-            or any(segment in {".", ".."} for segment in decoded_path.split("/"))
-        ):
-            raise ValueError("path cannot traverse outside the Product API")
-        return value
+        if not _is_approved_workspace_read(self.product, self.path):
+            raise ValueError("path is not an approved workspace READ operation for this Product")
+        return self
 
 
 class SnapshotRequest(ContractModel):

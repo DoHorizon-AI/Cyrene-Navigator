@@ -245,9 +245,7 @@ class PersistenceStore:
         with self._read() as conn:
             self._require_session(conn, organization_key, workspace_id, session_id)
             return self._product_metadata_from_row(
-                self._require_product_metadata(
-                    conn, organization_key, workspace_id, session_id
-                )
+                self._require_product_metadata(conn, organization_key, workspace_id, session_id)
             )
 
     def open_handle(
@@ -361,9 +359,7 @@ class PersistenceStore:
                 "PERSISTENCE_PAGE_TOO_LARGE", 422, f"length must be <= {_MAX_PAGE_LENGTH}"
             )
         with self._read() as conn:
-            session = self._require_session(
-                conn, organization_key, workspace_id, session_id
-            )
+            session = self._require_session(conn, organization_key, workspace_id, session_id)
             next_seq = _column_int(session, "event_count")
             if length == 0 or offset >= next_seq:
                 return [], next_seq
@@ -795,9 +791,7 @@ class PersistenceStore:
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 ).fetchall()
             }
-            if "sessions" in existing_tables and self._needs_scope_rebuild(
-                conn, existing_tables
-            ):
+            if "sessions" in existing_tables and self._needs_scope_rebuild(conn, existing_tables):
                 self._rebuild_scope_schema(conn, existing_tables)
             else:
                 self._create_scoped_schema(conn)
@@ -820,9 +814,7 @@ class PersistenceStore:
             )
 
     @staticmethod
-    def _needs_scope_rebuild(
-        conn: sqlite3.Connection, existing_tables: set[str]
-    ) -> bool:
+    def _needs_scope_rebuild(conn: sqlite3.Connection, existing_tables: set[str]) -> bool:
         """Detect the pre-organization schema or an incomplete scope migration."""
 
         expected_primary_keys = {
@@ -939,9 +931,7 @@ class PersistenceStore:
             conn.execute(statement)
 
     @staticmethod
-    def _rebuild_scope_schema(
-        conn: sqlite3.Connection, existing_tables: set[str]
-    ) -> None:
+    def _rebuild_scope_schema(conn: sqlite3.Connection, existing_tables: set[str]) -> None:
         """Migrate every historical row to unknown organization scope atomically."""
 
         for table_name in (

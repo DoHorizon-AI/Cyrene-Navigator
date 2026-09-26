@@ -25,6 +25,18 @@ conversation payloads. Adding a Product or Plugin adapter must therefore change
 the owning repository or Navigator adapter, while the published Platform
 contract remains unchanged.
 
+The browser-facing `POST /api/v1/workspace-snapshots` requires a configured
+bearer principal whose server-side organization and Workspace scope matches
+`workspaceId`. Navigator does not accept a caller-selected organization and does
+not forward the browser bearer to a Product. Each downstream Product bearer is
+selected from server configuration by `(Product, organization_id, workspace_id)`;
+missing credentials fail closed without an unauthenticated Product request.
+Only the private, fixed Product READ paths in
+[`product-read-port.md`](../contracts/product/v1/product-read-port.md) are
+accepted. The response `sourceUrl` is a stable `cyrene://product/{owner}{path}`
+provenance URI; it never includes the configured private Product hostname and
+is not a navigation link.
+
 ## Navigator-owned surfaces
 
 - `contracts/product/v1/persistence.openapi.yaml`: session persistence and the
@@ -69,6 +81,15 @@ Navigator 是一个活跃的 Product，拥有持久化会话状态、持久化�
 ## 权威与请求路径
 
 用户通过可选客户端 UI 调用 Navigator。Navigator 按业务域直接调用 Catalyst、Yield、Echo、Reactor 或 Exchange。可选 UI bundle 和已安装适配器不改变 Product 权威。Platform 只提供安装/兼容性底座，不会中转数据集、训练、服务、评估或对话负载。因此新增 Product 或 Plugin 适配器应修改其 owner 仓库或 Navigator 适配器，已发布的 Platform 契约保持不变。
+
+面向浏览器的 `POST /api/v1/workspace-snapshots` 要求配置好的 bearer principal，其服务端
+organization 与 Workspace scope 必须和 `workspaceId` 匹配。Navigator 不接受调用方指定
+organization，也不向 Product 转发浏览器 bearer。每个下游 Product bearer 都按
+`(Product, organization_id, workspace_id)` 从服务端配置选择；缺少凭据时 fail closed，不会发出
+未认证的 Product 请求。只接受
+[`product-read-port.md`](../contracts/product/v1/product-read-port.md) 中固定的私有 Product READ 路径。
+响应 `sourceUrl` 是稳定的 `cyrene://product/{owner}{path}` 来源 URI，不包含配置的私有 Product 主机名，
+也不是导航链接。
 
 ## Navigator 所有的接口
 

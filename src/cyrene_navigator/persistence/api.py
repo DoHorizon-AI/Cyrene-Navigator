@@ -196,9 +196,7 @@ def create_persistence_app(
         """List Workspace sessions without write capabilities. | 列出 Workspace 会话。"""
 
         principal = authenticate(request, workspace_id)
-        return {
-            "items": store.list_snapshots(workspace_id, principal.organization_id)
-        }
+        return {"items": store.list_snapshots(workspace_id, principal.organization_id)}
 
     @app.get(
         _SESSIONS_PATH + "/{session_id}",
@@ -225,9 +223,7 @@ def create_persistence_app(
         """
 
         principal = authenticate(request, workspace_id)
-        return store.get_product_metadata(
-            workspace_id, session_id, principal.organization_id
-        )
+        return store.get_product_metadata(workspace_id, session_id, principal.organization_id)
 
     @app.post(
         _SESSIONS_PATH + "/{session_id}/handles",
