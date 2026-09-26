@@ -14,13 +14,13 @@ The service uses SQLite WAL and synchronous commits. The review manifest uses on
 
 The image runs only scripts/serve-persistence.py; it does not load the Harness session-control.ts Connection routes. The persistence API returns writerToken and epoch to an authenticated caller when it grants a write handle. Keep the Harness bearer and every returned writer capability inside a trusted server-side Harness/Persistence runtime. A browser, BFF, Frontend Relay, or Workspace Connector must not call the raw Harness mutation routes, receive or forward a writerToken/epoch, or submit arbitrary event batches.
 
-The internal ACA ingress restricts traffic to the Container Apps environment; it does not authorize individual apps or callers inside that environment. The manifest's inbound bearer is a server-to-server credential, not a browser session. Any production route must terminate at an independently authorized server-side boundary that owns the writer capability and never serializes it into a browser response. The ownershipAction response shape in the separate Harness host also requires its own owner review before that host is exposed.
+The internal ACA ingress restricts traffic to the Container Apps environment; it does not authorize individual apps or callers inside that environment. The manifest's inbound bearer is a server-to-server credential, not a browser session. Any production route must terminate at an independently authorized server-side boundary that owns the writer capability and never serializes it into a browser response. The separate Harness host now allowlists its takeover response fields, but that does not make this raw persistence API safe for browser/BFF use or prove that the Host is production-ready.
 
 The BFF/Workspace call chain remains BFF → Frontend Relay → Workspace Connector → ProductHttpApiAdapter → Product ACA. This Navigator package is not a substitute for that Connector path. There is no production Connector placement or Navigator ACA app to demonstrate the required private network routes.
 
 镜像只运行 scripts/serve-persistence.py，不会加载 Harness session-control.ts Connection 路由。持久化 API 在向经过认证的调用方授予写句柄时会返回 writerToken 和 epoch。Harness bearer 与返回的写能力必须留在可信的 server-side Harness/Persistence runtime 中。浏览器、BFF、Frontend Relay 或 Workspace Connector 不得调用原始 Harness 变更路由、接收或转发 writerToken/epoch，也不得提交任意 event batch。
 
-ACA 内网 ingress 只将流量限定在 Container Apps 环境内，不会授权环境内的具体应用或调用方。manifest 的入站 bearer 是服务间凭据，不是浏览器 session。任何生产路由都必须经过独立授权的服务端边界；该边界拥有写能力，且不会把写能力序列化进浏览器响应。独立 Harness host 中 ownershipAction 的响应形状，在该 host 暴露前也必须由其 owner 单独审查。
+ACA 内网 ingress 只将流量限定在 Container Apps 环境内，不会授权环境内的具体应用或调用方。manifest 的入站 bearer 是服务间凭据，不是浏览器 session。任何生产路由都必须经过独立授权的服务端边界；该边界拥有写能力，且不会把写能力序列化进浏览器响应。独立 Harness host 现已对 takeover 响应字段使用 allowlist，但这不代表原始持久化 API 可以供浏览器/BFF 调用，也不证明 Host 已达到生产就绪。
 
 BFF/Workspace 调用链仍为 BFF → Frontend Relay → Workspace Connector → ProductHttpApiAdapter → Product ACA。这个 Navigator 包不能替代该 Connector 路径。当前没有生产 Connector host 部署位置或 Navigator ACA app 能证明所需的私网路由。
 
@@ -90,6 +90,14 @@ Before production, the owner must provide and verify all of the following:
 5. Real ACA ingress, probe, secret-volume, identity, and network acceptance. This review template is not live-environment evidence.
 
 该 manifest 仅允许环境内访问，使用不可变镜像 digest 占位符、Key Vault 引用、挂载 JSON 配置的 secret volume、单副本和本地临时存储。模板故意保留未完成占位符，尚未应用到 Azure。本 slice 不包含 GHCR build 或 Azure 部署 workflow。
+
+## References
+
+- ACA ingress: https://learn.microsoft.com/en-us/azure/container-apps/ingress-how-to
+- ACA health probes: https://learn.microsoft.com/en-us/azure/container-apps/health-probes
+- ACA secret volumes and Key Vault references: https://learn.microsoft.com/en-us/azure/container-apps/manage-secrets
+- ACA storage mounts: https://learn.microsoft.com/en-us/azure/container-apps/storage-mounts
+- SQLite Write-Ahead Logging: https://www.sqlite.org/wal.html
 
 生产前必须提供并验证：
 
