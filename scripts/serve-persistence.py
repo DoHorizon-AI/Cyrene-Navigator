@@ -15,7 +15,8 @@ import socket
 from pathlib import Path
 
 import uvicorn
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from cyrene_navigator import Product
 from cyrene_navigator import create_app as create_product_api_app
@@ -85,8 +86,17 @@ def main() -> None:
     parser.add_argument("--lease-seconds", type=float, default=120)
     parser.add_argument("--artifact-root", type=Path)
     parser.add_argument("--echo-url")
+    parser.add_argument(
+        "--require-product-service-configuration",
+        action="store_true",
+        help="fail startup unless all Product origins and scoped Bearers are configured",
+    )
     args = parser.parse_args()
-    config = ServiceConfig.model_validate_json(args.principal_config.read_text(encoding="utf-8"))
+    try:
+        config_text = args.principal_config.read_text(encoding="utf-8")
+        config = ServiceConfig.model_validate_json(config_text)
+    except (OSError, UnicodeDecodeError, ValidationError):
+        raise ValueError("Unable to read or validate Navigator service configuration") from None
     principals: dict[str, PersistencePrincipal] = {}
     for row in config.principals:
         token = os.environ.get(row.token_env)
@@ -104,6 +114,10 @@ def main() -> None:
     product_service_credentials = _load_product_service_credentials(
         config.product_service_credentials
     )
+    if args.require_product_service_configuration:
+        _require_product_service_configuration(
+            config, product_directory, product_service_credentials
+        )
     args.database.parent.mkdir(parents=True, exist_ok=True)
     app = create_persistence_app(
         args.database,
@@ -112,6 +126,25 @@ def main() -> None:
         artifact_root=args.artifact_root,
         echo_url=args.echo_url,
     )
+
+    @app.get("/healthz", include_in_schema=False)
+    def healthz() -> dict[str, str]:
+        """Report only that the ASGI process can answer HTTP probes. | 仅报告进程存活。"""
+
+        return {"status": "alive"}
+
+    @app.get("/readyz", include_in_schema=False)
+    def readyz() -> JSONResponse:
+        """Report local startup completion, not downstream or durability health.
+
+        中文:仅报告配置加载与本地 SQLite 初始化已完成，不代表下游或持久性可用。
+        """
+
+        store = app.state.persistence_store
+        if not store.db_path.is_file():
+            return JSONResponse(status_code=503, content={"status": "not-ready"})
+        return JSONResponse(content={"status": "ready"})
+
     app.mount(
         "",
         create_product_api_app(
@@ -159,6 +192,38 @@ def _load_product_service_credentials(
         if value:
             credentials[key] = value
     return credentials
+
+
+def _require_product_service_configuration(
+    config: ServiceConfig,
+    product_directory: dict[Product, str],
+    credentials: dict[tuple[Product, str, str], str],
+) -> None:
+    """Require a complete exact Product credential matrix for packaged service mode.
+
+    中文:打包服务模式必须为每个组织与 Workspace 配置全部五个 Product 的专属凭据。
+    """
+
+    products = set(Product)
+    if set(product_directory) != products:
+        raise ValueError("packaged service requires one configured origin for every Product")
+
+    scopes = {
+        (principal.organization_id, workspace_id)
+        for principal in config.principals
+        if principal.organization_id is not None
+        for workspace_id in principal.workspace_ids
+    }
+    if not scopes:
+        raise ValueError("packaged service requires an organization-scoped Workspace principal")
+
+    expected = {
+        (product, organization_id, workspace_id)
+        for product in products
+        for organization_id, workspace_id in scopes
+    }
+    if set(credentials) != expected:
+        raise ValueError("packaged service requires one scoped credential per Product Workspace")
 
 
 if __name__ == "__main__":
