@@ -45,6 +45,15 @@ class PersistencePrincipal:
     actor_id: str
     workspace_ids: frozenset[str]
     can_takeover: bool = False
+    organization_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.actor_id, str) or not self.actor_id.strip():
+            raise ValueError("principal actor_id must be non-empty text")
+        if self.organization_id is not None and (
+            not isinstance(self.organization_id, str) or not self.organization_id.strip()
+        ):
+            raise ValueError("principal organization_id must be non-empty text when configured")
 
 
 # The shorter name is convenient for callers while keeping the API contract explicit.
@@ -128,13 +137,14 @@ class PersistenceStore:
         )
         normalized_header = _validate_header(header, session_id, inherited_event_count)
         creator_actor_id = _validate_identifier(principal.actor_id, "actor_id")
+        organization_id = _organization_key(principal.organization_id)
         now = _unix_ms()
         token = _new_token()
         epoch = 1
         lease_expires_at = self._lease_expiry(now)
         try:
             with self._mutation() as conn:
-                if self._fetch_session(conn, workspace_id, session_id) is not None:
+                if self._fetch_session(conn, organization_id, workspace_id, session_id) is not None:
                     raise PersistenceError(
                         SESSION_ALREADY_EXISTS,
                         409,
@@ -143,12 +153,14 @@ class PersistenceStore:
                 conn.execute(
                     """
                     INSERT INTO sessions (
-                        workspace_id, session_id, header_json, inherited_event_count,
+                        organization_id, workspace_id, session_id, header_json,
+                        inherited_event_count,
                         event_count, revision, last_activity_at, owner_actor_id,
                         owner_client_id, writer_token_hash, epoch, lease_expires_at
-                    ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
+                        organization_id,
                         workspace_id,
                         session_id,
                         _json_text(normalized_header),
@@ -165,11 +177,12 @@ class PersistenceStore:
                 conn.execute(
                     """
                     INSERT INTO session_product_metadata (
-                        workspace_id, session_id, creator_actor_id, owner_actor_id,
+                        organization_id, workspace_id, session_id, creator_actor_id, owner_actor_id,
                         owner_state, metadata_version, source, created_at
-                    ) VALUES (?, ?, ?, ?, 'known', 1, 'cyrene', ?)
+                    ) VALUES (?, ?, ?, ?, ?, 'known', 1, 'cyrene', ?)
                     """,
                     (
+                        organization_id,
                         workspace_id,
                         session_id,
                         creator_actor_id,
@@ -177,7 +190,7 @@ class PersistenceStore:
                         now,
                     ),
                 )
-                row = self._require_session(conn, workspace_id, session_id)
+                row = self._require_session(conn, organization_id, workspace_id, session_id)
                 return self._handle_from_row(row, "write", token_override=token)
         except sqlite3.IntegrityError as exc:
             raise PersistenceError(
@@ -186,36 +199,55 @@ class PersistenceStore:
                 "The session already exists in this Workspace.",
             ) from exc
 
-    def list_snapshots(self, workspace_id: str) -> list[JsonObject]:
+    def list_snapshots(
+        self, workspace_id: str, organization_id: str | None = None
+    ) -> list[JsonObject]:
         """List Harness and Product metadata without writer lease state. | 列出会话与产品元数据。"""
 
         workspace_id = _validate_identifier(workspace_id, "workspace_id")
+        organization_key = _organization_key(organization_id)
         with self._read() as conn:
             rows = conn.execute(
-                "SELECT * FROM sessions WHERE workspace_id = ? ORDER BY session_id",
-                (workspace_id,),
+                "SELECT * FROM sessions WHERE organization_id = ? AND workspace_id = ? "
+                "ORDER BY session_id",
+                (organization_key, workspace_id),
             ).fetchall()
             return [self._snapshot_from_row(conn, row) for row in rows]
 
-    def get_snapshot(self, workspace_id: str, session_id: str) -> JsonObject:
+    def get_snapshot(
+        self,
+        workspace_id: str,
+        session_id: str,
+        organization_id: str | None = None,
+    ) -> JsonObject:
         """Read one Harness and Product metadata snapshot. | 读取会话与产品元数据快照。"""
 
         workspace_id = _validate_identifier(workspace_id, "workspace_id")
         session_id = _validate_identifier(session_id, "session_id")
+        organization_key = _organization_key(organization_id)
         with self._read() as conn:
             return self._snapshot_from_row(
-                conn, self._require_session(conn, workspace_id, session_id)
+                conn,
+                self._require_session(conn, organization_key, workspace_id, session_id),
             )
 
-    def get_product_metadata(self, workspace_id: str, session_id: str) -> JsonObject:
+    def get_product_metadata(
+        self,
+        workspace_id: str,
+        session_id: str,
+        organization_id: str | None = None,
+    ) -> JsonObject:
         """Read stable Product metadata without opening a writer handle. | 读取稳定产品元数据。"""
 
         workspace_id = _validate_identifier(workspace_id, "workspace_id")
         session_id = _validate_identifier(session_id, "session_id")
+        organization_key = _organization_key(organization_id)
         with self._read() as conn:
-            self._require_session(conn, workspace_id, session_id)
+            self._require_session(conn, organization_key, workspace_id, session_id)
             return self._product_metadata_from_row(
-                self._require_product_metadata(conn, workspace_id, session_id)
+                self._require_product_metadata(
+                    conn, organization_key, workspace_id, session_id
+                )
             )
 
     def open_handle(
@@ -232,6 +264,7 @@ class PersistenceStore:
         workspace_id = _validate_identifier(workspace_id, "workspace_id")
         session_id = _validate_identifier(session_id, "session_id")
         client_id = _validate_identifier(client_id, "client_id")
+        organization_id = _organization_key(principal.organization_id)
         if access not in {"read", "write"}:
             raise PersistenceError(
                 "PERSISTENCE_INVALID_ACCESS", 422, "access must be read or write"
@@ -243,11 +276,11 @@ class PersistenceStore:
 
         if access == "read":
             with self._read() as conn:
-                row = self._require_session(conn, workspace_id, session_id)
+                row = self._require_session(conn, organization_id, workspace_id, session_id)
                 return self._handle_from_row(row, "read")
 
         with self._mutation() as conn:
-            row = self._require_session(conn, workspace_id, session_id)
+            row = self._require_session(conn, organization_id, workspace_id, session_id)
 
             current_epoch = _column_int(row, "epoch")
             owner_actor = _column_optional_string(row, "owner_actor_id")
@@ -291,7 +324,7 @@ class PersistenceStore:
                 UPDATE sessions
                 SET owner_actor_id = ?, owner_client_id = ?, writer_token_hash = ?,
                     epoch = ?, lease_expires_at = ?, last_activity_at = ?
-                WHERE workspace_id = ? AND session_id = ?
+                WHERE organization_id = ? AND workspace_id = ? AND session_id = ?
                 """,
                 (
                     _validate_identifier(principal.actor_id, "actor_id"),
@@ -300,20 +333,27 @@ class PersistenceStore:
                     epoch,
                     lease_expires_at,
                     _unix_ms(),
+                    organization_id,
                     workspace_id,
                     session_id,
                 ),
             )
-            current = self._require_session(conn, workspace_id, session_id)
+            current = self._require_session(conn, organization_id, workspace_id, session_id)
             return self._handle_from_row(current, "write", token_override=token)
 
     def read_events(
-        self, workspace_id: str, session_id: str, offset: int = 0, length: int = 10_000
+        self,
+        workspace_id: str,
+        session_id: str,
+        offset: int = 0,
+        length: int = 10_000,
+        organization_id: str | None = None,
     ) -> tuple[list[JsonObject], int]:
         """Read a committed contiguous slice without mutating the log. | 读取已提交事件。"""
 
         workspace_id = _validate_identifier(workspace_id, "workspace_id")
         session_id = _validate_identifier(session_id, "session_id")
+        organization_key = _organization_key(organization_id)
         offset = _validate_non_negative_int(offset, "offset")
         length = _validate_non_negative_int(length, "length")
         if length > _MAX_PAGE_LENGTH:
@@ -321,17 +361,19 @@ class PersistenceStore:
                 "PERSISTENCE_PAGE_TOO_LARGE", 422, f"length must be <= {_MAX_PAGE_LENGTH}"
             )
         with self._read() as conn:
-            session = self._require_session(conn, workspace_id, session_id)
+            session = self._require_session(
+                conn, organization_key, workspace_id, session_id
+            )
             next_seq = _column_int(session, "event_count")
             if length == 0 or offset >= next_seq:
                 return [], next_seq
             rows = conn.execute(
                 """
                 SELECT seq, event_json FROM session_events
-                WHERE workspace_id = ? AND session_id = ? AND seq >= ?
+                WHERE organization_id = ? AND workspace_id = ? AND session_id = ? AND seq >= ?
                 ORDER BY seq LIMIT ?
                 """,
-                (workspace_id, session_id, offset, length),
+                (organization_key, workspace_id, session_id, offset, length),
             ).fetchall()
             expected_count = min(length, next_seq - offset)
             if len(rows) != expected_count:
@@ -371,18 +413,20 @@ class PersistenceStore:
         writer_token = _validate_identifier(writer_token, "writer_token")
         batch_id = _validate_identifier(batch_id, "batch_id")
         epoch = _validate_non_negative_int(epoch, "epoch")
+        organization_id = _organization_key(principal.organization_id)
         normalized_events = _validate_event_shapes(events)
         digest = _digest(normalized_events)
 
         with self._mutation() as conn:
-            row = self._require_session(conn, workspace_id, session_id)
+            row = self._require_session(conn, organization_id, workspace_id, session_id)
             self._assert_writer(row, principal, writer_token, epoch)
             existing = conn.execute(
                 """
                 SELECT digest, next_seq FROM session_batches
-                WHERE workspace_id = ? AND session_id = ? AND epoch = ? AND batch_id = ?
+                WHERE organization_id = ? AND workspace_id = ? AND session_id = ?
+                  AND epoch = ? AND batch_id = ?
                 """,
-                (workspace_id, session_id, epoch, batch_id),
+                (organization_id, workspace_id, session_id, epoch, batch_id),
             ).fetchone()
             if existing is not None:
                 existing_digest = _column_string(existing, "digest")
@@ -399,11 +443,18 @@ class PersistenceStore:
             try:
                 conn.executemany(
                     """
-                    INSERT INTO session_events (workspace_id, session_id, seq, event_json)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO session_events (
+                        organization_id, workspace_id, session_id, seq, event_json
+                    ) VALUES (?, ?, ?, ?, ?)
                     """,
                     [
-                        (workspace_id, session_id, event["seq"], _json_text(event))
+                        (
+                            organization_id,
+                            workspace_id,
+                            session_id,
+                            event["seq"],
+                            _json_text(event),
+                        )
                         for event in normalized_events
                     ],
                 )
@@ -413,12 +464,13 @@ class PersistenceStore:
                     """
                     UPDATE sessions
                     SET event_count = ?, revision = ?, last_activity_at = ?
-                    WHERE workspace_id = ? AND session_id = ?
+                    WHERE organization_id = ? AND workspace_id = ? AND session_id = ?
                     """,
                     (
                         committed_next_seq,
                         _revision(committed_next_seq, digest),
                         now,
+                        organization_id,
                         workspace_id,
                         session_id,
                     ),
@@ -426,10 +478,12 @@ class PersistenceStore:
                 conn.execute(
                     """
                     INSERT INTO session_batches (
-                        workspace_id, session_id, epoch, batch_id, digest, event_count, next_seq
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        organization_id, workspace_id, session_id, epoch, batch_id,
+                        digest, event_count, next_seq
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
+                        organization_id,
                         workspace_id,
                         session_id,
                         epoch,
@@ -489,8 +543,9 @@ class PersistenceStore:
         session_id = _validate_identifier(session_id, "session_id")
         writer_token = _validate_identifier(writer_token, "writer_token")
         epoch = _validate_non_negative_int(epoch, "epoch")
+        organization_id = _organization_key(principal.organization_id)
         with self._mutation() as conn:
-            row = self._require_session(conn, workspace_id, session_id)
+            row = self._require_session(conn, organization_id, workspace_id, session_id)
             self._assert_writer(row, principal, writer_token, epoch)
             next_epoch = _column_int(row, "epoch") + 1
             conn.execute(
@@ -498,9 +553,9 @@ class PersistenceStore:
                 UPDATE sessions
                 SET owner_actor_id = NULL, owner_client_id = NULL,
                     writer_token_hash = NULL, lease_expires_at = NULL, epoch = ?
-                WHERE workspace_id = ? AND session_id = ?
+                WHERE organization_id = ? AND workspace_id = ? AND session_id = ?
                 """,
-                (next_epoch, workspace_id, session_id),
+                (next_epoch, organization_id, workspace_id, session_id),
             )
             return _column_int(row, "event_count")
 
@@ -520,8 +575,9 @@ class PersistenceStore:
         session_id = _validate_identifier(session_id, "session_id")
         writer_token = _validate_identifier(writer_token, "writer_token")
         epoch = _validate_non_negative_int(epoch, "epoch")
+        organization_id = _organization_key(principal.organization_id)
         with self._mutation() as conn:
-            row = self._require_session(conn, workspace_id, session_id)
+            row = self._require_session(conn, organization_id, workspace_id, session_id)
             self._assert_writer(row, principal, writer_token, epoch)
             lease_expires_at = _column_int(row, "lease_expires_at")
             if renew:
@@ -530,9 +586,15 @@ class PersistenceStore:
                     """
                     UPDATE sessions
                     SET lease_expires_at = ?, last_activity_at = ?
-                    WHERE workspace_id = ? AND session_id = ?
+                    WHERE organization_id = ? AND workspace_id = ? AND session_id = ?
                     """,
-                    (lease_expires_at, _unix_ms(), workspace_id, session_id),
+                    (
+                        lease_expires_at,
+                        _unix_ms(),
+                        organization_id,
+                        workspace_id,
+                        session_id,
+                    ),
                 )
             return _column_int(row, "event_count"), lease_expires_at
 
@@ -591,6 +653,7 @@ class PersistenceStore:
             "productMetadata": self._product_metadata_from_row(
                 self._require_product_metadata(
                     conn,
+                    _column_string(row, "organization_id"),
                     _column_string(row, "workspace_id"),
                     _column_string(row, "session_id"),
                 )
@@ -602,25 +665,33 @@ class PersistenceStore:
 
     @staticmethod
     def _fetch_session(
-        conn: sqlite3.Connection, workspace_id: str, session_id: str
+        conn: sqlite3.Connection,
+        organization_id: str,
+        workspace_id: str,
+        session_id: str,
     ) -> sqlite3.Row | None:
-        """Fetch one keyed session row. | 读取 workspace/session 复合键。"""
+        """Fetch one scoped session row. | 读取 organization/workspace/session 复合键。"""
 
         return cast(
             sqlite3.Row | None,
             conn.execute(
-                "SELECT * FROM sessions WHERE workspace_id = ? AND session_id = ?",
-                (workspace_id, session_id),
+                "SELECT * FROM sessions WHERE organization_id = ? AND workspace_id = ? "
+                "AND session_id = ?",
+                (organization_id, workspace_id, session_id),
             ).fetchone(),
         )
 
     @classmethod
     def _require_session(
-        cls, conn: sqlite3.Connection, workspace_id: str, session_id: str
+        cls,
+        conn: sqlite3.Connection,
+        organization_id: str,
+        workspace_id: str,
+        session_id: str,
     ) -> sqlite3.Row:
         """Require a session row or return the stable not-found error. | 要求会话存在。"""
 
-        row = cls._fetch_session(conn, workspace_id, session_id)
+        row = cls._fetch_session(conn, organization_id, workspace_id, session_id)
         if row is None:
             raise PersistenceError(
                 SESSION_NOT_FOUND,
@@ -631,7 +702,10 @@ class PersistenceStore:
 
     @staticmethod
     def _require_product_metadata(
-        conn: sqlite3.Connection, workspace_id: str, session_id: str
+        conn: sqlite3.Connection,
+        organization_id: str,
+        workspace_id: str,
+        session_id: str,
     ) -> sqlite3.Row:
         """Require the separately stored Product projection. | 要求独立产品投影。"""
 
@@ -640,9 +714,9 @@ class PersistenceStore:
             conn.execute(
                 """
                 SELECT * FROM session_product_metadata
-                WHERE workspace_id = ? AND session_id = ?
+                WHERE organization_id = ? AND workspace_id = ? AND session_id = ?
                 """,
-                (workspace_id, session_id),
+                (organization_id, workspace_id, session_id),
             ).fetchone(),
         )
         if row is None:
@@ -715,73 +789,19 @@ class PersistenceStore:
         """Create the durable schema under a write transaction. | 在写事务中建表。"""
 
         with self._mutation() as conn:
-            for statement in (
-                """
-                CREATE TABLE IF NOT EXISTS sessions (
-                    workspace_id TEXT NOT NULL,
-                    session_id TEXT NOT NULL,
-                    header_json TEXT NOT NULL,
-                    inherited_event_count INTEGER NOT NULL CHECK (inherited_event_count >= 0),
-                    event_count INTEGER NOT NULL CHECK (event_count >= 0),
-                    revision TEXT NOT NULL,
-                    last_activity_at INTEGER NOT NULL,
-                    owner_actor_id TEXT,
-                    owner_client_id TEXT,
-                    writer_token_hash TEXT,
-                    epoch INTEGER NOT NULL CHECK (epoch >= 0),
-                    lease_expires_at INTEGER,
-                    PRIMARY KEY (workspace_id, session_id),
-                    CHECK (
-                        (owner_actor_id IS NULL AND owner_client_id IS NULL
-                         AND writer_token_hash IS NULL AND lease_expires_at IS NULL)
-                        OR
-                        (owner_actor_id IS NOT NULL AND owner_client_id IS NOT NULL
-                         AND writer_token_hash IS NOT NULL AND lease_expires_at IS NOT NULL)
-                    )
-                );
-                """,
-                """
-                CREATE TABLE IF NOT EXISTS session_events (
-                    workspace_id TEXT NOT NULL,
-                    session_id TEXT NOT NULL,
-                    seq INTEGER NOT NULL CHECK (seq >= 0),
-                    event_json TEXT NOT NULL,
-                    PRIMARY KEY (workspace_id, session_id, seq),
-                    FOREIGN KEY (workspace_id, session_id)
-                        REFERENCES sessions (workspace_id, session_id) ON DELETE CASCADE
-                );
-                """,
-                """
-                CREATE TABLE IF NOT EXISTS session_batches (
-                    workspace_id TEXT NOT NULL,
-                    session_id TEXT NOT NULL,
-                    epoch INTEGER NOT NULL CHECK (epoch >= 0),
-                    batch_id TEXT NOT NULL,
-                    digest TEXT NOT NULL,
-                    event_count INTEGER NOT NULL CHECK (event_count > 0),
-                    next_seq INTEGER NOT NULL CHECK (next_seq >= 0),
-                    PRIMARY KEY (workspace_id, session_id, epoch, batch_id),
-                    FOREIGN KEY (workspace_id, session_id)
-                        REFERENCES sessions (workspace_id, session_id) ON DELETE CASCADE
-                );
-                """,
-                """
-                CREATE TABLE IF NOT EXISTS session_product_metadata (
-                    workspace_id TEXT NOT NULL,
-                    session_id TEXT NOT NULL,
-                    creator_actor_id TEXT,
-                    owner_actor_id TEXT,
-                    owner_state TEXT NOT NULL CHECK (owner_state IN ('known', 'unknown')),
-                    metadata_version INTEGER NOT NULL CHECK (metadata_version >= 1),
-                    source TEXT NOT NULL CHECK (source IN ('cyrene', 'legacy')),
-                    created_at INTEGER,
-                    PRIMARY KEY (workspace_id, session_id),
-                    FOREIGN KEY (workspace_id, session_id)
-                        REFERENCES sessions (workspace_id, session_id) ON DELETE CASCADE
-                );
-                """,
+            existing_tables = {
+                str(row["name"])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            if "sessions" in existing_tables and self._needs_scope_rebuild(
+                conn, existing_tables
             ):
-                conn.execute(statement)
+                self._rebuild_scope_schema(conn, existing_tables)
+            else:
+                self._create_scoped_schema(conn)
+
             # This additive bootstrap is the migration for databases created before
             # Product metadata existed. The old mutable writer is intentionally not
             # copied into the stable Product owner fields.
@@ -790,13 +810,289 @@ class PersistenceStore:
             conn.execute(
                 """
                 INSERT OR IGNORE INTO session_product_metadata (
-                    workspace_id, session_id, creator_actor_id, owner_actor_id,
+                    organization_id, workspace_id, session_id, creator_actor_id, owner_actor_id,
                     owner_state, metadata_version, source, created_at
                 )
-                SELECT workspace_id, session_id, NULL, NULL, 'unknown', 1, 'legacy', NULL
+                SELECT organization_id, workspace_id, session_id, NULL, NULL,
+                       'unknown', 1, 'legacy', NULL
                 FROM sessions
                 """
             )
+
+    @staticmethod
+    def _needs_scope_rebuild(
+        conn: sqlite3.Connection, existing_tables: set[str]
+    ) -> bool:
+        """Detect the pre-organization schema or an incomplete scope migration."""
+
+        expected_primary_keys = {
+            "sessions": ("organization_id", "workspace_id", "session_id"),
+            "session_events": ("organization_id", "workspace_id", "session_id", "seq"),
+            "session_batches": (
+                "organization_id",
+                "workspace_id",
+                "session_id",
+                "epoch",
+                "batch_id",
+            ),
+            "session_product_metadata": ("organization_id", "workspace_id", "session_id"),
+        }
+        for table_name, primary_key in expected_primary_keys.items():
+            if table_name not in existing_tables:
+                continue
+            columns = {
+                str(row["name"])
+                for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+            }
+            primary_key_columns = tuple(
+                str(row["name"])
+                for row in sorted(
+                    (
+                        row
+                        for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+                        if int(row["pk"]) > 0
+                    ),
+                    key=lambda row: int(row["pk"]),
+                )
+            )
+            if "organization_id" not in columns or primary_key_columns != primary_key:
+                return True
+        return False
+
+    @staticmethod
+    def _create_scoped_schema(conn: sqlite3.Connection) -> None:
+        """Create the organization/workspace/session composite-key schema."""
+
+        for statement in (
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                organization_id TEXT NOT NULL DEFAULT '',
+                workspace_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                header_json TEXT NOT NULL,
+                inherited_event_count INTEGER NOT NULL CHECK (inherited_event_count >= 0),
+                event_count INTEGER NOT NULL CHECK (event_count >= 0),
+                revision TEXT NOT NULL,
+                last_activity_at INTEGER NOT NULL,
+                owner_actor_id TEXT,
+                owner_client_id TEXT,
+                writer_token_hash TEXT,
+                epoch INTEGER NOT NULL CHECK (epoch >= 0),
+                lease_expires_at INTEGER,
+                PRIMARY KEY (organization_id, workspace_id, session_id),
+                CHECK (
+                    (owner_actor_id IS NULL AND owner_client_id IS NULL
+                     AND writer_token_hash IS NULL AND lease_expires_at IS NULL)
+                    OR
+                    (owner_actor_id IS NOT NULL AND owner_client_id IS NOT NULL
+                     AND writer_token_hash IS NOT NULL AND lease_expires_at IS NOT NULL)
+                )
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS session_events (
+                organization_id TEXT NOT NULL DEFAULT '',
+                workspace_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                seq INTEGER NOT NULL CHECK (seq >= 0),
+                event_json TEXT NOT NULL,
+                PRIMARY KEY (organization_id, workspace_id, session_id, seq),
+                FOREIGN KEY (organization_id, workspace_id, session_id)
+                    REFERENCES sessions (organization_id, workspace_id, session_id)
+                    ON DELETE CASCADE
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS session_batches (
+                organization_id TEXT NOT NULL DEFAULT '',
+                workspace_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                epoch INTEGER NOT NULL CHECK (epoch >= 0),
+                batch_id TEXT NOT NULL,
+                digest TEXT NOT NULL,
+                event_count INTEGER NOT NULL CHECK (event_count > 0),
+                next_seq INTEGER NOT NULL CHECK (next_seq >= 0),
+                PRIMARY KEY (organization_id, workspace_id, session_id, epoch, batch_id),
+                FOREIGN KEY (organization_id, workspace_id, session_id)
+                    REFERENCES sessions (organization_id, workspace_id, session_id)
+                    ON DELETE CASCADE
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS session_product_metadata (
+                organization_id TEXT NOT NULL DEFAULT '',
+                workspace_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                creator_actor_id TEXT,
+                owner_actor_id TEXT,
+                owner_state TEXT NOT NULL CHECK (owner_state IN ('known', 'unknown')),
+                metadata_version INTEGER NOT NULL CHECK (metadata_version >= 1),
+                source TEXT NOT NULL CHECK (source IN ('cyrene', 'legacy')),
+                created_at INTEGER,
+                PRIMARY KEY (organization_id, workspace_id, session_id),
+                FOREIGN KEY (organization_id, workspace_id, session_id)
+                    REFERENCES sessions (organization_id, workspace_id, session_id)
+                    ON DELETE CASCADE
+            );
+            """,
+        ):
+            conn.execute(statement)
+
+    @staticmethod
+    def _rebuild_scope_schema(
+        conn: sqlite3.Connection, existing_tables: set[str]
+    ) -> None:
+        """Migrate every historical row to unknown organization scope atomically."""
+
+        for table_name in (
+            "sessions_scope_v2",
+            "session_events_scope_v2",
+            "session_batches_scope_v2",
+            "session_product_metadata_scope_v2",
+        ):
+            conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+
+        conn.execute(
+            """
+            CREATE TABLE sessions_scope_v2 (
+                organization_id TEXT NOT NULL DEFAULT '',
+                workspace_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                header_json TEXT NOT NULL,
+                inherited_event_count INTEGER NOT NULL CHECK (inherited_event_count >= 0),
+                event_count INTEGER NOT NULL CHECK (event_count >= 0),
+                revision TEXT NOT NULL,
+                last_activity_at INTEGER NOT NULL,
+                owner_actor_id TEXT,
+                owner_client_id TEXT,
+                writer_token_hash TEXT,
+                epoch INTEGER NOT NULL CHECK (epoch >= 0),
+                lease_expires_at INTEGER,
+                PRIMARY KEY (organization_id, workspace_id, session_id),
+                CHECK (
+                    (owner_actor_id IS NULL AND owner_client_id IS NULL
+                     AND writer_token_hash IS NULL AND lease_expires_at IS NULL)
+                    OR
+                    (owner_actor_id IS NOT NULL AND owner_client_id IS NOT NULL
+                     AND writer_token_hash IS NOT NULL AND lease_expires_at IS NOT NULL)
+                )
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE session_events_scope_v2 (
+                organization_id TEXT NOT NULL DEFAULT '',
+                workspace_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                seq INTEGER NOT NULL CHECK (seq >= 0),
+                event_json TEXT NOT NULL,
+                PRIMARY KEY (organization_id, workspace_id, session_id, seq),
+                FOREIGN KEY (organization_id, workspace_id, session_id)
+                    REFERENCES sessions_scope_v2 (organization_id, workspace_id, session_id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE session_batches_scope_v2 (
+                organization_id TEXT NOT NULL DEFAULT '',
+                workspace_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                epoch INTEGER NOT NULL CHECK (epoch >= 0),
+                batch_id TEXT NOT NULL,
+                digest TEXT NOT NULL,
+                event_count INTEGER NOT NULL CHECK (event_count > 0),
+                next_seq INTEGER NOT NULL CHECK (next_seq >= 0),
+                PRIMARY KEY (organization_id, workspace_id, session_id, epoch, batch_id),
+                FOREIGN KEY (organization_id, workspace_id, session_id)
+                    REFERENCES sessions_scope_v2 (organization_id, workspace_id, session_id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE session_product_metadata_scope_v2 (
+                organization_id TEXT NOT NULL DEFAULT '',
+                workspace_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                creator_actor_id TEXT,
+                owner_actor_id TEXT,
+                owner_state TEXT NOT NULL CHECK (owner_state IN ('known', 'unknown')),
+                metadata_version INTEGER NOT NULL CHECK (metadata_version >= 1),
+                source TEXT NOT NULL CHECK (source IN ('cyrene', 'legacy')),
+                created_at INTEGER,
+                PRIMARY KEY (organization_id, workspace_id, session_id),
+                FOREIGN KEY (organization_id, workspace_id, session_id)
+                    REFERENCES sessions_scope_v2 (organization_id, workspace_id, session_id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            INSERT INTO sessions_scope_v2 (
+                organization_id, workspace_id, session_id, header_json,
+                inherited_event_count, event_count, revision, last_activity_at,
+                owner_actor_id, owner_client_id, writer_token_hash, epoch, lease_expires_at
+            )
+            SELECT '', workspace_id, session_id, header_json,
+                   inherited_event_count, event_count, revision, last_activity_at,
+                   owner_actor_id, owner_client_id, writer_token_hash, epoch, lease_expires_at
+            FROM sessions
+            """
+        )
+        if "session_events" in existing_tables:
+            conn.execute(
+                """
+                INSERT INTO session_events_scope_v2 (
+                    organization_id, workspace_id, session_id, seq, event_json
+                )
+                SELECT '', workspace_id, session_id, seq, event_json FROM session_events
+                """
+            )
+        if "session_batches" in existing_tables:
+            conn.execute(
+                """
+                INSERT INTO session_batches_scope_v2 (
+                    organization_id, workspace_id, session_id, epoch, batch_id,
+                    digest, event_count, next_seq
+                )
+                SELECT '', workspace_id, session_id, epoch, batch_id,
+                       digest, event_count, next_seq FROM session_batches
+                """
+            )
+        if "session_product_metadata" in existing_tables:
+            conn.execute(
+                """
+                INSERT INTO session_product_metadata_scope_v2 (
+                    organization_id, workspace_id, session_id, creator_actor_id,
+                    owner_actor_id, owner_state, metadata_version, source, created_at
+                )
+                SELECT '', workspace_id, session_id, creator_actor_id,
+                       owner_actor_id, owner_state, metadata_version, source, created_at
+                FROM session_product_metadata
+                """
+            )
+
+        for table_name in (
+            "session_product_metadata",
+            "session_batches",
+            "session_events",
+            "sessions",
+        ):
+            if table_name in existing_tables:
+                conn.execute(f"DROP TABLE {table_name}")
+        for old_name, new_name in (
+            ("sessions_scope_v2", "sessions"),
+            ("session_events_scope_v2", "session_events"),
+            ("session_batches_scope_v2", "session_batches"),
+            ("session_product_metadata_scope_v2", "session_product_metadata"),
+        ):
+            conn.execute(f"ALTER TABLE {old_name} RENAME TO {new_name}")
 
     def _lease_expiry(self, now: int) -> int:
         """Return a millisecond lease deadline. | 返回毫秒租约截止时间。"""
@@ -964,6 +1260,14 @@ def _validate_identifier(value: str, field: str) -> str:
             "PERSISTENCE_INVALID_IDENTIFIER", 422, f"{field} contains control characters"
         )
     return value
+
+
+def _organization_key(organization_id: str | None) -> str:
+    """Encode unknown legacy organization scope without adopting its rows."""
+
+    if organization_id is None:
+        return ""
+    return _validate_identifier(organization_id, "organization_id")
 
 
 def _validate_non_negative_int(value: int, field: str) -> int:

@@ -388,7 +388,7 @@ def test_legacy_sessions_migrate_with_explicit_unknown_product_owner(tmp_path: P
                 workspace_id, session_id, header_json, inherited_event_count,
                 event_count, revision, last_activity_at, owner_actor_id,
                 owner_client_id, writer_token_hash, epoch, lease_expires_at
-            ) VALUES (?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, 0, 1, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "workspace-a",
@@ -403,9 +403,48 @@ def test_legacy_sessions_migrate_with_explicit_unknown_product_owner(tmp_path: P
                 1_900_000_000_000,
             ),
         )
+        connection.execute(
+            """
+            CREATE TABLE session_events (
+                workspace_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                event_json TEXT NOT NULL,
+                PRIMARY KEY (workspace_id, session_id, seq)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE session_batches (
+                workspace_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                epoch INTEGER NOT NULL,
+                batch_id TEXT NOT NULL,
+                digest TEXT NOT NULL,
+                event_count INTEGER NOT NULL,
+                next_seq INTEGER NOT NULL,
+                PRIMARY KEY (workspace_id, session_id, epoch, batch_id)
+            )
+            """
+        )
+        legacy_event = _event(0, "workspace-a")
+        connection.execute(
+            "INSERT INTO session_events VALUES (?, ?, ?, ?)",
+            ("workspace-a", "legacy-session", 0, json.dumps(legacy_event)),
+        )
+        connection.execute(
+            "INSERT INTO session_batches VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("workspace-a", "legacy-session", 9, "legacy-batch", "legacy-digest", 1, 1),
+        )
         connection.commit()
 
-    client = TestClient(create_persistence_app(db_path, PRINCIPALS))
+    scoped_principals = PRINCIPALS | {
+        "private-token": PersistencePrincipal(
+            "private-reader", frozenset({"workspace-a"}), organization_id="org-private"
+        )
+    }
+    client = TestClient(create_persistence_app(db_path, scoped_principals))
     metadata_path = f"{SESSIONS.format(workspace='workspace-a')}/legacy-session/metadata"
     metadata = client.get(metadata_path, headers=_headers("alice-token"))
     assert metadata.status_code == 200
@@ -419,18 +458,46 @@ def test_legacy_sessions_migrate_with_explicit_unknown_product_owner(tmp_path: P
         "source": "legacy",
         "createdAt": None,
     }
+    legacy_list = client.get(
+        SESSIONS.format(workspace="workspace-a"), headers=_headers("alice-token")
+    )
+    assert [item["meta"]["id"] for item in legacy_list.json()["items"]] == ["legacy-session"]
+    legacy_events = client.get(
+        f"{SESSIONS.format(workspace='workspace-a')}/legacy-session/events",
+        headers=_headers("alice-token"),
+    )
+    assert legacy_events.json() == {"events": [legacy_event], "nextSeq": 1}
+
+    private_list = client.get(
+        SESSIONS.format(workspace="workspace-a"), headers=_headers("private-token")
+    )
+    assert private_list.status_code == 200
+    assert private_list.json() == {"items": []}
+    private_get = client.get(
+        f"{SESSIONS.format(workspace='workspace-a')}/legacy-session",
+        headers=_headers("private-token"),
+    )
+    assert private_get.status_code == 404
 
     # Reopening the service is idempotent; the old mutable writer remains only
     # in the lease table and cannot populate Product metadata later.
     # 中文:重新打开服务是幂等的;旧的可变 writer 只留在 lease 表中,之后不能再写入 Product metadata。
-    TestClient(create_persistence_app(db_path, PRINCIPALS))
+    TestClient(create_persistence_app(db_path, scoped_principals))
     with sqlite3.connect(db_path) as connection:
         migrated = connection.execute(
             """
-            SELECT creator_actor_id, owner_actor_id, owner_state, source
+            SELECT organization_id, creator_actor_id, owner_actor_id, owner_state, source
             FROM session_product_metadata
-            WHERE workspace_id = ? AND session_id = ?
+            WHERE organization_id = '' AND workspace_id = ? AND session_id = ?
             """,
             ("workspace-a", "legacy-session"),
         ).fetchone()
-    assert migrated == (None, None, "unknown", "legacy")
+        migrated_batch = connection.execute(
+            """
+            SELECT organization_id, workspace_id, session_id, epoch, batch_id, next_seq
+            FROM session_batches
+            """
+        ).fetchone()
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert migrated == ("", None, None, "unknown", "legacy")
+    assert migrated_batch == ("", "workspace-a", "legacy-session", 9, "legacy-batch", 1)
