@@ -1,20 +1,16 @@
 # Navigator documentation / Navigator 文档
 
-Navigator owns the Conversation and AgentRun experience. Its V1 runtime is a
-pinned DeepSeek Harness Profile with Cyrene adapters and supervised Rust tools.
-The documents below distinguish the Alpha contract from work under acceptance.
+Navigator composes a pinned revision of the upstream DeepSeek Harness repository with Cyrene adapters and provides local session and Product-read APIs. The `Cyrene-Client` control service reaches Navigator's separate Web Host through a configured service URL. The upstream project owns the Agent Loop and Session event model. `Cyrene-Client` owns the application shell and primary presentation; Navigator also contains Harness UI adapters but no standalone client application.
 
-Navigator 拥有 Conversation 和 AgentRun 产品体验。V1 使用固定的 DeepSeek Harness
-Profile、Cyrene 适配器和受监管 Rust 工具；下列文档区分 Alpha 契约与正在验收的工作。
+Navigator 将固定版本的上游 DeepSeek Harness 仓库与 Cyrene 适配器组合，并提供本地会话与 Product 读取 API。`Cyrene-Client` control service 通过配置的服务 URL 访问 Navigator 的独立 Web Host。上游项目拥有 Agent Loop 与 Session 事件模型。`Cyrene-Client` 拥有应用 shell 和主要展示层；Navigator 也包含 Harness UI 适配器，但不提供独立的客户端应用。
 
 | Document | Purpose / 用途 |
 | --- | --- |
-| [API](API.md) | Existing Product API / 现有产品 API |
+| [API](API.md) | Product, session & Harness API / Product、会话与 Harness 接口 |
 | [Repository lifecycle](REPOSITORY-LIFECYCLE.md) | Repository delivery conventions / 仓库交付约定 |
-| [Harness adoption](adoption/README.md) | Pin, compatibility, plugin inventory and evidence limits / 固定版本、兼容性和证据边界 |
+| [Harness adoption](adoption/README.md) | DeepSeek Harness integration, compatibility & boundaries / DeepSeek Harness 接入、兼容性与边界 |
 | [Codex import](import/README.md) | Archive and explicit Continue semantics / 归档及显式 Continue |
-| [Windows desktop](desktop/README.md) | Native client checks and packaging status / 原生客户端检查与打包状态 |
-| [Logging & Error Standards](logging-and-errors.md) | Cross-repository logging, error codes, and diagnostics specification / 跨仓日志、错误码与诊断规范 (草案 v0.1) |
+| [Logging & Error Standards](logging-and-errors.md) | Cross-repository logging, error codes, and diagnostics specification / 跨仓日志、错误码与诊断规范 |
 
 Repository governance and public-source guidance live in the root
 [`CONTRIBUTING.md`](../CONTRIBUTING.md), [`SECURITY.md`](../SECURITY.md),

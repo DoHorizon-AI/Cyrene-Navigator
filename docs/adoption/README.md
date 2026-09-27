@@ -24,8 +24,9 @@ Platform tool or source dependency. Its implemented methods are reported by the
 
 The profile tests use the real pinned Harness CLI, Bundle, Rust host, and local
 persistence process. Deterministic model adapters used by focused tests are
-fixtures and do not count as real model inference. Installed Windows smoke and
-interactive GUI checks remain separate evidence lanes.
+fixtures and do not count as real model inference. Native Client application UI
+and interactive integration checks are owned by `Cyrene-Client`; Navigator
+continues to cover its Harness UI adapters and API boundaries.
 
 The native supervisor matrix retains cancellation, reaping, protocol-version,
 bounded-output, and credential-isolation checks. Its controlled fault fixture
@@ -54,7 +55,7 @@ explicit, reviewable adapter; it must not be hidden in an installation script.
 
 ## 兼容性与证据
 
-Profile 测试使用真实固定版本 Harness CLI、Bundle、Rust host 和本地持久化进程。重点测试中的确定性模型适配器只是 fixture，不算真实模型推理。已安装 Windows 冒烟和交互式 GUI 检查属于独立证据路径。
+Profile 测试使用真实固定版本 Harness CLI、Bundle、Rust host 和本地持久化进程。重点测试中的确定性模型适配器只是 fixture，不算真实模型推理。Native Client（`Cyrene-Client`）负责应用 UI 和交互集成检查；Navigator 仍覆盖自身 Harness UI 适配器和 API 边界。
 
 原生 supervisor 矩阵保留取消、回收、协议版本、有界输出和凭据隔离检查。受控故障 fixture 只验证传输；Codex 导入仍通过真实 Navigator Rust host。
 

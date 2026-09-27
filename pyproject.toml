@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "cyrene-navigator"
 version = "0.1.0"
-description = "Cyrene Navigator desktop Harness integration and authoritative Session persistence"
+description = "Cyrene Navigator session persistence, Product reads, and Harness integration"
 requires-python = ">=3.12"
 license = "Apache-2.0"
 dependencies = [
