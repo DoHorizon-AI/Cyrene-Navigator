@@ -13,22 +13,11 @@ Navigator 适配器）、`native/`
 （Rust `cyrene-native-host` 进程/集成宿主）、`src/cyrene_navigator/`（Python 会话
 持久化与产品读取服务）。
 
-## How does the Windows client get its data? / Windows 客户端的数据从哪里来？
+## Which repository owns Navigator's client UI? / Navigator 的客户端 UI 归哪个仓库？
 
-The WinUI client now lives in `cyrene.ui.navigator`. Its reads come from the
-workspace-scoped Navigator persistence service through its client adapters
-(`CYRENE_NAVIGATOR_API_URL`, `CYRENE_NAVIGATOR_API_TOKEN`,
-`CYRENE_NAVIGATOR_WORKSPACE`). Actions that require the Harness control route
-(send, cancel, approve) fail closed with `NAVIGATOR_CONTROL_NOT_CONNECTED`. When
-no API is configured the client says so; `CYRENE_NAVIGATOR_UI_PREVIEW=mock` is a
-Debug-only preview mode, and Release builds do not compile the fixtures at all.
+`Cyrene-Client` owns the application shell and primary user-facing presentation. Navigator does not provide a standalone client application, but its `harness/src/client/` directory contains UI adapters for the pinned Harness profile. Report issues against the repository that owns the affected code.
 
-WinUI 客户端现位于 `cyrene.ui.navigator`。其读取路径经客户端适配器来自工作区级
-Navigator 持久化服务（通过 `CYRENE_NAVIGATOR_API_URL`、
-`CYRENE_NAVIGATOR_API_TOKEN`、`CYRENE_NAVIGATOR_WORKSPACE` 配置）。需要 Harness 控制
-通道的动作（发送、取消、审批）以 `NAVIGATOR_CONTROL_NOT_CONNECTED` fail closed。未配置
-API 时客户端会如实说明；`CYRENE_NAVIGATOR_UI_PREVIEW=mock` 是仅 Debug 的预览模式，
-Release 构建完全不编译 fixture。
+`Cyrene-Client` 拥有应用 shell 和主要面向用户的展示层。Navigator 不提供独立的客户端应用，但其 `harness/src/client/` 目录包含固定 Harness profile 的 UI 适配器。报告问题时应按受影响代码的实际归属选择仓库。
 
 ## Where are local capability contracts defined? / 本地能力契约在哪里定义？
 
@@ -46,12 +35,14 @@ Product API references live under `contracts/product/v1/`.
 
 ## Does Navigator own remote product state? / Navigator 是否拥有远程产品状态？
 
-No. Navigator coordinates user-facing workflows and renders remote results.
-Catalyst, Yield, Echo, Reactor, and Exchange remain authorities for their own
-domain state and APIs.
+No. Navigator's bounded `ProductReadPort` aggregates selected Workspace reads,
+but it does not own or change the remote records. Catalyst, Yield, Echo, Reactor,
+and Exchange remain authorities for their own domain state and APIs; the Native
+Client owns the primary user-facing workflow and presentation.
 
-不拥有。Navigator 负责协调面向用户的工作流并呈现远程结果；Catalyst、Yield、Echo、
-Reactor 与 Exchange 仍分别是各自领域状态和 API 的权威。
+不拥有。Navigator 的受限 `ProductReadPort` 聚合指定的 Workspace 读取结果，但不会拥有或修改远程记录。
+Catalyst、Yield、Echo、Reactor 与 Exchange 仍分别是各自领域状态和 API 的权威；主要面向用户的工作流
+与展示由 Native Client 负责。
 
 ## Can the client call a local tool directly? / 客户端可以直接调用本地工具吗？
 

@@ -16,7 +16,7 @@ Navigator V1 未接入任何 MCP 服务端、客户端或桥接。历史 MCP 桥
 
 ```mermaid
 flowchart LR
-    User["Navigator user\nNavigator 用户"] --> UI["Navigator UI\nNavigator 界面"]
+    User["Client user\n工作台用户"] --> UI["Client UI\n客户端界面"]
     UI --> Bridge["MCP tool bridge\nMCP 工具桥"]
     Bridge --> Contract["Plugins-owned capability contract\nPlugins-owned 能力契约"]
     Contract --> Server["Approved MCP server\n获批 MCP 服务"]

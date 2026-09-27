@@ -10,15 +10,17 @@ repository:
   default_branch: develop
 ownership:
   owns:
-  - Harness adapters and Product-facing service APIs
-  - Session persistence and explicit Product handoffs
-  - Navigator local Artifact publication adapter
-  - Codex rollout import native host
+  - Pinned DeepSeek Harness profile and Cyrene Harness adapters
+  - Local session persistence API and authoritative event store
+  - Bounded Product workspace-read API and explicit Product handoffs
+  - Codex rollout import native host and local Artifact publication adapter
+  - Harness UI adapters for the pinned upstream Harness profile
   does_not_own:
-  - Server-side training, serving, evaluation, or dataset execution
-  - Product capability payload contracts or Plugin implementations
-  - Platform installation, compatibility, or control-plane authority
-  - Browser WebUI or native Windows presentation; those live in the optional cyrene.ui.navigator Plugin
+  - The Native Client application shell and primary user-facing presentation
+  - Other Product capability payload contracts
+  - Other Product services (training, serving, evaluation, dataset processing, gateway governance)
+  - Platform installation, kernel supervision, or cluster lease authority
+  - External plugin capability implementations
 build:
   independent: true
   build_systems:

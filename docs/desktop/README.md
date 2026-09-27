@@ -1,26 +1,13 @@
-# Navigator UI extraction / Navigator UI 迁移记录
+# Historical UI extraction notice / 历史 UI 剥离说明
 
-The browser WebUI and native WinUI client were extracted from this repository
-at `a8091ca8e8a01ca8d103aa10ef706891c75c4fb3` into
-`Cyrene-Plugins-Official/plugins/ui/navigator`.
+`Cyrene-Client` owns the application shell and primary user-facing presentation. Navigator retains Harness UI adapter code under `harness/src/client/`, but does not provide a standalone client application.
 
-浏览器 WebUI 与原生 WinUI 客户端从本仓库
-`a8091ca8e8a01ca8d103aa10ef706891c75c4fb3` 迁移到
-`Cyrene-Plugins-Official/plugins/ui/navigator`。
+`Cyrene-Client` 拥有应用 shell 和主要面向用户的展示层。Navigator 在 `harness/src/client/` 中保留 Harness UI 适配代码，但不提供独立的客户端应用。
 
-The destination owns presentation code, Product-client HTTP adapters, Debug
-preview fixtures, and UI-specific build and license evidence. Navigator retains
-the published Product API, durable session persistence, Harness adapters, and
-Rust native process host. The historical source remains available in Git; it is
-not copied back into the active Navigator tree.
+The browser application and native client presentation are maintained by `Cyrene-Client`. This note distinguishes those application surfaces from Navigator's Harness UI adapters.
 
-目标包拥有展示代码、Product 客户端 HTTP 适配器、Debug 预览 fixture，以及 UI 专属构建与
-许可证证据。Navigator 保留公开 Product API、持久会话状态、Harness 适配器与 Rust 原生进程
-宿主。历史源码仍可从 Git 恢复，但不会复制回 Navigator 活跃目录。
+浏览器应用与原生客户端展示由 `Cyrene-Client` 维护。此说明用于区分客户端应用展示与 Navigator 的 Harness UI 适配器。
 
-UI source/build, Windows GUI, packaging, and signing evidence must be checked in
-the Plugins repository. Navigator CI covers only the API, persistence, Harness,
-and native-host side of the boundary.
+Navigator retains Harness runtime adapters, local session and Product APIs, UI adapter code, and native process integration. It does not provide a standalone client shell.
 
-UI 源码/构建、Windows GUI、打包与签名证据必须在 Plugins 仓库验证；Navigator CI 只覆盖
-API、持久化、Harness 与 native host 一侧。
+Navigator 保留 Harness 运行时适配、本地会话和 Product API、UI 适配代码及原生进程集成；它不提供独立的客户端 shell。

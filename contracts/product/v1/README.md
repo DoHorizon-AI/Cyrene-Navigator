@@ -3,7 +3,9 @@
 Status: `HEADLESS_MVP_READY`; real HTTP fan-out is implemented, while browser
 and native-client adapters remain separate boundaries.
 
-Navigator owns presentation and client aggregation, not Product resource state.
+Navigator owns the bounded Product snapshot aggregation API, not the client
+application presentation or Product resource state. `Cyrene-Client` consumes
+this API and owns the primary user-facing presentation.
 `WorkspaceSnapshot` is an observed view produced on demand; it is neither
 durable authority nor an event-sourced projection.
 
@@ -48,7 +50,7 @@ Reinterpreting owner state or changing partial-failure semantics requires v2.
 
 状态为 `HEADLESS_MVP_READY`：已实现真实 HTTP fan-out；浏览器和原生客户端适配器仍是独立边界。
 
-Navigator 拥有展示与客户端聚合，不拥有 Product 资源状态。`WorkspaceSnapshot` 是按需生成的观测视图，既不是持久化权威，也不是事件溯源投影。
+Navigator 拥有受限的 Product 快照聚合 API，不拥有客户端应用展示层或 Product 资源状态。`Cyrene-Client` 消费此 API 并拥有主要面向用户的展示层。`WorkspaceSnapshot` 是按需生成的观测视图，既不是持久化权威，也不是事件溯源投影。
 
 ## 边界
 

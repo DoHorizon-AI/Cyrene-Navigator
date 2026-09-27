@@ -1,29 +1,29 @@
-# Navigator Product API Contract
+# Navigator Product, Session & Harness API Contract
 
-Navigator is an active Product that owns durable session state, its persistence
-service, native host, and user-triggered handoffs. Optional client interfaces
-consume this contract without becoming a second Product authority.
+Navigator composes a pinned revision of the upstream [DeepSeek Harness repository](../harness/upstream.lock.json) with Cyrene adapters. It provides local session persistence APIs, a bounded Product workspace-read API, explicit handoffs, and a Rust native host for Codex rollout import over versioned NDJSON. The separate `Cyrene-Client` control service reaches the Navigator Web Host through its configured service URL. The `harness/src/client/` UI adapters are part of this repository's Harness profile and are distinct from the Client application UI.
+
+`Cyrene-Client` owns the application shell and primary user-facing presentation. Its control service reaches the separately running Navigator Web Host through `STUDIO_NAVIGATOR_URL`. Navigator also contains UI adapter code for its pinned Harness profile; it does not provide a standalone client application.
 
 ## Authority and request paths
 
 ```mermaid
 flowchart LR
-    User --> UI["Optional client UI"]
-    UI --> Navigator
-    Navigator --> Catalyst
-    Navigator --> Yield
-    Navigator --> Echo
-    Navigator --> Reactor
-    Navigator --> Exchange
-    UI --> Plugins["Optional UI bundle and installed adapters"]
-    Platform["Platform substrate (installation/compatibility)"] -. "installation and compatibility" .-> Navigator
+    Client["Cyrene-Client application UI"] --> Control["Cyrene-Client Control Service"]
+    Control -->|STUDIO_NAVIGATOR_URL / HTTP| WebHost["Navigator Web Host APIs"]
+    WebHost --> Read["ProductReadPort"]
+    Read --> Catalyst["Cyrene-Catalyst"]
+    Read --> Yield["Cyrene-Yield"]
+    Read --> Echo["Cyrene-Echo"]
+    Read --> Reactor["Cyrene-Reactor"]
+    Read --> Exchange["Cyrene-Exchange"]
+    HarnessRuntime["Pinned Harness profile"]
+    HarnessRuntime -->|Harness model inference| Exchange
+    WebHost -->|explicit evaluation handoff| Echo
 ```
 
-Navigator calls each Product or installed Plugin directly for its domain
-operation. Platform does not relay dataset, training, serving, evaluation, or
-conversation payloads. Adding a Product or Plugin adapter must therefore change
-the owning repository or Navigator adapter, while the published Platform
-contract remains unchanged.
+The Product snapshot fan-out is a bounded read path. Harness model inference
+uses Exchange, while the explicit evaluation handoff to Echo is a separate
+write path.
 
 The browser-facing `POST /api/v1/workspace-snapshots` requires a configured
 bearer principal whose server-side organization and Workspace scope matches
@@ -51,6 +51,10 @@ The response is a closed summary and omits arbitrary Harness header metadata.
 
 ## Navigator-owned surfaces
 
+- `contracts/product/v1/openapi.yaml`: the bounded Workspace Product-read
+  snapshot API.
+- `src/cyrene_navigator/reader.py` and `service.py`: Navigator's Product read
+  port and aggregation service.
 - `contracts/product/v1/persistence.openapi.yaml`: session persistence and the
   explicit `Send to Echo` handoff.
 - `src/cyrene_navigator/persistence`: session authority and the local Artifact
@@ -72,27 +76,22 @@ identities fail closed as `NAVIGATOR_ECHO_HANDOFF_FAILED`.
 Navigator contains no Product capability implementation, old typed SPI
 registration, Platform source dependency, or Platform executable bootstrap.
 Optional Platform management is outside the request path and communicates only
-through published compatibility contracts.
+through published compatibility contracts. The client application owns primary
+presentation; the `harness/src/client/` directory contains adapter code, not a
+standalone application shell.
 
-The browser and WinUI clients are owned by
-`Cyrene-Plugins-Official/plugins/ui/navigator`. Their Product-client adapters
-consume this published API; they must not persist authoritative session state
-or copy Navigator lifecycle logic. Packaging and signing status are reported by
-that bundle, not by this contract repository.
-
-浏览器与 WinUI 客户端归属 `Cyrene-Plugins-Official/plugins/ui/navigator`。其中的 Product
-客户端适配器消费本公开 API，不得持久化权威会话状态或复制 Navigator 生命周期逻辑。打包与
-签名状态由该 UI 包报告，不由本契约仓库声明。
 ---
 <!-- Chinese Translation / 中文翻译 -->
 
-# Navigator Product API 契约
+# Navigator Product、会话与 Harness API 契约
 
-Navigator 是一个活跃的 Product，拥有持久化会话状态、持久化服务、原生宿主和由用户触发的交接。可选客户端接口可以消费此契约，但不会成为第二个 Product 权威。
+Navigator 将固定版本的上游 [DeepSeek Harness 仓库](../harness/upstream.lock.json) 与 Cyrene 适配器组合，并提供本地会话持久化 API、受限的 Product Workspace 读取 API、显式交接，以及通过版本化 NDJSON 导入 Codex rollout 的 Rust 原生宿主。独立的 `Cyrene-Client` control service 通过配置的服务 URL 访问 Navigator Web Host。本仓库也包含 pinned Harness profile 的 UI 适配器代码。
+
+`Cyrene-Client` 拥有应用 shell 和主要面向用户的展示层；其 control service 通过 `STUDIO_NAVIGATOR_URL` 访问独立运行的 Navigator Web Host。Navigator 也包含 pinned Harness profile 的 UI 适配器代码，但不提供独立的客户端应用。
 
 ## 权威与请求路径
 
-用户通过可选客户端 UI 调用 Navigator。Navigator 按业务域直接调用 Catalyst、Yield、Echo、Reactor 或 Exchange。可选 UI bundle 和已安装适配器不改变 Product 权威。Platform 只提供安装/兼容性底座，不会中转数据集、训练、服务、评估或对话负载。因此新增 Product 或 Plugin 适配器应修改其 owner 仓库或 Navigator 适配器，已发布的 Platform 契约保持不变。
+`Cyrene-Client` 的 control service 通过配置的服务 URL 调用 Navigator API。`ProductReadPort` 通过固定的读取操作聚合 Catalyst、Yield、Echo、Reactor 和 Exchange 的 Workspace 视图；各 Product 仍拥有各自领域状态。Harness 模型推理通过 Exchange；显式 Echo 评估交接是独立的写入路径。Navigator 不接管上游 Agent Loop 或 Session 事件模型。
 
 面向浏览器的 `POST /api/v1/workspace-snapshots` 要求配置好的 bearer principal，其服务端
 organization 与 Workspace scope 必须和 `workspaceId` 匹配。Navigator 不接受调用方指定
@@ -113,6 +112,8 @@ session ID 是唯一资源路径参数。响应为封闭摘要，不包含任意
 ## Navigator 所有的接口
 
 - `contracts/product/v1/persistence.openapi.yaml`：会话持久化和显式的 `Send to Echo` 交接。
+- `contracts/product/v1/openapi.yaml`：受限的 Workspace Product-read snapshot API。
+- `src/cyrene_navigator/reader.py`、`service.py`：Navigator 本地 Product read port 和聚合服务。
 - `src/cyrene_navigator/persistence`：会话权威以及交接使用的本地 Artifact 适配器。
 - `native/crates/cyrene-native-host`：Navigator 所有的 Codex rollout 导入，使用版本化 NDJSON 协议。
 - `harness`：可替换的 DeepSeek Harness 适配器和 Profile 集成。
@@ -121,6 +122,4 @@ Artifact 适配器发布不可变的内容寻址字节，并返回标准透明�
 
 ## 兼容性边界
 
-Navigator 不包含 Product capability 实现、旧 typed SPI 注册、Platform 源码依赖或 Platform 可执行文件引导。可选 Platform 管理功能不在请求路径中，只通过已发布的兼容契约通信。
-
-浏览器与 WinUI 客户端归 `Cyrene-Plugins-Official/plugins/ui/navigator` 所有。它们的 Product 客户端适配器消费本 API；不得持久化权威会话状态或复制 Navigator 生命周期逻辑。打包与签名状态由该 UI 包报告，而不是由本契约仓库声明。
+Navigator 不包含 Product capability 实现、旧 typed SPI 注册、Platform 源码依赖或 Platform 可执行文件引导。客户端应用 shell 与主要展示层由 Native Client（`Cyrene-Client`）拥有；本仓库的 `harness/src/client/` 只提供 Harness UI 适配代码。
