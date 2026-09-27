@@ -103,6 +103,15 @@ class Snapshot(PersistenceModel):
     last_activity_at: int | None = Field(default=None, ge=0)
 
 
+class WorkspaceSessionSummary(PersistenceModel):
+    """Closed private Workspace read that omits the arbitrary Harness header."""
+
+    product_metadata: ProductMetadata
+    revision: str = Field(min_length=1)
+    event_count: int = Field(ge=0)
+    last_activity_at: int | None = Field(default=None, ge=0)
+
+
 class SnapshotList(PersistenceModel):
     """Workspace-scoped session listing. | Workspace 会话列表。"""
 

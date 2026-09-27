@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from pathlib import Path
 from uuid import uuid4
@@ -34,6 +35,7 @@ from cyrene_navigator.persistence.models import (
     SessionCreateRequest,
     Snapshot,
     SnapshotList,
+    WorkspaceSessionSummary,
 )
 from cyrene_navigator.persistence.store import PersistencePrincipal, PersistenceStore
 
@@ -59,10 +61,14 @@ def create_persistence_app(
     ):
         raise TypeError("principals must contain PersistencePrincipal values")
 
+    principal_digests = {
+        hashlib.sha256(token.encode("utf-8")).hexdigest(): principal
+        for token, principal in configured_principals.items()
+    }
     store = PersistenceStore(Path(db_path), lease_seconds=lease_seconds)
     app = FastAPI(title="Cyrene Navigator Harness Persistence API", version="1.0.0")
     app.state.persistence_store = store
-    app.state.persistence_principals = configured_principals
+    app.state.persistence_principal_digests = principal_digests
     handoff = EchoHandoff(store, artifact_root, echo_url)
     app.state.echo_handoff = handoff
 
@@ -74,7 +80,8 @@ def create_persistence_app(
     def send_to_echo(
         workspace_id: str, session_id: str, body: SendToEcho, request: Request
     ) -> EchoReceipt:
-        authenticate(request, workspace_id)
+        principal = authenticate(request, workspace_id)
+        require_legacy_writer(principal)
         return handoff.send(workspace_id, session_id, body)
 
     @app.exception_handler(PersistenceError)
@@ -132,8 +139,9 @@ def create_persistence_app(
                 401,
                 "A bearer credential is required for Harness persistence.",
             )
-        token = authorization[7:]
-        principal = configured_principals.get(token)
+        token = authorization[7:].strip()
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        principal = principal_digests.get(digest)
         if principal is None:
             raise PersistenceError(
                 WORKSPACE_UNAUTHORIZED,
@@ -148,6 +156,16 @@ def create_persistence_app(
             )
         return principal
 
+    def require_legacy_writer(principal: PersistencePrincipal) -> None:
+        """Keep scoped Product Bearers read-only until a trusted writer exists."""
+
+        if principal.organization_id is not None:
+            raise PersistenceError(
+                WORKSPACE_FORBIDDEN,
+                403,
+                "A trusted Navigator Harness writer context is required for mutations.",
+            )
+
     @app.post(
         _SESSIONS_PATH,
         response_model=HandleView,
@@ -159,6 +177,7 @@ def create_persistence_app(
         """Create and own one session. | 创建并持有一个会话。"""
 
         principal = authenticate(request, workspace_id)
+        require_legacy_writer(principal)
         record = store.create_session(
             workspace_id,
             body.header["id"] if isinstance(body.header.get("id"), str) else "",
@@ -177,8 +196,36 @@ def create_persistence_app(
     def list_sessions(workspace_id: str, request: Request) -> dict[str, object]:
         """List Workspace sessions without write capabilities. | 列出 Workspace 会话。"""
 
-        authenticate(request, workspace_id)
-        return {"items": store.list_snapshots(workspace_id)}
+        principal = authenticate(request, workspace_id)
+        return {"items": store.list_snapshots(workspace_id, principal.organization_id)}
+
+    @app.get(
+        "/internal/workspace/v1/workspaces/{workspace_id}/sessions/{session_id}",
+        response_model=WorkspaceSessionSummary,
+        response_model_exclude_none=True,
+        operation_id="getWorkspaceSession",
+    )
+    def get_workspace_session(
+        workspace_id: str, session_id: str, request: Request
+    ) -> WorkspaceSessionSummary:
+        """Read a closed session summary for the exact organization and Workspace."""
+
+        principal = authenticate(request, workspace_id)
+        if principal.organization_id is None:
+            raise PersistenceError(
+                WORKSPACE_FORBIDDEN,
+                403,
+                "The private Workspace session read requires an organization-scoped bearer.",
+            )
+        snapshot = Snapshot.model_validate(
+            store.get_snapshot(workspace_id, session_id, principal.organization_id)
+        )
+        return WorkspaceSessionSummary(
+            product_metadata=snapshot.product_metadata,
+            revision=snapshot.revision,
+            event_count=snapshot.event_count,
+            last_activity_at=snapshot.last_activity_at,
+        )
 
     @app.get(
         _SESSIONS_PATH + "/{session_id}",
@@ -188,8 +235,8 @@ def create_persistence_app(
     def get_session(workspace_id: str, session_id: str, request: Request) -> dict[str, object]:
         """Read one Workspace session snapshot. | 读取一个会话快照。"""
 
-        authenticate(request, workspace_id)
-        return store.get_snapshot(workspace_id, session_id)
+        principal = authenticate(request, workspace_id)
+        return store.get_snapshot(workspace_id, session_id, principal.organization_id)
 
     @app.get(
         _SESSIONS_PATH + "/{session_id}/metadata",
@@ -204,8 +251,8 @@ def create_persistence_app(
         独立读取产品元数据；不把 Harness header 或可变 writer lease 当作产品身份。
         """
 
-        authenticate(request, workspace_id)
-        return store.get_product_metadata(workspace_id, session_id)
+        principal = authenticate(request, workspace_id)
+        return store.get_product_metadata(workspace_id, session_id, principal.organization_id)
 
     @app.post(
         _SESSIONS_PATH + "/{session_id}/handles",
@@ -221,6 +268,8 @@ def create_persistence_app(
         """Open a read handle or an explicitly fenced write handle. | 打开读写句柄。"""
 
         principal = authenticate(request, workspace_id)
+        if body.access == "write":
+            require_legacy_writer(principal)
         record = store.open_handle(
             workspace_id,
             session_id,
@@ -245,8 +294,10 @@ def create_persistence_app(
     ) -> dict[str, object]:
         """Read a committed event slice. | 读取已提交事件片段。"""
 
-        authenticate(request, workspace_id)
-        events, next_seq = store.read_events(workspace_id, session_id, offset, length)
+        principal = authenticate(request, workspace_id)
+        events, next_seq = store.read_events(
+            workspace_id, session_id, offset, length, principal.organization_id
+        )
         return {"events": events, "nextSeq": next_seq}
 
     @app.post(
@@ -263,6 +314,7 @@ def create_persistence_app(
         """Append an atomically committed event batch. | 原子提交事件批次。"""
 
         principal = authenticate(request, workspace_id)
+        require_legacy_writer(principal)
         next_seq = store.append_events(
             workspace_id,
             session_id,
@@ -288,6 +340,7 @@ def create_persistence_app(
         """Confirm the durable event prefix. | 确认已持久化事件前缀。"""
 
         principal = authenticate(request, workspace_id)
+        require_legacy_writer(principal)
         next_seq, lease_expires_at = store.flush(
             workspace_id, session_id, principal, body.writer_token, body.epoch
         )
@@ -307,6 +360,7 @@ def create_persistence_app(
         """Renew a current write lease. | 续期当前写租约。"""
 
         principal = authenticate(request, workspace_id)
+        require_legacy_writer(principal)
         next_seq, lease_expires_at = store.heartbeat(
             workspace_id, session_id, principal, body.writer_token, body.epoch
         )
@@ -326,6 +380,7 @@ def create_persistence_app(
         """Release the current write lease after fencing. | 释放当前写租约。"""
 
         principal = authenticate(request, workspace_id)
+        require_legacy_writer(principal)
         next_seq = store.release(workspace_id, session_id, principal, body.writer_token, body.epoch)
         return {"nextSeq": next_seq}
 
