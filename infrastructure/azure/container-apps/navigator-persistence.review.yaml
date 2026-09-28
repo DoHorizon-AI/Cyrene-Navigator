@@ -1,0 +1,121 @@
+# REVIEW ONLY: placeholders are intentionally not deployment values.
+# Do not create or update Azure resources from this template.
+# The single-replica EmptyDir SQLite profile is a packaging smoke profile only.
+
+name: cyrene-navigator-persistence-review
+type: Microsoft.App/containerApps
+location: eastasia
+identity:
+  type: SystemAssigned
+properties:
+  managedEnvironmentId: "REPLACE_WITH_REVIEW_ENVIRONMENT_RESOURCE_ID"
+  configuration:
+    activeRevisionsMode: Single
+    secrets:
+      - name: principal-config
+        keyVaultUrl: "https://REPLACE_WITH_KEY_VAULT.vault.azure.net/secrets/navigator-principal-config"
+        identity: system
+      - name: harness-session-bearer
+        keyVaultUrl: "https://REPLACE_WITH_KEY_VAULT.vault.azure.net/secrets/navigator-harness-session-bearer"
+        identity: system
+      - name: catalyst-service-bearer
+        keyVaultUrl: "https://REPLACE_WITH_KEY_VAULT.vault.azure.net/secrets/navigator-catalyst-service-bearer"
+        identity: system
+      - name: yield-service-bearer
+        keyVaultUrl: "https://REPLACE_WITH_KEY_VAULT.vault.azure.net/secrets/navigator-yield-service-bearer"
+        identity: system
+      - name: reactor-service-bearer
+        keyVaultUrl: "https://REPLACE_WITH_KEY_VAULT.vault.azure.net/secrets/navigator-reactor-service-bearer"
+        identity: system
+      - name: exchange-service-bearer
+        keyVaultUrl: "https://REPLACE_WITH_KEY_VAULT.vault.azure.net/secrets/navigator-exchange-service-bearer"
+        identity: system
+      - name: echo-service-bearer
+        keyVaultUrl: "https://REPLACE_WITH_KEY_VAULT.vault.azure.net/secrets/navigator-echo-service-bearer"
+        identity: system
+    ingress:
+      external: false
+      targetPort: 8080
+      transport: http
+      allowInsecure: false
+  template:
+    revisionSuffix: review
+    containers:
+      - name: navigator-persistence
+        image: "ghcr.io/dohorizon-ai/cyrene-navigator-persistence@sha256:REPLACE_WITH_VERIFIED_IMAGE_DIGEST"
+        env:
+          - name: NAVIGATOR_PRINCIPAL_CONFIG_FILE
+            value: /run/secrets/principal-config.json
+          - name: NAVIGATOR_DATABASE_PATH
+            value: /var/lib/cyrene-navigator/persistence.db
+          - name: NAVIGATOR_HOST
+            value: 0.0.0.0
+          - name: PORT
+            value: "8080"
+          - name: CATALYST_BASE_URL
+            value: "https://REPLACE_WITH_CATALYST_INTERNAL_FQDN"
+          - name: YIELD_BASE_URL
+            value: "https://REPLACE_WITH_YIELD_INTERNAL_FQDN"
+          - name: REACTOR_BASE_URL
+            value: "https://REPLACE_WITH_REACTOR_INTERNAL_FQDN"
+          - name: EXCHANGE_BASE_URL
+            value: "https://REPLACE_WITH_EXCHANGE_INTERNAL_FQDN"
+          - name: ECHO_BASE_URL
+            value: "https://REPLACE_WITH_ECHO_INTERNAL_FQDN"
+          - name: NAVIGATOR_HARNESS_BEARER
+            secretRef: harness-session-bearer
+          - name: NAVIGATOR_CATALYST_SERVICE_BEARER
+            secretRef: catalyst-service-bearer
+          - name: NAVIGATOR_YIELD_SERVICE_BEARER
+            secretRef: yield-service-bearer
+          - name: NAVIGATOR_REACTOR_SERVICE_BEARER
+            secretRef: reactor-service-bearer
+          - name: NAVIGATOR_EXCHANGE_SERVICE_BEARER
+            secretRef: exchange-service-bearer
+          - name: NAVIGATOR_ECHO_SERVICE_BEARER
+            secretRef: echo-service-bearer
+        volumeMounts:
+          - volumeName: principal-config
+            mountPath: /run/secrets
+          - volumeName: navigator-data
+            mountPath: /var/lib/cyrene-navigator
+        probes:
+          - type: Startup
+            httpGet:
+              path: /readyz
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 1
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 10
+          - type: Readiness
+            httpGet:
+              path: /readyz
+              port: 8080
+              scheme: HTTP
+            periodSeconds: 15
+            timeoutSeconds: 2
+            failureThreshold: 3
+          - type: Liveness
+            httpGet:
+              path: /healthz
+              port: 8080
+              scheme: HTTP
+            periodSeconds: 30
+            timeoutSeconds: 2
+            failureThreshold: 3
+        resources:
+          cpu: 0.5
+          memory: 1Gi
+    volumes:
+      - name: principal-config
+        storageType: Secret
+        secrets:
+          - secretRef: principal-config
+            path: principal-config.json
+      - name: navigator-data
+        storageType: EmptyDir
+    scale:
+      minReplicas: 1
+      maxReplicas: 1
