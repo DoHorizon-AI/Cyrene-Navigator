@@ -1,8 +1,8 @@
 # Navigator Harness adoption / Harness 接入
 
-Navigator composes the pinned upstream DeepSeek Harness revision recorded in `upstream.lock.json` with an out-of-tree Cordis bundle and Cyrene adapters. The upstream project owns the Agent Loop and Session event model; Navigator owns its persistence and adapters for the upstream Harness client. The Native Client (`Cyrene-Client`) owns the application shell and primary presentation. Navigator's `src/client/` contains Harness UI adapter code, not a standalone application.
+Navigator composes a pinned DeepSeek Harness runtime with an out-of-tree Cordis bundle as a built-in Harness component for the Native Client (`Cyrene-Client`). Navigator owns persistence and Harness runtime adaptation; upstream owns the Agent Loop and Session event model. Navigator carries NO UI and no other unrelated features; all user interfaces are exclusively owned by `Cyrene-Client`.
 
-Navigator 将 `upstream.lock.json` 记录的固定版本上游 DeepSeek Harness 与独立 Cordis Bundle 及 Cyrene 适配器组合。上游项目拥有 Agent Loop 与 Session 事件模型；Navigator 负责自身的持久化和上游 Harness 客户端适配器。Native Client（`Cyrene-Client`）拥有应用 shell 和主要展示层。Navigator 的 `src/client/` 包含 Harness UI 适配代码，不是独立应用。
+Navigator 使用固定版本的上游 DeepSeek Harness 运行时，通过独立 Bundle 接入，作为 Native Client（`Cyrene-Client`）的内置 Harness 组件。Navigator 负责持久化与 Harness 运行时适配；上游拥有 Agent Loop 与 Session 事件模型。Navigator 本身不带任何 UI，也不承担其他无关功能；所有用户界面均由 `Cyrene-Client` 独占拥有。
 
 | Path | Responsibility / 职责 |
 | --- | --- |

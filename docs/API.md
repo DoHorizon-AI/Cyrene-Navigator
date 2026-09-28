@@ -1,29 +1,19 @@
-# Navigator Product, Session & Harness API Contract
+# Navigator Session & Harness API Contract
 
-Navigator composes a pinned revision of the upstream [DeepSeek Harness repository](../harness/upstream.lock.json) with Cyrene adapters. It provides local session persistence APIs, a bounded Product workspace-read API, explicit handoffs, and a Rust native host for Codex rollout import over versioned NDJSON. The separate `Cyrene-Client` control service reaches the Navigator Web Host through its configured service URL. The `harness/src/client/` UI adapters are part of this repository's Harness profile and are distinct from the Client application UI.
+Navigator is the **built-in Harness component** of the Native Client (`Cyrene-Client`), developed as a secondary development of **DeepSeek harness** (`@deepseek-ai/deepseek-harness`). It owns durable session state, its local persistence service, native host, and user-triggered handoffs.
 
-`Cyrene-Client` owns the application shell and primary user-facing presentation. Its control service reaches the separately running Navigator Web Host through `STUDIO_NAVIGATOR_URL`. Navigator also contains UI adapter code for its pinned Harness profile; it does not provide a standalone client application.
+**Key Invariant**: Navigator carries **NO UI** and no unrelated service features. All presentation is owned by the Native Client (`Cyrene-Client`).
 
 ## Authority and request paths
 
 ```mermaid
-flowchart LR
-    Client["Cyrene-Client application UI"] --> Control["Cyrene-Client Control Service"]
-    Control -->|STUDIO_NAVIGATOR_URL / HTTP| WebHost["Navigator Web Host APIs"]
-    WebHost --> Read["ProductReadPort"]
-    Read --> Catalyst["Cyrene-Catalyst"]
-    Read --> Yield["Cyrene-Yield"]
-    Read --> Echo["Cyrene-Echo"]
-    Read --> Reactor["Cyrene-Reactor"]
-    Read --> Exchange["Cyrene-Exchange"]
-    HarnessRuntime["Pinned Harness profile"]
-    HarnessRuntime -->|Harness model inference| Exchange
-    WebHost -->|explicit evaluation handoff| Echo
+flowchart TD
+    subgraph Client["Native Client (Cyrene-Client)"]
+        UI["Client UI / Presentation"] --> Navigator["Navigator (Built-in Harness Component)"]
+    end
+    Navigator --> Echo["Cyrene-Echo (Feedback handoff)"]
+    Navigator --> Exchange["Cyrene-Exchange (Inference)"]
 ```
-
-The Product snapshot fan-out is a bounded read path. Harness model inference
-uses Exchange, while the explicit evaluation handoff to Echo is a separate
-write path.
 
 The browser-facing `POST /api/v1/workspace-snapshots` requires a configured
 bearer principal whose server-side organization and Workspace scope matches
@@ -51,10 +41,6 @@ The response is a closed summary and omits arbitrary Harness header metadata.
 
 ## Navigator-owned surfaces
 
-- `contracts/product/v1/openapi.yaml`: the bounded Workspace Product-read
-  snapshot API.
-- `src/cyrene_navigator/reader.py` and `service.py`: Navigator's Product read
-  port and aggregation service.
 - `contracts/product/v1/persistence.openapi.yaml`: session persistence and the
   explicit `Send to Echo` handoff.
 - `src/cyrene_navigator/persistence`: session authority and the local Artifact
@@ -76,22 +62,22 @@ identities fail closed as `NAVIGATOR_ECHO_HANDOFF_FAILED`.
 Navigator contains no Product capability implementation, old typed SPI
 registration, Platform source dependency, or Platform executable bootstrap.
 Optional Platform management is outside the request path and communicates only
-through published compatibility contracts. The client application owns primary
-presentation; the `harness/src/client/` directory contains adapter code, not a
-standalone application shell.
+through published compatibility contracts.
+
+Navigator carries NO user interface (UI); all presentation, consoles, and interactive user experiences are exclusively owned and rendered by the Native Client (`Cyrene-Client`).
 
 ---
 <!-- Chinese Translation / 中文翻译 -->
 
-# Navigator Product、会话与 Harness API 契约
+# Navigator 会话与 Harness API 契约
 
-Navigator 将固定版本的上游 [DeepSeek Harness 仓库](../harness/upstream.lock.json) 与 Cyrene 适配器组合，并提供本地会话持久化 API、受限的 Product Workspace 读取 API、显式交接，以及通过版本化 NDJSON 导入 Codex rollout 的 Rust 原生宿主。独立的 `Cyrene-Client` control service 通过配置的服务 URL 访问 Navigator Web Host。本仓库也包含 pinned Harness profile 的 UI 适配器代码。
+Navigator 是 Native Client（`Cyrene-Client`）的**内置 Harness 组件**，基于 **DeepSeek harness**（`@deepseek-ai/deepseek-harness`）进行二次开发。它拥有持久化会话状态、本地持久化服务、原生宿主和用户触发的交接。
 
-`Cyrene-Client` 拥有应用 shell 和主要面向用户的展示层；其 control service 通过 `STUDIO_NAVIGATOR_URL` 访问独立运行的 Navigator Web Host。Navigator 也包含 pinned Harness profile 的 UI 适配器代码，但不提供独立的客户端应用。
+**核心不变量**：Navigator 本身不带 UI，也不承担其他无关服务功能。所有的图形界面与交互面板均由 Native Client（`Cyrene-Client`）拥有与渲染。
 
 ## 权威与请求路径
 
-`Cyrene-Client` 的 control service 通过配置的服务 URL 调用 Navigator API。`ProductReadPort` 通过固定的读取操作聚合 Catalyst、Yield、Echo、Reactor 和 Exchange 的 Workspace 视图；各 Product 仍拥有各自领域状态。Harness 模型推理通过 Exchange；显式 Echo 评估交接是独立的写入路径。Navigator 不接管上游 Agent Loop 或 Session 事件模型。
+Navigator 作为 Native Client 的内置 Harness 模块运行。Native Client 工作台界面直接调用 Navigator 驱动 Agent 执行循环与会话持久化；Navigator 按需对接 Exchange 进行模型推理，以及对接 Echo 提交评估交接。Platform 只提供底层安装/兼容性支持，不中转对话负载。
 
 面向浏览器的 `POST /api/v1/workspace-snapshots` 要求配置好的 bearer principal，其服务端
 organization 与 Workspace scope 必须和 `workspaceId` 匹配。Navigator 不接受调用方指定
@@ -112,8 +98,6 @@ session ID 是唯一资源路径参数。响应为封闭摘要，不包含任意
 ## Navigator 所有的接口
 
 - `contracts/product/v1/persistence.openapi.yaml`：会话持久化和显式的 `Send to Echo` 交接。
-- `contracts/product/v1/openapi.yaml`：受限的 Workspace Product-read snapshot API。
-- `src/cyrene_navigator/reader.py`、`service.py`：Navigator 本地 Product read port 和聚合服务。
 - `src/cyrene_navigator/persistence`：会话权威以及交接使用的本地 Artifact 适配器。
 - `native/crates/cyrene-native-host`：Navigator 所有的 Codex rollout 导入，使用版本化 NDJSON 协议。
 - `harness`：可替换的 DeepSeek Harness 适配器和 Profile 集成。
@@ -122,4 +106,4 @@ Artifact 适配器发布不可变的内容寻址字节，并返回标准透明�
 
 ## 兼容性边界
 
-Navigator 不包含 Product capability 实现、旧 typed SPI 注册、Platform 源码依赖或 Platform 可执行文件引导。客户端应用 shell 与主要展示层由 Native Client（`Cyrene-Client`）拥有；本仓库的 `harness/src/client/` 只提供 Harness UI 适配代码。
+Navigator 本身不包含任何 UI；所有图形界面、工作台操作台及可视化交互均由 Native Client（`Cyrene-Client`）独占拥有与呈现。

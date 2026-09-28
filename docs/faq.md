@@ -13,11 +13,11 @@ Navigator 适配器）、`native/`
 （Rust `cyrene-native-host` 进程/集成宿主）、`src/cyrene_navigator/`（Python 会话
 持久化与产品读取服务）。
 
-## Which repository owns Navigator's client UI? / Navigator 的客户端 UI 归哪个仓库？
+## Does Navigator carry a UI? / Navigator 包含 UI 吗？
 
-`Cyrene-Client` owns the application shell and primary user-facing presentation. Navigator does not provide a standalone client application, but its `harness/src/client/` directory contains UI adapters for the pinned Harness profile. Report issues against the repository that owns the affected code.
+No. Navigator carries NO user interface. All graphical user interfaces, interactive controls, and visual consoles are exclusively owned and rendered by the Native Client (`Cyrene-Client`). Navigator strictly serves as the built-in Harness component for the Native Client, managing the DeepSeek harness execution loop and local session persistence.
 
-`Cyrene-Client` 拥有应用 shell 和主要面向用户的展示层。Navigator 不提供独立的客户端应用，但其 `harness/src/client/` 目录包含固定 Harness profile 的 UI 适配器。报告问题时应按受影响代码的实际归属选择仓库。
+不包含。Navigator 本身不带任何 UI。所有的图形界面、交互控制和可视化面板均完全归属于 Native Client（`Cyrene-Client`）。Navigator 纯粹作为 Native Client 的内置 Harness 组件，负责 DeepSeek harness 执行循环与本地会话持久化。
 
 ## Where are local capability contracts defined? / 本地能力契约在哪里定义？
 
@@ -35,14 +35,12 @@ Product API references live under `contracts/product/v1/`.
 
 ## Does Navigator own remote product state? / Navigator 是否拥有远程产品状态？
 
-No. Navigator's bounded `ProductReadPort` aggregates selected Workspace reads,
-but it does not own or change the remote records. Catalyst, Yield, Echo, Reactor,
-and Exchange remain authorities for their own domain state and APIs; the Native
-Client owns the primary user-facing workflow and presentation.
+No. Navigator coordinates user-facing workflows and renders remote results.
+Catalyst, Yield, Echo, Reactor, and Exchange remain authorities for their own
+domain state and APIs.
 
-不拥有。Navigator 的受限 `ProductReadPort` 聚合指定的 Workspace 读取结果，但不会拥有或修改远程记录。
-Catalyst、Yield、Echo、Reactor 与 Exchange 仍分别是各自领域状态和 API 的权威；主要面向用户的工作流
-与展示由 Native Client 负责。
+不拥有。Navigator 负责协调面向用户的工作流并呈现远程结果；Catalyst、Yield、Echo、
+Reactor 与 Exchange 仍分别是各自领域状态和 API 的权威。
 
 ## Can the client call a local tool directly? / 客户端可以直接调用本地工具吗？
 

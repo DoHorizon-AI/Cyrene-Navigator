@@ -1,16 +1,13 @@
 # Security policy / 安全策略
 
-Navigator is a public repository. It composes a pinned revision of the upstream DeepSeek Harness
-repository with Cyrene adapters and provides local session and Product-read APIs plus a Rust native
-host. These surfaces have different trust and deployment boundaries. A report should name the
-affected surface and the commit where it was observed. Application-shell and primary-presentation
-findings belong to `Cyrene-Client`; findings in Navigator's Harness UI adapters remain in this
-repository's scope.
+Navigator is a public repository. It provides the built-in Harness component of the Native Client,
+based on DeepSeek harness. Its Python persistence API, Harness adapters, and Rust native host
+have different trust and deployment boundaries. A report should name the affected surface and the commit
+where it was observed. All UI findings belong strictly to the `Cyrene-Client` repository scope.
 
-Navigator 是公开仓库，将固定版本的上游 DeepSeek Harness 仓库与 Cyrene 适配器组合，并提供本地会话
-与 Product 读取 API 以及 Rust 原生宿主。不同交付面具有不同的信任与部署边界。报告应说明受影响的
-交付面和观察问题时使用的 commit。应用 shell 与主要展示层问题归 `Cyrene-Client`；Navigator 内
-Harness UI 适配器的问题仍属于本仓库。
+Navigator 是公开仓库，作为基于 DeepSeek harness 二次开发的 Native Client 内置 Harness 组件。
+Python 持久化 API、Harness 适配器与 Rust 原生宿主具有不同的信任与部署边界。报告应说明受影响的
+交付面以及观察问题时使用的 commit。所有 UI 相关问题严格归属 `Cyrene-Client` 仓库范围。
 
 ## Reporting a vulnerability / 报告漏洞
 
@@ -46,13 +43,12 @@ Include, when safe to share privately:
   principal boundaries.
 - Harness and native-host inputs are untrusted protocol data; validate them
   before persistence or process execution.
-- The Native Client application shell, preview fixtures, packaging, and signing
-  are outside this repository. Navigator's Harness UI adapters remain in scope.
+- UI source, preview fixtures, packaging, and signing are outside this
+  repository after extraction.
 
 - 持久化 API 拥有持久会话状态，必须执行 workspace 与 principal 边界。
 - Harness 与 native-host 输入是不可信协议数据，必须在持久化或启动进程前校验。
-- Native Client 应用 shell、预览 fixture、打包与签名不属于本仓库；Navigator 的
-  Harness UI 适配器仍在本仓库安全范围内。
+- UI 源码、预览 fixture、打包与签名在迁出后不属于本仓库范围。
 
 Security fixes should preserve the repository's public API boundaries and must
 not silently add a second Product, Plugin, or Platform authority.

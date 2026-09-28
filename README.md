@@ -1,31 +1,24 @@
 # Navigator
 
-Navigator provides Harness integration, local APIs, and a Rust native host for
-Codex rollout import over versioned NDJSON. `Cyrene-Client` owns the application
-shell and reaches the separate Navigator Web Host through its control service's
-configured URL. Navigator's profile composes a pinned revision of the upstream
-[DeepSeek Harness repository](harness/upstream.lock.json) with Cyrene adapters;
-it does not replace the upstream Agent Loop or Session event model.
+Navigator is a **built-in Harness component** of the Native Client (`Cyrene-Client`), developed as a secondary development of **DeepSeek harness** (`@deepseek-ai/deepseek-harness`).
 
-## Responsibilities and boundaries
+It provides the test and execution Harness runtime, Agent loop coordination, and authoritative local session persistence.
 
-- **Harness integration**: The `harness/` bundle composes the pinned upstream runtime with Cyrene
-  session, persistence, and client adapters.
-- **Local session service**: The Python service owns durable local session persistence and exposes the session API.
-- **Product reads and handoffs**: Navigator's `ProductReadPort` provides bounded Workspace read
-  snapshots across Catalyst, Yield, Echo, Reactor, and Exchange. Harness inference uses Exchange;
-  an explicit evaluation handoff publishes a local Artifact and sends the session to Echo. Each
-  Product remains authoritative for its own domain state.
-- **Native host**: The Rust `native/` workspace imports Codex rollouts over a versioned NDJSON protocol.
-- **Client UI boundary**: `Cyrene-Client` owns the application shell and primary user-facing
-  presentation. Navigator includes Harness UI adapters under `harness/src/client/`, but does not
-  provide a standalone client application.
-- **Product boundaries**: Navigator does not own dataset processing, training, serving deployment, evaluation services, gateway governance, or Platform kernel supervision.
+**Key Clarifications & Boundaries**:
+- **Navigator carries NO UI**: Navigator contains no presentation layer or user interface. All graphical user interfaces, interactive controls, and visual consoles are exclusively owned and rendered by the Native Client (`Cyrene-Client`).
+- **Navigator carries NO unrelated service features**: Navigator is strictly a client-internal Harness component. It does not provide server-side model training (owned by Yield), serving deployment (owned by Reactor), dataset preparation (owned by Catalyst), evaluation (owned by Echo), gateway governance (owned by Exchange), or kernel process supervision (owned by Platform).
+
+## Architecture & Responsibilities
+
+- **Harness Runtime**: Secondary development on top of pinned DeepSeek harness packages (`@deepseek-ai/dsh-*`), managing out-of-tree Cordis plugins, Agent loop execution, and tool execution boundaries.
+- **Authoritative Session Persistence**: Stores canonical session headers and append-only event logs in local SQLite storage, providing deterministic session recovery and replay isolation.
+- **Native Host & IPC**: The Rust `native/` workspace provides native process isolation, NDJSON supervisor primitives, and local tool execution hooks for the Harness.
+- **Integration with Products**: Connects directly to Exchange for LLM inference and Echo for post-session evaluations and feedback; it does not proxy or intermediate other product services.
 
 ## Documentation
 
 - [Harness Adoption & Architecture](docs/adoption/README.md)
-- [Product, Session & Harness API Contract](docs/API.md)
+- [Product & Session API Contract](docs/API.md)
 - [Repository Lifecycle](docs/REPOSITORY-LIFECYCLE.md)
 - [Native Host](native/README.md)
 - [Contributing](CONTRIBUTING.md)
@@ -38,26 +31,25 @@ it does not replace the upstream Agent Loop or Session event model.
 
 # Navigator
 
-Navigator 提供 Harness 集成、本地 API 和通过版本化 NDJSON 协议导入 Codex rollout 的 Rust 原生宿主。
-`Cyrene-Client` 拥有应用 shell，并由其 control service 通过配置的 URL 访问独立的 Navigator Web Host。
-Navigator profile 将固定版本的上游 [DeepSeek Harness 仓库](harness/upstream.lock.json) 与 Cyrene 适配器组合；上游仍拥有 Agent Loop 和 Session 事件模型。
+Navigator 是 Native Client（`Cyrene-Client`）的**内置 Harness 组件**，基于 **DeepSeek harness**（`@deepseek-ai/deepseek-harness`）进行二次开发。
 
-## 职责与边界
+它为 Native Client 提供会话执行与测试适配 Harness 运行时、Agent 执行循环协调以及权威的本地会话持久化支持。
 
-- **Harness 接入**：`harness/` bundle 将固定版本的上游运行时与 Cyrene 会话、持久化及客户端
-  适配器组合起来。
-- **本地会话服务**：Python 服务负责权威的本地会话持久化并提供会话 API。
-- **Product 读取与交接**：Navigator 的 `ProductReadPort` 为 Catalyst、Yield、Echo、Reactor 和
-  Exchange 提供受限的 Workspace 读取快照；Harness 推理通过 Exchange，显式评估交接会先发布本地
-  Artifact，再将会话发送到 Echo。各 Product 仍是自身领域状态的权威。
-- **原生宿主**：Rust `native/` 工作区通过版本化 NDJSON 协议导入 Codex rollout。
-- **客户端 UI 边界**：`Cyrene-Client` 拥有应用 shell 和主要面向用户的展示层。Navigator 在 `harness/src/client/` 中保留 Harness UI 适配器，但不提供独立的客户端应用。
-- **Product 边界**：Navigator 不拥有数据集处理、训练、服务部署、评估服务、网关治理或 Platform 内核监管。
+**核心澄清与职责边界**：
+- **Navigator 本身不带 UI**：Navigator 不包含任何展示层或图形界面。所有的工作台 UI、用户交互界面与可视化面板均完全由 Native Client（`Cyrene-Client`）拥有与渲染。
+- **Navigator 不带其他无关功能**：Navigator 是一个纯粹的客户端内置 Harness 组件，不包含任何与 Harness 无关的服务功能。服务端模型训练（归 Yield 所有）、模型推理部署（归 Reactor 所有）、数据集清洗处理（归 Catalyst 所有）、评测与反馈分析（归 Echo 所有）、API 网关治理（归 Exchange 所有）及平台内核调度（归 Platform 所有）均由各对应专业仓库负责。
+
+## 架构与核心职责
+
+- **Harness 运行时适配**：基于固定版本的 DeepSeek harness（`@deepseek-ai/dsh-*`）进行二次开发，提供 Cordis 插件组合、Agent 循环驱动及工具调用边界控制。
+- **权威会话持久化**：在本地 SQLite 中权威保存规范会话头（SessionHeader）及只追加原始事件日志（Append-only event envelope），提供可恢复的会话状态保障。
+- **原生宿主与 IPC**：Rust `native/` 工作区提供轻量原生进程宿主、NDJSON 监管原语及本地工具沙箱钩子。
+- **与其它服务交互**：仅作为客户端内置组件，按需直连 Exchange 进行模型推理，以及直连 Echo 提交会话评测和反馈。
 
 ## 文档索引
 
 - [Harness 接入与架构说明](docs/adoption/README.md)
-- [Product、会话与 Harness API 契约](docs/API.md)
+- [API 与会话契约](docs/API.md)
 - [仓库生命周期](docs/REPOSITORY-LIFECYCLE.md)
 - [原生宿主说明](native/README.md)
 - [贡献指南](CONTRIBUTING.md)
