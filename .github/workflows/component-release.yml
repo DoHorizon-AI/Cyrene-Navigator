@@ -58,7 +58,6 @@ jobs:
       CHANNEL: ${{ github.ref == 'refs/heads/develop' && 'preview' || 'stable' }}
       RELEASE_ID: ${{ (github.ref == 'refs/heads/develop' && 'preview-' || 'stable-') }}${{ github.sha }}
       IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-      OUTPUT_ROOT: ${{ runner.temp }}/component-release
       CATALOG_COMMIT: 522524b86a8f79c70e948fed8cb27c4cc70f29c4
       CATALOG_SHA256: 248a9a3b27f3d1daa4c0a6fdc405c612fd492483bb4157ff46b6d2836ffd0d35
       WORKSPACE_BUILDER_COMMIT: ae34998afab7457d864c29cd6dffdc860fa07c55
@@ -104,6 +103,9 @@ jobs:
           if actual != expected:
               raise SystemExit("trusted static component catalog does not match its pinned SHA-256")
           PY
+
+      - name: Set component output path
+        run: echo "OUTPUT_ROOT=$RUNNER_TEMP/component-release" >> "$GITHUB_ENV"
 
       - name: Bootstrap the trusted Platform SDK index from the fixed catalog locator
         id: sdk-index
@@ -472,7 +474,7 @@ jobs:
       - name: Attest exact component index bytes
         uses: actions/attest@v4
         with:
-          subject-path: ${{ env.OUTPUT_ROOT }}/component-release-index-v1.json
+          subject-path: ${{ runner.temp }}/component-release/component-release-index-v1.json
           github-token: ${{ github.token }}
 
       - name: Create a draft immutable release with long-lived assets
