@@ -2,6 +2,10 @@
 
 FROM python:3.12-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e AS build
 
+ARG CYRENE_RUNTIME_MAINTENANCE_MANIFEST_SHA256
+ARG CYRENE_RUNTIME_MAINTENANCE_WHEEL_SHA256
+ARG CYRENE_RUNTIME_MAINTENANCE_RELEASE_ID
+
 COPY --from=ghcr.io/astral-sh/uv:0.12.3@sha256:2d890623d310b57771ce840f0da5eed5fc6d657da05ffaa45d82797b53fa3abc /uv /uvx /usr/local/bin/
 
 WORKDIR /build
@@ -13,7 +17,27 @@ COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src ./src
 RUN uv sync --frozen --no-dev --no-editable
 
+# Install the immutable, release-verified runtime maintenance SDK wheel.
+COPY --from=runtime-maintenance-wheel /cyrene_runtime_maintenance-0.1.0-py3-none-any.whl /tmp/wheels/cyrene_runtime_maintenance-0.1.0-py3-none-any.whl
+RUN printf '%s\n' "$CYRENE_RUNTIME_MAINTENANCE_MANIFEST_SHA256" | grep -Eq '^[0-9a-f]{64}$' && \
+    printf '%s\n' "$CYRENE_RUNTIME_MAINTENANCE_WHEEL_SHA256" | grep -Eq '^[0-9a-f]{64}$' && \
+    test -n "$CYRENE_RUNTIME_MAINTENANCE_RELEASE_ID" && \
+    printf '%s  %s\n' "$CYRENE_RUNTIME_MAINTENANCE_WHEEL_SHA256" \
+        /tmp/wheels/cyrene_runtime_maintenance-0.1.0-py3-none-any.whl | sha256sum -c - && \
+    uv pip install --python /opt/venv/bin/python --no-deps \
+        /tmp/wheels/cyrene_runtime_maintenance-0.1.0-py3-none-any.whl && \
+    rm -rf /tmp/wheels
+
 FROM python:3.12-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e AS runtime
+
+ARG CYRENE_RUNTIME_MAINTENANCE_MANIFEST_SHA256
+ARG CYRENE_RUNTIME_MAINTENANCE_WHEEL_SHA256
+ARG CYRENE_RUNTIME_MAINTENANCE_RELEASE_ID
+
+LABEL io.cyrene.runtime-maintenance.sdk-version="0.1.0" \
+      io.cyrene.runtime-maintenance.manifest-sha256="${CYRENE_RUNTIME_MAINTENANCE_MANIFEST_SHA256}" \
+      io.cyrene.runtime-maintenance.wheel-sha256="${CYRENE_RUNTIME_MAINTENANCE_WHEEL_SHA256}" \
+      io.cyrene.runtime-maintenance.release-id="${CYRENE_RUNTIME_MAINTENANCE_RELEASE_ID}"
 
 ENV PATH=/opt/venv/bin:$PATH \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -28,6 +52,10 @@ RUN groupadd --system --gid 10001 navigator \
         --shell /usr/sbin/nologin navigator \
     && install -d --owner=navigator --group=navigator --mode=0750 \
         /app/scripts /var/lib/cyrene-navigator
+
+RUN printf '%s\n' "$CYRENE_RUNTIME_MAINTENANCE_MANIFEST_SHA256" | grep -Eq '^[0-9a-f]{64}$' && \
+    printf '%s\n' "$CYRENE_RUNTIME_MAINTENANCE_WHEEL_SHA256" | grep -Eq '^[0-9a-f]{64}$' && \
+    test -n "$CYRENE_RUNTIME_MAINTENANCE_RELEASE_ID"
 
 WORKDIR /app
 COPY --from=build /opt/venv /opt/venv
