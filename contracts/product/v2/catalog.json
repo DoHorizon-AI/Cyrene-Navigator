@@ -1,0 +1,113 @@
+{
+  "schemaVersion": "cyrene.product.operation-catalog.v2",
+  "catalogVersion": "2.0.0",
+  "ownerId": "navigator",
+  "operations": [
+    {
+      "operationId": "observeWorkspaceSnapshot",
+      "routeId": "observeWorkspaceSnapshot",
+      "openapiPath": "contracts/product/v1/openapi.yaml",
+      "kind": "READ",
+      "requestSchemaPointer": "#/paths/~1api~1v1~1workspace-snapshots/post/requestBody/content/application~1json/schema",
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1workspace-snapshots/post/responses/200/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": false,
+        "pathParameter": null,
+        "minLength": 1,
+        "maxLength": 512,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": false,
+        "header": null,
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": null,
+        "responseBindings": [
+          {
+            "jsonPointer": "/workspaceId",
+            "matches": "WORKSPACE_ID"
+          }
+        ],
+        "requestBindings": [
+          {
+            "jsonPointer": "/workspaceId",
+            "matches": "WORKSPACE_ID"
+          }
+        ]
+      }
+    },
+    {
+      "operationId": "getWorkspaceSession",
+      "routeId": "getWorkspaceSession",
+      "openapiPath": "contracts/product/v1/persistence.openapi.yaml",
+      "kind": "READ",
+      "requestSchemaPointer": null,
+      "responseSchemaPointers": [
+        "#/paths/~1internal~1workspace~1v1~1workspaces~1{workspace_id}~1sessions~1{session_id}/get/responses/200/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": true,
+        "pathParameter": "session_id",
+        "minLength": 1,
+        "maxLength": 512,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": false,
+        "header": null,
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": "workspace_id",
+        "responseBindings": [
+          {
+            "jsonPointer": "/productMetadata/workspaceId",
+            "matches": "WORKSPACE_ID"
+          },
+          {
+            "jsonPointer": "/productMetadata/sessionId",
+            "matches": "RESOURCE_ID"
+          }
+        ],
+        "requestBindings": []
+      }
+    },
+    {
+      "operationId": "append_events_api_v1_harness_workspaces__workspace_id__sessions__session_id__append_post",
+      "routeId": "append_events_api_v1_harness_workspaces__workspace_id__sessions__session_id__append_post",
+      "openapiPath": "contracts/product/v1/persistence.openapi.yaml",
+      "kind": "COMMAND",
+      "requestSchemaPointer": "#/paths/~1api~1v1~1harness~1workspaces~1{workspace_id}~1sessions~1{session_id}~1append/post/requestBody/content/application~1json/schema",
+      "responseSchemaPointers": [
+        "#/paths/~1api~1v1~1harness~1workspaces~1{workspace_id}~1sessions~1{session_id}~1append/post/responses/200/content/application~1json/schema"
+      ],
+      "resourceId": {
+        "required": true,
+        "pathParameter": "session_id",
+        "minLength": 1,
+        "maxLength": 512,
+        "pattern": null
+      },
+      "idempotency": {
+        "required": false,
+        "header": null,
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "scope": {
+        "organizationPathParameter": null,
+        "workspacePathParameter": "workspace_id",
+        "responseBindings": [],
+        "requestBindings": []
+      }
+    }
+  ]
+}
