@@ -72,3 +72,14 @@ Navigator 拥有受限的 Product 快照聚合 API，不拥有客户端应用展
 聚合 API 根路径为 `/api/v1`，使用 OpenAPI 3.1.2 和 JSON Schema Draft 2020-12，并遵循 Workspace 的 `product-http-v1` 兼容配置文件。POST 仅因读取集合是结构化请求体才被选用；它是安全的非变更查询，不使用 `Idempotency-Key`，也不创建资源。
 
 弃用、迁移窗口和移除遵循通用配置文件。重新解释 owner 状态或改变部分失败语义需要升至 v2。
+
+## Product operation catalog v2
+
+This Product publishes its Workspace operation catalog at
+[../v2/catalog.json](../v2/catalog.json). Each listed operation binds its exact
+owner operationId to the corresponding OpenAPI source and schema pointers.
+The release manifest pins the catalog and its complete OpenAPI reference closure
+to the same repository commit. This catalog declares operation contracts only;
+Workspace policy controls access independently.
+
+本 Product 在 [../v2/catalog.json](../v2/catalog.json) 发布 Workspace 操作目录。每个目录项都将准确的 owner operationId 绑定到对应的 OpenAPI 文档和 schema pointer。发布清单会将目录及其完整 OpenAPI 引用闭包固定到同一仓库提交。目录只声明操作契约；访问权限由独立的 Workspace policy 控制。
