@@ -10,6 +10,147 @@ permissions:
   contents: read
 
 jobs:
+  publish-owner-contract:
+    name: owner / signed Product contract
+    if: github.event_name == 'push' && contains(fromJSON('["refs/heads/develop","refs/heads/main","refs/heads/release"]'), github.ref)
+    needs: [product-contract]
+    runs-on: ubuntu-latest
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    env:
+      SOURCE_REPOSITORY: ${{ github.repository }}
+      SOURCE_REF: ${{ github.ref }}
+      SOURCE_COMMIT: ${{ github.sha }}
+      RUN_ID: ${{ github.run_id }}
+      RUN_ATTEMPT: ${{ github.run_attempt }}
+      PUBLICATION_ROOT: ${{ runner.temp }}/product-contract-publication
+    steps:
+      - name: Check out the exact owner source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Preflight immutable owner release support and tag namespace
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.CYRENE_IMMUTABLE_RELEASES_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$IMMUTABLE_RELEASES_READ_TOKEN" ]]; then
+            echo "CYRENE_IMMUTABLE_RELEASES_READ_TOKEN is required for read-only immutable-release preflight" >&2
+            exit 2
+          fi
+          setting="$(GH_TOKEN="$IMMUTABLE_RELEASES_READ_TOKEN" gh api "repos/$SOURCE_REPOSITORY/immutable-releases")"
+          if [[ "$(jq -r '.enabled' <<<"$setting")" != true ]]; then
+            echo "immutable releases are not enabled for $SOURCE_REPOSITORY; refusing publication" >&2
+            exit 2
+          fi
+          case "$SOURCE_REF" in
+            refs/heads/develop) release_channel=preview ;;
+            refs/heads/main|refs/heads/release) release_channel=stable ;;
+            *) echo "unapproved Product source ref: $SOURCE_REF" >&2; exit 2 ;;
+          esac
+          release_tag="product-contract-v2-${release_channel}-${SOURCE_COMMIT}"
+          for ref_path in "repos/$SOURCE_REPOSITORY/git/ref/tags/$release_tag" "repos/$SOURCE_REPOSITORY/releases/tags/$release_tag"; do
+            error_file="$RUNNER_TEMP/github-api-error.txt"
+            if gh api "$ref_path" >/dev/null 2>"$error_file"; then
+              echo "owner release tag or release already exists: $release_tag" >&2
+              exit 2
+            fi
+            if ! grep -q 'HTTP 404' "$error_file"; then
+              cat "$error_file" >&2
+              echo "could not prove owner release namespace is unused" >&2
+              exit 2
+            fi
+          done
+          echo "RELEASE_CHANNEL=$release_channel" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=$release_tag" >> "$GITHUB_ENV"
+      - name: Prepare the exact committed Product catalog
+        run: >-
+          python tools/release/product_contract_release.py prepare
+          --root "$GITHUB_WORKSPACE"
+          --repository "$SOURCE_REPOSITORY"
+          --ref "$SOURCE_REF"
+          --commit "$SOURCE_COMMIT"
+          --output-dir "$PUBLICATION_ROOT"
+      - name: Attest the owner catalog bytes
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ runner.temp }}/product-contract-publication/contracts/product/v2/catalog.json
+          github-token: ${{ github.token }}
+      - name: Download the detached owner attestation bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          download_dir="$RUNNER_TEMP/product-contract-attestations"
+          mkdir -p "$download_dir"
+          (
+            cd "$download_dir"
+            gh attestation download \
+              "$PUBLICATION_ROOT/contracts/product/v2/catalog.json" \
+              --repo "$SOURCE_REPOSITORY"
+          )
+          mapfile -t bundles < <(find "$download_dir" -maxdepth 1 -type f -name '*.jsonl' -print)
+          if [[ "${#bundles[@]}" -ne 1 ]]; then
+            echo "expected one detached attestation bundle, found ${#bundles[@]}" >&2
+            exit 2
+          fi
+          gh attestation verify \
+            "$PUBLICATION_ROOT/contracts/product/v2/catalog.json" \
+            --repo "$SOURCE_REPOSITORY" \
+            --bundle "${bundles[0]}" \
+            --cert-identity "https://github.com/$SOURCE_REPOSITORY/.github/workflows/product-contract.yml@$SOURCE_REF" \
+            --source-digest "sha1:$SOURCE_COMMIT" \
+            --source-ref "$SOURCE_REF" \
+            --deny-self-hosted-runners
+          python tools/release/product_contract_release.py finalize \
+            --root "$GITHUB_WORKSPACE" \
+            --repository "$SOURCE_REPOSITORY" \
+            --ref "$SOURCE_REF" \
+            --commit "$SOURCE_COMMIT" \
+            --run-id "$RUN_ID" \
+            --run-attempt "$RUN_ATTEMPT" \
+            --bundle "${bundles[0]}" \
+            --output-dir "$PUBLICATION_ROOT"
+      - name: Publish durable immutable owner release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          asset_dir="$RUNNER_TEMP/product-contract-assets"
+          mkdir -p "$asset_dir"
+          cp "$PUBLICATION_ROOT/contracts/product/v2/catalog.json" "$asset_dir/product-catalog-v2.json"
+          owner_id="$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["ownerId"])' "$PUBLICATION_ROOT/owner-publication-v1.json")"
+          cp "$PUBLICATION_ROOT/attestations/owners/${owner_id}.jsonl" "$asset_dir/product-catalog-v2.attestation.jsonl"
+          cp "$PUBLICATION_ROOT/owner-publication-v1.json" "$asset_dir/owner-publication-v1.json"
+          release_args=("$RELEASE_TAG" "$asset_dir/product-catalog-v2.json" "$asset_dir/product-catalog-v2.attestation.jsonl" "$asset_dir/owner-publication-v1.json" --draft --target "$SOURCE_COMMIT" --title "Product catalog v2 $RELEASE_CHANNEL $SOURCE_COMMIT" --notes "Owner-published Product catalog and detached GitHub artifact attestation for $SOURCE_REPOSITORY@$SOURCE_COMMIT ($SOURCE_REF).")
+          if [[ "$RELEASE_CHANNEL" == preview ]]; then release_args+=(--prerelease); fi
+          gh release create "${release_args[@]}"
+          release_id="$(gh api "repos/$SOURCE_REPOSITORY/releases/tags/$RELEASE_TAG" --jq .id)"
+          gh api --method PATCH "repos/$SOURCE_REPOSITORY/releases/$release_id" -F draft=false >/dev/null
+          immutable="$(gh api "repos/$SOURCE_REPOSITORY/releases/tags/$RELEASE_TAG" --jq .immutable)"
+          if [[ "$immutable" != true ]]; then
+            echo "GitHub did not enforce immutable releases for $SOURCE_REPOSITORY; refusing acceptance" >&2
+            exit 2
+          fi
+          tag_commit="$(gh api "repos/$SOURCE_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq .object.sha)"
+          if [[ "$tag_commit" != "$SOURCE_COMMIT" ]]; then
+            echo "owner release tag resolves to $tag_commit, expected $SOURCE_COMMIT" >&2
+            exit 2
+          fi
+          verify_dir="$RUNNER_TEMP/product-contract-release-verification"
+          mkdir -p "$verify_dir"
+          gh release download "$RELEASE_TAG" --repo "$SOURCE_REPOSITORY" --dir "$verify_dir"
+          cmp "$asset_dir/product-catalog-v2.json" "$verify_dir/product-catalog-v2.json"
+          cmp "$asset_dir/product-catalog-v2.attestation.jsonl" "$verify_dir/product-catalog-v2.attestation.jsonl"
+          cmp "$asset_dir/owner-publication-v1.json" "$verify_dir/owner-publication-v1.json"
+
   product-contract:
     runs-on: ubuntu-latest
     steps:
