@@ -60,7 +60,7 @@ jobs:
       IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
       CATALOG_COMMIT: 522524b86a8f79c70e948fed8cb27c4cc70f29c4
       CATALOG_SHA256: 248a9a3b27f3d1daa4c0a6fdc405c612fd492483bb4157ff46b6d2836ffd0d35
-      WORKSPACE_BUILDER_COMMIT: ae34998afab7457d864c29cd6dffdc860fa07c55
+      WORKSPACE_BUILDER_COMMIT: cec19d36ab7eaeb10daada52dc5c1e9166ea30d0
     steps:
       - name: Check out exact Product source
         uses: actions/checkout@v5
