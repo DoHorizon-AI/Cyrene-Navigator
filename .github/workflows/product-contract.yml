@@ -135,7 +135,7 @@ jobs:
           release_args=("$RELEASE_TAG" "$asset_dir/product-catalog-v2.json" "$asset_dir/product-catalog-v2.attestation.jsonl" "$asset_dir/owner-publication-v1.json" --draft --target "$SOURCE_COMMIT" --title "Product catalog v2 $RELEASE_CHANNEL $SOURCE_COMMIT" --notes "Owner-published Product catalog and detached GitHub artifact attestation for $SOURCE_REPOSITORY@$SOURCE_COMMIT ($SOURCE_REF).")
           if [[ "$RELEASE_CHANNEL" == preview ]]; then release_args+=(--prerelease); fi
           gh release create "${release_args[@]}"
-          release_id="$(gh api "repos/$SOURCE_REPOSITORY/releases/tags/$RELEASE_TAG" --jq .id)"
+          release_id="$(gh release view "$RELEASE_TAG" --repo "$SOURCE_REPOSITORY" --json databaseId --jq .databaseId)"
           gh api --method PATCH "repos/$SOURCE_REPOSITORY/releases/$release_id" -F draft=false >/dev/null
           immutable="$(gh api "repos/$SOURCE_REPOSITORY/releases/tags/$RELEASE_TAG" --jq .immutable)"
           if [[ "$immutable" != true ]]; then
