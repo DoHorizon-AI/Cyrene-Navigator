@@ -41,12 +41,12 @@ const nativeBinary = process.env.CYRENE_NATIVE_HOST ?? join(repository, 'native/
 async function startService(directory, token) {
   const config = join(directory, 'principals.json');
   await writeFile(config, JSON.stringify({ principals: [{
-    token_env: 'CYRENE_TEST_SESSION_TOKEN', actor_id: 'import-owner', workspace_ids: ['import-proof'],
+    token_env: 'CYRENE_CODEX_TEST_SESSION_TOKEN', actor_id: 'import-owner', workspace_ids: ['import-proof'],
   }] }));
   const child = spawn(python, [join(repository, 'scripts/serve-persistence.py'),
     '--database', join(directory, 'sessions.sqlite'), '--principal-config', config,
     '--port', '0', '--lease-seconds', '5'], {
-    env: { ...process.env, CYRENE_TEST_SESSION_TOKEN: token },
+    env: { ...process.env, CYRENE_CODEX_TEST_SESSION_TOKEN: token },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let logs = '';
@@ -118,7 +118,7 @@ async function client(baseUrl, { agentRuntime = false } = {}) {
   await ctx.plugin(CyreneSessionPersistence, {
     baseUrl,
     workspaceId: 'import-proof',
-    tokenEnv: 'CYRENE_TEST_SESSION_TOKEN',
+    tokenEnv: 'CYRENE_CODEX_TEST_SESSION_TOKEN',
     clientId: 'import-proof',
     requestTimeoutMs: 2_000,
     heartbeatMs: 250,
@@ -139,7 +139,7 @@ async function client(baseUrl, { agentRuntime = false } = {}) {
 test('Codex import persists real upstream messages and never replays historical tools', { timeout: 30_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'cyrene-codex-import-test-'));
   const token = randomUUID();
-  process.env.CYRENE_TEST_SESSION_TOKEN = token;
+  process.env.CYRENE_CODEX_TEST_SESSION_TOKEN = token;
   let service;
   let mounted;
   try {
@@ -249,7 +249,7 @@ test('Codex import persists real upstream messages and never replays historical 
     if (mounted) outcomes.push(mounted.ctx.fiber.dispose());
     await Promise.allSettled(outcomes);
     if (service) await stopService(service);
-    delete process.env.CYRENE_TEST_SESSION_TOKEN;
+    delete process.env.CYRENE_CODEX_TEST_SESSION_TOKEN;
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -296,7 +296,7 @@ test('Codex import route rejects non-POST, malformed and oversized buffered requ
 test('Codex archive Continue creates a real seeded Agent and never executes archive history', { timeout: 30_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'cyrene-codex-continue-test-'));
   const token = randomUUID();
-  process.env.CYRENE_TEST_SESSION_TOKEN = token;
+  process.env.CYRENE_CODEX_TEST_SESSION_TOKEN = token;
   let service;
   let archive;
   let runtime;
@@ -411,7 +411,7 @@ test('Codex archive Continue creates a real seeded Agent and never executes arch
     if (archive) outcomes.push(archive.ctx.fiber.dispose());
     await Promise.allSettled(outcomes);
     if (service) await stopService(service);
-    delete process.env.CYRENE_TEST_SESSION_TOKEN;
+    delete process.env.CYRENE_CODEX_TEST_SESSION_TOKEN;
     await rm(directory, { recursive: true, force: true });
   }
 });
