@@ -108,7 +108,7 @@ jobs:
             --repo "$SOURCE_REPOSITORY" \
             --bundle "${bundles[0]}" \
             --cert-identity "https://github.com/$SOURCE_REPOSITORY/.github/workflows/product-contract.yml@$SOURCE_REF" \
-            --source-digest "sha1:$SOURCE_COMMIT" \
+            --source-digest "$SOURCE_COMMIT" \
             --source-ref "$SOURCE_REF" \
             --deny-self-hosted-runners
           python tools/release/product_contract_release.py finalize \
