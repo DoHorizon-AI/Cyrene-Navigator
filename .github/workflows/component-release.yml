@@ -3,6 +3,9 @@ name: Immutable component release
 on:
   push:
     branches: [main, release, develop]
+    # Workflow edits require explicit publication. 工作流修改需手动发布。
+    paths-ignore:
+      - '.github/workflows/component-release.yml'
   pull_request:
     branches: [main, release, develop]
   workflow_dispatch:
@@ -64,7 +67,7 @@ jobs:
       CHANNEL: ${{ github.ref == 'refs/heads/develop' && 'preview' || 'stable' }}
       RELEASE_ID: ${{ (github.ref == 'refs/heads/develop' && 'preview-' || 'stable-') }}${{ github.sha }}
       IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-      CATALOG_HELPER_SOURCE_COMMIT: "a11cc779ce563fd8a35e80ecd8cb718af1a2b3d7"
+      CATALOG_HELPER_SOURCE_COMMIT: "69481d10f4a89f4679bc00195bc9caa5db5fb16a"
       CATALOG_RELEASE_ID: ${{ inputs.catalog_release_id || (github.ref == 'refs/heads/develop' && vars.CYRENE_PREVIEW_COMPONENT_CATALOG_RELEASE_ID) || (github.ref != 'refs/heads/develop' && vars.CYRENE_STABLE_COMPONENT_CATALOG_RELEASE_ID) || '' }}
       WORKSPACE_BUILDER_COMMIT: cec19d36ab7eaeb10daada52dc5c1e9166ea30d0
     steps:
