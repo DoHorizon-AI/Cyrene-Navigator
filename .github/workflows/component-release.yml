@@ -58,8 +58,8 @@ jobs:
       CHANNEL: ${{ github.ref == 'refs/heads/develop' && 'preview' || 'stable' }}
       RELEASE_ID: ${{ (github.ref == 'refs/heads/develop' && 'preview-' || 'stable-') }}${{ github.sha }}
       IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-      CATALOG_COMMIT: 522524b86a8f79c70e948fed8cb27c4cc70f29c4
-      CATALOG_SHA256: 248a9a3b27f3d1daa4c0a6fdc405c612fd492483bb4157ff46b6d2836ffd0d35
+      CATALOG_HELPER_SOURCE_COMMIT: "87b8e676300eb2a9041740e651773cb01a2a7724"
+      CATALOG_RELEASE_ID: ${{ github.ref == 'refs/heads/develop' && vars.CYRENE_PREVIEW_COMPONENT_CATALOG_RELEASE_ID || (github.ref != 'refs/heads/develop' && vars.CYRENE_STABLE_COMPONENT_CATALOG_RELEASE_ID) }}
       WORKSPACE_BUILDER_COMMIT: cec19d36ab7eaeb10daada52dc5c1e9166ea30d0
     steps:
       - name: Check out exact Product source
@@ -70,23 +70,38 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Check out trusted component catalog and schemas
+      - name: Check out the fixed catalog verifier and schemas
         uses: actions/checkout@v5
         with:
           repository: DoHorizon-AI/Cyrene-Workspace
-          ref: ${{ env.CATALOG_COMMIT }}
-          path: workspace-catalog
+          ref: ${{ env.CATALOG_HELPER_SOURCE_COMMIT }}
+          path: catalog-helper
+          fetch-depth: 0
           persist-credentials: false
+          sparse-checkout: |
+            packaging/fetch_component_catalog.py
+            packaging/catalog_metadata.py
+            packaging/component_updates.py
+            governance/component-catalog-v1.json
+            governance/component-catalog-v1.schema.json
+            governance/component-release-manifest-v1.schema.json
+            governance/component-release-manifest-v2.schema.json
+            governance/component-release-index-v1.schema.json
+          sparse-checkout-cone-mode: false
 
       - name: Set up Python 3.12 release runtime
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
-      - name: Install the pinned index bootstrap dependencies
-        run: python -m pip install --disable-pip-version-check rfc8785==0.1.4 jsonschema==4.26.0
+      - name: Install pinned catalog verifier dependencies
+        run: python -m pip install --disable-pip-version-check jsonschema==4.26.0 rfc8785==0.1.4
 
-      - name: Verify exact Product source and catalog pin
+      - name: Verify exact Product source and fetch signed immutable catalog
+        id: catalog
+        env:
+          CATALOG_RELEASE_ID: ${{ env.CATALOG_RELEASE_ID }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           test "$(git -C product-source rev-parse HEAD)" = "$SOURCE_COMMIT"
@@ -95,14 +110,52 @@ jobs:
             *) echo "release channel does not match the exact source ref" >&2; exit 2 ;;
           esac
           test "$RELEASE_ID" = "$CHANNEL-$SOURCE_COMMIT"
-          python - "$CATALOG_SHA256" workspace-catalog/governance/component-catalog-v1.json <<'PY'
-          import hashlib, sys
+          mkdir -p workspace-catalog/governance
+          for schema in \
+            component-catalog-v1.schema.json \
+            component-release-manifest-v1.schema.json \
+            component-release-manifest-v2.schema.json \
+            component-release-index-v1.schema.json; do
+            cp "catalog-helper/governance/$schema" workspace-catalog/governance/
+          done
+          args=(--output workspace-catalog/governance/component-catalog-v1.json \
+            --metadata-output workspace-catalog/component-catalog-release.json \
+            --schema-root catalog-helper/governance)
+          if [[ -n "$CATALOG_RELEASE_ID" ]]; then
+            args+=(--release-id "$CATALOG_RELEASE_ID")
+          else
+            args+=(--latest-channel "$CHANNEL")
+          fi
+          python catalog-helper/packaging/fetch_component_catalog.py "${args[@]}"
+          catalog_sha256="$(python - workspace-catalog/component-catalog-release.json <<'PY'
+          import hashlib, json, os, re, sys
           from pathlib import Path
-          expected, path = sys.argv[1:]
-          actual = hashlib.sha256(Path(path).read_bytes()).hexdigest()
-          if actual != expected:
-              raise SystemExit("trusted static component catalog does not match its pinned SHA-256")
+          metadata_path = Path(sys.argv[1])
+          metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+          raw_path = Path("workspace-catalog/governance/component-catalog-v1.json")
+          digest = metadata.get("catalogSha256")
+          channel = os.environ["CHANNEL"]
+          source_commit = metadata.get("sourceCommit")
+          allowed_refs = {"preview": {"refs/heads/develop"}, "stable": {"refs/heads/main", "refs/heads/release"}}
+          if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+              raise SystemExit("verified catalog metadata has an invalid raw catalog digest")
+          if metadata.get("repository") != "DoHorizon-AI/Cyrene-Workspace" or metadata.get("workflow") != "DoHorizon-AI/Cyrene-Workspace/.github/workflows/component-catalog-release.yml":
+              raise SystemExit("verified catalog metadata does not identify the trusted Workspace publisher")
+          if metadata.get("channel") != channel or not isinstance(source_commit, str) or re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
+              raise SystemExit("verified catalog channel or source commit differs from this release")
+          if metadata.get("releaseId") != f"catalog-{channel}-{source_commit}" or metadata.get("sourceRef") not in allowed_refs[channel]:
+              raise SystemExit("verified catalog tag or source ref does not match its channel")
+          generation = metadata.get("generation")
+          if not isinstance(generation, int) or isinstance(generation, bool):
+              raise SystemExit("verified catalog generation is not an integer")
+          actual = hashlib.sha256(raw_path.read_bytes()).hexdigest()
+          if digest != f"sha256:{actual}":
+              raise SystemExit("verified catalog metadata digest does not match downloaded raw bytes")
+          print(actual)
           PY
+          )"
+          echo "CATALOG_SHA256=$catalog_sha256" >> "$GITHUB_ENV"
+          echo "catalog_sha256=$catalog_sha256" >> "$GITHUB_OUTPUT"
 
       - name: Set component output path
         run: echo "OUTPUT_ROOT=$RUNNER_TEMP/component-release" >> "$GITHUB_ENV"
@@ -273,7 +326,7 @@ jobs:
         env:
           PYTHONPATH: platform-tools
           CYRENE_COMPONENT_CATALOG: workspace-catalog/governance/component-catalog-v1.json
-          CYRENE_COMPONENT_CATALOG_SHA256: 248a9a3b27f3d1daa4c0a6fdc405c612fd492483bb4157ff46b6d2836ffd0d35
+          CYRENE_COMPONENT_CATALOG_SHA256: ${{ steps.catalog.outputs.catalog_sha256 }}
         run: python -m pytest platform-tools/tooling/release/tests -q
 
       - name: Validate and fetch the Platform SDK from its immutable index
