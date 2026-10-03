@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 2,
+  "releaseId": "cyrene-navigator-0.2.0",
+  "componentId": "cyrene-navigator",
+  "version": "0.2.0",
+  "channel": "preview",
+  "protocolVersion": "cyrene.workspace.authority.v1",
+  "contentDigest": "sha256:7a419c8f2b3e8e19d7d2a52df2be2996d934bb99bcce95914614e7a683955639",
+  "target": {
+    "os": "linux",
+    "osVersion": "24.04",
+    "distribution": "ubuntu",
+    "distributionVersion": "24.04",
+    "architecture": "x86_64",
+    "abi": "glibc-2.39",
+    "runtime": "python:3.12"
+  },
+  "artifact": {
+    "kind": "oci-image",
+    "repository": "ghcr.io/dohorizon-ai/cyrene-navigator",
+    "digest": "sha256:7a419c8f2b3e8e19d7d2a52df2be2996d934bb99bcce95914614e7a683955639",
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64"
+    }
+  },
+  "dependencies": [
+    {
+      "componentId": "cyrene-runtime-maintenance-sdk",
+      "versionRange": ">=0.1.0"
+    }
+  ],
+  "restart": {
+    "group": "single-service",
+    "unit": "cyrene-navigator.service"
+  },
+  "source": {
+    "repository": "https://github.com/DoHorizon-AI/Cyrene-Navigator",
+    "ref": "refs/heads/develop",
+    "commit": "639ed015397290b3745d163aafe02ffee4aa3f84"
+  },
+  "provenance": {
+    "attestation": {
+      "kind": "github-artifact-attestation",
+      "predicateType": "https://slsa.dev/provenance/v1",
+      "repository": "DoHorizon-AI/Cyrene-Navigator",
+      "subjectName": "ghcr.io/dohorizon-ai/cyrene-navigator",
+      "workflow": "DoHorizon-AI/Cyrene-Navigator/.github/workflows/ci.yml",
+      "run": {
+        "id": "1827364529",
+        "attempt": 1,
+        "url": "https://github.com/DoHorizon-AI/Cyrene-Navigator/actions/runs/1827364529"
+      }
+    }
+  },
+  "health": {
+    "kind": "http",
+    "path": "/api/v1/health",
+    "port": 8080
+  },
+  "manifestDigest": "sha256:536e004337066b1113f000accfa242b9e31089119a192f5d0248e8df1c5c073e"
+}
