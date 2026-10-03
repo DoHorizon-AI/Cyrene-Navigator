@@ -25,7 +25,6 @@ jobs:
       SOURCE_COMMIT: ${{ github.sha }}
       RUN_ID: ${{ github.run_id }}
       RUN_ATTEMPT: ${{ github.run_attempt }}
-      PUBLICATION_ROOT: ${{ runner.temp }}/product-contract-publication
     steps:
       - name: Check out the exact owner source
         uses: actions/checkout@v4
@@ -71,6 +70,8 @@ jobs:
           echo "RELEASE_CHANNEL=$release_channel" >> "$GITHUB_ENV"
           echo "RELEASE_TAG=$release_tag" >> "$GITHUB_ENV"
       - name: Prepare the exact committed Product catalog
+        env:
+          PUBLICATION_ROOT: ${{ runner.temp }}/product-contract-publication
         run: >-
           python tools/release/product_contract_release.py prepare
           --root "$GITHUB_WORKSPACE"
@@ -86,6 +87,7 @@ jobs:
       - name: Download the detached owner attestation bundle
         env:
           GH_TOKEN: ${{ github.token }}
+          PUBLICATION_ROOT: ${{ runner.temp }}/product-contract-publication
         run: |
           set -euo pipefail
           download_dir="$RUNNER_TEMP/product-contract-attestations"
@@ -121,6 +123,7 @@ jobs:
       - name: Publish durable immutable owner release assets
         env:
           GH_TOKEN: ${{ github.token }}
+          PUBLICATION_ROOT: ${{ runner.temp }}/product-contract-publication
         run: |
           set -euo pipefail
           asset_dir="$RUNNER_TEMP/product-contract-assets"
