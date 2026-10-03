@@ -459,6 +459,7 @@ export class NavigatorExecutor {
         this.sendJson(res, 200, {
           status: 'ok',
           service: 'cyrene-navigator-executor',
+          version: '0.2.0-rc.2',
           activeTasks: Array.from(this.tasks.values()).filter(t => t.status === 'running').length,
           totalTasks: this.tasks.size,
           timestamp: Date.now(),

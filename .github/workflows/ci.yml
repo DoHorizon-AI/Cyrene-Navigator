@@ -123,7 +123,8 @@ jobs:
             harness/tests/compaction.test.mjs \
             harness/tests/session-titles.test.mjs \
             harness/tests/profile.integration.test.mjs \
-            harness/tests/native.integration.test.mjs
+            harness/tests/native.integration.test.mjs \
+            harness/tests/executor.integration.test.mjs
 
   publish-artifact:
     name: ci / immutable-artifact
