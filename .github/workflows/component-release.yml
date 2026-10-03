@@ -104,7 +104,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install pinned catalog verifier dependencies
-        run: python -m pip install --disable-pip-version-check jsonschema==4.26.0 rfc8785==0.1.4
+        run: python -m pip install --disable-pip-version-check jsonschema==4.26.0 rfc8785==0.1.4 uv==0.12.3
 
       - name: Verify exact Product source and fetch signed immutable catalog
         id: catalog
@@ -553,9 +553,9 @@ jobs:
           fi
           release_args=("$RELEASE_ID" "${assets[@]}" --draft --target "$SOURCE_COMMIT" --title "Cyrene component release $RELEASE_ID" --notes "Immutable component release for $SOURCE_REPOSITORY@$SOURCE_COMMIT ($SOURCE_REF). Assets are verified by SHA-256 and GitHub artifact attestations.")
           if [ "$CHANNEL" = preview ]; then release_args+=(--prerelease); fi
-          gh release create "${release_args[@]}"
+          gh release create "${release_args[@]}" --repo "$GITHUB_REPOSITORY"
           release_api="repos/$SOURCE_REPOSITORY/releases/tags/$RELEASE_ID"
-          release_number="$(gh release view "$RELEASE_ID" --repo "$SOURCE_REPOSITORY" --json databaseId --jq .databaseId)"
+          release_number="$(gh release view "$RELEASE_ID" --repo "$GITHUB_REPOSITORY" --json databaseId --jq .databaseId)"
           gh api --method PATCH "repos/$SOURCE_REPOSITORY/releases/$release_number" -F draft=false >/dev/null
           immutable="$(gh api "$release_api" --jq .immutable)"
           if [ "$immutable" != true ]; then
