@@ -570,8 +570,8 @@ jobs:
           python platform-tools/tooling/release/component_artifacts.py verify-index \
             --index "$OUTPUT_ROOT/component-release-index-v1.json" \
             --catalog workspace-catalog/governance/component-catalog-v1.json \
-            --verify-run \
-            --verify-attestation
+            --verify-release \
+            --verify-attestation-only
           for manifest in "$OUTPUT_ROOT/manifests"/*.manifest.json; do
             artifact_kind="$(python - "$manifest" <<'PY'
           import json, sys
@@ -579,7 +579,7 @@ jobs:
           print(json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))["artifact"]["kind"])
           PY
           )"
-            verify_args=(--manifest "$manifest" --catalog workspace-catalog/governance/component-catalog-v1.json --verify-run --verify-attestation)
+            verify_args=(--manifest "$manifest" --catalog workspace-catalog/governance/component-catalog-v1.json --verify-release --verify-attestation-only)
             if [ "$artifact_kind" != oci-image ]; then
               artifact_name="$(python - "$manifest" <<'PY'
           import json, sys
