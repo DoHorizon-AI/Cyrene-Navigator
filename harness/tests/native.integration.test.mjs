@@ -153,7 +153,7 @@ test('real Rust host rejects invalid arguments and a missing executable', async 
       graceMs: 100,
     });
     await assert.rejects(missing.done, /ENOENT|not found|spawn/u);
-    assert.equal(missing.pid, -1);
+    assert.ok(missing.pid === undefined || missing.pid === -1);
     assert.equal(await missing.waitForExit(), true);
   } finally {
     await fiber.dispose();

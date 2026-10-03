@@ -21,7 +21,7 @@ import type {
   ResumeAgentOptions,
 } from '@deepseek-ai/dsh-agent';
 import type { Session, SessionEvent, SessionHeader, SessionId } from '@deepseek-ai/dsh-session';
-import { SessionId as makeSessionId, SessionLogOffset, SessionSeq } from '@deepseek-ai/dsh-session';
+import { SessionId as makeSessionId, SessionLogOffset, SessionSeq, SESSION_FORMAT_VERSION } from '@deepseek-ai/dsh-session';
 import type { SessionHandle, SessionPersistence } from '@deepseek-ai/dsh-session-persistence';
 import {
   SessionAlreadyExistsError,
@@ -507,7 +507,7 @@ async function persistImportOnce(
   let duplicate = false;
   try {
     writer = await persistence.create(materializeCreateHeader({
-      version: 2,
+      version: SESSION_FORMAT_VERSION,
       id: sessionId,
       createdAt: createdAtOf(native),
       isSeeded: false,
@@ -792,7 +792,7 @@ async function readStored(
     return {
       header: reader.header,
       inheritedEventCount: reader.inheritedEventCount,
-      events: await reader.read(0, Number.MAX_SAFE_INTEGER, { signal }),
+      events: (await reader.read(0, Number.MAX_SAFE_INTEGER, { signal })).events,
     };
   } finally {
     await reader.close();

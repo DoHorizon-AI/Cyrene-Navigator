@@ -27,6 +27,7 @@ import type {
   SessionHandleAppendOptions,
   SessionHandleFlushOptions,
   SessionHandleReadOptions,
+  SessionHandleReadResult,
   SessionPersistenceCreateOptions,
   SessionPersistenceListOptions,
   SessionPersistenceOpenOptions,
@@ -232,7 +233,7 @@ export class CyreneSessionHandle implements SessionHandle {
     }
   }
 
-  async read(offset = 0, length = Number.MAX_SAFE_INTEGER, options?: SessionHandleReadOptions): Promise<readonly SessionEvent[]> {
+  async read(offset = 0, length = Number.MAX_SAFE_INTEGER, options?: SessionHandleReadOptions): Promise<SessionHandleReadResult> {
     this.assertOpen('read');
     integer(offset, 'read offset');
     integer(length, 'read length');
@@ -255,7 +256,10 @@ export class CyreneSessionHandle implements SessionHandle {
       remaining -= batch.length;
       if (cursor >= end || batch.length === 0 || remaining === 0) break;
     } while (remaining > 0);
-    return Object.freeze(events);
+    return {
+      eventState: 'shared-frozen',
+      events: Object.freeze(events),
+    };
   }
 
   async append(events: readonly SessionEvent[], options?: SessionHandleAppendOptions): Promise<void> {

@@ -84,6 +84,14 @@ if (values.link) {
       if (entry.isDirectory()) roots.push(join(upstream, group, entry.name));
     }
   }
+  if (existsSync(join(upstream, 'native/system'))) {
+    roots.push(join(upstream, 'native/system'));
+    if (existsSync(join(upstream, 'native/system/packages'))) {
+      for (const entry of readdirSync(join(upstream, 'native/system/packages'), { withFileTypes: true })) {
+        if (entry.isDirectory()) roots.push(join(upstream, 'native/system/packages', entry.name));
+      }
+    }
+  }
   for (const path of roots) {
     const packagePath = join(path, 'package.json');
     if (!existsSync(packagePath)) continue;

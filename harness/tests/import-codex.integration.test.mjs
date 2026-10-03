@@ -181,7 +181,8 @@ test('Codex import persists real upstream messages and never replays historical 
     assert.equal(mounted.ctx.get('agents'), undefined, 'the import did not start an AgentRun');
 
     const reader = await mounted.ctx.get('sessionPersistence').open(id, 'read');
-    const events = await reader.read();
+    const readResult = await reader.read();
+    const events = readResult.events ?? readResult;
     await reader.close();
     assert.ok(events.some(event => event.type === 'user/message' && event.surfaceOp === 'append'));
     assert.ok(events.some(event => event.type === 'assistant/message' && event.surfaceOp === 'append'));
@@ -209,7 +210,8 @@ test('Codex import persists real upstream messages and never replays historical 
     assert.equal(second.sessionId, first.sessionId);
     assert.equal(second.duplicate, true);
     const reread = await mounted.ctx.get('sessionPersistence').open(id, 'read');
-    assert.equal((await reread.read()).length, events.length);
+    const rereadRes = await reread.read();
+    assert.equal((rereadRes.events ?? rereadRes).length, events.length);
     await reread.close();
 
     // The desktop preview is a read-only projection over the same Cyrene log.
@@ -369,7 +371,10 @@ test('Codex archive Continue creates a real seeded Agent and never executes arch
     await runtime.ctx.sessions.flush(target.session);
     const continuedEvents = await (async () => {
       const reader = await runtime.ctx.get('sessionPersistence').open(targetSessionId, 'read');
-      try { return await reader.read(); } finally { await reader.close(); }
+      try {
+        const res = await reader.read();
+        return res.events ?? res;
+      } finally { await reader.close(); }
     })();
     assert.ok(continuedEvents.some(event => event.type === 'user/message'
       && event.data.content.some(block => block.type === 'text' && block.text === 'Continue the manifest review.')));
@@ -383,7 +388,8 @@ test('Codex archive Continue creates a real seeded Agent and never executes arch
     const duplicate = await duplicateResponse.json();
     assert.equal(duplicate.duplicate, true);
     const reread = await runtime.ctx.get('sessionPersistence').open(targetSessionId, 'read');
-    assert.equal((await reread.read()).length, countAfterContinue);
+    const rereadRes = await reread.read();
+    assert.equal((rereadRes.events ?? rereadRes).length, countAfterContinue);
     await reread.close();
 
     // A process restart must recover the target through the upstream resume

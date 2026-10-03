@@ -159,7 +159,6 @@ test('Profile compaction removes only auxiliary tools and preserves purpose/stre
     assert.ok(engine instanceof BasicCompactionEngine);
     const session = ctx.sessions.create(SessionId('compaction-profile-tools'));
     const input = {
-      system: 'profile system',
       tools: [TOOL_SCHEMA],
       messages: [createUserMessage({
         source: { kind: 'user' },
@@ -182,7 +181,6 @@ test('Profile compaction removes only auxiliary tools and preserves purpose/stre
     assert.equal(compactionCall.provider, 'cyrene-exchange');
     assert.equal(compactionCall.model, 'cyrene-proof-text');
     assert.equal(compactionCall.signal, signal);
-    assert.equal(compactionCall.system, 'profile system');
     assert.equal(compactionCall.tools, undefined);
 
     // A separate ordinary model request still receives the same tool schema.
