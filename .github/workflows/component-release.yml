@@ -320,7 +320,7 @@ jobs:
 
       - name: Prove immutable release is enabled and unused
         env:
-          CYRENE_IMMUTABLE_RELEASE_SETTINGS_READ_TOKEN: ${{ secrets.CYRENE_IMMUTABLE_RELEASE_SETTINGS_READ_TOKEN }}
+          CYRENE_IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.CYRENE_IMMUTABLE_RELEASES_READ_TOKEN }}
         run: |
           set -euo pipefail
           python platform-tools/tooling/release/preflight_component_release.py \
