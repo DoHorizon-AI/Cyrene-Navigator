@@ -12,6 +12,8 @@
     "./session-control": "./dist/session-control.js",
     "./session-titles": "./dist/session-titles.js",
     "./compaction": "./dist/compaction.js",
+    "./executor": "./dist/executor.js",
+    "./plugins": "./dist/plugin-manager.js",
     "./client": "./dist/client.js",
     "./package.json": "./package.json"
   },
