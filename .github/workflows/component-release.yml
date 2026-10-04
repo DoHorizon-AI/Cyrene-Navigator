@@ -540,6 +540,12 @@ jobs:
         with:
           name: navigator-publication-context
           path: ${{ runner.temp }}/release-context
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install pinned canonical JSON verifier
+        run: python -m pip install --disable-pip-version-check rfc8785==0.1.4
       - name: Require identical native profile receipts
         id: receipts
         env:
@@ -606,10 +612,6 @@ jobs:
           path: product-source
           fetch-depth: 0
           persist-credentials: false
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
       - name: Install pinned release tooling
         run: python -m pip install --disable-pip-version-check build pyyaml pytest rfc8785==0.1.4 -r platform-tools/tooling/release/requirements.txt
       - name: Verify exact source tuple and unused immutable release
