@@ -69,7 +69,7 @@ jobs:
       IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
       CATALOG_HELPER_SOURCE_COMMIT: "69481d10f4a89f4679bc00195bc9caa5db5fb16a"
       CATALOG_RELEASE_ID: ${{ inputs.catalog_release_id || (github.ref == 'refs/heads/develop' && vars.CYRENE_PREVIEW_COMPONENT_CATALOG_RELEASE_ID) || (github.ref != 'refs/heads/develop' && vars.CYRENE_STABLE_COMPONENT_CATALOG_RELEASE_ID) || '' }}
-      WORKSPACE_BUILDER_COMMIT: cec19d36ab7eaeb10daada52dc5c1e9166ea30d0
+      WORKSPACE_BUILDER_COMMIT: 75d05e05e2ee83118d7eb0a726f4dfb96124e0ae
     steps:
       - name: Check out exact Product source
         uses: actions/checkout@v5
