@@ -1408,9 +1408,7 @@ def create_web_host_app(
             # 缺少这些信息时,控制台无法确定应提供哪些选项。
             "bootstrapState": bootstrap_info,
             "runtime": runtime_info,
-            "diagnosticsDegraded": _diagnostics_degraded(
-                svc_info, bootstrap_info, activity_info
-            ),
+            "diagnosticsDegraded": _diagnostics_degraded(svc_info, bootstrap_info, activity_info),
             "activitySource": activity_info,
             # The Exchange OpenAI-compatible gateway port differs between the
             # dev stack and packaged deployments, so it is published here
