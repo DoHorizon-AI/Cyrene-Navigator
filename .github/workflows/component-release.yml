@@ -631,8 +631,8 @@ jobs:
         run: python -m pytest platform-tools/tooling/release/tests -q
       - name: Verify Platform SDK index and provenance
         run: |
-          python platform-tools/tooling/release/validate_component_schema.py --kind index --document release-context/platform-component-release-index-v1.json --schema-dir release-context/workspace-catalog/governance
-          python platform-tools/tooling/release/component_artifacts.py verify-index --index release-context/platform-component-release-index-v1.json --catalog release-context/workspace-catalog/governance/component-catalog-v1.json --verify-run --verify-attestation
+          python platform-tools/tooling/release/validate_component_schema.py --kind index --document "$RUNNER_TEMP/release-context/platform-component-release-index-v1.json" --schema-dir "$RUNNER_TEMP/release-context/workspace-catalog/governance"
+          python platform-tools/tooling/release/component_artifacts.py verify-index --index "$RUNNER_TEMP/release-context/platform-component-release-index-v1.json" --catalog "$RUNNER_TEMP/release-context/workspace-catalog/governance/component-catalog-v1.json" --verify-run --verify-attestation
       - name: Assemble two native manifests and create index
         run: |
           set -euo pipefail
@@ -645,10 +645,10 @@ jobs:
           test "$(find "$RELEASE_ROOT/artifacts" -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 2
           test "$(find "$RELEASE_ROOT/manifests" -maxdepth 1 -name '*.manifest.json' | wc -l)" -eq 2
           for m in "$RELEASE_ROOT"/manifests/*.manifest.json; do
-            python platform-tools/tooling/release/validate_component_schema.py --kind manifest --document "$m" --schema-dir release-context/workspace-catalog/governance
+            python platform-tools/tooling/release/validate_component_schema.py --kind manifest --document "$m" --schema-dir "$RUNNER_TEMP/release-context/workspace-catalog/governance"
           done
           python platform-tools/tooling/release/component_artifacts.py index --manifest-dir "$RELEASE_ROOT/manifests" --channel "$CHANNEL" --source-ref "$SOURCE_REF" --source-commit "$SOURCE_COMMIT" --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" --workflow "$SOURCE_REPOSITORY/.github/workflows/component-release.yml" --output "$RELEASE_ROOT/component-release-index-v1.json"
-          python platform-tools/tooling/release/validate_component_schema.py --kind index --document "$RELEASE_ROOT/component-release-index-v1.json" --schema-dir release-context/workspace-catalog/governance
+          python platform-tools/tooling/release/validate_component_schema.py --kind index --document "$RELEASE_ROOT/component-release-index-v1.json" --schema-dir "$RUNNER_TEMP/release-context/workspace-catalog/governance"
       - name: Download and verify detached bundle attestations
         run: |
           set -euo pipefail
@@ -696,7 +696,7 @@ jobs:
       - name: Verify published index, manifests, artifacts and attestations
         run: |
           set -euo pipefail
-          python platform-tools/tooling/release/component_artifacts.py verify-index --index "$RELEASE_ROOT/component-release-index-v1.json" --catalog release-context/workspace-catalog/governance/component-catalog-v1.json --verify-release --verify-attestation-only
+          python platform-tools/tooling/release/component_artifacts.py verify-index --index "$RELEASE_ROOT/component-release-index-v1.json" --catalog "$RUNNER_TEMP/release-context/workspace-catalog/governance/component-catalog-v1.json" --verify-release --verify-attestation-only
           for manifest in "$RELEASE_ROOT"/manifests/*.manifest.json; do
             name="$(python - "$manifest" <<'PY'
           import json,sys
@@ -705,6 +705,6 @@ jobs:
           print(Path(urlparse(json.loads(Path(sys.argv[1]).read_text())["artifact"]["uri"]).path).name)
           PY
           )"
-            python platform-tools/tooling/release/component_artifacts.py verify --manifest "$manifest" --catalog release-context/workspace-catalog/governance/component-catalog-v1.json --artifact "$RELEASE_ROOT/artifacts/$name" --verify-release --verify-attestation-only
+            python platform-tools/tooling/release/component_artifacts.py verify --manifest "$manifest" --catalog "$RUNNER_TEMP/release-context/workspace-catalog/governance/component-catalog-v1.json" --artifact "$RELEASE_ROOT/artifacts/$name" --verify-release --verify-attestation-only
             gh attestation verify "$RELEASE_ROOT/artifacts/$name" --bundle "$RELEASE_ROOT/artifacts/$name.attestation.jsonl" --repo "$SOURCE_REPOSITORY" --signer-workflow "$SOURCE_REPOSITORY/.github/workflows/component-release.yml" --source-ref "$SOURCE_REF" --source-digest "$SOURCE_COMMIT" --predicate-type https://slsa.dev/provenance/v1 --format json >/dev/null
           done
