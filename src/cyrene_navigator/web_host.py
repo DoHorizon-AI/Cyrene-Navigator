@@ -39,6 +39,8 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from pydantic.alias_generators import to_camel
 
+from cyrene_navigator.runtime_activity import RuntimeActivityTracker, RuntimeActivityUnavailable
+
 JsonObject = dict[str, Any]
 Clock = Callable[[], float]
 
@@ -1013,11 +1015,15 @@ def _query_runtime() -> dict[str, Any]:
     }
 
 
-def _diagnostics_degraded(services: list[dict[str, Any]], bootstrap: dict[str, Any]) -> bool:
+def _diagnostics_degraded(
+    services: list[dict[str, Any]],
+    bootstrap: dict[str, Any],
+    activity: Mapping[str, Any] | None = None,
+) -> bool:
     """Whether the host's view of the stack is known to be incomplete.
 
-    True when a configured Product is unreachable or the runtime state could not
-    be determined: in both cases any diagnostics shown elsewhere are partial.
+    True when a configured Product is unreachable, runtime state is unknown, or
+    managed activity reporting is degraded; diagnostics are then incomplete.
 
     主机对系统栈的视图是否已知不完整。如果某个已配置 Product 无法访问,或无法确定运行时状态,
     则返回 True;这两种情况下其他位置显示的诊断信息都只是部分信息。
@@ -1025,7 +1031,9 @@ def _diagnostics_degraded(services: list[dict[str, Any]], bootstrap: dict[str, A
 
     if any(entry.get("status") != "UP" for entry in services):
         return True
-    return bootstrap.get("state") == "UNKNOWN"
+    if bootstrap.get("state") == "UNKNOWN":
+        return True
+    return bool(activity and activity.get("status") == "degraded")
 
 
 def _compute_blockers(
@@ -1132,10 +1140,14 @@ def create_web_host_app(
     )
     credentials = credential_store or CredentialStore(clock=clock)
     configured_proxies = _normalize_proxy_targets(proxy_targets or {})
+    activity = RuntimeActivityTracker()
+    activity.start()
     app = FastAPI(title="Cyrene Navigator Web Host", version=app_version)
     app.state.web_host_state = state
     app.state.web_host_credentials = credentials
     app.state.web_host_proxy_targets = configured_proxies
+    app.state.runtime_activity = activity
+    app.router.on_shutdown.append(activity.close)
 
     @app.middleware("http")
     async def propagate_trace(
@@ -1368,9 +1380,18 @@ def create_web_host_app(
         svc_info = _query_services(configured_proxies)
         bootstrap_info = _query_bootstrap()
         runtime_info = _query_runtime()
+        activity_info = activity.health()
+        blockers = _compute_blockers(gpu_info, disk_info, svc_info)
+        if activity_info.get("status") == "degraded":
+            blockers.append(
+                {
+                    "code": "ACTIVITY_SOURCE_UNAVAILABLE",
+                    "message": "Navigator runtime activity reporting is unavailable.",
+                }
+            )
         return {
             "service": "cyrene-navigator-web-host",
-            "status": "ok",
+            "status": "degraded" if activity_info.get("status") == "degraded" else "ok",
             "version": app_version,
             "authenticated": authenticated,
             "proxyPrefixes": [entry.prefix for entry in configured_proxies],
@@ -1378,7 +1399,7 @@ def create_web_host_app(
             "gpu": gpu_info,
             "disk": disk_info,
             "services": svc_info,
-            "blockers": _compute_blockers(gpu_info, disk_info, svc_info),
+            "blockers": blockers,
             "plugins": _query_plugins(svc_info),
             # Whether the pinned runtime is installed, which engine versions it
             # holds, and whether this host can see the whole stack. A console
@@ -1387,7 +1408,10 @@ def create_web_host_app(
             # 缺少这些信息时,控制台无法确定应提供哪些选项。
             "bootstrapState": bootstrap_info,
             "runtime": runtime_info,
-            "diagnosticsDegraded": _diagnostics_degraded(svc_info, bootstrap_info),
+            "diagnosticsDegraded": _diagnostics_degraded(
+                svc_info, bootstrap_info, activity_info
+            ),
+            "activitySource": activity_info,
             # The Exchange OpenAI-compatible gateway port differs between the
             # dev stack and packaged deployments, so it is published here
             # instead of being guessed in the browser.
@@ -1552,15 +1576,40 @@ def create_web_host_app(
             headers["authorization"] = f"Bearer {secret}"
         body = await request.body()
         is_stream = "text/event-stream" in request.headers.get("accept", "").lower()
+        try:
+            activity_task_id = activity.begin()
+        except RuntimeActivityUnavailable as exc:
+            raise WebHostError(
+                "NAVIGATOR_ACTIVITY_SOURCE_UNAVAILABLE",
+                503,
+                "Navigator cannot safely start a managed proxy request.",
+                retryable=True,
+            ) from exc
         if is_stream:
+            client = http_client or httpx.AsyncClient(follow_redirects=False)
+            owns_client = http_client is None
             try:
-                client = http_client or httpx.AsyncClient(follow_redirects=False)
                 req = client.build_request(
                     request.method, upstream_url, content=body, headers=headers, timeout=600.0
                 )
                 upstream_stream = await client.send(req, stream=True)
+
+                async def stream_activity() -> Any:
+                    try:
+                        async for chunk in upstream_stream.aiter_raw():
+                            yield chunk
+                    finally:
+                        try:
+                            await upstream_stream.aclose()
+                        finally:
+                            try:
+                                if owns_client:
+                                    await client.aclose()
+                            finally:
+                                activity.finish(activity_task_id)
+
                 return StreamingResponse(
-                    upstream_stream.aiter_raw(),
+                    stream_activity(),
                     status_code=upstream_stream.status_code,
                     headers={
                         name: value
@@ -1570,12 +1619,24 @@ def create_web_host_app(
                     media_type="text/event-stream",
                 )
             except httpx.RequestError as exc:
+                try:
+                    if owns_client:
+                        await client.aclose()
+                finally:
+                    activity.finish(activity_task_id)
                 raise WebHostError(
                     "NAVIGATOR_PROXY_UNAVAILABLE",
                     502,
                     "The configured upstream is unavailable.",
                     retryable=True,
                 ) from exc
+            except Exception:
+                try:
+                    if owns_client:
+                        await client.aclose()
+                finally:
+                    activity.finish(activity_task_id)
+                raise
         try:
             if http_client is None:
                 async with httpx.AsyncClient(follow_redirects=False) as client:
@@ -1601,6 +1662,8 @@ def create_web_host_app(
                 "The configured upstream is unavailable.",
                 retryable=True,
             ) from exc
+        finally:
+            activity.finish(activity_task_id)
         response_headers = {
             name: value
             for name, value in upstream.headers.items()
