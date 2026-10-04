@@ -626,7 +626,7 @@ jobs:
       - name: Test attested Platform release tooling
         env:
           PYTHONPATH: platform-tools
-          CYRENE_COMPONENT_CATALOG: release-context/workspace-catalog/governance/component-catalog-v1.json
+          CYRENE_COMPONENT_CATALOG: ${{ runner.temp }}/release-context/workspace-catalog/governance/component-catalog-v1.json
           CYRENE_COMPONENT_CATALOG_SHA256: ${{ steps.receipts.outputs.catalog_sha256 }}
         run: python -m pytest platform-tools/tooling/release/tests -q
       - name: Verify Platform SDK index and provenance
