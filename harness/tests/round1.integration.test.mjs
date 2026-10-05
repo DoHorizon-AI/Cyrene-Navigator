@@ -11,6 +11,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
+import { performance } from 'node:perf_hooks';
 import { createExecutorApp } from '../dist/serve.js';
 
 const REPOSITORY = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -208,8 +209,8 @@ async function requestWork(baseUrl, path, { method = 'GET', body } = {}) {
 }
 
 async function waitFor(predicate, label, timeoutMs = 20_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
     const result = await predicate();
     if (result) return result;
     await delay(50);

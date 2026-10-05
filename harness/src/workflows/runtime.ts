@@ -27,7 +27,7 @@ import type {
   WorkflowWrite,
 } from './store.js';
 import { loadDefaultWorkflowTemplates } from './store.js';
-import { installWorkflowReadonlyGuard } from './readonly.js';
+import { installWorkflowReadonlyGuard, resolveWorkflowReadonlyPolicy } from './readonly.js';
 
 /** Exact executor input for a durable workflow occurrence. */
 export interface WorkflowDispatchRequest {
@@ -168,7 +168,8 @@ async function createWorkflowRuntime(ctx: Context, options: WorkflowRuntimeOptio
   let reconciliationTimer: ReturnType<typeof setInterval> | undefined;
   const sync = async (): Promise<void> => {
     if (reconciliation !== undefined) return reconciliation;
-    const pending = reconcileSchedules(ctx, options.store, schedulerSessionId);
+    const pending = reconcileSchedules(ctx, options.store, schedulerSessionId)
+      .then(() => reconcileWorkflowNotifications(ctx, options.store));
     reconciliation = pending;
     try {
       await pending;
@@ -402,6 +403,8 @@ async function dispatchOccurrence(
   const sessionId = occurrenceSessionId(occurrence.marker.workflowId, occurrence.scheduledAt);
   if (workflow === undefined || !workflow.enabled) return;
   const history = await options.store.listScheduleEvents({ workflowId: workflow.id, limit: 100 });
+  if (history.items.some(event => event.scheduledAt === occurrence.scheduledAt
+    && (event.status === 'succeeded' || event.status === 'failed'))) return;
   const previous = previousRunState(history.items, occurrence.scheduledAt);
   if (workflow.targets.length === 0) {
     const errorCode = 'WORKFLOW_TARGETS_REQUIRED';
@@ -415,11 +418,36 @@ async function dispatchOccurrence(
     return;
   }
 
+  const readonlyPolicy = resolveWorkflowReadonlyPolicy(ctx, workflow);
+  if (!readonlyPolicy.supported) {
+    const errorCode = 'WORKFLOW_READONLY_TARGET_UNAVAILABLE';
+    const summary = 'No supported read-only observation tool is available for every configured target.';
+    await appendOccurrenceEvent(options.store, workflow.id, occurrence.scheduledAt, 'failed', {
+      errorCode, taskId, sessionId, summary,
+    });
+    if (workflow.notifications.onFailure && shouldNotifyFailure(previous, errorCode)) {
+      await enqueueWorkflowNotification(ctx, options.store, workflow, occurrence.scheduledAt, 'failure', summary, taskId);
+    }
+    return;
+  }
+
   await appendOccurrenceEvent(options.store, workflow.id, occurrence.scheduledAt, 'queued', { taskId, sessionId });
   await appendOccurrenceEvent(options.store, workflow.id, occurrence.scheduledAt, 'running', { taskId, sessionId });
 
   try {
-    const disposeReadonlyGuard = installWorkflowReadonlyGuard(ctx, workflow, sessionId);
+    const observedTargets = new Set<number>();
+    const disposeReadonlyGuard = installWorkflowReadonlyGuard(ctx, readonlyPolicy, sessionId);
+    const disposeObservationListener = ctx.on('tools/result', (execution, result) => {
+      if (execution.agent === undefined || String(execution.agent.session.id) !== sessionId || result.isError) return;
+      for (const target of readonlyPolicy.observationTargets) {
+        if (!target.tools.has(execution.name)) continue;
+        if (target.projectId !== undefined) {
+          const args = isRecord(execution.arguments) ? execution.arguments : undefined;
+          if (args?.projectId !== target.projectId) continue;
+        }
+        observedTargets.add(target.index);
+      }
+    });
     let outcome: WorkflowDispatchOutcome;
     try {
       outcome = await options.executeTask({
@@ -427,6 +455,7 @@ async function dispatchOccurrence(
       });
     } finally {
       disposeReadonlyGuard();
+      disposeObservationListener();
     }
     if (outcome.status !== 'completed') {
       const errorCode = outcome.status === 'aborted' ? 'EXECUTOR_ABORTED'
@@ -438,6 +467,17 @@ async function dispatchOccurrence(
       if (workflow.notifications.onFailure && shouldNotifyFailure(previous, errorCode)) {
         await enqueueWorkflowNotification(ctx, options.store, workflow, occurrence.scheduledAt, 'failure',
           'Workflow execution did not complete.', taskId);
+      }
+      return;
+    }
+    if (readonlyPolicy.observationTargets.some(target => !observedTargets.has(target.index))) {
+      const errorCode = 'WORKFLOW_OBSERVATION_REQUIRED';
+      const summary = 'A successful target-bound read-only observation is required for every configured target.';
+      await appendOccurrenceEvent(options.store, workflow.id, occurrence.scheduledAt, 'failed', {
+        errorCode, taskId, sessionId, summary,
+      });
+      if (workflow.notifications.onFailure && shouldNotifyFailure(previous, errorCode)) {
+        await enqueueWorkflowNotification(ctx, options.store, workflow, occurrence.scheduledAt, 'failure', summary, taskId);
       }
       return;
     }
@@ -570,6 +610,42 @@ function emitNotification(ctx: Context, notification: WorkflowNotification): voi
   }
 }
 
+const RECORDED_NOTICES = new WeakMap<Context, Set<string>>();
+
+/** Retry outbox writes from durable terminal events, including after a host restart. */
+async function reconcileWorkflowNotifications(ctx: Context, store: WorkflowStore): Promise<void> {
+  for (const workflow of await store.listWorkflows()) {
+    const events: WorkflowScheduleEvent[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await store.listScheduleEvents({ workflowId: workflow.id, limit: 100, ...(cursor === undefined ? {} : { cursor }) });
+      events.push(...page.items);
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor !== undefined);
+    const terminals = new Map<string, WorkflowScheduleEvent>();
+    for (const event of events) {
+      if (event.status !== 'failed' && event.status !== 'succeeded') continue;
+      const existing = terminals.get(event.scheduledAt);
+      if (existing === undefined || event.status === 'failed') terminals.set(event.scheduledAt, event);
+    }
+    for (const event of terminals.values()) {
+      const previous = previousRunState(events, event.scheduledAt);
+      let kind: WorkflowNotificationKind | undefined;
+      if (event.status === 'failed') {
+        if (workflow.notifications.onFailure && shouldNotifyFailure(previous, event.errorCode ?? 'WORKFLOW_DISPATCH_FAILED')) kind = 'failure';
+      } else if (previous?.status === 'failed' && workflow.notifications.onRecovery) {
+        kind = 'recovery';
+      } else if (event.changed && workflow.notifications.onChange) {
+        kind = 'change';
+      }
+      if (kind !== undefined) {
+        await enqueueWorkflowNotification(ctx, store, workflow, event.scheduledAt, kind,
+          event.summary ?? 'Workflow occurrence finished.', event.taskId ?? occurrenceTaskId(workflow.id, event.scheduledAt));
+      }
+    }
+  }
+}
+
 /** Persist a quiet-by-default transition before observers can enqueue product delivery. */
 async function enqueueWorkflowNotification(
   ctx: Context,
@@ -583,12 +659,20 @@ async function enqueueWorkflowNotification(
   const occurrenceId = `occ-${digest(`${workflow.id}\0${scheduledAt}`).slice(0, 40)}`;
   const type: WorkflowOutboxType = kind === 'change' ? 'workflow.change'
     : kind === 'failure' ? 'workflow.failure' : 'workflow.recovery';
+  const deduplicationKey = `workflow:${workflow.id}:${occurrenceId}:${kind}`;
+  let recorded = RECORDED_NOTICES.get(ctx);
+  if (recorded === undefined) {
+    recorded = new Set();
+    RECORDED_NOTICES.set(ctx, recorded);
+  }
+  if (recorded.has(deduplicationKey)) return;
   try {
     const receipt = await store.enqueueNotification({
-      deduplicationKey: `workflow:${workflow.id}:${occurrenceId}:${kind}`,
+      deduplicationKey,
       type,
       payload: { workflowId: workflow.id, occurrenceId, summary: redactSummary(summary), taskId },
     });
+    recorded.add(deduplicationKey);
     if (!receipt.duplicate) {
       emitNotification(ctx, { workflowId: workflow.id, title: workflow.title, kind, scheduledAt, summary: redactSummary(summary), taskId });
     }

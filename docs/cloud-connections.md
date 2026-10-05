@@ -88,11 +88,33 @@ denies `work_notify`, provider writes, repository writes, subagent launchers,
 Hugging Face tools, and every unlisted tool. The guard is removed when the
 occurrence executor settles and does not affect other Sessions.
 
+Scheduled observation targets currently support `cloud-connection` bindings
+for `microsoft-learn`, `google-developer-knowledge`, and a configured readonly
+`azure` profile, plus `google-cloud-project` bindings for exact project IDs in
+the `google-cloud-readonly` profile. Hugging Face, unknown profile IDs, other
+target kinds, and profiles that are disabled, missing credentials, or lack a
+registered readonly tool fail preflight before executor dispatch. A completed
+executor result is accepted only after a successful `tools/result` receipt from
+the occurrence Session for **every configured target**. Memory/source lookup
+does not count as a cloud observation, and a Google Cloud receipt must carry
+the exact target project ID. A degraded official MCP profile may make a
+bounded recovery probe with its already-discovered source-classified tools;
+disabled or unauthenticated profiles remain unavailable.
+
 Google Cloud target 的 `id` 是配置过的项目 ID，`kind` 为
 `google-cloud-project`。每个执行 Session 都会临时安装工具 guard，只允许
 `work_memory_search`、`work_sources` 和该工作流明确绑定且经来源分类的云只读工具。Guard
 会拒绝 `work_notify`、provider 写工具、仓库写工具、subagent 启动器、Hugging Face 工具和其余
 未列出的工具；执行完成后移除 guard，不改变其他 Session。
+
+定时观察目前支持 `cloud-connection` 绑定 `microsoft-learn`、
+`google-developer-knowledge` 和已配置只读策略的 `azure`，以及通过
+`google-cloud-readonly` 精确绑定允许项目 ID 的 `google-cloud-project`。
+Hugging Face、未知连接 ID、其他 target kind、已禁用或缺少凭据的连接，以及没有已注册只读工具的连接，
+都会在执行器启动前被拒绝。只有当前 occurrence Session 为**每个已配置 target**产生成功的
+`tools/result` 回执后，执行结果才会接受。记忆或来源查询不能代替云观察；Google Cloud 回执还必须包含
+与目标完全一致的项目 ID。官方 MCP 连接暂时降级时，可用已发现且来源分类为只读的工具进行有限恢复探测；
+已禁用或未配置凭据的连接仍不可用。
 
 On a meaningful `change`, first `failure`, or `recovery` transition, the
 runtime awaits `POST /api/v1/workspaces/{workspaceId}/work/notifications` before
@@ -110,14 +132,25 @@ outbox; it does not send them until an operator-configured adapter claims them.
 已脱敏摘要和可选 task ID。重放 occurrence 会复用 Work API outbox 项。无变化的成功及重复失败
 保持静默。API 将通知写入共享 SQLite outbox；只有运维方配置的 adapter 才会实际发送。
 
+Outbox transport failures leave the terminal occurrence evidence intact.
+Startup and periodic reconciliation retry missing notifications with the same
+deduplication key, without re-executing the workflow. Recorded receipts are
+cached only within the current host process; restart deduplication uses SQLite.
+
+通知写入暂时失败时，保留已持久化的运行记录；启动和周期同步会用原去重键重试通知，
+不会重新执行巡检。当前进程只缓存已记录的回执，重启后由 SQLite 保证去重。
+
 ## Local integration evidence / 本地集成验证
 
 The cloud integration test uses local fake MCP HTTP and stdio servers and a
 stubbed `gcloud` command runner. The workflow integration test mounts the real
 DSH Schedule and JSON storage plugins, checks restart and occurrence dedup,
-and attempts malicious write-tool calls against the real ToolRuntime guard.
-These tests do not call live cloud APIs or launch chargeable workloads.
+requires a successful receipt for each configured target (including two
+projects sharing the same `gcloud_readonly` tool), checks unsupported-target
+preflight, and attempts malicious write-tool calls against the real ToolRuntime
+guard. These tests do not call live cloud APIs or launch chargeable workloads.
 
 云集成测试使用本地伪造的 MCP HTTP/stdio 服务和 stub `gcloud` 命令执行器。工作流集成测试
-挂载真实 DSH Schedule 与 JSON storage 插件，验证重启、occurrence 去重，并通过真实 ToolRuntime
-guard 尝试恶意写工具调用。测试不会请求线上云 API，也不会启动计费工作负载。
+挂载真实 DSH Schedule 与 JSON storage 插件，验证重启和 occurrence 去重，要求每个配置的 target 都有成功
+回执（包括两个共用 `gcloud_readonly` 工具的项目），检查不支持 target 的预检失败，并通过真实
+ToolRuntime guard 尝试恶意写工具调用。测试不会请求线上云 API，也不会启动计费工作负载。

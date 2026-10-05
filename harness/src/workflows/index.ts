@@ -37,4 +37,9 @@ export {
   type WorkflowRuntimeHandle,
   type WorkflowRuntimeOptions,
 } from './runtime.js';
-export { installWorkflowReadonlyGuard } from './readonly.js';
+export {
+  installWorkflowReadonlyGuard,
+  resolveWorkflowReadonlyPolicy,
+  type WorkflowObservationTarget,
+  type WorkflowReadonlyPolicy,
+} from './readonly.js';

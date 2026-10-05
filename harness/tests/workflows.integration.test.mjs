@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
+import { performance } from 'node:perf_hooks';
 import { Context } from '@deepseek-ai/cordis';
 import LlmRuntime, { createUserMessage, LlmAdapter } from '@deepseek-ai/dsh-llm';
 import { ToolCallId } from '@deepseek-ai/dsh-llm/brand';
@@ -26,6 +27,7 @@ import {
   InMemoryWorkflowStore,
   installWorkflowReadonlyGuard,
   registerWorkflowRuntime,
+  resolveWorkflowReadonlyPolicy,
   WorkflowsClient,
 } from '../dist/workflows/index.js';
 
@@ -80,8 +82,8 @@ async function createHost(directory, store, executeTask, adapter) {
 }
 
 async function waitFor(predicate, message, timeoutMs = 10_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
     if (await predicate()) return;
     await delay(20);
   }
@@ -89,7 +91,29 @@ async function waitFor(predicate, message, timeoutMs = 10_000) {
 }
 
 async function eventsFor(store) {
-  return (await store.listScheduleEvents({ workflowId: WORKFLOW_ID, limit: 100 })).items;
+  return eventsForId(store, WORKFLOW_ID);
+}
+
+async function eventsForId(store, workflowId) {
+  return (await store.listScheduleEvents({ workflowId, limit: 100 })).items;
+}
+
+function createReadonlyFixtureRegistry(getLearnStatus) {
+  const learnTools = [{
+    name: 'mcp__microsoft_learn__search', description: 'Fixture documentation search.', parameters: {},
+  }];
+  return {
+    list: () => [],
+    get: id => id === 'microsoft-learn' ? {
+      id, name: 'Microsoft Learn fixture', kind: 'mcp', status: getLearnStatus(),
+      source: { publisher: 'Microsoft', endpoint: 'https://learn.microsoft.com/api/mcp', documentation: 'https://learn.microsoft.com/en-us/training/support/mcp' },
+      description: 'Local readonly workflow fixture.', tools: learnTools,
+    } : undefined,
+    workflowReadonlyTools: id => id === 'microsoft-learn'
+      ? getLearnStatus() === 'available' ? ['mcp__microsoft_learn__search'] : []
+      : id === 'google-cloud-readonly' ? ['gcloud_readonly'] : [],
+    workflowReadonlyProjectIds: id => id === 'google-cloud-readonly' ? ['alpha-project', 'beta-project'] : [],
+  };
 }
 
 test('workflow notification client awaits the durable outbox endpoint and replays by its stable key', { timeout: 15_000 }, async () => {
@@ -182,7 +206,7 @@ test('workflow readonly guard blocks notify/provider/vendor writes for only the 
   });
   const activeHandle = await host.ctx.agents.create({ sessionId: SessionId('workflow-policy-active') });
   const unrelatedHandle = await host.ctx.agents.create({ sessionId: SessionId('workflow-policy-unrelated') });
-  const dispose = installWorkflowReadonlyGuard(host.ctx, {
+  const workflow = {
     id: 'workflow-policy', version: 1, title: 'Read only policy', description: 'test', instructions: 'inspect',
     targets: [
       { id: 'microsoft-learn', label: 'Microsoft Learn', kind: 'cloud-connection' },
@@ -190,7 +214,10 @@ test('workflow readonly guard blocks notify/provider/vendor writes for only the 
     ],
     notifications: { onChange: true, onFailure: true, onRecovery: true, quietWhenUnchanged: true },
     enabled: true, updatedAt: new Date().toISOString(),
-  }, String(activeHandle.agent.session.id));
+  };
+  const policy = resolveWorkflowReadonlyPolicy(host.ctx, workflow);
+  assert.equal(policy.supported, true);
+  const dispose = installWorkflowReadonlyGuard(host.ctx, policy, String(activeHandle.agent.session.id));
   const invoke = async (name, callId, agent, args = {}) => host.ctx.tools.execute({
     name, callId: ToolCallId(callId), arguments: args, signal: new AbortController().signal, agent,
   });
@@ -225,17 +252,20 @@ test('workflow readonly guard blocks notify/provider/vendor writes for only the 
   }
 });
 
-test('official DSH Schedule source is consumed once, remains durable, and dispatches idempotently after restart', { timeout: 60_000 }, async () => {
+test('official DSH Schedule source requires receipts for every target and remains idempotent after restart', { timeout: 60_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'navigator-workflow-runtime-'));
   const store = new InMemoryWorkflowStore();
   const adapter = new CountingAdapter();
   const taskOutcomes = new Map();
+  let learnStatus = 'available';
   const plannedOutcomes = [
-    { status: 'completed', output: JSON.stringify({ changed: false, summary: 'No configured resource changed.' }) },
-    { status: 'failed', output: '', error: 'fixture failure' },
-    { status: 'failed', output: '', error: 'fixture failure' },
-    { status: 'completed', output: JSON.stringify({ changed: false, summary: 'The read completed after recovery.' }) },
-    { status: 'completed', output: JSON.stringify({ changed: true, summary: 'The configured target changed.' }) },
+    { status: 'completed', observation: 'success', output: JSON.stringify({ changed: false, summary: 'No configured resource changed.' }) },
+    { status: 'completed', observation: 'memory', output: JSON.stringify({ changed: false, summary: 'healthy' }) },
+    { status: 'completed', observation: 'error', output: JSON.stringify({ changed: false, summary: 'healthy' }) },
+    { status: 'completed', observation: 'none', output: JSON.stringify({ changed: false, summary: 'healthy' }) },
+    { status: 'completed', observation: 'partial', output: JSON.stringify({ changed: false, summary: 'healthy' }) },
+    { status: 'completed', observation: 'success', output: JSON.stringify({ changed: false, summary: 'The read completed after recovery.' }) },
+    { status: 'completed', observation: 'success', output: JSON.stringify({ changed: true, summary: 'The configured target changed.' }) },
   ];
   const executorRequests = [];
   const executionStarts = [];
@@ -248,18 +278,39 @@ test('official DSH Schedule source is consumed once, remains durable, and dispat
     executionStarts.push(request.taskId);
     const next = plannedOutcomes.shift();
     assert.ok(next, 'test supplied an outcome for every unique occurrence');
-    if (workflowContext !== undefined && executionStarts.length === 1) {
+    if (workflowContext !== undefined) {
       const executionAgent = await workflowContext.agents.create({ sessionId: SessionId(request.sessionId) });
-      const blockedWrite = await workflowContext.tools.execute({
-        name: 'work_notify',
-        arguments: { deduplicationKey: 'malicious', type: 'external.write', payload: { text: 'send' } },
-        callId: ToolCallId('workflow-malicious-write'),
-        signal: new AbortController().signal,
-        agent: executionAgent.agent,
+      if (executionStarts.length === 1) {
+        const blockedWrite = await workflowContext.tools.execute({
+          name: 'work_notify',
+          arguments: { deduplicationKey: 'malicious', type: 'external.write', payload: { text: 'send' } },
+          callId: ToolCallId('workflow-malicious-write'),
+          signal: new AbortController().signal,
+          agent: executionAgent.agent,
+        });
+        assert.equal(blockedWrite.isError, true, 'the executing workflow model request must be denied before tool dispatch');
+      }
+      const observe = async (name, args, suffix) => workflowContext.tools.execute({
+        name, arguments: args, callId: ToolCallId(`${request.taskId}-${suffix}`),
+        signal: new AbortController().signal, agent: executionAgent.agent,
       });
-      assert.equal(blockedWrite.isError, true, 'the executing workflow model request must be denied before tool dispatch');
+      if (next.observation === 'memory') {
+        await observe('work_sources', {}, 'memory');
+      } else if (['error', 'partial', 'success'].includes(next.observation)) {
+        if (next.observation === 'error') learnStatus = 'degraded';
+        const docs = await observe('mcp__microsoft_learn__search', { fail: next.observation === 'error' }, 'docs');
+        assert.equal(docs.isError, next.observation === 'error', 'only a successful readonly receipt should count as observation');
+        if (next.observation !== 'error') {
+          learnStatus = 'available';
+          await observe('gcloud_readonly', { operation: 'projects.describe', projectId: 'alpha-project' }, 'alpha');
+          if (next.observation !== 'partial') {
+            await observe('gcloud_readonly', { operation: 'projects.describe', projectId: 'beta-project' }, 'beta');
+          }
+        }
+      }
     }
-    const outcome = { taskId: request.taskId, sessionId: request.sessionId, ...next };
+    const { observation: _observation, ...plannedOutcome } = next;
+    const outcome = { taskId: request.taskId, sessionId: request.sessionId, ...plannedOutcome };
     taskOutcomes.set(request.taskId, outcome);
     return outcome;
   };
@@ -267,9 +318,13 @@ test('official DSH Schedule source is consumed once, remains durable, and dispat
     id: WORKFLOW_ID,
     version: 1,
     title: 'Configured cloud snapshot',
-    description: 'Check one configured read-only fixture target.',
+    description: 'Check one documentation target and two explicitly configured Google projects.',
     instructions: 'Report the configured target state without changing it.',
-    targets: [{ id: 'fixture-resource', label: 'Fixture resource', kind: 'cloud-resource' }],
+    targets: [
+      { id: 'microsoft-learn', label: 'Microsoft Learn', kind: 'cloud-connection' },
+      { id: 'alpha-project', label: 'Alpha project', kind: 'google-cloud-project' },
+      { id: 'beta-project', label: 'Beta project', kind: 'google-cloud-project' },
+    ],
     notifications: { onChange: true, onFailure: true, onRecovery: true, quietWhenUnchanged: true },
     enabled: true,
     schedule: { kind: 'cron', expression: '0 0 1 1 *', timeZone: 'UTC' },
@@ -284,6 +339,27 @@ test('official DSH Schedule source is consumed once, remains durable, and dispat
     await store.putWorkflow(workflow);
     first = await createHost(directory, store, executeTask, adapter);
     workflowContext = first.ctx;
+    first.ctx.provide('cloudConnections', createReadonlyFixtureRegistry(() => learnStatus));
+    first.ctx.tools.register(defineTool({
+      name: 'work_sources', description: 'Read source inventory health.', parameters: {},
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+      execute: async () => 'all configured sources appear healthy',
+    }));
+    first.ctx.tools.register(defineTool({
+      name: 'mcp__microsoft_learn__search', description: 'Search official documentation.',
+      parameters: { fail: { type: 'boolean' } },
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+      execute: async args => {
+        if (args.fail) throw new Error('fixture readonly transport failure');
+        return 'Observed the configured official documentation target.';
+      },
+    }));
+    first.ctx.tools.register(defineTool({
+      name: 'gcloud_readonly', description: 'Inspect one fixed Google Cloud project operation.',
+      parameters: { operation: { type: 'string' }, projectId: { type: 'string' } },
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+      execute: async args => args.projectId,
+    }));
     first.ctx.tools.register(defineTool({
       name: 'work_notify', description: 'Attempt a model-requested external notification.',
       parameters: {
@@ -345,6 +421,28 @@ test('official DSH Schedule source is consumed once, remains durable, and dispat
     // The official DSH JSON domain and scheduler Session are reopened from the same
     // persistent roots, while the Work API and executor remain their own authorities.
     second = await createHost(directory, store, executeTask, adapter);
+    workflowContext = second.ctx;
+    second.ctx.provide('cloudConnections', createReadonlyFixtureRegistry(() => learnStatus));
+    second.ctx.tools.register(defineTool({
+      name: 'work_sources', description: 'Read source inventory health.', parameters: {},
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+      execute: async () => 'all configured sources appear healthy',
+    }));
+    second.ctx.tools.register(defineTool({
+      name: 'mcp__microsoft_learn__search', description: 'Search official documentation.',
+      parameters: { fail: { type: 'boolean' } },
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+      execute: async args => {
+        if (args.fail) throw new Error('fixture readonly transport failure');
+        return 'Observed the configured official documentation target.';
+      },
+    }));
+    second.ctx.tools.register(defineTool({
+      name: 'gcloud_readonly', description: 'Inspect one fixed Google Cloud project operation.',
+      parameters: { operation: { type: 'string' }, projectId: { type: 'string' } },
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+      execute: async args => args.projectId,
+    }));
     const [restartedWorkflow] = await store.listWorkflows();
     assert.ok(restartedWorkflow?.enabled && restartedWorkflow.targets.length > 0 && restartedWorkflow.schedule,
       `workflow definition survives host reinitialization: ${JSON.stringify(restartedWorkflow)}`);
@@ -357,11 +455,10 @@ test('official DSH Schedule source is consumed once, remains durable, and dispat
     assert.equal(restored.status, 'active');
 
     // Simulate redelivery of the same official source frame after restart. The
-    // stable executor id returns its durable outcome; no second run starts.
+    // durable terminal occurrence receipt prevents a second run from starting.
     await deliverDuplicate(restartedAgent, firstSchedule.prompt, oneShot.scheduledAt);
     assert.equal(executionStarts.length, 1);
-    assert.equal(executorRequests.length, 2);
-    assert.equal(executorRequests[0].taskId, executorRequests[1].taskId);
+    assert.equal(executorRequests.length, 1);
     assert.equal(second.modelRequests(), 0);
     assert.equal(adapter.calls, 0);
     const duplicateEvents = (await eventsFor(store)).filter(event => event.scheduledAt === oneShot.scheduledAt);
@@ -371,20 +468,32 @@ test('official DSH Schedule source is consumed once, remains durable, and dispat
     await deliverDuplicate(restartedAgent, firstSchedule.prompt, secondAt);
     assert.equal(notifications.at(-1)?.kind, 'failure');
     assert.equal(store.listNotifications().length, 1, 'a failure transition is durably queued before observation');
+    assert.equal((await eventsFor(store)).find(event => event.scheduledAt === secondAt && event.status === 'failed')?.errorCode, 'WORKFLOW_OBSERVATION_REQUIRED',
+      'memory lookup alone cannot prove any configured cloud target');
     await deliverDuplicate(restartedAgent, firstSchedule.prompt, secondAt);
     assert.equal(store.listNotifications().length, 1, 'a duplicate occurrence reuses its durable deduplication key');
     assert.equal(notifications.filter(item => item.kind === 'failure').length, 1,
       'a duplicate occurrence emits no second observation');
     const thirdAt = new Date(Date.parse(oneShot.scheduledAt) + 120_000).toISOString();
     await deliverDuplicate(restartedAgent, firstSchedule.prompt, thirdAt);
-    assert.equal(store.listNotifications().length, 1, 'repeated unchanged failures stay quiet');
+    assert.equal(store.listNotifications().length, 1, 'failed observation tool calls do not count and repeated failure stays quiet');
     assert.equal(notifications.filter(item => item.kind === 'failure').length, 1);
+    assert.equal((await eventsFor(store)).find(event => event.scheduledAt === thirdAt && event.status === 'failed')?.errorCode, 'WORKFLOW_OBSERVATION_REQUIRED');
     const fourthAt = new Date(Date.parse(oneShot.scheduledAt) + 180_000).toISOString();
     await deliverDuplicate(restartedAgent, firstSchedule.prompt, fourthAt);
-    assert.equal(notifications.at(-1)?.kind, 'recovery');
-    assert.equal(store.listNotifications().length, 2, 'recovery is durably enqueued across the host restart');
+    assert.equal(store.listNotifications().length, 1, 'healthy output without any target observation remains failed');
+    assert.equal((await eventsFor(store)).find(event => event.scheduledAt === fourthAt && event.status === 'failed')?.errorCode, 'WORKFLOW_OBSERVATION_REQUIRED');
     const fifthAt = new Date(Date.parse(oneShot.scheduledAt) + 240_000).toISOString();
     await deliverDuplicate(restartedAgent, firstSchedule.prompt, fifthAt);
+    assert.equal((await eventsFor(store)).find(event => event.scheduledAt === fifthAt && event.status === 'failed')?.errorCode, 'WORKFLOW_OBSERVATION_REQUIRED',
+      'observing only one of two projects sharing gcloud_readonly must fail');
+    assert.equal(store.listNotifications().length, 1, 'missing a target receipt stays within the quiet repeated-failure transition');
+    const sixthAt = new Date(Date.parse(oneShot.scheduledAt) + 300_000).toISOString();
+    await deliverDuplicate(restartedAgent, firstSchedule.prompt, sixthAt);
+    assert.equal(notifications.at(-1)?.kind, 'recovery');
+    assert.equal(store.listNotifications().length, 2, 'observed recovery is durably enqueued across the host restart');
+    const seventhAt = new Date(Date.parse(oneShot.scheduledAt) + 360_000).toISOString();
+    await deliverDuplicate(restartedAgent, firstSchedule.prompt, seventhAt);
     assert.equal(notifications.at(-1)?.kind, 'change');
     assert.equal(store.listNotifications().length, 3);
     assert.equal(second.modelRequests(), 0);
@@ -403,6 +512,114 @@ test('official DSH Schedule source is consumed once, remains durable, and dispat
     if (second !== undefined) {
       await second.handle.dispose().catch(() => undefined);
       await second.ctx.fiber.dispose().catch(() => undefined);
+    }
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('unsupported, unknown, and credential-missing targets fail before executor dispatch', { timeout: 45_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'navigator-workflow-preflight-'));
+  const store = new InMemoryWorkflowStore();
+  const adapter = new CountingAdapter();
+  const executorRequests = [];
+  const workflowTargets = [
+    { workflowId: 'workflow-hf-preflight', title: 'HF preflight', target: { id: 'huggingface', label: 'Hugging Face', kind: 'cloud-connection' } },
+    { workflowId: 'workflow-unknown-preflight', title: 'Unknown preflight', target: { id: 'unknown-vendor', label: 'Unknown vendor', kind: 'cloud-connection' } },
+    { workflowId: 'workflow-auth-preflight', title: 'Auth preflight', target: { id: 'microsoft-learn', label: 'Microsoft Learn', kind: 'cloud-connection' } },
+  ];
+  const notifications = [];
+  const enqueue = store.enqueueNotification.bind(store);
+  let outboxInterrupted = false;
+  store.enqueueNotification = async request => {
+    if (!outboxInterrupted && request.payload.workflowId === 'workflow-hf-preflight') {
+      outboxInterrupted = true;
+      throw new Error('fixture outbox transport interrupted');
+    }
+    return enqueue(request);
+  };
+  let host;
+
+  try {
+    for (const item of workflowTargets) {
+      await store.putWorkflow({
+        id: item.workflowId, version: 1, title: item.title, description: 'Verify fail-closed workflow preflight.',
+        instructions: 'Inspect the configured target without changing it.', targets: [item.target],
+        notifications: { onChange: true, onFailure: true, onRecovery: true, quietWhenUnchanged: true },
+        enabled: true, schedule: { kind: 'cron', expression: '0 0 1 1 *', timeZone: 'UTC' },
+      });
+    }
+    host = await createHost(directory, store, async request => {
+      executorRequests.push(request);
+      return { taskId: request.taskId, sessionId: request.sessionId, status: 'completed',
+        output: JSON.stringify({ changed: false, summary: 'healthy' }) };
+    }, adapter);
+    host.ctx.provide('cloudConnections', {
+      list: () => [],
+      get: id => id === 'microsoft-learn' ? {
+        id, name: 'Microsoft Learn', kind: 'mcp', status: 'missing-credential',
+        source: { publisher: 'Microsoft', endpoint: 'https://learn.microsoft.com/api/mcp', documentation: 'https://learn.microsoft.com/en-us/training/support/mcp' },
+        description: 'Credential is not configured.', tools: [],
+      } : id === 'huggingface' ? {
+        id, name: 'Hugging Face', kind: 'mcp', status: 'available',
+        source: { publisher: 'Hugging Face', endpoint: 'https://huggingface.co/mcp', documentation: 'https://huggingface.co/docs/hub/agents-mcp' },
+        description: 'Interactive tools are available.', tools: [{ name: 'mcp__huggingface__model_search', description: 'Search models.', parameters: {} }],
+      } : undefined,
+      workflowReadonlyTools: id => id === 'huggingface' ? ['mcp__huggingface__model_search'] : [],
+      workflowReadonlyProjectIds: () => [],
+    });
+    host.ctx.on('workflow/notification', notification => {
+      assert.equal(store.listNotifications().length, notifications.length + 1,
+        'preflight failure notification follows its durable outbox receipt');
+      notifications.push(notification);
+    });
+
+    const recurring = await host.ctx.schedule.catalog();
+    const oneShots = await Promise.all(workflowTargets.map(item => {
+      const source = recurring.find(entry => entry.kind === 'cron' && entry.title === item.title);
+      assert.ok(source, `DSH cron row exists for ${item.workflowId}`);
+      return host.ctx.schedule.create(SessionId(SCHEDULER_SESSION_ID), {
+        title: `Preflight trigger ${item.workflowId}`, prompt: source.prompt, after_seconds: 1,
+      }).then(oneShot => ({ ...item, prompt: source.prompt, oneShot }));
+    }));
+    for (const item of oneShots) {
+      await waitFor(async () => (await eventsForId(store, item.workflowId))
+        .some(event => event.scheduledAt === item.oneShot.scheduledAt && event.status === 'failed'),
+      `preflight did not reject ${item.workflowId}`);
+    }
+
+    const scheduler = host.ctx.agents.get(SessionId(SCHEDULER_SESSION_ID));
+    assert.ok(scheduler);
+    await scheduler.whenIdle();
+    assert.equal(executorRequests.length, 0, 'the executor and model must not run for unclassified or unauthenticated targets');
+    assert.equal(host.modelRequests(), 0);
+    assert.equal(adapter.calls, 0);
+    assert.equal(outboxInterrupted, true);
+    assert.equal(store.listNotifications().length, 2, 'the failed outbox write is not falsely acknowledged');
+    await host.handle.sync();
+    assert.equal(store.listNotifications().length, 3);
+    assert.equal(notifications.length, 3);
+    await host.handle.sync();
+    assert.equal(store.listNotifications().length, 3, 'durable terminal evidence retries one missing outbox item without replaying execution');
+    assert.equal(notifications.length, 3);
+    for (const item of oneShots) {
+      const events = await eventsForId(store, item.workflowId);
+      assert.deepEqual(events.map(event => event.status), ['failed'], 'failed target preflight never enters queued or running execution');
+      assert.equal(events[0]?.errorCode, 'WORKFLOW_READONLY_TARGET_UNAVAILABLE');
+      await deliverDuplicate(scheduler, item.prompt, item.oneShot.scheduledAt);
+      assert.equal((await eventsForId(store, item.workflowId)).length, 1, 'duplicate preflight delivery reuses its terminal occurrence receipt');
+    }
+
+    const repeated = oneShots[2];
+    const laterAt = new Date(Date.parse(repeated.oneShot.scheduledAt) + 60_000).toISOString();
+    await deliverDuplicate(scheduler, repeated.prompt, laterAt);
+    assert.equal((await eventsForId(store, repeated.workflowId)).length, 2);
+    assert.equal(store.listNotifications().length, 3, 'an unchanged repeated preflight failure stays quiet');
+    assert.equal(executorRequests.length, 0);
+    assert.equal(host.modelRequests(), 0);
+  } finally {
+    if (host !== undefined) {
+      await host.handle.dispose().catch(() => undefined);
+      await host.ctx.fiber.dispose().catch(() => undefined);
     }
     await rm(directory, { recursive: true, force: true });
   }
