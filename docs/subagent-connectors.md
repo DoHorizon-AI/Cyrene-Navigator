@@ -159,7 +159,10 @@ CodeBuddy uses the documented ACP-over-stdio transport with the native
 session, and runs one `session/prompt`. It only calls `session/load` when the
 server advertises `agentCapabilities.loadSession`. ACP permission requests are
 sent to `requestPermission`; absent, timed-out, failed, or explicit-deny
-callbacks return ACP's cancelled outcome. The only approval the adapter can
+callbacks select native `reject_once` when available, allowing independent
+work to continue. Actual cancellation or a missing reject-once option returns
+ACP's cancelled outcome. Tool execution progress reads ACP's flat update fields.
+The only approval the adapter can
 send is the native `allow_once` option, and only after the host callback
 returns `allow-once`; it never selects persistent approval. Without a host
 approval service, write requests are denied.
@@ -173,7 +176,9 @@ explicit native-login failure and does not bypass it.
 CodeBuddy 使用文档化的 ACP-over-stdio 传输与原生 `default` 权限模式。适配器执行
 `initialize`、创建 ACP session，并发送一次 `session/prompt`。只有服务端声明
 `agentCapabilities.loadSession` 时才调用 `session/load`。ACP 权限请求交给 `requestPermission`；
-回调缺失、超时、失败或明确拒绝时，均返回 ACP cancelled 结果。适配器只可能在宿主回调返回
+回调缺失、超时、失败或明确拒绝时，优先选择原生 `reject_once`，让其他独立工作继续。
+实际取消或缺少本次拒绝选项时才返回 ACP cancelled。工具进度读取标准 ACP 的平铺更新字段。
+适配器只可能在宿主回调返回
 `allow-once` 后选择原生 `allow_once` 选项，不会选择永久授权。没有宿主审批服务时，写入请求会被拒绝。
 
 ACP `authMethods` 声明可用登录方式，不代表当前未登录。Navigator 使用原生宿主的缓存登录，
