@@ -141,8 +141,12 @@ function createExchangeFixture() {
 }
 
 async function startPersistence(database, principalConfig, env) {
-  const child = spawn('uv', [
-    'run', '--project', REPOSITORY, '--frozen', 'python', '-u', 'scripts/serve-persistence.py',
+  // Launch the already-synced interpreter directly so Windows cleanup owns
+  // the actual server, rather than leaving a child behind its uv launcher.
+  const python = join(REPOSITORY, '.venv', process.platform === 'win32' ? 'Scripts' : 'bin',
+    process.platform === 'win32' ? 'python.exe' : 'python');
+  const child = spawn(python, [
+    '-u', 'scripts/serve-persistence.py',
     '--database', database,
     '--principal-config', principalConfig,
     '--artifact-root', join(dirname(database), 'artifacts'),
@@ -250,7 +254,7 @@ input.on('line', line => {
   process.exit(0);
 });`;
 
-test('round1 simulated connector-to-DSH approval and notification flow uses durable Work state', async t => {
+test('round1 simulated connector-to-DSH approval and notification flow uses durable Work state', { timeout: 60_000 }, async t => {
   const directory = await mkdtemp(join(tmpdir(), 'navigator-round1-'));
   const environment = {
     CYRENE_SESSION_TOKEN: priorEnvironment('CYRENE_SESSION_TOKEN'),
@@ -456,12 +460,16 @@ test('round1 simulated connector-to-DSH approval and notification flow uses dura
   assert.equal(replayedNotification.body.duplicate, true);
   assert.equal(replayedNotification.body.notification.id, notificationId);
 
-  const claimed = await requestWork(persistence.address, '/notifications/claim', {
-    method: 'POST', body: {
-      workerId: 'fixture-connector-worker', limit: 10, leaseSeconds: 60,
-      type: 'wecom.message', recipient: 'fixture-conversation',
-    },
-  });
+  const claimed = await waitFor(async () => {
+    const response = await requestWork(persistence.address, '/notifications/claim', {
+      method: 'POST', body: {
+        workerId: 'fixture-connector-worker', limit: 10, leaseSeconds: 60,
+        type: 'wecom.message', recipient: 'fixture-conversation',
+      },
+    });
+    assert.equal(response.status, 200);
+    return response.body.items.length > 0 ? response : undefined;
+  }, 'the queued notification to become available for its connector lease');
   assert.equal(claimed.body.items.length, 1);
   const lease = claimed.body.items[0];
   await requestWork(persistence.address, `/notifications/${lease.notification.id}/start`, {

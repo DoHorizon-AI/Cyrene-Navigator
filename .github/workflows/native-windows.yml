@@ -115,6 +115,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Windows persistence and Work API fixtures failed.' }
 
       - name: Run Windows headless executor and Work fixtures
+        timeout-minutes: 10
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true

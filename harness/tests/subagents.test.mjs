@@ -11,14 +11,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
+import { performance } from 'node:perf_hooks';
 import { Context } from '@deepseek-ai/cordis';
 import { LocalSubprocessRuntime } from '@deepseek-ai/dsh-subprocess-local';
 import { registerSubagents } from '../dist/subagents/index.js';
 
 const FIXTURE_MODE_ENV = 'CYRENE_TEST_SUBAGENT_MODE';
 const FIXTURE_LOG_ENV = 'CYRENE_TEST_SUBAGENT_LOG';
+const FIXTURE_NODE_ENV = 'CYRENE_TEST_NODE';
+const FIXTURE_SCRIPT_ENV = 'CYRENE_TEST_SUBAGENT_SCRIPT';
 
-/** Executable native-protocol peer. POSIX shebang execution is part of this fixture boundary. */
+/** Native-protocol peer launched through a POSIX shebang or the compiled Windows wrapper. */
 const fixtureSource = String.raw`#!/usr/bin/env node
 import { appendFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
@@ -154,8 +157,8 @@ async function readLog(path) {
 }
 
 async function waitForLog(path, predicate, timeoutMs = 3_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
     const entries = await readLog(path);
     if (predicate(entries)) return entries;
     await delay(10);
@@ -164,8 +167,8 @@ async function waitForLog(path, predicate, timeoutMs = 3_000) {
 }
 
 async function waitForProcessExit(pid, timeoutMs = 3_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
     if (process.platform === 'linux') {
       try {
         const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
@@ -205,6 +208,14 @@ async function fixtureHost(t, backend, mode, overrides = {}) {
 
   const oldMode = priorEnvironment(FIXTURE_MODE_ENV);
   const oldLog = priorEnvironment(FIXTURE_LOG_ENV);
+  const oldNode = priorEnvironment(FIXTURE_NODE_ENV);
+  const oldScript = priorEnvironment(FIXTURE_SCRIPT_ENV);
+  const command = process.platform === 'win32' ? process.env.CYRENE_TEST_SUBAGENT_WRAPPER : executable;
+  assert.ok(command, 'the native protocol fixture wrapper must be compiled on Windows');
+  if (process.platform === 'win32') {
+    process.env[FIXTURE_NODE_ENV] = process.execPath;
+    process.env[FIXTURE_SCRIPT_ENV] = executable;
+  }
   process.env[FIXTURE_MODE_ENV] = mode;
   process.env[FIXTURE_LOG_ENV] = logPath;
 
@@ -226,11 +237,12 @@ async function fixtureHost(t, backend, mode, overrides = {}) {
   const disposeRegistration = registerSubagents(fakeHostContext, {
     deployments: [{
       backend,
-      command: executable,
+      command,
       cwd: directory,
       envRefs: {
         FIXTURE_MODE: FIXTURE_MODE_ENV,
         FIXTURE_LOG: FIXTURE_LOG_ENV,
+        ...(process.platform === 'win32' ? { FIXTURE_NODE: FIXTURE_NODE_ENV, FIXTURE_SCRIPT: FIXTURE_SCRIPT_ENV } : {}),
       },
     }],
     timeoutMs: 2_000,
@@ -249,6 +261,8 @@ async function fixtureHost(t, backend, mode, overrides = {}) {
     await subprocessFiber.dispose();
     restoreEnvironment(FIXTURE_MODE_ENV, oldMode);
     restoreEnvironment(FIXTURE_LOG_ENV, oldLog);
+    restoreEnvironment(FIXTURE_NODE_ENV, oldNode);
+    restoreEnvironment(FIXTURE_SCRIPT_ENV, oldScript);
     await rm(directory, { recursive: true, force: true });
   });
   return {
@@ -272,7 +286,7 @@ async function completeRun(provider, cwd, parentSessionId = 'fixture-parent') {
 }
 
 test('Antigravity stream-json emits bounded deltas and resumes the associated conversation', {
-  skip: process.platform === 'win32' ? 'POSIX executable fixture requires a native Windows runner on Windows' : false,
+  timeout: 20_000,
 }, async t => {
   const host = await fixtureHost(t, 'antigravity', 'ag-normal');
   assert.ok(host.provider);
@@ -300,7 +314,7 @@ test('Antigravity stream-json emits bounded deltas and resumes the associated co
 });
 
 test('Antigravity native error is surfaced and cancellation reaps its child', {
-  skip: process.platform === 'win32' ? 'POSIX executable fixture requires a native Windows runner on Windows' : false,
+  timeout: 20_000,
 }, async t => {
   const errorHost = await fixtureHost(t, 'antigravity', 'ag-error');
   const failure = await completeRun(errorHost.provider, errorHost.cwd);
@@ -325,7 +339,7 @@ test('Antigravity native error is surfaced and cancellation reaps its child', {
 
 for (const [mode, label] of [['ag-malformed', 'malformed'], ['ag-oversized', 'oversized']]) {
   test(`Antigravity rejects ${label} frames after publication`, {
-    skip: process.platform === 'win32' ? 'POSIX executable fixture requires a native Windows runner on Windows' : false,
+    timeout: 20_000,
   }, async t => {
     const host = await fixtureHost(t, 'antigravity', mode);
     const run = await host.provider.start(startRequest('fault-parent', host.cwd, new AbortController().signal));
@@ -340,7 +354,7 @@ for (const [mode, label] of [['ag-malformed', 'malformed'], ['ag-oversized', 'ov
 }
 
 test('Antigravity rejects malformed startup and non-documented native permission modes', {
-  skip: process.platform === 'win32' ? 'POSIX executable fixture requires a native Windows runner on Windows' : false,
+  timeout: 20_000,
 }, async t => {
   const malformed = await fixtureHost(t, 'antigravity', 'ag-malformed-start');
   await assert.rejects(
@@ -358,7 +372,7 @@ test('Antigravity rejects malformed startup and non-documented native permission
 });
 
 test('CodeBuddy ACP rejects a native write approval and associates approved requests with the parent task', {
-  skip: process.platform === 'win32' ? 'POSIX executable fixture requires a native Windows runner on Windows' : false,
+  timeout: 20_000,
 }, async t => {
   const host = await fixtureHost(t, 'codebuddy', 'cb-permission', {
     requestPermission: async () => 'deny',
@@ -381,7 +395,7 @@ test('CodeBuddy ACP rejects a native write approval and associates approved requ
 });
 
 test('CodeBuddy ACP resumes only when loadSession is advertised', {
-  skip: process.platform === 'win32' ? 'POSIX executable fixture requires a native Windows runner on Windows' : false,
+  timeout: 20_000,
 }, async t => {
   const host = await fixtureHost(t, 'codebuddy', 'cb-normal');
   await completeRun(host.provider, host.cwd, 'resume-parent');

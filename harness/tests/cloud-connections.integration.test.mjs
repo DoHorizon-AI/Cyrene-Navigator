@@ -6,6 +6,7 @@
 
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { realpathSync } from 'node:fs';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
 import { fileURLToPath } from 'node:url';
@@ -21,11 +22,11 @@ import {
   runGcloudReadonly,
 } from '../dist/integrations/index.js';
 
-const mcpRequire = createRequire(new URL('../node_modules/@deepseek-ai/dsh-mcp-client/package.json', import.meta.url));
+const stdioPackageJson = realpathSync(fileURLToPath(new URL('../node_modules/@deepseek-ai/dsh-mcp-client/package.json', import.meta.url)));
+const mcpRequire = createRequire(stdioPackageJson);
 const { McpServer, createMcpHandler } = mcpRequire('@modelcontextprotocol/server');
 const { toNodeHandler } = mcpRequire('@modelcontextprotocol/node');
 const { z } = mcpRequire('zod');
-const stdioPackageJson = fileURLToPath(new URL('../node_modules/@deepseek-ai/dsh-mcp-client/package.json', import.meta.url));
 const stdioFixture = fileURLToPath(new URL('./fixtures/official-cloud-mcp-stdio.mjs', import.meta.url));
 
 async function startHttpMcp() {
