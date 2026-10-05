@@ -155,6 +155,19 @@ partial output into a success claim.
 并等待进程退出。取消和清理不得遗留未回收的子进程。结果不明确时不得自动重试命令，因为它可能已经产生
 副作用。失败或取消的终态结果应保留有效的部分助手输出，但不得把部分输出描述为成功。
 
+Local cancellation and protocol cancellation have separate evidence gates.
+Explicit disposal attempts `session/cancel` before settling local requests.
+Direct caller-signal abort currently fails the peer and terminates the managed
+child before that notification can be sent. A promptly settled result and a
+reaped child therefore do not prove that the native agent received or processed
+the notification. A future cooperative-cancellation implementation must retain
+a bounded forced-stop path and test native receipt separately.
+
+本地取消与协议取消需要分别验收。显式销毁会先尝试发送 `session/cancel`，再结算本地请求。
+调用方信号直接中止时，当前实现会先使协议端失败并终止受管子进程，导致取消通知无法发出。
+因此，及时结算结果且回收子进程不能证明原生 Agent 已收到或处理通知。后续协作式取消实现必须保留
+有期限的强制停止路径，并单独验证原生通知接收。
+
 ## Acceptance checklist / 验收清单
 
 Each adapter change should satisfy the portable fixture checks and, for every
@@ -203,6 +216,7 @@ unproven.
 | **OBSERVED — generic ACP regression** | Linux WSL2 CodeBuddy with the approved default-permission launcher completed a generic ACP call using the observed `glm-5.3` model in 15.74 seconds. A separate active-run disposal settled locally in 3 ms and reaped the native child. This establishes reuse with the tested CLI, not other vendors. / Linux WSL2 上的 CodeBuddy 经审核的默认权限启动器，以实际观测到的 `glm-5.3` 在 15.74 秒内完成通用 ACP 调用。另一次运行中的销毁在本地 3 毫秒内结算，并回收原生子进程。这证明已测 CLI 的共用能力，不代表其他厂商。 |
 | **OPEN — current Antigravity availability** | A further bounded `gemini-3.8-flash-medium` marker call connected and reported the configured model but did not return within its 90-second turn deadline. The child was reaped; no host fallback or permission elevation was used. Native availability remains unresolved. / 再次对 `gemini-3.8-flash-medium` 发起有界简短调用，已连接且报告配置模型，但未在 90 秒整轮期限内返回。子进程已回收，未回退到宿主执行或提升权限；原生可用性仍待定位。 |
 | **OPEN — vendor denial behavior** | The tested CodeBuddy CLI may still end the whole prompt as `cancelled` after receiving `reject_once`. Fixture continuation proves protocol handling only, not native vendor continuation. / 已测 CodeBuddy CLI 收到 `reject_once` 后仍可能以 `cancelled` 结束整个 prompt。Fixture 继续执行只能证明协议处理，不能证明原生厂商 CLI 会继续。 |
+| **OPEN — cooperative cancellation** | Direct caller-signal abort currently terminates the managed child before `session/cancel` can be sent. Explicit disposal attempts the notification, but the native test establishes only local settlement and reaping. A future change needs a bounded grace period plus separate notification-receipt evidence. / 调用方信号直接中止时，当前实现会先终止受管子进程，无法发送 `session/cancel`。显式销毁会尝试通知，但原生测试只证明本地结算和回收。后续变更需要有界宽限期，以及单独的通知接收证据。 |
 | **OPEN — incomplete permission metadata** | A request with absent or unknown `kind` must receive explicit host review as unknown. Tool names and titles must never trigger automatic approval. / `kind` 缺失或未知的请求必须作为 unknown 交由宿主明确审核。工具名称和标题不得触发自动批准。 |
 | **OPEN — client capabilities** | The shared ACP client currently advertises `{}`. An ACP agent requiring Client filesystem or terminal methods needs a documented capability implementation and native test before it can be called compatible. / 共享 ACP 客户端当前声明 `{}`。需要 Client 文件系统或终端方法的 ACP Agent，必须完成有文档依据的能力实现及原生测试后才能称为兼容。 |
 | **OPEN — host restart association** | Native conversation IDs live in provider memory. Durable Navigator tasks/SSE do not establish that `provider + parent session + native session` association survives restart; recovery must use existing persistence, without a second history store. / 原生 conversation ID 位于提供方内存中。Navigator 持久任务/SSE 不能证明 `provider + parent session + native session` 关联可跨重启保留；恢复必须使用现有持久化能力，不能另建历史存储。 |
