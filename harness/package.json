@@ -15,10 +15,18 @@
     "./executor": "./dist/executor.js",
     "./plugins": "./dist/plugin-manager.js",
     "./client": "./dist/client.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./subagents": "./dist/subagents/index.js",
+    "./cloud-connections": "./dist/integrations/index.js",
+    "./workflows": "./dist/workflows/index.js",
+    "./work-tools": "./dist/work-tools.js",
+    "./executor-client": "./dist/executor-client.js",
+    "./tool-providers": "./dist/tool-providers.js"
   },
   "dsh": {
-    "bundle": { "patch": "cordis.patch.yml" },
+    "bundle": {
+      "patch": "cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "inject": [
@@ -44,6 +52,14 @@
     "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
     "@deepseek-ai/dsh-util-values": "0.2.0-rc.2",
     "@deepseek-ai/dsh-subprocess": "0.2.0-rc.2",
-    "@deepseek-ai/schemastery": "3.18.4"
+    "@deepseek-ai/schemastery": "3.18.4",
+    "@deepseek-ai/dsh-brand": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-subagent": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-tool-subagent": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-mcp-client": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-schedule": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-storage-json": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-storage-domain": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-storage": "0.2.0-rc.2"
   }
 }

@@ -1,94 +1,100 @@
 // ┌─────────────────────────────────────────────────────────────────────┐
-// │ Proof: Verify Navigator Autonomous Cloud Executor Daemon Process   │
-// │ Demonstrates end-to-end HTTP/SSE API, task execution, plugin reload │
-// │ and graceful shutdown.                                              │
+// │ Proof: Verify authenticated Navigator executor with test adapter    │
+// │ Scope: REST, durable SSE replay, task state, and graceful shutdown. │
+// │ 范围：认证 REST、SSE 重放、任务状态和正常关闭。                       │
 // └─────────────────────────────────────────────────────────────────────┘
 
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import assert from 'node:assert/strict';
+import { setTimeout as delay } from 'node:timers/promises';
+
+const bearer = 'navigator-proof-only-token';
 
 async function main() {
-  console.log('[proof] Starting Navigator Cloud Daemon process...');
   const port = 54399;
   const proc = spawn(process.execPath, [
     'scripts/serve-executor.mjs',
     `--port=${port}`,
     '--host=127.0.0.1',
+    '--test-mode',
+    '--test-echo-adapter',
   ], {
     cwd: process.cwd(),
+    env: { ...process.env, CYRENE_EXECUTOR_TOKEN: bearer },
     stdio: ['ignore', 'pipe', 'inherit'],
   });
-
+  const exited = once(proc, 'exit');
   let serverUrl = '';
+  let buffer = '';
   proc.stdout.on('data', chunk => {
-    const lines = chunk.toString().trim().split('\n');
-    for (const line of lines) {
+    buffer += chunk.toString();
+    let newline = buffer.indexOf('\n');
+    while (newline >= 0) {
+      const line = buffer.slice(0, newline);
+      buffer = buffer.slice(newline + 1);
       try {
         const parsed = JSON.parse(line);
-        if (parsed.status === 'ready') {
-          serverUrl = parsed.url;
-          console.log(`[proof] Server ready at ${serverUrl}`);
-        }
+        if (parsed.status === 'ready') serverUrl = parsed.url;
       } catch {}
+      newline = buffer.indexOf('\n');
     }
   });
 
-  // Wait for server ready
-  for (let i = 0; i < 50; i++) {
-    if (serverUrl) break;
-    await new Promise(r => setTimeout(r, 100));
-  }
-  assert.ok(serverUrl, 'Server failed to start in time');
-
+  const headers = { Authorization: `Bearer ${bearer}` };
   try {
-    // 1. Health check
-    console.log('[proof] 1. Checking /api/v1/health...');
+    for (let i = 0; i < 50 && !serverUrl; i += 1) await delay(100);
+    assert.ok(serverUrl, 'Server failed to start in time');
+
     const healthRes = await fetch(`${serverUrl}/api/v1/health`);
     assert.equal(healthRes.status, 200);
     const health = await healthRes.json();
-    assert.equal(health.status, 'ok');
+    assert.equal(health.service, 'cyrene-navigator-executor');
     assert.equal(health.version, '0.2.0-rc.2');
-    console.log('[proof] Health check passed:', health);
 
-    // 2. Execute task
-    console.log('[proof] 2. Submitting task via /api/v1/execute...');
-    const execRes = await fetch(`${serverUrl}/api/v1/execute`, {
+    const denied = await fetch(`${serverUrl}/api/v1/tasks`);
+    assert.equal(denied.status, 401);
+
+    const createRes = await fetch(`${serverUrl}/api/v1/tasks`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt: 'Test autonomous executor' }),
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: 'Test isolated executor proof' }),
     });
-    assert.equal(execRes.status, 200);
-    const taskResult = await execRes.json();
-    assert.equal(taskResult.status, 'completed');
-    assert.ok(taskResult.taskId);
-    console.log('[proof] Task executed successfully:', taskResult);
+    assert.equal(createRes.status, 202);
+    const admitted = await createRes.json();
+    assert.equal(admitted.status, 'queued');
 
-    // 3. Inspect task status
-    console.log('[proof] 3. Inspecting task status via /api/v1/tasks/:id/status...');
-    const statusRes = await fetch(`${serverUrl}/api/v1/tasks/${taskResult.taskId}/status`);
-    assert.equal(statusRes.status, 200);
-    const statusData = await statusRes.json();
-    assert.equal(statusData.id, taskResult.taskId);
-    assert.equal(statusData.status, 'completed');
-    console.log('[proof] Task status verified:', statusData);
+    let task = admitted;
+    for (let i = 0; i < 100 && !['completed', 'failed', 'aborted'].includes(task.status); i += 1) {
+      await delay(50);
+      const statusRes = await fetch(`${serverUrl}/api/v1/tasks/${admitted.id}`, { headers });
+      assert.equal(statusRes.status, 200);
+      task = await statusRes.json();
+    }
+    assert.equal(task.status, 'completed');
+    assert.match(task.output, /Test isolated executor proof/u);
 
-    // 4. Hot-reload plugins
-    console.log('[proof] 4. Triggering dynamic plugin hot-reload via /api/v1/plugins/reload...');
+    const streamRes = await fetch(`${serverUrl}/api/v1/tasks/${admitted.id}/events?after=0`, { headers });
+    assert.equal(streamRes.status, 200);
+    assert.match(streamRes.headers.get('content-type'), /text\/event-stream/u);
+    const stream = await streamRes.text();
+    assert.match(stream, /id: \d+\nevent: finish/u);
+    assert.match(stream, /"status":"completed"/u);
+
+    const pluginsRes = await fetch(`${serverUrl}/api/v1/plugins`, { headers });
+    assert.equal(pluginsRes.status, 200);
+    assert.ok(Array.isArray((await pluginsRes.json()).plugins));
     const reloadRes = await fetch(`${serverUrl}/api/v1/plugins/reload`, {
-      method: 'POST',
+      method: 'POST', headers,
     });
     assert.equal(reloadRes.status, 200);
-    const reloadData = await reloadRes.json();
-    assert.equal(reloadData.reloaded, true);
-    console.log('[proof] Plugin hot-reload verified:', reloadData);
+    assert.equal((await reloadRes.json()).reloaded, true);
 
-    console.log('[proof] All end-to-end verifications passed successfully!');
+    console.log('[proof] SIMULATED: authenticated REST, queue dispatch, ordered SSE replay, plugin access, and explicit test echo passed.');
   } finally {
-    console.log('[proof] Shutting down daemon...');
-    proc.kill('SIGTERM');
-    await once(proc, 'exit');
-    console.log('[proof] Daemon exited gracefully.');
+    if (proc.exitCode === null && proc.signalCode === null) proc.kill('SIGTERM');
+    const [code, signal] = await exited;
+    assert.equal(code, 0, `Daemon exit code=${code}, signal=${signal}`);
   }
 }
 

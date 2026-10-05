@@ -1,0 +1,82 @@
+{
+  "version": 1,
+  "workflows": [
+    {
+      "id": "readonly-cloud-inventory-hourly",
+      "version": 1,
+      "title": "Read-only cloud inventory",
+      "description": "Review configured official cloud connections and resource inventory for meaningful changes.",
+      "instructions": "Inspect only the configured targets using registered, read-only official cloud connections. Compare the current inventory with the previous successful run. Do not create or change cloud resources, start jobs, incur workload charges, or run arbitrary commands.",
+      "targets": [],
+      "notifications": { "onChange": true, "onFailure": true, "onRecovery": true, "quietWhenUnchanged": true },
+      "enabled": false,
+      "schedule": { "kind": "cron", "expression": "5 * * * *", "timeZone": "UTC" }
+    },
+    {
+      "id": "virtual-machine-health-quarter-hour",
+      "version": 1,
+      "title": "Virtual machine health",
+      "description": "Check configured virtual machine health signals on a 15-minute cadence.",
+      "instructions": "Inspect only configured virtual-machine targets and read-only health signals. Compare with the previous successful run. Do not start, stop, resize, or otherwise change any machine.",
+      "targets": [],
+      "notifications": { "onChange": true, "onFailure": true, "onRecovery": true, "quietWhenUnchanged": true },
+      "enabled": false,
+      "schedule": { "kind": "cron", "expression": "*/15 * * * *", "timeZone": "UTC" }
+    },
+    {
+      "id": "stale-data-watchdog-quarter-hour",
+      "version": 1,
+      "title": "Stale-data watchdog",
+      "description": "Check configured service signals for missing or stale observations; offset from the VM health cadence.",
+      "instructions": "Inspect only configured service and data freshness targets using their read-only interfaces. Report missing or stale observations and compare with the previous successful run. Do not retry workloads or change service state.",
+      "targets": [],
+      "notifications": { "onChange": true, "onFailure": true, "onRecovery": true, "quietWhenUnchanged": true },
+      "enabled": false,
+      "schedule": { "kind": "cron", "expression": "7,22,37,52 * * * *", "timeZone": "UTC" }
+    },
+    {
+      "id": "model-catalog-daily",
+      "version": 1,
+      "title": "Model catalog review",
+      "description": "Review configured model catalog targets and highlight meaningful catalog changes.",
+      "instructions": "Inspect configured model catalog targets through official read-only documentation or catalog tools. Compare the current result with the previous successful run. Do not download models, start jobs, or incur compute charges.",
+      "targets": [],
+      "notifications": { "onChange": true, "onFailure": true, "onRecovery": true, "quietWhenUnchanged": true },
+      "enabled": false,
+      "schedule": { "kind": "cron", "expression": "0 9 * * *", "timeZone": "UTC" }
+    },
+    {
+      "id": "repository-issue-changes-hourly",
+      "version": 1,
+      "title": "Repository issue changes",
+      "description": "Review configured repository issue targets for changes and newly actionable items.",
+      "instructions": "Inspect configured repository issue targets using read-only tools. Compare with the previous successful run and summarize only meaningful changes. Do not create, edit, close, or comment on issues.",
+      "targets": [],
+      "notifications": { "onChange": true, "onFailure": true, "onRecovery": true, "quietWhenUnchanged": true },
+      "enabled": false,
+      "schedule": { "kind": "cron", "expression": "10 * * * *", "timeZone": "UTC" }
+    },
+    {
+      "id": "workspace-review-weekdays",
+      "version": 1,
+      "title": "Weekday workspace review",
+      "description": "Review configured workspace signals each weekday and surface significant follow-up needs.",
+      "instructions": "Review only configured workspace targets and their read-only status. Compare with the previous successful run and report important changes or unresolved issues. Do not edit files, start deployments, or send external messages.",
+      "targets": [],
+      "notifications": { "onChange": true, "onFailure": true, "onRecovery": true, "quietWhenUnchanged": true },
+      "enabled": false,
+      "schedule": { "kind": "cron", "expression": "0 9 * * 1-5", "timeZone": "UTC" }
+    },
+    {
+      "id": "repository-security-review-weekly",
+      "version": 1,
+      "title": "Weekly repository security review",
+      "description": "Review configured repositories for new security advisories and read-only source changes.",
+      "instructions": "Review only configured repositories using read-only security and source metadata. Compare findings with the previous successful run. Do not open issues, modify source, install packages, or execute build/deployment jobs.",
+      "targets": [],
+      "notifications": { "onChange": true, "onFailure": true, "onRecovery": true, "quietWhenUnchanged": true },
+      "enabled": false,
+      "schedule": { "kind": "cron", "expression": "0 9 * * 1", "timeZone": "UTC" }
+    }
+  ]
+}

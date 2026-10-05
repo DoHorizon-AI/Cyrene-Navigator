@@ -50,7 +50,7 @@ _CSRF_COOKIE = "cyrene_csrf"
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _TRACEPARENT = r"^00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$"
 _PROXY_REQUEST_HEADERS = frozenset(
-    {"accept", "content-type", "idempotency-key", "traceparent", "tracestate"}
+    {"accept", "content-type", "idempotency-key", "last-event-id", "traceparent", "tracestate"}
 )
 _PROXY_RESPONSE_HEADERS = frozenset(
     {
@@ -1106,6 +1106,7 @@ def create_web_host_app(
     secure_cookies: bool = False,
     clock: Clock = time.time,
     http_client: httpx.AsyncClient | None = None,
+    workspace_id: str | None = None,
 ) -> FastAPI:
     """Build the same-origin Web Host boundary.
 
@@ -1116,6 +1117,10 @@ def create_web_host_app(
     代理响应也不会设置来自上游的浏览器 cookie。
     """
 
+    if workspace_id is not None and not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}", workspace_id
+    ):
+        raise ValueError("workspace_id must be a bounded deployment identifier")
     resolved_pairing_code = (
         pairing_code or os.environ.get("CYRENE_WEB_HOST_PAIR_CODE") or generate_pairing_code()
     )
@@ -1394,6 +1399,7 @@ def create_web_host_app(
             "status": "degraded" if activity_info.get("status") == "degraded" else "ok",
             "version": app_version,
             "authenticated": authenticated,
+            "workspaceId": workspace_id if authenticated else None,
             "proxyPrefixes": [entry.prefix for entry in configured_proxies],
             "credentials": counts,
             "gpu": gpu_info,
@@ -1547,7 +1553,10 @@ def create_web_host_app(
         require_session(request, mutation=request.method in _MUTATING_METHODS)
         target = target_entry.target
         suffix = request.url.path.removeprefix(target_entry.prefix)
-        upstream_url = target.base_url + (suffix or "/")
+        # A target may name a collection route, whose empty suffix must not
+        # turn into a different trailing-slash endpoint. 保留集合路由原始路径。
+        empty_suffix = "" if urlsplit(target.base_url).path else "/"
+        upstream_url = target.base_url + (suffix or empty_suffix)
         if request.url.query:
             upstream_url += "?" + request.url.query
         headers = {
@@ -1572,7 +1581,18 @@ def create_web_host_app(
                     retryable=True,
                 )
             headers["authorization"] = f"Bearer {secret}"
-        body = await request.body()
+        # Bound buffered uploads before forwarding, including base64 attachments.
+        # 中文:逐块限制上传大小,避免先完整缓存超限附件。
+        body_chunks: list[bytes] = []
+        body_size = 0
+        async for chunk in request.stream():
+            body_size += len(chunk)
+            if body_size > 16 * 1024 * 1024:
+                raise WebHostError(
+                    "NAVIGATOR_PROXY_BODY_TOO_LARGE", 413, "The proxy body exceeds 16 MiB."
+                )
+            body_chunks.append(chunk)
+        body = b"".join(body_chunks)
         is_stream = "text/event-stream" in request.headers.get("accept", "").lower()
         try:
             activity_task_id = activity.begin()

@@ -7,6 +7,8 @@ Navigator 是 Native Client（`Cyrene-Client`）的内置 Harness 组件，基�
 | Document | Purpose / 用途 |
 | --- | --- |
 | [API](API.md) | Session & Harness API / 会话与 Harness 接口 |
+| [Work Assistant API](work-assistant-api.md) | Durable task, approval, memory, notification, and connector contracts / 持久任务、审批、记忆、通知与连接器接口 |
+| [Official cloud connections](cloud-connections.md) | Source-backed cloud profiles, readonly workflow scope, and credential references / 有来源的云 profile、工作流只读范围与凭据引用 |
 | [Repository lifecycle](REPOSITORY-LIFECYCLE.md) | Repository delivery conventions / 仓库交付约定 |
 | [Harness adoption](adoption/README.md) | DeepSeek Harness integration, compatibility & boundaries / DeepSeek Harness 接入、兼容性与边界 |
 | [Codex import](import/README.md) | Archive and explicit Continue semantics / 归档及显式 Continue |
