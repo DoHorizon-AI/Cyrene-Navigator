@@ -628,8 +628,9 @@ async function reconcileWorkflowNotifications(ctx: Context, store: WorkflowStore
       const existing = terminals.get(event.scheduledAt);
       if (existing === undefined || event.status === 'failed') terminals.set(event.scheduledAt, event);
     }
-    for (const event of terminals.values()) {
-      const previous = previousRunState(events, event.scheduledAt);
+    let previous: PreviousWorkflowRun | undefined;
+    let successfulSummary: string | undefined;
+    for (const event of [...terminals.values()].sort((left, right) => left.scheduledAt.localeCompare(right.scheduledAt))) {
       let kind: WorkflowNotificationKind | undefined;
       if (event.status === 'failed') {
         if (workflow.notifications.onFailure && shouldNotifyFailure(previous, event.errorCode ?? 'WORKFLOW_DISPATCH_FAILED')) kind = 'failure';
@@ -642,6 +643,12 @@ async function reconcileWorkflowNotifications(ctx: Context, store: WorkflowStore
         await enqueueWorkflowNotification(ctx, store, workflow, event.scheduledAt, kind,
           event.summary ?? 'Workflow occurrence finished.', event.taskId ?? occurrenceTaskId(workflow.id, event.scheduledAt));
       }
+      if (event.status === 'succeeded') successfulSummary = event.summary;
+      previous = {
+        status: event.status as 'succeeded' | 'failed',
+        ...(successfulSummary === undefined ? {} : { summary: successfulSummary }),
+        ...(event.errorCode === undefined ? {} : { errorCode: event.errorCode }),
+      };
     }
   }
 }
