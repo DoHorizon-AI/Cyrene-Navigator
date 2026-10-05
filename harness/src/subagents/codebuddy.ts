@@ -126,7 +126,7 @@ class AcpStdioClient {
     const error = isJsonObject(frame.error) ? frame.error : undefined
     if (error !== undefined) {
       const code = typeof error.code === 'number' ? error.code : -32603
-      pending.reject(new RpcProtocolError(`CodeBuddy ACP request failed with code ${code}`))
+      pending.reject(new RpcProtocolError(code))
     } else {
       pending.resolve(frame.result)
     }
@@ -155,8 +155,31 @@ class AcpStdioClient {
   }
 }
 
-/** Failure class used to distinguish a remote JSON-RPC error from local framing faults. */
-class RpcProtocolError extends Error {}
+/** Retain only the JSON-RPC code needed for safe protocol-level classification. */
+class RpcProtocolError extends Error {
+  readonly code: number | undefined
+
+  constructor(codeOrMessage: number | string) {
+    super(typeof codeOrMessage === 'number'
+      ? `CodeBuddy ACP request failed with code ${codeOrMessage}`
+      : codeOrMessage)
+    this.code = typeof codeOrMessage === 'number' ? codeOrMessage : undefined
+    this.name = 'RpcProtocolError'
+  }
+}
+
+/** ACP uses -32000 for auth_required; never retain its message or data fields. */
+function isAuthRequired(error: unknown): error is RpcProtocolError {
+  return error instanceof RpcProtocolError && error.code === -32000
+}
+
+/** Return a fixed diagnostic that does not include child-provided RPC content. */
+function authUnavailableFailure(): NativeSubagentFailure {
+  return new NativeSubagentFailure(
+    'CodeBuddy ACP requires native CLI authentication',
+    'NATIVE_AUTH_UNAVAILABLE: CodeBuddy requires native CLI sign-in; Navigator did not start a login flow or proxy credentials.',
+  )
+}
 
 /** Build a disjoint key for numeric and textual RPC ids. */
 function rpcKey(id: string | number): string {
@@ -319,12 +342,6 @@ export class CodeBuddySubagentProvider extends NativeSubagentProvider {
       )
       const init = objectResult(initValue, 'initialize')
       const agentCapabilities = isJsonObject(init.agentCapabilities) ? init.agentCapabilities : {}
-      if (Array.isArray(init.authMethods) && init.authMethods.length > 0) {
-        throw new NativeSubagentFailure(
-          'CodeBuddy ACP requires a client authentication flow Navigator does not proxy',
-          'CodeBuddy ACP requested a separate authentication exchange; native host credentials were not extracted.',
-        )
-      }
       const canLoadSession = agentCapabilities.loadSession === true
       if (previousConversation !== undefined && canLoadSession) {
         await withDeadline(peer.request('session/load', {
@@ -361,7 +378,16 @@ export class CodeBuddySubagentProvider extends NativeSubagentProvider {
           sessionId: remoteSessionId,
           prompt: [{ type: 'text', text: prompt }],
         }).then(value => objectResult(value, 'session/prompt'))
-        const response = await withDeadline(promptRequest, request.signal, this.timeoutMs, 'CodeBuddy ACP prompt')
+        let response: Record<string, unknown>
+        try {
+          response = await withDeadline(promptRequest, request.signal, this.timeoutMs, 'CodeBuddy ACP prompt')
+        } catch (error: unknown) {
+          if (isAuthRequired(error)) {
+            diagnostic = authUnavailableFailure().diagnostic
+            throw authUnavailableFailure()
+          }
+          throw error
+        }
         const reason = stopReason(response.stopReason)
         if (reason === 'error') {
           diagnostic = `CodeBuddy ACP returned stop reason ${safeLabel(response.stopReason, 80) ?? 'unknown'}.`
@@ -509,6 +535,7 @@ function safeJsonValue(value: unknown): unknown {
 /** Hide raw CLI errors and arguments behind provider-owned startup diagnostics. */
 function safeStartupFailure(error: unknown): Error {
   if (error instanceof NativeSubagentFailure) return error
+  if (isAuthRequired(error)) return authUnavailableFailure()
   const message = error instanceof Error ? error.message : ''
   if (message.includes('timed out')) {
     return new NativeSubagentFailure('CodeBuddy ACP startup timed out', 'CodeBuddy ACP startup timed out.')
