@@ -126,6 +126,7 @@ jobs:
             harness/tests/native.integration.test.mjs \
             harness/tests/executor.integration.test.mjs \
             harness/tests/subagents.test.mjs \
+            harness/tests/subagent-wire.test.mjs \
             harness/tests/antigravity-boundary.test.mjs \
             harness/tests/antigravity-profile.test.mjs \
             harness/tests/tool-providers.test.mjs \

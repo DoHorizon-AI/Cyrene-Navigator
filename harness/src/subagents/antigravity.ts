@@ -24,7 +24,7 @@ import {
 import { AntigravityBoundaryObserver } from './antigravity-boundary.js'
 import { assertAntigravitySandboxProfile } from './antigravity-profile.js'
 import type { SubagentAdapterConfig } from './types.js'
-import { MAX_NATIVE_OUTPUT_BYTES, isJsonObject, optionalIdentifier, optionalString, pumpJsonLines, writeJsonLine } from './wire.js'
+import { MAX_NATIVE_OUTPUT_BYTES, nativeWireDiagnostic, isJsonObject, optionalIdentifier, optionalString, pumpJsonLines, writeJsonLine } from './wire.js'
 
 interface Deferred<T> {
   readonly promise: Promise<T>
@@ -163,16 +163,21 @@ export class AntigravitySubagentProvider extends NativeSubagentProvider {
     let activeConversationId: string | undefined
     let resultSettled = false
     terminal.promise.catch(() => {})
+    let streamFailed = false
     const failStream = (error: Error): void => {
-      if (flags.terminalReceived) return
+      if (flags.terminalReceived || streamFailed) return
+      streamFailed = true // Preserve the first failure rather than replacing it with cleanup EOF.
       const permissionModeRejected = error.message.includes('permission mode')
       if (permissionModeRejected) flags.modeRejected = true
-      diagnostic = error.message.includes('byte limit')
+      const wireDiagnostic = nativeWireDiagnostic(error) ?? (error instanceof NativeSubagentFailure ? error.diagnostic : undefined)
+      diagnostic = wireDiagnostic ?? (error.message.includes('byte limit')
         ? 'Antigravity stream exceeded a configured byte limit.'
         : permissionModeRejected
           ? 'Antigravity did not advertise an approved native permission mode.'
-          : 'Antigravity stream protocol returned malformed or incomplete data.'
-      const failure = error.message.includes('byte limit')
+          : 'Antigravity stream protocol returned malformed or incomplete data.')
+      const failure = wireDiagnostic !== undefined
+        ? new NativeSubagentFailure('Antigravity stream protocol failed', wireDiagnostic)
+        : error.message.includes('byte limit')
         ? new NativeSubagentFailure('Antigravity stream frame exceeded its size limit', 'Antigravity stream frame was rejected by the byte limit.')
         : permissionModeRejected
           ? new NativeSubagentFailure('Antigravity native permission mode was not approved', diagnostic)
@@ -183,6 +188,7 @@ export class AntigravitySubagentProvider extends NativeSubagentProvider {
     }
 
     pumpJsonLines(child.stdout, request.signal, frame => {
+      if (streamFailed) return
       boundary.observeFrame(frame)
       publishBoundaryReceipts()
       const event = frame.event
@@ -225,11 +231,12 @@ export class AntigravitySubagentProvider extends NativeSubagentProvider {
         // The CLI emits short answers in the terminal DONE frame without an earlier ACTIVE text event.
         if (stepType === 'agent_response' && (state === 'ACTIVE' || state === 'DONE') && typeof step.text_delta === 'string') {
           const delta = step.text_delta
-          output += delta
-          if (Buffer.byteLength(output, 'utf8') > MAX_NATIVE_OUTPUT_BYTES) {
-            failStream(new Error('Antigravity output exceeded its size limit'))
+          if (Buffer.byteLength(output, 'utf8') + Buffer.byteLength(delta, 'utf8') > MAX_NATIVE_OUTPUT_BYTES) {
+            failStream(new NativeSubagentFailure('Antigravity output exceeded its size limit',
+              'NATIVE_OUTPUT_LIMIT: Antigravity assistant output exceeded the byte limit; valid partial output retained.'))
             return
           }
+          output += delta
           if (delta.length > 0) {
             emitEvent(this.config, {
               type: 'assistant-delta',
