@@ -117,11 +117,26 @@ if (!codebuddy) {
     }
     record({ kind: 'rpc', method: request.method, params: request.params ?? {} });
     if (request.method === 'initialize') {
-      void respond(request.id, { protocolVersion: 1, agentCapabilities: { loadSession: true }, authMethods: [] });
+      const authMethods = mode === 'cb-auth-advertised'
+        ? [{ id: 'native-login', name: 'Native CLI login' }]
+        : [];
+      void respond(request.id, { protocolVersion: 1, agentCapabilities: { loadSession: true }, authMethods });
     } else if (request.method === 'session/new') {
-      void respond(request.id, { sessionId: 'codebuddy-conversation-fixture' });
+      if (mode === 'cb-auth-required-session') {
+        void writeFrame({ jsonrpc: '2.0', id: request.id, error: {
+          code: -32000, message: 'auth_required at /private token=mocksecret', data: { token: 'mocksecret' },
+        } });
+      } else {
+        void respond(request.id, { sessionId: 'codebuddy-conversation-fixture' });
+      }
     } else if (request.method === 'session/load') {
-      void respond(request.id, {});
+      if (mode === 'cb-auth-required-load') {
+        void writeFrame({ jsonrpc: '2.0', id: request.id, error: {
+          code: -32000, message: 'auth_required at /private token=mocksecret', data: { token: 'mocksecret' },
+        } });
+      } else {
+        void respond(request.id, {});
+      }
     } else if (request.method === 'session/prompt' && mode === 'cb-permission') {
       promptRequestId = request.id;
       void writeFrame({ jsonrpc: '2.0', id: 'fixture-permission', method: 'session/request_permission', params: {
@@ -132,6 +147,10 @@ if (!codebuddy) {
           { optionId: 'always', kind: 'allow_always' },
           { optionId: 'reject', kind: 'reject_once' },
         ],
+      } });
+    } else if (request.method === 'session/prompt' && mode === 'cb-auth-required-prompt') {
+      void writeFrame({ jsonrpc: '2.0', id: request.id, error: {
+        code: -32000, message: 'auth_required at /private token=mocksecret', data: { token: 'mocksecret' },
       } });
     } else if (request.method === 'session/prompt') {
       void (async () => {
@@ -423,6 +442,83 @@ test('CodeBuddy ACP resumes only when loadSession is advertised', {
   const prompts = log.filter(entry => entry.kind === 'rpc' && entry.method === 'session/prompt');
   assert.equal(prompts.length, 2);
   assert.ok(host.events.every(event => event.parentSessionId === 'resume-parent'));
+});
+
+test('CodeBuddy ACP uses native session success instead of rejecting advertised auth methods', {
+  timeout: 20_000,
+}, async t => {
+  const host = await fixtureHost(t, 'codebuddy', 'cb-auth-advertised');
+  const completed = await completeRun(host.provider, host.cwd, 'cached-native-auth-parent');
+  assert.equal(completed.result.stopReason, 'completed');
+  assert.deepEqual(completed.result.output, [{ type: 'text', text: 'buddy answer' }]);
+
+  const methods = (await readLog(host.logPath))
+    .filter(entry => entry.kind === 'rpc')
+    .map(entry => entry.method);
+  assert.deepEqual(methods, ['initialize', 'session/new', 'session/prompt']);
+  assert.equal(methods.includes('authenticate'), false);
+});
+
+test('CodeBuddy ACP reports auth_required from session creation without prompting or exposing RPC data', {
+  timeout: 20_000,
+}, async t => {
+  const host = await fixtureHost(t, 'codebuddy', 'cb-auth-required-session');
+  await assert.rejects(
+    host.provider.start(startRequest('auth-required-parent', host.cwd, new AbortController().signal)),
+    error => {
+      assert.match(error.diagnostic, /NATIVE_AUTH_UNAVAILABLE/u);
+      assert.match(error.diagnostic, /native CLI sign-in/u);
+      assert.doesNotMatch(error.message + error.diagnostic, /mocksecret|\/private/u);
+      return true;
+    },
+  );
+
+  const methods = (await readLog(host.logPath))
+    .filter(entry => entry.kind === 'rpc')
+    .map(entry => entry.method);
+  assert.deepEqual(methods, ['initialize', 'session/new']);
+  assert.equal(methods.includes('authenticate'), false);
+});
+
+test('CodeBuddy ACP reports auth_required from session load without prompting or authenticating', {
+  timeout: 20_000,
+}, async t => {
+  const host = await fixtureHost(t, 'codebuddy', 'cb-auth-required-load');
+  await completeRun(host.provider, host.cwd, 'load-auth-required-parent');
+  await assert.rejects(
+    host.provider.start(startRequest('load-auth-required-parent', host.cwd, new AbortController().signal)),
+    error => {
+      assert.match(error.diagnostic, /NATIVE_AUTH_UNAVAILABLE/u);
+      assert.doesNotMatch(error.message + error.diagnostic, /mocksecret|\/private/u);
+      return true;
+    },
+  );
+
+  const methods = (await readLog(host.logPath))
+    .filter(entry => entry.kind === 'rpc')
+    .map(entry => entry.method);
+  assert.deepEqual(methods, ['initialize', 'session/new', 'session/prompt', 'initialize', 'session/load']);
+  assert.equal(methods.includes('authenticate'), false);
+});
+
+test('CodeBuddy ACP reports auth_required from prompt without exposing RPC data or authenticating', {
+  timeout: 20_000,
+}, async t => {
+  const host = await fixtureHost(t, 'codebuddy', 'cb-auth-required-prompt');
+  const run = await host.provider.start(startRequest('prompt-auth-required-parent', host.cwd, new AbortController().signal));
+  try {
+    const result = await run.result;
+    assert.equal(result.stopReason, 'error');
+    assert.match(result.diagnostic, /NATIVE_AUTH_UNAVAILABLE/u);
+    assert.doesNotMatch(result.diagnostic, /mocksecret|\/private/u);
+    const methods = (await readLog(host.logPath))
+      .filter(entry => entry.kind === 'rpc')
+      .map(entry => entry.method);
+    assert.deepEqual(methods, ['initialize', 'session/new', 'session/prompt']);
+    assert.equal(methods.includes('authenticate'), false);
+  } finally {
+    await run.dispose();
+  }
 });
 
 test('native deployment validation rejects shell-like or unsupported argv and credential forwarding', () => {

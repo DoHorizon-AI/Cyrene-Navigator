@@ -79,6 +79,11 @@ The init handshake must also advertise `proceed-in-sandbox`; other values are
 refused before sending a model prompt. No dangerous permission flag or host
 fallback is used. Conversation IDs remain scoped to the parent DSH session.
 
+The native terminal sandbox also mounts temporary directories and common build
+caches as writable. An outside-workspace path inside those mounts is not an
+outside-sandbox path. Boundary smoke tests must use private canaries outside
+both the workspace and those default writable mounts.
+
 Antigravity 使用文档化的 stream-json stdin/stdout，并由适配器控制
 `--sandbox --mode accept-edits` 参数。默认策略是在原生终端沙箱允许范围内自动执行。
 每次启动前，Navigator 都校验官方宿主配置：启用沙箱、
@@ -86,6 +91,9 @@ Antigravity 使用文档化的 stream-json stdin/stdout，并由适配器控制
 清空旧的 allow/ask 授权，并拒绝 `unsandboxed(*)` 与 `mcp(*)`。
 Workspace 不得包含该配置文件。握手还必须声明 `proceed-in-sandbox`，否则在发送模型提示前拒绝。
 不会传入跳过权限参数或改到宿主执行。Conversation ID 仍按父级 DSH Session 隔离。
+
+原生终端沙箱还允许写入临时目录和常用构建缓存；这些目录中的 workspace 外路径仍可能位于沙箱
+允许范围内。边界烟测必须使用同时位于 workspace 与这些默认可写挂载之外的私有测试文件。
 
 The CLI currently documents its global settings file and does not document a
 per-invocation settings override. Prepare the profile explicitly on each
@@ -156,11 +164,21 @@ send is the native `allow_once` option, and only after the host callback
 returns `allow-once`; it never selects persistent approval. Without a host
 approval service, write requests are denied.
 
+ACP `authMethods` advertises available login methods rather than the current
+login state. Navigator attempts ordinary session creation or loading with the
+native host's cached login. It never calls `authenticate` or copies credentials.
+If the native server actually returns `auth_required`, the adapter reports an
+explicit native-login failure and does not bypass it.
+
 CodeBuddy 使用文档化的 ACP-over-stdio 传输与原生 `default` 权限模式。适配器执行
 `initialize`、创建 ACP session，并发送一次 `session/prompt`。只有服务端声明
 `agentCapabilities.loadSession` 时才调用 `session/load`。ACP 权限请求交给 `requestPermission`；
 回调缺失、超时、失败或明确拒绝时，均返回 ACP cancelled 结果。适配器只可能在宿主回调返回
 `allow-once` 后选择原生 `allow_once` 选项，不会选择永久授权。没有宿主审批服务时，写入请求会被拒绝。
+
+ACP `authMethods` 声明可用登录方式，不代表当前未登录。Navigator 使用原生宿主的缓存登录，
+尝试普通会话创建或加载；不会调用 `authenticate` 或复制凭据。原生服务真正返回
+`auth_required` 时，适配器会明确报告原生登录不可用，不会绕过该错误。
 
 Every child uses DSH's managed subprocess lifetime and cancellation path.
 Frames are strict UTF-8 NDJSON objects with a 1 MiB per-frame limit, a 16 MiB
@@ -183,14 +201,16 @@ SQLite memory mutation, partial output reaching the parent, final blocked
 summary, and durable event/task read-back after restart. Profile and boundary
 fixtures run in the Linux x64, Linux ARM64, and Windows x64 CI suites.
 
-On Linux x64, the official host setup and no-prompt `agy 1.2.16` handshake
-were run successfully: init advertised `proceed-in-sandbox`. The native CLI
-rewrites omitted safe default fields on shutdown; preflight accepts documented
-`allowNonWorkspaceAccess=false` and absent empty grant lists. The real native
-mixed-work smoke was attempted but hit native startup/response time limits without completing permitted work; actual
-OS-boundary enforcement and continuation remain unverified. Windows/ARM64
-native-account sandbox execution and CodeBuddy authentication are **NOT_RUN**.
-A future CLI advertising a different init mode is refused.
+On Linux x64 / WSL2, real `agy 1.2.17` and `CodeBuddy 2.158.0` native print
+and Navigator provider calls returned the exact requested text without approval
+requests. The CodeBuddy native ACP session succeeded with cached login despite
+advertising authentication methods; no `authenticate` request was sent. These
+checks exercised the real native programs and DSH managed subprocess, not the
+HTTP, Client, or Exchange route. Antigravity workspace command execution also
+ran successfully, but complete OS-boundary enforcement and denial-continuation
+acceptance remain separate from the marker-only checks. Windows/ARM64
+native-account execution remains **NOT_RUN**. Native profile preflight accepts
+documented safe omitted defaults, and a different init mode is refused.
 
 Opt-in real CLI validation uses the native subscription and only private test
 files; it is never part of automatic CI:
@@ -202,10 +222,12 @@ node harness/tests/antigravity-live-smoke.mjs --run /path/to/agy
 `harness/tests/subagents.test.mjs` 使用本地可执行 fixture 模拟两种官方协议，覆盖正常完成、原生错误、
 取消与子进程回收、畸形和超限数据流、ACP 审批拒绝、事件与 task 关联，以及原生会话恢复。Fixture 不会
 对任一服务进行认证；混合任务链路还验证拒绝后继续写入 SQLite 记忆、父代理收到部分输出、最终无法执行项以及重启后状态/事件
-读回。Profile 与拒绝测试接入 Linux x64、Linux ARM64、Windows x64 CI。本机 Linux x64 已执行官方配置
-初始化，`agy 1.2.16` 零提示握手返回 `proceed-in-sandbox`。CLI 退出时会省略安全默认字段，预检接受文档化的
-`allowNonWorkspaceAccess=false` 缺省和缺省空授权列表。真实混合任务烟测已尝试，但出现原生启动/响应超时、未完成允许工作，
-实际 OS 边界强制执行与拒绝后继续仍未验证。Windows/ARM64 原生账号执行和 CodeBuddy 认证为 **NOT_RUN**。
+读回。Profile 与拒绝测试接入 Linux x64、Linux ARM64、Windows x64 CI。在 Linux x64 / WSL2 上，
+`agy 1.2.17` 和 `CodeBuddy 2.158.0` 的原生 print 与 Navigator provider 真实调用均返回指定文本，
+未触发审批请求。CodeBuddy 原生 ACP 即使声明认证方式，也能使用缓存登录完成会话，无需发送
+`authenticate`。这些检查覆盖真实 CLI 和 DSH 受管子进程，不代表 HTTP、Client 或 Exchange 整条链路。
+Antigravity 工作区命令也已真实执行；完整 OS 边界及拒绝后继续的验收与简短回复测试分开记录。
+Windows/ARM64 原生账号执行仍为 **NOT_RUN**。预检接受文档化的安全缺省字段，并拒绝不同 init 模式。
 上面的显式烟测命令使用原生订阅，只操作私有测试文件；不会加入自动 CI。后续 CLI 如声明不同 init 模式，
 会明确拒绝。
 
