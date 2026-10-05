@@ -119,7 +119,9 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          node --test `
+          # These files launch independent Python/MCP peers; avoid cold-start contention.
+          # 多个文件各自启动 Python/MCP 进程，串行执行避免冷启动资源竞争。
+          node --test --test-concurrency=1 `
             harness/tests/executor.integration.test.mjs `
             harness/tests/subagents.test.mjs `
             harness/tests/tool-providers.test.mjs `

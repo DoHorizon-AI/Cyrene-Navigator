@@ -86,6 +86,7 @@ function textCompletion(text) {
 function createExchangeFixture() {
   const calls = { approved: 0, denied: 0 };
   const toolCalls = { approved: [], denied: [] };
+  const toolResults = { approved: [], denied: [] };
   const authHeaders = [];
   const server = createServer(async (request, response) => {
     if (request.method !== 'POST' || request.url !== '/v1/chat/completions') {
@@ -96,6 +97,12 @@ function createExchangeFixture() {
     authHeaders.push(request.headers.authorization);
     const history = JSON.stringify(body.messages ?? []);
     const scenario = history.includes('ROUND1-APPROVED') ? 'approved' : 'denied';
+    toolResults[scenario] = (body.messages ?? [])
+      .filter(message => message.role === 'tool')
+      .map(message => ({
+        toolCallId: message.tool_call_id,
+        content: JSON.stringify(message.content ?? null).slice(0, 2_000),
+      }));
     const index = calls[scenario]++;
     const availableTools = (body.tools ?? []).map(tool => tool.function?.name);
     let frame;
@@ -137,7 +144,7 @@ function createExchangeFixture() {
     }
     completionStream(response, frame);
   });
-  return { server, calls, toolCalls, authHeaders };
+  return { server, calls, toolCalls, toolResults, authHeaders };
 }
 
 async function startPersistence(database, principalConfig, env) {
@@ -418,7 +425,14 @@ test('round1 simulated connector-to-DSH approval and notification flow uses dura
     }
     return undefined;
   }, 'approved human decision or task terminal state');
-  assert.ok(!approvalAttempt.terminalTask, JSON.stringify(approvalAttempt));
+  const approvalDiagnostic = approvalAttempt.terminalTask
+    ? {
+      ...approvalAttempt,
+      toolResults: exchange.toolResults.approved,
+      events: (await requestWork(persistence.address, `/tasks/${admitted.body.task.id}/events`)).body.events,
+    }
+    : approvalAttempt;
+  assert.ok(!approvalAttempt.terminalTask, JSON.stringify(approvalDiagnostic));
   const approvalResult = approvalAttempt.approval;
   assert.equal(approvalResult.approval.status, 'pending');
   assert.equal(approvalResult.resolved.status, 'approved');
