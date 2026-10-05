@@ -41,6 +41,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
 
       - name: Install locked Python tool and environment
         run: |
