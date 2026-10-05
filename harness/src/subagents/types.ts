@@ -32,6 +32,17 @@ export type SubagentAdapterEvent =
     readonly text: string
   }
   | {
+    readonly type: 'blocked'
+    readonly providerName: string
+    readonly backend: NativeSubagentBackend
+    readonly parentSessionId: SessionId
+    readonly runId: SessionId
+    readonly reasonCode: 'SANDBOX_BOUNDARY_DENIED' | 'SANDBOX_PROFILE_UNAVAILABLE' | 'SANDBOX_MODE_UNVERIFIED' | 'SUBAGENT_FAILED'
+    readonly toolCategory: 'file' | 'command' | 'network' | 'other' | 'unknown'
+    /** Number of native denial observations, not a count of unique operations. */
+    readonly count: number
+  }
+  | {
     readonly type: 'permission'
     readonly providerName: string
     readonly backend: NativeSubagentBackend

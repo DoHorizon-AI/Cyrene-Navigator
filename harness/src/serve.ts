@@ -363,6 +363,11 @@ function publishSubagentEvent(executor: NavigatorExecutor, event: SubagentAdapte
       type: 'subagent-assistant-delta', taskId, provider: event.providerName,
       text: event.text, timestamp,
     });
+  } else if (event.type === 'blocked') {
+    void executor.recordSubagentEvent(taskId, {
+      type: 'subagent-blocked', taskId, provider: event.providerName, runId: String(event.runId),
+      reasonCode: event.reasonCode, toolCategory: event.toolCategory, count: event.count, timestamp,
+    });
   } else {
     void executor.recordSubagentEvent(taskId, {
       type: 'permission', taskId, provider: event.providerName,

@@ -21,6 +21,8 @@ import {
   withDeadline,
   type ValidatedDeployment,
 } from './common.js'
+import { AntigravityBoundaryObserver } from './antigravity-boundary.js'
+import { assertAntigravitySandboxProfile } from './antigravity-profile.js'
 import type { SubagentAdapterConfig } from './types.js'
 import { MAX_NATIVE_OUTPUT_BYTES, isJsonObject, optionalIdentifier, optionalString, pumpJsonLines, writeJsonLine } from './wire.js'
 
@@ -70,10 +72,19 @@ export class AntigravitySubagentProvider extends NativeSubagentProvider {
   /** Start one native child turn and publish after the CLI announces its conversation. */
   async start(request: ResolvedSubagentStartRequest): Promise<SubagentRun> {
     if (request.signal.aborted) throw new Error('Antigravity subagent was cancelled before spawn')
-    const prompt = promptText(request)
+    const prompt = `${promptText(request)}\n\nNavigator execution policy: complete every permitted independent task. If an action is denied by the sandbox or permission policy, record it as cannot execute with its reason and continue the other permitted tasks. Preserve successful results. End with completed and cannot-execute items. Never retry outside the sandbox, request permission escalation, or change the permission profile.`
     const cwd = resolveRunCwd(this.deployment, request)
     const runId = createRunId()
     const parentSessionId = request.parent.session.id
+    const reportBlocked = (reasonCode: 'SANDBOX_BOUNDARY_DENIED' | 'SANDBOX_PROFILE_UNAVAILABLE' | 'SANDBOX_MODE_UNVERIFIED' | 'SUBAGENT_FAILED', toolCategory: 'file' | 'command' | 'network' | 'other' | 'unknown' = 'unknown', count = 1): void => {
+      emitEvent(this.config, { type: 'blocked', providerName: this.name, backend: 'antigravity', parentSessionId, runId, reasonCode, toolCategory, count })
+    }
+    try {
+      await assertAntigravitySandboxProfile(cwd)
+    } catch (error: unknown) {
+      reportBlocked('SANDBOX_PROFILE_UNAVAILABLE')
+      throw safeStartupFailure(error)
+    }
     const parentReservation = this.reserveParentConversation(parentSessionId, this.conversations)
     const previousConversation = parentReservation.previousConversation
     const argv = [
@@ -82,7 +93,7 @@ export class AntigravitySubagentProvider extends NativeSubagentProvider {
       '--input-format', 'stream-json',
       '--output-format', 'stream-json',
       '--sandbox',
-      '--mode', 'default',
+      '--mode', 'accept-edits',
       ...(previousConversation === undefined ? [] : ['--conversation', previousConversation]),
     ]
 
@@ -90,6 +101,7 @@ export class AntigravitySubagentProvider extends NativeSubagentProvider {
     try {
       child = spawnNativeChild(this.ctx, this.deployment, cwd, argv, request.signal, this.disposeGraceMs)
     } catch {
+      reportBlocked('SUBAGENT_FAILED')
       parentReservation.release()
       throw new NativeSubagentFailure(
         'Antigravity CLI could not be started',
@@ -97,6 +109,7 @@ export class AntigravitySubagentProvider extends NativeSubagentProvider {
       )
     }
     if (child.stdin === undefined || child.stdout === undefined) {
+      reportBlocked('SUBAGENT_FAILED')
       try {
         await disposeNativeChild(child, this.disposeGraceMs)
       } finally {
@@ -108,9 +121,43 @@ export class AntigravitySubagentProvider extends NativeSubagentProvider {
       )
     }
 
+    const boundary = new AntigravityBoundaryObserver()
+    // Native stderr may carry a soft denial even when result=SUCCESS and exit=0.
+    // 中文：原生 stderr 可能报告软拒绝，而 result 和退出码仍表示成功。
+    const stderrEnded = new Promise<void>((resolveEnd, rejectEnd) => {
+      if (!child.stderr || child.stderr.readableEnded) return resolveEnd()
+      child.stderr.on('data', (chunk: Buffer | string) => {
+        boundary.observeStderr(chunk)
+        publishBoundaryReceipts()
+      })
+      child.stderr.once('end', resolveEnd)
+      child.stderr.once('close', () => {
+        if (child.stderr?.readableEnded) resolveEnd()
+        else rejectEnd(new NativeSubagentFailure('Antigravity diagnostic stream closed early', 'Antigravity diagnostic EOF could not be verified.'))
+      })
+      child.stderr.once('error', () => rejectEnd(new NativeSubagentFailure('Antigravity diagnostic stream failed', 'Antigravity diagnostic stream could not be verified.')))
+    })
+    stderrEnded.catch(() => {})
+    let blockedReported = false
+    const reportedCounts = new Map<string, number>()
+    const publishBoundaryReceipts = (): void => {
+      for (const receipt of boundary.getBlockedReceipts()) {
+        if ((reportedCounts.get(receipt.toolCategory) ?? 0) >= receipt.count) continue
+        reportedCounts.set(receipt.toolCategory, receipt.count)
+        blockedReported = true
+        reportBlocked(receipt.reasonCode, receipt.toolCategory, receipt.count)
+      }
+    }
+    const checkBoundary = (): void => {
+      try { boundary.assertAllowed() } catch (error: unknown) {
+        diagnostic = 'SANDBOX_BOUNDARY_DENIED：无法执行受限操作。已保留成功结果，请继续其余可执行任务并在总结中列出无法执行项；禁止改到宿主执行或提升权限。'
+        publishBoundaryReceipts()
+        throw error
+      }
+    }
     const initialized = deferred<string>()
     const terminal = deferred<SubagentResult>()
-    const flags = { initReceived: false, terminalReceived: false, cancelled: false }
+    const flags = { initReceived: false, terminalReceived: false, cancelled: false, modeRejected: false }
     let output = ''
     let diagnostic: string | undefined
     let activeConversationId: string | undefined
@@ -119,6 +166,7 @@ export class AntigravitySubagentProvider extends NativeSubagentProvider {
     const failStream = (error: Error): void => {
       if (flags.terminalReceived) return
       const permissionModeRejected = error.message.includes('permission mode')
+      if (permissionModeRejected) flags.modeRejected = true
       diagnostic = error.message.includes('byte limit')
         ? 'Antigravity stream exceeded a configured byte limit.'
         : permissionModeRejected
@@ -135,6 +183,8 @@ export class AntigravitySubagentProvider extends NativeSubagentProvider {
     }
 
     pumpJsonLines(child.stdout, request.signal, frame => {
+      boundary.observeFrame(frame)
+      publishBoundaryReceipts()
       const event = frame.event
       if (event === 'init') {
         const init = isJsonObject(frame.init) ? frame.init : {}
@@ -144,8 +194,8 @@ export class AntigravitySubagentProvider extends NativeSubagentProvider {
           failStream(new Error('Antigravity init omitted conversation id'))
           return
         }
-        if (permissionMode !== 'request-review') {
-          failStream(new Error('Antigravity did not advertise the documented request-review permission mode'))
+        if (permissionMode !== 'proceed-in-sandbox') {
+          failStream(new Error('Antigravity did not advertise the required proceed-in-sandbox permission mode'))
           return
         }
         flags.initReceived = true
@@ -218,7 +268,8 @@ export class AntigravitySubagentProvider extends NativeSubagentProvider {
           child.stdin?.end()
           return
         }
-        const status = (optionalString(result.status) ?? 'INVALID').slice(0, 80)
+        const rawStatus = optionalString(result.status)
+        const status = rawStatus !== undefined && ['SUCCESS', 'ERROR', 'CANCELED', 'INTERRUPTED', 'INVALID', 'WAITING', 'RUNNING'].includes(rawStatus) ? rawStatus : 'INVALID'
         const response = typeof result.response === 'string' ? result.response : ''
         const resultConversation = optionalIdentifier(result.conversation_id)
         if (status === 'SUCCESS' && response.trim().length > 0) {
@@ -230,14 +281,15 @@ export class AntigravitySubagentProvider extends NativeSubagentProvider {
           } else {
             const completedConversation = resultConversation ?? activeConversationId
             if (completedConversation !== undefined) this.conversations.set(parentSessionId, completedConversation)
+            output = response
             terminal.resolve({ output: [{ type: 'text', text: response }], stopReason: 'completed' })
           }
         } else {
           const stopReason = status === 'CANCELED' || status === 'INTERRUPTED' ? 'aborted' : 'error'
-          diagnostic = `Antigravity CLI returned terminal status ${status}.`
+          diagnostic = `Antigravity CLI returned terminal status ${status}. ${nativeFailureCategory(result.error)}`
           terminal.reject(new NativeSubagentFailure(
             `Antigravity CLI stopped with status ${status}`,
-            `Antigravity CLI returned terminal status ${status}.`,
+            diagnostic,
           ))
           if (stopReason === 'aborted') flags.cancelled = true
         }
@@ -270,10 +322,13 @@ export class AntigravitySubagentProvider extends NativeSubagentProvider {
       }), request.signal, DEFAULT_STARTUP_TIMEOUT_MS, 'Antigravity CLI prompt write')
 
       const terminalAttempt = async (): Promise<SubagentResult> => {
-        const result = await withDeadline(terminal.promise, request.signal, this.timeoutMs, 'Antigravity CLI turn')
+        const attempt = await withDeadline(terminal.promise.then(result => ({ kind: 'result' as const, result }), error => ({ kind: 'error' as const, error })), request.signal, this.timeoutMs, 'Antigravity CLI turn')
         const outcome = await withDeadline(child.done, request.signal, this.disposeGraceMs, 'Antigravity CLI exit')
+        await withDeadline(stderrEnded, request.signal, this.disposeGraceMs, 'Antigravity diagnostic EOF')
+        checkBoundary()
         assertCleanExit(outcome)
-        return result
+        if (attempt.kind === 'error') throw attempt.error
+        return attempt.result
       }
       const onAbort = (): void => {
         if (flags.cancelled) return
@@ -298,6 +353,7 @@ export class AntigravitySubagentProvider extends NativeSubagentProvider {
         signal: request.signal,
         onAbort,
         onError: (error, stopReason) => {
+          if (!flags.cancelled && !blockedReported) reportBlocked('SUBAGENT_FAILED')
           emitEvent(this.config, {
             type: 'progress', providerName: this.name, backend: 'antigravity', parentSessionId, runId,
             conversationId: activeConversationId ?? conversationId, phase: 'error', status: stopReason,
@@ -316,12 +372,14 @@ export class AntigravitySubagentProvider extends NativeSubagentProvider {
           try {
             await disposeNativeChild(child, this.disposeGraceMs)
           } finally {
+            try { checkBoundary() } catch { /* Receipts survive cancellation; no escalation or extra termination. */ }
             parentReservation.release()
           }
         },
       })
       return this.publish(run)
     } catch (error: unknown) {
+      reportBlocked(flags.modeRejected ? 'SANDBOX_MODE_UNVERIFIED' : 'SUBAGENT_FAILED')
       try {
         await disposeNativeChild(child, this.disposeGraceMs)
       } catch {
@@ -332,6 +390,18 @@ export class AntigravitySubagentProvider extends NativeSubagentProvider {
       throw safeStartupFailure(error)
     }
   }
+}
+
+/** Classify a native failure without copying its paths, credentials, or diagnostic text. | 分类原生失败，不复制路径、凭据或原始诊断。 */
+function nativeFailureCategory(value: unknown): string {
+  if (typeof value !== 'string') return 'NATIVE_FAILURE: 无法执行，请继续其余可执行任务。'
+  const text = value.slice(0, 4_096)
+  if (/quota|credits? (?:exhausted|insufficient)|rate.?limit|resource.?exhausted/iu.test(text)) return 'NATIVE_QUOTA_UNAVAILABLE: 原生模型额度不可用，无法执行；请继续其余任务。'
+  if (/not (?:authenticated|logged in)|authentication|login required|unauthori[sz]ed|access token/iu.test(text)) return 'NATIVE_AUTH_UNAVAILABLE: 原生登录不可用，无法执行；请继续其余任务。'
+  if (/invalid model|unknown model|model .*not (?:recognized|available|found)/iu.test(text)) return 'NATIVE_MODEL_UNAVAILABLE: 原生模型选择不可用，无法执行；请继续其余任务。'
+  if (/sandbox.*(?:failed|unavailable|not supported)|namespace.*(?:denied|not permitted)|bwrap|sandbox-exec/iu.test(text)) return 'NATIVE_SANDBOX_UNAVAILABLE: 原生沙箱不可用，无法执行；请继续其余任务。'
+  if (/network|connect(?:ion)?.*(?:failed|refused|reset)|timed? out|timeout|dns|(?:service|provider|server|endpoint|backend).*(?:unavailable|unreachable)|502|503|504/iu.test(text)) return 'NATIVE_CONNECTION_UNAVAILABLE: 原生服务连接不可用，无法执行；请继续其余任务。'
+  return 'NATIVE_FAILURE: 原生 CLI 返回失败，无法执行；请继续其余可执行任务。'
 }
 
 /** Verify that the child process exited normally after its terminal result. */

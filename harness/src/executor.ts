@@ -38,6 +38,7 @@ export type ExecutorStreamEvent =
   | { type: 'tool-result'; taskId: string; callId: string; result: string; isError?: boolean; timestamp: number; seq?: number }
   | { type: 'subagent-progress'; taskId: string; provider: string; phase?: string; message?: string; timestamp: number; seq?: number }
   | { type: 'subagent-assistant-delta'; taskId: string; provider: string; text: string; timestamp: number; seq?: number }
+  | { type: 'subagent-blocked'; taskId: string; provider: string; runId: string; reasonCode: 'SANDBOX_BOUNDARY_DENIED' | 'SANDBOX_PROFILE_UNAVAILABLE' | 'SANDBOX_MODE_UNVERIFIED' | 'SUBAGENT_FAILED'; toolCategory: 'file' | 'command' | 'network' | 'other' | 'unknown'; count: number; timestamp: number; seq?: number }
   | { type: 'permission'; taskId: string; provider: string; tool?: string; decision: 'approved' | 'denied'; timestamp: number; seq?: number }
   | { type: 'finish'; taskId: string; status: TaskStatus; output: string; durationMs: number; timestamp: number; seq?: number }
   | { type: 'error'; taskId: string; message: string; code?: string; timestamp: number; seq?: number };
@@ -61,6 +62,7 @@ interface InternalTaskState {
   record: TaskRecord;
   output: string;
   reasoning: string;
+  blocked?: Map<string, Extract<ExecutorStreamEvent, { type: 'subagent-blocked' }>>;
   agentError?: string;
   error?: string;
   agent?: Agent;
@@ -173,12 +175,14 @@ export class NavigatorExecutor {
           const reason = row.status === 'running'
             ? 'Execution interrupted by executor restart; automatic replay is disabled.'
             : 'Human-gated execution was interrupted by executor restart; review the preserved approval record before creating a new task.';
-          await this.config.workState.patchTask(row.id, { status: 'failed', error: reason });
+          const blocked = await this.readBlockedReceipts(row.id);
+          const output = appendBlockedSummary(row.output, blocked);
+          await this.config.workState.patchTask(row.id, { status: 'failed', error: reason, output });
           await this.config.workState.appendEvent(row.id, {
             type: 'error', taskId: row.id, message: reason, code: 'EXECUTOR_RESTARTED', timestamp: now,
           });
           await this.config.workState.appendEvent(row.id, {
-            type: 'finish', taskId: row.id, status: 'failed', output: row.output,
+            type: 'finish', taskId: row.id, status: 'failed', output,
             durationMs: Math.max(row.durationMs, now - startedAt), timestamp: now,
           });
         }
@@ -186,6 +190,30 @@ export class NavigatorExecutor {
       if (!page.nextCursor) break;
       cursor = page.nextCursor;
     }
+  }
+
+  /** Restore refused work from ordered receipts without replaying native operations. | 从事件恢复无法执行记录，不重放原生操作。 */
+  private async readBlockedReceipts(taskId: string): Promise<InternalTaskState['blocked']> {
+    const blocked: NonNullable<InternalTaskState['blocked']> = new Map();
+    let after = 0;
+    for (;;) {
+      const page = await this.config.workState.getEvents(taskId, after);
+      for (const row of page.events) {
+        const value = row.event;
+        if (value.type !== 'subagent-blocked' || value.taskId !== taskId
+          || typeof value.provider !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(value.provider)
+          || typeof value.runId !== 'string' || !/^[A-Za-z0-9-]{1,80}$/u.test(value.runId)
+          || !['SANDBOX_BOUNDARY_DENIED', 'SANDBOX_PROFILE_UNAVAILABLE', 'SANDBOX_MODE_UNVERIFIED', 'SUBAGENT_FAILED'].includes(String(value.reasonCode))
+          || !['file', 'command', 'network', 'other', 'unknown'].includes(String(value.toolCategory))
+          || typeof value.count !== 'number' || !Number.isSafeInteger(value.count) || value.count < 1) continue;
+        const receipt = value as unknown as Extract<ExecutorStreamEvent, { type: 'subagent-blocked' }>;
+        blocked.set(`${receipt.provider}:${receipt.runId}:${receipt.reasonCode}:${receipt.toolCategory}`, receipt);
+      }
+      const last = page.events.at(-1)?.seq;
+      if (last === undefined || last <= after) break;
+      after = last;
+    }
+    return blocked;
   }
 
   /** Execute one task, returning a prior durable result or joining its live run when taskId repeats.  中文：执行任务；重复 taskId 会读取结果或加入当前运行。 */
@@ -361,6 +389,7 @@ export class NavigatorExecutor {
         return outcome(claim.task);
       }
       claimed = true;
+      task.blocked = await this.readBlockedReceipts(task.id);
       const startedAt = claim.task.startedAt ?? Date.now();
       await this.flushEvents(task);
       await this.publish(task, {
@@ -421,6 +450,7 @@ export class NavigatorExecutor {
       const latestRecord = await this.config.workState.getTask(task.id);
       if (latestRecord) task.record = latestRecord;
       if (task.record.status === 'waiting_approval' || task.record.status === 'waiting_input') {
+        if (task.blocked?.size) await this.patch(task, { output: appendBlockedSummary(task.output, task.blocked) });
         return outcome(task.record);
       }
       if (TERMINAL_STATUSES.has(task.record.status)) return outcome(task.record);
@@ -428,8 +458,13 @@ export class NavigatorExecutor {
       if (!task.output) task.output = this.extractLatestAssistantText(agent.session);
       const finishedAt = Date.now();
       const isAborted = task.abortController.signal.aborted;
-      const status: TaskStatus = isAborted ? 'aborted' : task.agentError ? 'failed' : 'completed';
-      const error = task.error ?? task.agentError ?? (isAborted ? 'Task was cancelled' : undefined);
+      // Let the agent finish all remaining work before reporting partial failure.
+      // 中文：先完成其余可执行工作，再汇总无法执行项并记录部分失败。
+      task.output = appendBlockedSummary(task.output, task.blocked);
+      const hasBlocked = (task.blocked?.size ?? 0) > 0;
+      const status: TaskStatus = isAborted ? 'aborted' : task.agentError || hasBlocked ? 'failed' : 'completed';
+      const error = task.error ?? task.agentError ?? (isAborted ? 'Task was cancelled'
+        : hasBlocked ? '部分子任务无法执行；已继续完成其余可执行工作，详见结果中的无法执行项。' : undefined);
       const durationMs = finishedAt - (task.record.startedAt ?? task.record.createdAt);
       await this.patch(task, {
         status, output: task.output, reasoning: task.reasoning,
@@ -468,6 +503,7 @@ export class NavigatorExecutor {
       const message = task.error ?? (isAborted ? abortMessage(task.abortController.signal.reason) : safeErrorMessage(err));
       const durationMs = endedAt - (task.record.startedAt ?? task.record.createdAt);
       task.output ||= task.agent ? this.extractLatestAssistantText(task.agent.session) : '';
+      task.output = appendBlockedSummary(task.output, task.blocked);
       try {
         // Close a failed write chain with an independent terminal reconciliation.
         // 中文：写入链失败后，独立尝试持久化失败终态，避免把执行成功写入事件。
@@ -584,6 +620,12 @@ export class NavigatorExecutor {
   async recordSubagentEvent(taskId: string, event: ExecutorStreamEvent): Promise<void> {
     const task = this.tasks.get(taskId);
     if (!task || TERMINAL_STATUSES.has(task.record.status)) return;
+    if (event.type === 'subagent-blocked') {
+      task.blocked ??= new Map();
+      // Group by run/category; native observation counts may include duplicate notices.
+      const key = `${event.provider}:${event.runId}:${event.reasonCode}:${event.toolCategory}`;
+      task.blocked.set(key, event);
+    }
     await this.publish(task, event);
   }
 
@@ -933,6 +975,21 @@ export class NavigatorExecutor {
     this.agentTaskMap.clear();
     this.sessionTaskMap.clear();
   }
+}
+
+/** Append trusted receipts even when model prose omits an unavailable operation. | 即使模型未提及，也追加可信的无法执行记录。 */
+function appendBlockedSummary(output: string, blocked: InternalTaskState['blocked']): string {
+  if (!blocked?.size) return output;
+  const categories: Record<string, string> = { file: '文件操作', command: '终端命令', network: '网络操作', other: '工具操作', unknown: '操作' };
+  const rows = [...blocked.values()].map(receipt => {
+    const reason = receipt.reasonCode === 'SANDBOX_BOUNDARY_DENIED' ? '超出沙箱或授权边界，无法执行'
+      : receipt.reasonCode === 'SANDBOX_PROFILE_UNAVAILABLE' ? '沙箱配置未通过校验，无法执行'
+      : receipt.reasonCode === 'SANDBOX_MODE_UNVERIFIED' ? '原生 CLI 未声明所要求的沙箱授权模式，无法执行'
+      : '原生子代理执行失败，无法完成';
+    return `- ${receipt.provider} / ${receipt.runId}：${categories[receipt.toolCategory] ?? '操作'}，${reason}（${receipt.reasonCode}）。`;
+  });
+  const suffix = `\n\n无法执行项（原生执行记录；已完成内容保留在上文）：\n${rows.join('\n')}`;
+  return output.endsWith(suffix) ? output : `${output}${suffix}`;
 }
 
 function stateFromRecord(record: TaskRecord): InternalTaskState {

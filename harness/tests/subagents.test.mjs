@@ -15,6 +15,7 @@ import { performance } from 'node:perf_hooks';
 import { Context } from '@deepseek-ai/cordis';
 import { LocalSubprocessRuntime } from '@deepseek-ai/dsh-subprocess-local';
 import { registerSubagents } from '../dist/subagents/index.js';
+import { installNativeProfileFixture } from './fixtures/antigravity-profile-host.mjs';
 
 const FIXTURE_MODE_ENV = 'CYRENE_TEST_SUBAGENT_MODE';
 const FIXTURE_LOG_ENV = 'CYRENE_TEST_SUBAGENT_LOG';
@@ -50,8 +51,8 @@ if (!codebuddy) {
     process.exit(0);
   }
   await writeFrame({ event: 'init', conversation_id: conversationId,
-    init: { permission_mode: mode === 'ag-unsafe-permission' ? 'always-proceed' : mode === 'ag-unknown-permission' ? 'strict' : 'request-review', cwd: process.cwd(), tools: [] } });
-  readline.on('line', line => {
+    init: { permission_mode: mode === 'ag-unsafe-permission' ? 'always-proceed' : mode === 'ag-unknown-permission' ? 'strict' : mode === 'ag-review-permission' ? 'request-review' : 'proceed-in-sandbox', cwd: process.cwd(), tools: [] } });
+  readline.on('line', async line => {
     let request;
     try { request = JSON.parse(line); } catch { process.exit(21); }
     record({ kind: 'input', event: request.event, message: request.message });
@@ -68,7 +69,11 @@ if (!codebuddy) {
       process.stdout.write('x'.repeat(1_048_577) + '\n');
       return;
     }
-    const status = mode === 'ag-error' ? 'ERROR' : 'SUCCESS';
+    const status = mode.startsWith('ag-error') ? 'ERROR' : 'SUCCESS';
+    if (mode === 'ag-denied-then-allowed') {
+      await writeFrame({ event: 'step_update', step_update: { step_type: 'tool', state: 'ERROR', tool_info: { name: 'command', error: { type: 'sandbox_denied', message: '/private token=secret' } } } });
+      record({ kind: 'allowed-after-denial' });
+    }
     const response = status === 'SUCCESS' ? 'hello' : '';
     void (async () => {
       if (response.length > 0) {
@@ -81,8 +86,14 @@ if (!codebuddy) {
       }
       await writeFrame({ event: 'result', result: {
         conversation_id: conversationId, status, response,
-        ...(status === 'ERROR' ? { error: 'fixture native failure' } : {}),
+        ...(status === 'ERROR' ? { error: mode === 'ag-error-auth' ? 'Authentication required at /private token=secret' : 'fixture native failure' } : {}),
       } });
+      if (mode === 'ag-late-stderr-denial') {
+        await wait(10);
+        await new Promise(resolve => process.stderr.write('Tool command was soft-', resolve));
+        await wait(2);
+        await new Promise(resolve => process.stderr.write('denied by sandbox', resolve));
+      }
       process.exit(0);
     })().catch(() => process.exit(23));
   });
@@ -200,6 +211,7 @@ function startRequest(parentSessionId, cwd, signal) {
 }
 
 async function fixtureHost(t, backend, mode, overrides = {}) {
+  if (backend === 'antigravity') await installNativeProfileFixture(t);
   const directory = await mkdtemp(join(tmpdir(), 'navigator-subagent-'));
   const executable = join(directory, process.platform === 'win32' ? 'fixture.mjs' : 'fixture');
   const logPath = join(directory, 'child.ndjson');
@@ -302,7 +314,8 @@ test('Antigravity stream-json emits bounded deltas and resumes the associated co
 
   const log = await readLog(host.logPath);
   assert.equal(log.filter(entry => entry.kind === 'input').length, 2);
-  assert.deepEqual(log.find(entry => entry.kind === 'input').message, { content: 'Run the fixture task.' });
+  assert.match(log.find(entry => entry.kind === 'input').message.content, /^Run the fixture task\./u);
+  assert.match(log.find(entry => entry.kind === 'input').message.content, /continue the other permitted tasks/u);
   const starts = log.filter(entry => entry.kind === 'start');
   assert.ok(starts[0].argv.includes('--sandbox'));
   assert.ok(starts[0].argv.includes('--mode'));
@@ -362,7 +375,7 @@ test('Antigravity rejects malformed startup and non-documented native permission
     /startup|protocol|frame|stream/iu,
   );
 
-  for (const [mode, label] of [['ag-unsafe-permission', 'unsafe'], ['ag-unknown-permission', 'unknown']]) {
+  for (const [mode, label] of [['ag-unsafe-permission', 'unsafe'], ['ag-unknown-permission', 'unknown'], ['ag-review-permission', 'review']]) {
     const host = await fixtureHost(t, 'antigravity', mode);
     await assert.rejects(
       host.provider.start(startRequest(`${label}-parent`, host.cwd, new AbortController().signal)),
@@ -425,4 +438,47 @@ test('native deployment validation rejects shell-like or unsupported argv and cr
     deployments: [{ backend: 'codebuddy', command: 'codebuddy', envRefs: { API_KEY: 'CYRENE_API_KEY' } }],
   }), /credential|secret|token|key/u);
   assert.equal(providers.size, 0);
+});
+
+
+test('Antigravity retains allowed work after native denial and reports it without terminating early', { timeout: 20_000 }, async t => {
+  const host = await fixtureHost(t, 'antigravity', 'ag-denied-then-allowed');
+  const { result } = await completeRun(host.provider, host.cwd);
+  assert.equal(result.stopReason, 'error');
+  assert.deepEqual(result.output, [{ type: 'text', text: 'hello' }]);
+  assert.match(result.diagnostic, /SANDBOX_BOUNDARY_DENIED.*无法执行/u);
+  assert.ok((await readLog(host.logPath)).some(entry => entry.kind === 'allowed-after-denial'));
+  const receipts = host.events.filter(event => event.type === 'blocked');
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0].reasonCode, 'SANDBOX_BOUNDARY_DENIED');
+  assert.equal(receipts[0].toolCategory, 'command');
+  assert.doesNotMatch(JSON.stringify(receipts), /private|token=secret/u);
+});
+
+test('Antigravity rejects an unsafe host profile before any child is spawned', { timeout: 20_000 }, async t => {
+  const profile = await installNativeProfileFixture(t);
+  const host = await fixtureHost(t, 'antigravity', 'ag-normal');
+  await writeFile(profile.settingsPath, JSON.stringify({ toolPermission: 'always-proceed' }));
+  await assert.rejects(completeRun(host.provider, host.cwd), error => error.code === 'SANDBOX_PROFILE_UNAVAILABLE');
+  assert.equal((await readLog(host.logPath)).length, 0);
+  assert.equal(host.events.find(event => event.type === 'blocked')?.reasonCode, 'SANDBOX_PROFILE_UNAVAILABLE');
+});
+
+
+test('Antigravity observes late unterminated stderr denials before accepting SUCCESS', { timeout: 20_000 }, async t => {
+  const host = await fixtureHost(t, 'antigravity', 'ag-late-stderr-denial');
+  const { result } = await completeRun(host.provider, host.cwd);
+  assert.equal(result.stopReason, 'error');
+  assert.deepEqual(result.output, [{ type: 'text', text: 'hello' }]);
+  assert.match(result.diagnostic, /SANDBOX_BOUNDARY_DENIED/u);
+  assert.equal(host.events.find(event => event.type === 'blocked')?.reasonCode, 'SANDBOX_BOUNDARY_DENIED');
+});
+
+
+test('Antigravity reports classified native authentication failure without raw diagnostics', { timeout: 20_000 }, async t => {
+  const host = await fixtureHost(t, 'antigravity', 'ag-error-auth');
+  const { result } = await completeRun(host.provider, host.cwd);
+  assert.equal(result.stopReason, 'error');
+  assert.match(result.diagnostic, /NATIVE_AUTH_UNAVAILABLE.*无法执行/u);
+  assert.doesNotMatch(result.diagnostic, /private|token=secret/u);
 });
