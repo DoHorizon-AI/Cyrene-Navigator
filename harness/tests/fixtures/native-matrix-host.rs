@@ -5,12 +5,15 @@
 //! └─────────────────────────────────────────────────────────────────────┘
 
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
+use std::path::Path;
 use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const DIAGNOSTIC_SECRET: &str = "native-matrix-test-secret";
 const CONFIG_FILE: &str = ".cyrene-native-fixture.json";
+static STATE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn json_quote(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len() + 2);
@@ -91,7 +94,28 @@ fn state(path: &str, status: &str, fields: &str) {
         process::id(),
         suffix,
     );
-    let _ = fs::write(path, payload);
+    let state_path = Path::new(path);
+    let file_name = state_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state");
+    let sequence = STATE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary_path =
+        state_path.with_file_name(format!(".{file_name}.{}.{}.tmp", process::id(), sequence,));
+    let result = (|| {
+        let mut temporary = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)?;
+        temporary.write_all(payload.as_bytes())?;
+        temporary.flush()?;
+        drop(temporary);
+        fs::rename(&temporary_path, state_path)
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temporary_path);
+        eprintln!("failed to publish native fixture state {path}: {error}");
+    }
 }
 
 fn send(frame: String) {
