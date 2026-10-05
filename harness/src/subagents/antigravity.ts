@@ -76,7 +76,7 @@ export class AntigravitySubagentProvider extends NativeSubagentProvider {
     const cwd = resolveRunCwd(this.deployment, request)
     const runId = createRunId()
     const parentSessionId = request.parent.session.id
-    const reportBlocked = (reasonCode: 'SANDBOX_BOUNDARY_DENIED' | 'SANDBOX_PROFILE_UNAVAILABLE' | 'SANDBOX_MODE_UNVERIFIED' | 'SUBAGENT_FAILED', toolCategory: 'file' | 'command' | 'network' | 'other' | 'unknown' = 'unknown', count = 1): void => {
+    const reportBlocked = (reasonCode: 'SANDBOX_BOUNDARY_DENIED' | 'SANDBOX_PROFILE_UNAVAILABLE' | 'SANDBOX_MODE_UNVERIFIED' | 'SUBAGENT_TIMEOUT' | 'SUBAGENT_FAILED', toolCategory: 'file' | 'command' | 'network' | 'other' | 'unknown' = 'unknown', count = 1): void => {
       emitEvent(this.config, { type: 'blocked', providerName: this.name, backend: 'antigravity', parentSessionId, runId, reasonCode, toolCategory, count })
     }
     try {
@@ -353,7 +353,11 @@ export class AntigravitySubagentProvider extends NativeSubagentProvider {
         signal: request.signal,
         onAbort,
         onError: (error, stopReason) => {
-          if (!flags.cancelled && !blockedReported) reportBlocked('SUBAGENT_FAILED')
+          const timedOut = error.message.includes('timed out')
+          diagnostic ??= error instanceof NativeSubagentFailure ? error.diagnostic
+            : timedOut ? 'NATIVE_RESPONSE_TIMEOUT：原生 CLI 响应超时，无法执行；请继续其余可执行任务并在总结中列出该项。'
+            : 'NATIVE_TRANSPORT_FAILED：原生 CLI 通道失败，无法执行；请继续其余可执行任务。'
+          if (!flags.cancelled && !blockedReported) reportBlocked(timedOut ? 'SUBAGENT_TIMEOUT' : 'SUBAGENT_FAILED')
           emitEvent(this.config, {
             type: 'progress', providerName: this.name, backend: 'antigravity', parentSessionId, runId,
             conversationId: activeConversationId ?? conversationId, phase: 'error', status: stopReason,
@@ -379,7 +383,7 @@ export class AntigravitySubagentProvider extends NativeSubagentProvider {
       })
       return this.publish(run)
     } catch (error: unknown) {
-      reportBlocked(flags.modeRejected ? 'SANDBOX_MODE_UNVERIFIED' : 'SUBAGENT_FAILED')
+      reportBlocked(flags.modeRejected ? 'SANDBOX_MODE_UNVERIFIED' : error instanceof Error && error.message.includes('timed out') ? 'SUBAGENT_TIMEOUT' : 'SUBAGENT_FAILED')
       try {
         await disposeNativeChild(child, this.disposeGraceMs)
       } catch {

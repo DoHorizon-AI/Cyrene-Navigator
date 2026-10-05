@@ -13,7 +13,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 /** Run a real subscription CLI turn only on explicit invocation; CI never calls this file. */
-async function smoke(command) {
+async function smoke(command, timeoutMs) {
   // Use HOME rather than system temp: native sandboxes intentionally permit temporary directories.
   const probeRoot = await mkdtemp(join(homedir(), '.navigator-sandbox-smoke-'));
   const workspace = join(probeRoot, 'workspace');
@@ -33,7 +33,7 @@ async function smoke(command) {
       subagents: { registerProvider(value) { provider = value; return () => {}; } },
     }, {
       deployments: [{ backend: 'antigravity', command, cwd: workspace }],
-      timeoutMs: 90_000,
+      timeoutMs,
       disposeGraceMs: 3_000,
       onEvent: event => {
         if (event.type === 'blocked') blocked.push({ code: event.reasonCode, category: event.toolCategory, count: event.count });
@@ -70,7 +70,9 @@ async function smoke(command) {
 if (process.argv[2] !== '--run' || process.argv.length > 4) {
   process.stdout.write('Opt-in real CLI smoke (uses subscription quota): node harness/tests/antigravity-live-smoke.mjs --run [agy-executable]\n');
 } else {
-  const result = await smoke(process.argv[3] ?? 'agy');
+  const timeoutMs = Number(process.env.CYRENE_NATIVE_SMOKE_TIMEOUT_MS ?? 90_000);
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 900_000) throw new Error('Invalid smoke timeout');
+  const result = await smoke(process.argv[3] ?? 'agy', timeoutMs);
   process.stdout.write(`${JSON.stringify(result)}\n`);
   if (result.status !== 'PASS') process.exitCode = 1;
 }

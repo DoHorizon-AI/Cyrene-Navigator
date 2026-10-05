@@ -57,7 +57,7 @@ if (!codebuddy) {
     try { request = JSON.parse(line); } catch { process.exit(21); }
     record({ kind: 'input', event: request.event, message: request.message });
     if (request.event !== 'user') process.exit(22);
-    if (mode === 'ag-cancel') {
+    if (mode === 'ag-cancel' || mode === 'ag-timeout') {
       record({ kind: 'active', pid: process.pid });
       return;
     }
@@ -257,7 +257,7 @@ async function fixtureHost(t, backend, mode, overrides = {}) {
         ...(process.platform === 'win32' ? { FIXTURE_NODE: FIXTURE_NODE_ENV, FIXTURE_SCRIPT: FIXTURE_SCRIPT_ENV } : {}),
       },
     }],
-    timeoutMs: 2_000,
+    timeoutMs: overrides.timeoutMs ?? 2_000,
     disposeGraceMs: 150,
     onEvent: event => events.push(event),
     ...(overrides.requestPermission === undefined ? {} : {
@@ -481,4 +481,15 @@ test('Antigravity reports classified native authentication failure without raw d
   assert.equal(result.stopReason, 'error');
   assert.match(result.diagnostic, /NATIVE_AUTH_UNAVAILABLE.*无法执行/u);
   assert.doesNotMatch(result.diagnostic, /private|token=secret/u);
+});
+
+
+test('Antigravity timeout produces an explicit cannot-execute receipt and reaps the child', { timeout: 20_000 }, async t => {
+  const host = await fixtureHost(t, 'antigravity', 'ag-timeout', { timeoutMs: 100 });
+  const { result } = await completeRun(host.provider, host.cwd);
+  assert.equal(result.stopReason, 'error');
+  assert.match(result.diagnostic, /NATIVE_RESPONSE_TIMEOUT.*无法执行/u);
+  assert.equal(host.events.find(event => event.type === 'blocked')?.reasonCode, 'SUBAGENT_TIMEOUT');
+  const start = (await readLog(host.logPath)).find(entry => entry.kind === 'start');
+  await waitForProcessExit(start.pid);
 });

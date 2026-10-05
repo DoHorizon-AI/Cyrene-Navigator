@@ -38,7 +38,7 @@ export type ExecutorStreamEvent =
   | { type: 'tool-result'; taskId: string; callId: string; result: string; isError?: boolean; timestamp: number; seq?: number }
   | { type: 'subagent-progress'; taskId: string; provider: string; phase?: string; message?: string; timestamp: number; seq?: number }
   | { type: 'subagent-assistant-delta'; taskId: string; provider: string; text: string; timestamp: number; seq?: number }
-  | { type: 'subagent-blocked'; taskId: string; provider: string; runId: string; reasonCode: 'SANDBOX_BOUNDARY_DENIED' | 'SANDBOX_PROFILE_UNAVAILABLE' | 'SANDBOX_MODE_UNVERIFIED' | 'SUBAGENT_FAILED'; toolCategory: 'file' | 'command' | 'network' | 'other' | 'unknown'; count: number; timestamp: number; seq?: number }
+  | { type: 'subagent-blocked'; taskId: string; provider: string; runId: string; reasonCode: 'SANDBOX_BOUNDARY_DENIED' | 'SANDBOX_PROFILE_UNAVAILABLE' | 'SANDBOX_MODE_UNVERIFIED' | 'SUBAGENT_TIMEOUT' | 'SUBAGENT_FAILED'; toolCategory: 'file' | 'command' | 'network' | 'other' | 'unknown'; count: number; timestamp: number; seq?: number }
   | { type: 'permission'; taskId: string; provider: string; tool?: string; decision: 'approved' | 'denied'; timestamp: number; seq?: number }
   | { type: 'finish'; taskId: string; status: TaskStatus; output: string; durationMs: number; timestamp: number; seq?: number }
   | { type: 'error'; taskId: string; message: string; code?: string; timestamp: number; seq?: number };
@@ -203,7 +203,7 @@ export class NavigatorExecutor {
         if (value.type !== 'subagent-blocked' || value.taskId !== taskId
           || typeof value.provider !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(value.provider)
           || typeof value.runId !== 'string' || !/^[A-Za-z0-9-]{1,80}$/u.test(value.runId)
-          || !['SANDBOX_BOUNDARY_DENIED', 'SANDBOX_PROFILE_UNAVAILABLE', 'SANDBOX_MODE_UNVERIFIED', 'SUBAGENT_FAILED'].includes(String(value.reasonCode))
+          || !['SANDBOX_BOUNDARY_DENIED', 'SANDBOX_PROFILE_UNAVAILABLE', 'SANDBOX_MODE_UNVERIFIED', 'SUBAGENT_TIMEOUT', 'SUBAGENT_FAILED'].includes(String(value.reasonCode))
           || !['file', 'command', 'network', 'other', 'unknown'].includes(String(value.toolCategory))
           || typeof value.count !== 'number' || !Number.isSafeInteger(value.count) || value.count < 1) continue;
         const receipt = value as unknown as Extract<ExecutorStreamEvent, { type: 'subagent-blocked' }>;
@@ -985,6 +985,7 @@ function appendBlockedSummary(output: string, blocked: InternalTaskState['blocke
     const reason = receipt.reasonCode === 'SANDBOX_BOUNDARY_DENIED' ? '超出沙箱或授权边界，无法执行'
       : receipt.reasonCode === 'SANDBOX_PROFILE_UNAVAILABLE' ? '沙箱配置未通过校验，无法执行'
       : receipt.reasonCode === 'SANDBOX_MODE_UNVERIFIED' ? '原生 CLI 未声明所要求的沙箱授权模式，无法执行'
+      : receipt.reasonCode === 'SUBAGENT_TIMEOUT' ? '原生 CLI 响应超时，无法执行'
       : '原生子代理执行失败，无法完成';
     return `- ${receipt.provider} / ${receipt.runId}：${categories[receipt.toolCategory] ?? '操作'}，${reason}（${receipt.reasonCode}）。`;
   });

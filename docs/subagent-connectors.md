@@ -179,7 +179,7 @@ On Linux x64, the official host setup and no-prompt `agy 1.2.16` handshake
 were run successfully: init advertised `proceed-in-sandbox`. The native CLI
 rewrites omitted safe default fields on shutdown; preflight accepts documented
 `allowNonWorkspaceAccess=false` and absent empty grant lists. The real native
-mixed-work smoke was attempted but did not complete permitted work; actual
+mixed-work smoke was attempted but hit native startup/response time limits without completing permitted work; actual
 OS-boundary enforcement and continuation remain unverified. Windows/ARM64
 native-account sandbox execution and CodeBuddy authentication are **NOT_RUN**.
 A future CLI advertising a different init mode is refused.
@@ -196,7 +196,7 @@ node harness/tests/antigravity-live-smoke.mjs --run /path/to/agy
 对任一服务进行认证；混合任务链路还验证拒绝后继续写入 SQLite 记忆、父代理收到部分输出、最终无法执行项以及重启后状态/事件
 读回。Profile 与拒绝测试接入 Linux x64、Linux ARM64、Windows x64 CI。本机 Linux x64 已执行官方配置
 初始化，`agy 1.2.16` 零提示握手返回 `proceed-in-sandbox`。CLI 退出时会省略安全默认字段，预检接受文档化的
-`allowNonWorkspaceAccess=false` 缺省和缺省空授权列表。真实混合任务烟测已尝试，但未完成允许工作，
+`allowNonWorkspaceAccess=false` 缺省和缺省空授权列表。真实混合任务烟测已尝试，但出现原生启动/响应超时、未完成允许工作，
 实际 OS 边界强制执行与拒绝后继续仍未验证。Windows/ARM64 原生账号执行和 CodeBuddy 认证为 **NOT_RUN**。
 上面的显式烟测命令使用原生订阅，只操作私有测试文件；不会加入自动 CI。后续 CLI 如声明不同 init 模式，
 会明确拒绝。

@@ -37,7 +37,7 @@ export type SubagentAdapterEvent =
     readonly backend: NativeSubagentBackend
     readonly parentSessionId: SessionId
     readonly runId: SessionId
-    readonly reasonCode: 'SANDBOX_BOUNDARY_DENIED' | 'SANDBOX_PROFILE_UNAVAILABLE' | 'SANDBOX_MODE_UNVERIFIED' | 'SUBAGENT_FAILED'
+    readonly reasonCode: 'SANDBOX_BOUNDARY_DENIED' | 'SANDBOX_PROFILE_UNAVAILABLE' | 'SANDBOX_MODE_UNVERIFIED' | 'SUBAGENT_TIMEOUT' | 'SUBAGENT_FAILED'
     readonly toolCategory: 'file' | 'command' | 'network' | 'other' | 'unknown'
     /** Number of native denial observations, not a count of unique operations. */
     readonly count: number
