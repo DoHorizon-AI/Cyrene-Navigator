@@ -296,7 +296,10 @@ test('receipt clamps the read to the stat prefix when an append races the read',
           // The backend has grown after stat. A bounded read must still return
           // only the prefix witnessed by stat, even if the backend would now
           // satisfy a larger request with the appended completed turn.
-          return [...prefix, ...appendedAfterStat].slice(offset, offset + length);
+          return {
+            eventState: 'shared-frozen',
+            events: [...prefix, ...appendedAfterStat].slice(offset, offset + length),
+          };
         },
         async close() { closed = true; },
       };

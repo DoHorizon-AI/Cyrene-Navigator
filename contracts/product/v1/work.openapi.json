@@ -1,0 +1,5149 @@
+{
+  "components": {
+    "schemas": {
+      "ApprovalCreate": {
+        "additionalProperties": false,
+        "description": "Create one human decision gate for a running task. | \u4e3a\u8fd0\u884c\u4efb\u52a1\u521b\u5efa\u5ba1\u6279\u95e8\u3002",
+        "properties": {
+          "details": {
+            "additionalProperties": true,
+            "title": "Details",
+            "type": "object"
+          },
+          "kind": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Kind",
+            "type": "string"
+          },
+          "messageId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Messageid"
+          },
+          "summary": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "summary"
+        ],
+        "title": "ApprovalCreate",
+        "type": "object"
+      },
+      "ApprovalReceipt": {
+        "additionalProperties": false,
+        "description": "Decision receipt with its atomically changed task. | \u5ba1\u6279\u51b3\u7b56\u56de\u6267\u3002",
+        "properties": {
+          "approval": {
+            "$ref": "#/components/schemas/ApprovalRecord"
+          },
+          "duplicate": {
+            "title": "Duplicate",
+            "type": "boolean"
+          },
+          "task": {
+            "$ref": "#/components/schemas/TaskRecord"
+          }
+        },
+        "required": [
+          "approval",
+          "task",
+          "duplicate"
+        ],
+        "title": "ApprovalReceipt",
+        "type": "object"
+      },
+      "ApprovalRecord": {
+        "additionalProperties": false,
+        "description": "Approval and its correlated task state. | \u5ba1\u6279\u4e0e\u5173\u8054\u4efb\u52a1\u72b6\u6001\u3002",
+        "properties": {
+          "createdAt": {
+            "title": "Createdat",
+            "type": "integer"
+          },
+          "details": {
+            "additionalProperties": true,
+            "title": "Details",
+            "type": "object"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "messageId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Messageid"
+          },
+          "resolvedAt": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolvedat"
+          },
+          "resolvedBy": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolvedby"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "approved",
+              "rejected"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          },
+          "taskId": {
+            "title": "Taskid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "taskId",
+          "kind",
+          "summary",
+          "details",
+          "status",
+          "createdAt"
+        ],
+        "title": "ApprovalRecord",
+        "type": "object"
+      },
+      "ApprovalResolve": {
+        "additionalProperties": false,
+        "description": "Resolve a pending decision once. | \u4e00\u6b21\u6027\u89e3\u6790\u5f85\u5ba1\u6279\u51b3\u7b56\u3002",
+        "properties": {
+          "decision": {
+            "enum": [
+              "approved",
+              "rejected"
+            ],
+            "title": "Decision",
+            "type": "string"
+          },
+          "messageId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Messageid"
+          }
+        },
+        "required": [
+          "decision"
+        ],
+        "title": "ApprovalResolve",
+        "type": "object"
+      },
+      "AttachmentCreate": {
+        "additionalProperties": false,
+        "description": "Upload a bounded base64 attachment. | \u4e0a\u4f20\u6709\u5927\u5c0f\u4e0a\u9650\u7684 base64 \u9644\u4ef6\u3002",
+        "properties": {
+          "contentBase64": {
+            "maxLength": 14000000,
+            "minLength": 1,
+            "title": "Contentbase64",
+            "type": "string"
+          },
+          "mediaType": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Mediatype",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "mediaType",
+          "contentBase64"
+        ],
+        "title": "AttachmentCreate",
+        "type": "object"
+      },
+      "AttachmentRecord": {
+        "additionalProperties": false,
+        "description": "Content-addressed attachment metadata. | \u5185\u5bb9\u5bfb\u5740\u9644\u4ef6\u5143\u6570\u636e\u3002",
+        "properties": {
+          "createdAt": {
+            "title": "Createdat",
+            "type": "integer"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "mediaType": {
+            "title": "Mediatype",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "sha256": {
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size": {
+            "title": "Size",
+            "type": "integer"
+          },
+          "workspaceId": {
+            "title": "Workspaceid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "workspaceId",
+          "sha256",
+          "name",
+          "mediaType",
+          "size",
+          "createdAt"
+        ],
+        "title": "AttachmentRecord",
+        "type": "object"
+      },
+      "ConnectorEventCreate": {
+        "additionalProperties": false,
+        "description": "Register one connector event and optional atomic task admission. | \u8fde\u63a5\u4e8b\u4ef6\u3002",
+        "properties": {
+          "accountId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accountid"
+          },
+          "conversationId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversationid"
+          },
+          "messageId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Messageid",
+            "type": "string"
+          },
+          "occurredAt": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Occurredat"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "title": "Payload",
+            "type": "object"
+          },
+          "senderId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Senderid"
+          },
+          "task": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TaskCreate"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "type": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "messageId",
+          "type"
+        ],
+        "title": "ConnectorEventCreate",
+        "type": "object"
+      },
+      "ConnectorEventReceipt": {
+        "additionalProperties": false,
+        "description": "Connector event acknowledgement with optional admitted task. | \u8fde\u63a5\u4e8b\u4ef6\u56de\u6267\u3002",
+        "properties": {
+          "duplicate": {
+            "title": "Duplicate",
+            "type": "boolean"
+          },
+          "eventId": {
+            "title": "Eventid",
+            "type": "string"
+          },
+          "receivedAt": {
+            "title": "Receivedat",
+            "type": "integer"
+          },
+          "task": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TaskRecord"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "eventId",
+          "duplicate",
+          "receivedAt"
+        ],
+        "title": "ConnectorEventReceipt",
+        "type": "object"
+      },
+      "ConnectorEvents": {
+        "additionalProperties": false,
+        "description": "Connector events after an exclusive event cursor. | \u6307\u5b9a\u6e38\u6807\u4e4b\u540e\u7684\u8fde\u63a5\u4e8b\u4ef6\u3002",
+        "properties": {
+          "events": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Events",
+            "type": "array"
+          },
+          "nextSeq": {
+            "title": "Nextseq",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "events",
+          "nextSeq"
+        ],
+        "title": "ConnectorEvents",
+        "type": "object"
+      },
+      "ConnectorList": {
+        "additionalProperties": false,
+        "description": "Known connector states in one authorized workspace. | \u6388\u6743\u7a7a\u95f4\u4e2d\u7684\u8fde\u63a5\u5668\u72b6\u6001\u3002",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ConnectorRecord"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "ConnectorList",
+        "type": "object"
+      },
+      "ConnectorRecord": {
+        "additionalProperties": false,
+        "description": "Workspace connector health view. | Workspace \u8fde\u63a5\u5668\u5065\u5eb7\u89c6\u56fe\u3002",
+        "properties": {
+          "accountId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accountid"
+          },
+          "configured": {
+            "default": false,
+            "title": "Configured",
+            "type": "boolean"
+          },
+          "connectorId": {
+            "title": "Connectorid",
+            "type": "string"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "lastEventAt": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lasteventat"
+          },
+          "status": {
+            "enum": [
+              "unknown",
+              "disconnected",
+              "authenticating",
+              "login_required",
+              "connected",
+              "degraded",
+              "error"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "updatedAt": {
+            "title": "Updatedat",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "connectorId",
+          "status",
+          "updatedAt"
+        ],
+        "title": "ConnectorRecord",
+        "type": "object"
+      },
+      "ConnectorStatusUpdate": {
+        "additionalProperties": false,
+        "description": "Update typed connector health and login state. | \u66f4\u65b0\u8fde\u63a5\u5668\u5065\u5eb7\u4e0e\u767b\u5f55\u72b6\u6001\u3002",
+        "properties": {
+          "accountId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accountid"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "status": {
+            "enum": [
+              "unknown",
+              "disconnected",
+              "authenticating",
+              "login_required",
+              "connected",
+              "degraded",
+              "error"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "ConnectorStatusUpdate",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "InputList": {
+        "additionalProperties": false,
+        "description": "Workspace-scoped input requests for the human control surface. | \u5de5\u4f5c\u533a\u8f93\u5165\u5217\u8868\u3002",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/InputRecord"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "InputList",
+        "type": "object"
+      },
+      "InputReceipt": {
+        "additionalProperties": false,
+        "description": "Input creation or answer with the atomically changed task. | \u8f93\u5165\u56de\u6267\u3002",
+        "properties": {
+          "duplicate": {
+            "title": "Duplicate",
+            "type": "boolean"
+          },
+          "input": {
+            "$ref": "#/components/schemas/InputRecord"
+          },
+          "task": {
+            "$ref": "#/components/schemas/TaskRecord"
+          }
+        },
+        "required": [
+          "input",
+          "task",
+          "duplicate"
+        ],
+        "title": "InputReceipt",
+        "type": "object"
+      },
+      "InputRecord": {
+        "additionalProperties": false,
+        "description": "Persisted user input request and its one-time answer. | \u6301\u4e45\u8f93\u5165\u8bf7\u6c42\u4e0e\u56de\u7b54\u3002",
+        "properties": {
+          "answer": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Answer"
+          },
+          "answerMessageId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Answermessageid"
+          },
+          "answeredAt": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Answeredat"
+          },
+          "answeredBy": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Answeredby"
+          },
+          "createdAt": {
+            "title": "Createdat",
+            "type": "integer"
+          },
+          "details": {
+            "additionalProperties": true,
+            "title": "Details",
+            "type": "object"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "messageId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Messageid"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "answered"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          },
+          "taskId": {
+            "title": "Taskid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "taskId",
+          "summary",
+          "details",
+          "status",
+          "createdAt"
+        ],
+        "title": "InputRecord",
+        "type": "object"
+      },
+      "InputRequestCreate": {
+        "additionalProperties": false,
+        "description": "Ask for one human-provided value while pausing its task. | \u8bf7\u6c42\u4eba\u5de5\u8865\u5145\u4fe1\u606f\u3002",
+        "properties": {
+          "details": {
+            "additionalProperties": true,
+            "title": "Details",
+            "type": "object"
+          },
+          "messageId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Messageid"
+          },
+          "summary": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "summary"
+        ],
+        "title": "InputRequestCreate",
+        "type": "object"
+      },
+      "InputResolve": {
+        "additionalProperties": false,
+        "description": "Resolve one pending input request with a safe structured answer. | \u56de\u7b54\u5f85\u5904\u7406\u8f93\u5165\u3002",
+        "properties": {
+          "answer": {
+            "additionalProperties": true,
+            "title": "Answer",
+            "type": "object"
+          },
+          "messageId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Messageid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer",
+          "messageId"
+        ],
+        "title": "InputResolve",
+        "type": "object"
+      },
+      "LoginPollRequest": {
+        "additionalProperties": false,
+        "description": "Accept a login identifier only; host, path and account come from trusted config.",
+        "properties": {
+          "loginId": {
+            "title": "Loginid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loginId"
+        ],
+        "title": "LoginPollRequest",
+        "type": "object"
+      },
+      "MemoryFact": {
+        "additionalProperties": false,
+        "description": "Structured fact with explicit freshness and provenance. | \u5e26\u65f6\u6548\u4e0e\u6765\u6e90\u7684\u4e8b\u5b9e\u3002",
+        "properties": {
+          "freshUntil": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Freshuntil"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "missing": {
+            "title": "Missing",
+            "type": "boolean"
+          },
+          "namespace": {
+            "title": "Namespace",
+            "type": "string"
+          },
+          "observedAt": {
+            "title": "Observedat",
+            "type": "integer"
+          },
+          "sourceId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sourceid"
+          },
+          "stale": {
+            "title": "Stale",
+            "type": "boolean"
+          },
+          "value": {
+            "additionalProperties": true,
+            "title": "Value",
+            "type": "object"
+          }
+        },
+        "required": [
+          "id",
+          "namespace",
+          "key",
+          "value",
+          "observedAt",
+          "missing",
+          "stale"
+        ],
+        "title": "MemoryFact",
+        "type": "object"
+      },
+      "MemoryFactUpsert": {
+        "additionalProperties": false,
+        "description": "Store one structured workspace fact. | \u4fdd\u5b58\u7ed3\u6784\u5316\u5de5\u4f5c\u4e8b\u5b9e\u3002",
+        "properties": {
+          "freshUntil": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Freshuntil"
+          },
+          "key": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Key",
+            "type": "string"
+          },
+          "namespace": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Namespace",
+            "type": "string"
+          },
+          "observedAt": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observedat"
+          },
+          "sourceId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sourceid"
+          },
+          "value": {
+            "additionalProperties": true,
+            "title": "Value",
+            "type": "object"
+          }
+        },
+        "required": [
+          "namespace",
+          "key",
+          "value"
+        ],
+        "title": "MemoryFactUpsert",
+        "type": "object"
+      },
+      "MemoryFacts": {
+        "additionalProperties": false,
+        "description": "Workspace facts returned by read or query endpoints. | \u5de5\u4f5c\u4e8b\u5b9e\u5217\u8868\u3002",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryFact"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "MemoryFacts",
+        "type": "object"
+      },
+      "MemoryQuery": {
+        "additionalProperties": false,
+        "description": "Search workspace facts by plain text. | \u6309\u666e\u901a\u6587\u672c\u67e5\u8be2\u5de5\u4f5c\u4e8b\u5b9e\u3002",
+        "properties": {
+          "includeStale": {
+            "default": false,
+            "title": "Includestale",
+            "type": "boolean"
+          },
+          "limit": {
+            "default": 20,
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "query": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Query",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "MemoryQuery",
+        "type": "object"
+      },
+      "NotificationClaim": {
+        "additionalProperties": false,
+        "description": "Claim notification rows for an adapter worker. | \u7531\u9002\u914d\u5668\u79df\u7528\u901a\u77e5\u9879\u3002",
+        "properties": {
+          "connectorId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connectorid"
+          },
+          "leaseSeconds": {
+            "default": 60,
+            "maximum": 3600.0,
+            "minimum": 5.0,
+            "title": "Leaseseconds",
+            "type": "integer"
+          },
+          "limit": {
+            "default": 10,
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "recipient": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recipient"
+          },
+          "type": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Type"
+          },
+          "workerId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Workerid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workerId"
+        ],
+        "title": "NotificationClaim",
+        "type": "object"
+      },
+      "NotificationClaimResult": {
+        "additionalProperties": false,
+        "description": "Claim response with no automatic external delivery. | \u4ec5\u79df\u7528\uff0c\u4e0d\u81ea\u52a8\u53d1\u9001\u3002",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/NotificationLease"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "NotificationClaimResult",
+        "type": "object"
+      },
+      "NotificationCreate": {
+        "additionalProperties": false,
+        "description": "Enqueue a deduplicated outbound notification. | \u52a0\u5165\u5e42\u7b49\u901a\u77e5\u961f\u5217\u3002",
+        "properties": {
+          "availableAt": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Availableat"
+          },
+          "connectorId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connectorid"
+          },
+          "deduplicationKey": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Deduplicationkey",
+            "type": "string"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "title": "Payload",
+            "type": "object"
+          },
+          "recipient": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recipient"
+          },
+          "taskId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Taskid"
+          },
+          "type": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "deduplicationKey",
+          "type",
+          "payload"
+        ],
+        "title": "NotificationCreate",
+        "type": "object"
+      },
+      "NotificationFinish": {
+        "additionalProperties": false,
+        "description": "Record known delivery, known failure, or unknown delivery. | \u8bb0\u5f55\u6295\u9012\u7ed3\u679c\u3002",
+        "properties": {
+          "leaseToken": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Leasetoken",
+            "type": "string"
+          },
+          "outcome": {
+            "enum": [
+              "delivered",
+              "failed",
+              "uncertain"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "result": {
+            "additionalProperties": true,
+            "title": "Result",
+            "type": "object"
+          }
+        },
+        "required": [
+          "leaseToken",
+          "outcome"
+        ],
+        "title": "NotificationFinish",
+        "type": "object"
+      },
+      "NotificationLease": {
+        "additionalProperties": false,
+        "description": "Leased row with one-time raw lease capability. | \u542b\u4e00\u6b21\u6027\u79df\u7ea6\u80fd\u529b\u3002",
+        "properties": {
+          "leaseExpiresAt": {
+            "title": "Leaseexpiresat",
+            "type": "integer"
+          },
+          "leaseToken": {
+            "title": "Leasetoken",
+            "type": "string"
+          },
+          "notification": {
+            "$ref": "#/components/schemas/NotificationRecord"
+          }
+        },
+        "required": [
+          "notification",
+          "leaseToken",
+          "leaseExpiresAt"
+        ],
+        "title": "NotificationLease",
+        "type": "object"
+      },
+      "NotificationList": {
+        "additionalProperties": false,
+        "description": "Workspace outbox records, including uncertain delivery. | \u5de5\u4f5c\u901a\u77e5\u5217\u8868\u3002",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/NotificationRecord"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "NotificationList",
+        "type": "object"
+      },
+      "NotificationQueued": {
+        "additionalProperties": false,
+        "description": "Queue acknowledgement. | \u901a\u77e5\u5165\u961f\u56de\u6267\u3002",
+        "properties": {
+          "duplicate": {
+            "title": "Duplicate",
+            "type": "boolean"
+          },
+          "notification": {
+            "$ref": "#/components/schemas/NotificationRecord"
+          }
+        },
+        "required": [
+          "notification",
+          "duplicate"
+        ],
+        "title": "NotificationQueued",
+        "type": "object"
+      },
+      "NotificationRecord": {
+        "additionalProperties": false,
+        "description": "Outbox status that distinguishes unknown delivery from queued work. | \u901a\u77e5\u72b6\u6001\u3002",
+        "properties": {
+          "availableAt": {
+            "title": "Availableat",
+            "type": "integer"
+          },
+          "connectorId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connectorid"
+          },
+          "createdAt": {
+            "title": "Createdat",
+            "type": "integer"
+          },
+          "deduplicationKey": {
+            "title": "Deduplicationkey",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "leaseExpiresAt": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Leaseexpiresat"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "title": "Payload",
+            "type": "object"
+          },
+          "recipient": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recipient"
+          },
+          "result": {
+            "additionalProperties": true,
+            "title": "Result",
+            "type": "object"
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "leased",
+              "started",
+              "uncertain",
+              "delivered",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "taskId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Taskid"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          },
+          "updatedAt": {
+            "title": "Updatedat",
+            "type": "integer"
+          },
+          "workerId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workerid"
+          }
+        },
+        "required": [
+          "id",
+          "deduplicationKey",
+          "type",
+          "payload",
+          "status",
+          "availableAt",
+          "createdAt",
+          "updatedAt",
+          "result"
+        ],
+        "title": "NotificationRecord",
+        "type": "object"
+      },
+      "NotificationStart": {
+        "additionalProperties": false,
+        "description": "Mark that the remote send may begin. | \u6807\u8bb0\u53ef\u80fd\u5f00\u59cb\u8fdc\u7aef\u53d1\u9001\u3002",
+        "properties": {
+          "leaseToken": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Leasetoken",
+            "type": "string"
+          }
+        },
+        "required": [
+          "leaseToken"
+        ],
+        "title": "NotificationStart",
+        "type": "object"
+      },
+      "OperationCreate": {
+        "additionalProperties": false,
+        "description": "Begin a durable external-operation receipt. | \u5efa\u7acb\u5916\u90e8\u64cd\u4f5c\u56de\u6267\u3002",
+        "properties": {
+          "idempotencyKey": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Idempotencykey",
+            "type": "string"
+          },
+          "operationType": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Operationtype",
+            "type": "string"
+          },
+          "request": {
+            "additionalProperties": true,
+            "title": "Request",
+            "type": "object"
+          },
+          "target": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target"
+          },
+          "taskId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Taskid"
+          }
+        },
+        "required": [
+          "idempotencyKey",
+          "operationType"
+        ],
+        "title": "OperationCreate",
+        "type": "object"
+      },
+      "OperationReceipt": {
+        "additionalProperties": false,
+        "description": "Creation or transition acknowledgement. | \u521b\u5efa\u4e0e\u72b6\u6001\u8f6c\u6362\u56de\u6267\u3002",
+        "properties": {
+          "duplicate": {
+            "default": false,
+            "title": "Duplicate",
+            "type": "boolean"
+          },
+          "operation": {
+            "$ref": "#/components/schemas/OperationRecord"
+          }
+        },
+        "required": [
+          "operation"
+        ],
+        "title": "OperationReceipt",
+        "type": "object"
+      },
+      "OperationRecord": {
+        "additionalProperties": false,
+        "description": "Started, uncertain, or verified operation receipt. | \u64cd\u4f5c\u56de\u6267\u72b6\u6001\u3002",
+        "properties": {
+          "createdAt": {
+            "title": "Createdat",
+            "type": "integer"
+          },
+          "evidence": {
+            "additionalProperties": true,
+            "title": "Evidence",
+            "type": "object"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "idempotencyKey": {
+            "title": "Idempotencykey",
+            "type": "string"
+          },
+          "operationType": {
+            "title": "Operationtype",
+            "type": "string"
+          },
+          "request": {
+            "additionalProperties": true,
+            "title": "Request",
+            "type": "object"
+          },
+          "status": {
+            "enum": [
+              "started",
+              "uncertain",
+              "verified"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "target": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target"
+          },
+          "taskId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Taskid"
+          },
+          "updatedAt": {
+            "title": "Updatedat",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "idempotencyKey",
+          "operationType",
+          "request",
+          "status",
+          "evidence",
+          "createdAt",
+          "updatedAt"
+        ],
+        "title": "OperationRecord",
+        "type": "object"
+      },
+      "OperationVerify": {
+        "additionalProperties": false,
+        "description": "Record an operation outcome without replaying the side effect. | \u8bb0\u5f55\u64cd\u4f5c\u7ed3\u679c\u3002",
+        "properties": {
+          "evidence": {
+            "additionalProperties": true,
+            "title": "Evidence",
+            "type": "object"
+          },
+          "status": {
+            "enum": [
+              "uncertain",
+              "verified"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "OperationVerify",
+        "type": "object"
+      },
+      "SourceFactInput": {
+        "additionalProperties": false,
+        "description": "One fact from a paginated source inventory. | \u5206\u9875\u6765\u6e90\u6e05\u5355\u4e2d\u7684\u4e00\u9879\u4e8b\u5b9e\u3002",
+        "properties": {
+          "key": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Key",
+            "type": "string"
+          },
+          "observedAt": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observedat"
+          },
+          "value": {
+            "additionalProperties": true,
+            "title": "Value",
+            "type": "object"
+          }
+        },
+        "required": [
+          "key",
+          "value"
+        ],
+        "title": "SourceFactInput",
+        "type": "object"
+      },
+      "SourceInventoryPage": {
+        "additionalProperties": false,
+        "description": "Submit one contiguous page of a source inventory. | \u63d0\u4ea4\u6765\u6e90\u6e05\u5355\u7684\u4e00\u9875\u3002",
+        "properties": {
+          "complete": {
+            "title": "Complete",
+            "type": "boolean"
+          },
+          "inventoryId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Inventoryid",
+            "type": "string"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SourceFactInput"
+            },
+            "maxItems": 10000,
+            "title": "Items",
+            "type": "array"
+          },
+          "nextPageToken": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nextpagetoken"
+          },
+          "pageToken": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pagetoken"
+          },
+          "successful": {
+            "title": "Successful",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "inventoryId",
+          "complete",
+          "successful",
+          "items"
+        ],
+        "title": "SourceInventoryPage",
+        "type": "object"
+      },
+      "SourceInventoryReceipt": {
+        "additionalProperties": false,
+        "description": "Inventory progress; missing facts change only at full success. | \u6e05\u5355\u8fdb\u5ea6\u56de\u6267\u3002",
+        "properties": {
+          "acceptedPageCount": {
+            "title": "Acceptedpagecount",
+            "type": "integer"
+          },
+          "complete": {
+            "title": "Complete",
+            "type": "boolean"
+          },
+          "duplicate": {
+            "default": false,
+            "title": "Duplicate",
+            "type": "boolean"
+          },
+          "inventoryId": {
+            "title": "Inventoryid",
+            "type": "string"
+          },
+          "itemCount": {
+            "title": "Itemcount",
+            "type": "integer"
+          },
+          "lastCompleteAt": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lastcompleteat"
+          },
+          "sourceId": {
+            "title": "Sourceid",
+            "type": "string"
+          },
+          "successful": {
+            "title": "Successful",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "sourceId",
+          "inventoryId",
+          "acceptedPageCount",
+          "complete",
+          "successful",
+          "itemCount"
+        ],
+        "title": "SourceInventoryReceipt",
+        "type": "object"
+      },
+      "SourceList": {
+        "additionalProperties": false,
+        "description": "Workspace source inventory summaries. | \u5de5\u4f5c\u6765\u6e90\u5217\u8868\u3002",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SourceRecord"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "SourceList",
+        "type": "object"
+      },
+      "SourceRecord": {
+        "additionalProperties": false,
+        "description": "Latest successful source inventory state. | \u6700\u8fd1\u6210\u529f\u6e05\u5355\u72b6\u6001\u3002",
+        "properties": {
+          "factCount": {
+            "title": "Factcount",
+            "type": "integer"
+          },
+          "lastCompleteAt": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lastcompleteat"
+          },
+          "sourceId": {
+            "title": "Sourceid",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "unknown",
+              "fresh",
+              "stale",
+              "incomplete",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "updatedAt": {
+            "title": "Updatedat",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sourceId",
+          "status",
+          "updatedAt",
+          "factCount"
+        ],
+        "title": "SourceRecord",
+        "type": "object"
+      },
+      "TaskClaimResult": {
+        "additionalProperties": false,
+        "description": "Single-winner task admission claim. | \u5355\u8d62\u5bb6\u4efb\u52a1\u8ba4\u9886\u56de\u6267\u3002",
+        "properties": {
+          "claimed": {
+            "title": "Claimed",
+            "type": "boolean"
+          },
+          "task": {
+            "$ref": "#/components/schemas/TaskRecord"
+          }
+        },
+        "required": [
+          "claimed",
+          "task"
+        ],
+        "title": "TaskClaimResult",
+        "type": "object"
+      },
+      "TaskCreate": {
+        "additionalProperties": false,
+        "description": "Create one durable executor task. | \u521b\u5efa\u4e00\u4e2a\u6301\u4e45\u6267\u884c\u4efb\u52a1\u3002",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 20000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "title": "Metadata",
+            "type": "object"
+          },
+          "prompt": {
+            "maxLength": 100000,
+            "minLength": 1,
+            "title": "Prompt",
+            "type": "string"
+          },
+          "sessionId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Sessionid",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "required": [
+          "sessionId",
+          "prompt"
+        ],
+        "title": "TaskCreate",
+        "type": "object"
+      },
+      "TaskEvent": {
+        "additionalProperties": false,
+        "description": "Durable event envelope. | \u6301\u4e45\u4e8b\u4ef6\u4fe1\u5c01\u3002",
+        "properties": {
+          "createdAt": {
+            "title": "Createdat",
+            "type": "integer"
+          },
+          "event": {
+            "additionalProperties": true,
+            "title": "Event",
+            "type": "object"
+          },
+          "messageId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Messageid"
+          },
+          "seq": {
+            "title": "Seq",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "seq",
+          "event",
+          "createdAt"
+        ],
+        "title": "TaskEvent",
+        "type": "object"
+      },
+      "TaskEventAppend": {
+        "additionalProperties": false,
+        "description": "Append an opaque typed event with an optional retry key. | \u8ffd\u52a0\u5e42\u7b49\u4e8b\u4ef6\u3002",
+        "properties": {
+          "event": {
+            "additionalProperties": true,
+            "title": "Event",
+            "type": "object"
+          },
+          "messageId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Messageid"
+          }
+        },
+        "required": [
+          "event"
+        ],
+        "title": "TaskEventAppend",
+        "type": "object"
+      },
+      "TaskEventReceipt": {
+        "additionalProperties": false,
+        "description": "Append acknowledgement and current task projection. | \u4e8b\u4ef6\u8ffd\u52a0\u56de\u6267\u3002",
+        "properties": {
+          "createdAt": {
+            "title": "Createdat",
+            "type": "integer"
+          },
+          "duplicate": {
+            "title": "Duplicate",
+            "type": "boolean"
+          },
+          "event": {
+            "additionalProperties": true,
+            "title": "Event",
+            "type": "object"
+          },
+          "seq": {
+            "title": "Seq",
+            "type": "integer"
+          },
+          "task": {
+            "$ref": "#/components/schemas/TaskRecord"
+          }
+        },
+        "required": [
+          "seq",
+          "event",
+          "createdAt",
+          "duplicate",
+          "task"
+        ],
+        "title": "TaskEventReceipt",
+        "type": "object"
+      },
+      "TaskEvents": {
+        "additionalProperties": false,
+        "description": "Events after an exclusive sequence cursor. | \u6307\u5b9a\u5e8f\u5217\u4e4b\u540e\u7684\u4e8b\u4ef6\u3002",
+        "properties": {
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/TaskEvent"
+            },
+            "title": "Events",
+            "type": "array"
+          },
+          "nextSeq": {
+            "title": "Nextseq",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "events",
+          "nextSeq"
+        ],
+        "title": "TaskEvents",
+        "type": "object"
+      },
+      "TaskList": {
+        "additionalProperties": false,
+        "description": "Cursor-paginated task view. | \u6e38\u6807\u5206\u9875\u4efb\u52a1\u89c6\u56fe\u3002",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/TaskRecord"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "nextCursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nextcursor"
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ],
+        "title": "TaskList",
+        "type": "object"
+      },
+      "TaskPatch": {
+        "additionalProperties": false,
+        "description": "Update mutable executor results and a validated task state. | \u66f4\u65b0\u6267\u884c\u7ed3\u679c\u4e0e\u72b6\u6001\u3002",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 20000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "maxLength": 200000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata"
+          },
+          "output": {
+            "anyOf": [
+              {
+                "maxLength": 2000000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "maxLength": 100000,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          },
+          "reasoning": {
+            "anyOf": [
+              {
+                "maxLength": 2000000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "queued",
+                  "running",
+                  "completed",
+                  "failed",
+                  "aborted",
+                  "waiting_approval",
+                  "waiting_input"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "title": "TaskPatch",
+        "type": "object"
+      },
+      "TaskRecord": {
+        "additionalProperties": false,
+        "description": "Public execution record with server-owned timestamps. | \u6267\u884c\u4efb\u52a1\u516c\u5f00\u8bb0\u5f55\u3002",
+        "properties": {
+          "createdAt": {
+            "title": "Createdat",
+            "type": "integer"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "durationMs": {
+            "title": "Durationms",
+            "type": "integer"
+          },
+          "endedAt": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Endedat"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "title": "Metadata",
+            "type": "object"
+          },
+          "output": {
+            "title": "Output",
+            "type": "string"
+          },
+          "prompt": {
+            "title": "Prompt",
+            "type": "string"
+          },
+          "reasoning": {
+            "title": "Reasoning",
+            "type": "string"
+          },
+          "sequence": {
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "sessionId": {
+            "title": "Sessionid",
+            "type": "string"
+          },
+          "startedAt": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Startedat"
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "running",
+              "completed",
+              "failed",
+              "aborted",
+              "waiting_approval",
+              "waiting_input"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "workspaceId": {
+            "title": "Workspaceid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "workspaceId",
+          "sessionId",
+          "prompt",
+          "status",
+          "createdAt",
+          "output",
+          "reasoning",
+          "durationMs",
+          "sequence",
+          "metadata"
+        ],
+        "title": "TaskRecord",
+        "type": "object"
+      },
+      "ToolCallBody": {
+        "additionalProperties": false,
+        "description": "The model supplies tool arguments only; host and credentials are fixed.\n\n\u4e2d\u6587:\u6a21\u578b\u4ec5\u4f20\u5de5\u5177\u53c2\u6570,\u4e0d\u80fd\u9009\u62e9\u5bbf\u4e3b\u6216\u51ed\u636e\u3002",
+        "properties": {
+          "arguments": {
+            "additionalProperties": true,
+            "title": "Arguments",
+            "type": "object"
+          }
+        },
+        "title": "ToolCallBody",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      },
+      "WorkflowList": {
+        "additionalProperties": false,
+        "description": "Versioned workflow catalog for one Workspace. | \u5de5\u4f5c\u6d41\u76ee\u5f55\u3002",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowRecord"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "WorkflowList",
+        "type": "object"
+      },
+      "WorkflowNotifications": {
+        "additionalProperties": false,
+        "description": "Quiet-by-default workflow notification preferences. | \u5b89\u9759\u901a\u77e5\u504f\u597d\u3002",
+        "properties": {
+          "onChange": {
+            "title": "Onchange",
+            "type": "boolean"
+          },
+          "onFailure": {
+            "title": "Onfailure",
+            "type": "boolean"
+          },
+          "onRecovery": {
+            "title": "Onrecovery",
+            "type": "boolean"
+          },
+          "quietWhenUnchanged": {
+            "const": true,
+            "title": "Quietwhenunchanged",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "onChange",
+          "onFailure",
+          "onRecovery",
+          "quietWhenUnchanged"
+        ],
+        "title": "WorkflowNotifications",
+        "type": "object"
+      },
+      "WorkflowRecord": {
+        "additionalProperties": false,
+        "description": "Versioned instructions and desired cadence for DSH. | \u7248\u672c\u5316\u5de5\u4f5c\u6d41\u5b9a\u4e49\u3002",
+        "properties": {
+          "description": {
+            "maxLength": 20000,
+            "title": "Description",
+            "type": "string"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "instructions": {
+            "maxLength": 100000,
+            "minLength": 1,
+            "title": "Instructions",
+            "type": "string"
+          },
+          "notifications": {
+            "$ref": "#/components/schemas/WorkflowNotifications"
+          },
+          "schedule": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowSchedule"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "targets": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowTarget"
+            },
+            "maxItems": 100,
+            "title": "Targets",
+            "type": "array"
+          },
+          "title": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Title",
+            "type": "string"
+          },
+          "updatedAt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updatedat"
+          },
+          "version": {
+            "const": 1,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "version",
+          "title",
+          "description",
+          "instructions",
+          "targets",
+          "notifications",
+          "enabled"
+        ],
+        "title": "WorkflowRecord",
+        "type": "object"
+      },
+      "WorkflowSchedule": {
+        "additionalProperties": false,
+        "description": "Desired DSH cron cadence; DSH remains the scheduling authority. | DSH \u5b9a\u65f6\u610f\u56fe\u3002",
+        "properties": {
+          "expression": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Expression",
+            "type": "string"
+          },
+          "kind": {
+            "const": "cron",
+            "title": "Kind",
+            "type": "string"
+          },
+          "timeZone": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Timezone",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "expression",
+          "timeZone"
+        ],
+        "title": "WorkflowSchedule",
+        "type": "object"
+      },
+      "WorkflowScheduleEvent": {
+        "additionalProperties": false,
+        "description": "Safe durable schedule execution history, without tool output or arguments. | \u8c03\u5ea6\u5386\u53f2\u3002",
+        "properties": {
+          "changed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Changed"
+          },
+          "createdAt": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Createdat",
+            "type": "string"
+          },
+          "endedAt": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Endedat"
+          },
+          "errorCode": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Errorcode"
+          },
+          "id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "scheduledAt": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Scheduledat",
+            "type": "string"
+          },
+          "sessionId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sessionid"
+          },
+          "startedAt": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Startedat"
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "running",
+              "succeeded",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Summary"
+          },
+          "taskId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Taskid"
+          },
+          "workflowId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Workflowid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "workflowId",
+          "scheduledAt",
+          "status",
+          "createdAt"
+        ],
+        "title": "WorkflowScheduleEvent",
+        "type": "object"
+      },
+      "WorkflowScheduleEventList": {
+        "additionalProperties": false,
+        "description": "Cursor-paginated schedule execution history. | \u5206\u9875\u8c03\u5ea6\u6267\u884c\u5386\u53f2\u3002",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowScheduleEvent"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "nextCursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nextcursor"
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ],
+        "title": "WorkflowScheduleEventList",
+        "type": "object"
+      },
+      "WorkflowTarget": {
+        "additionalProperties": false,
+        "description": "Generic resource scope for a versioned workflow. | \u901a\u7528\u5de5\u4f5c\u6d41\u76ee\u6807\u3002",
+        "properties": {
+          "id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Kind",
+            "type": "string"
+          },
+          "label": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          },
+          "uri": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Uri"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "kind"
+        ],
+        "title": "WorkflowTarget",
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "NavigatorBearer": {
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "title": "Navigator Work API / \u5de5\u4f5c\u52a9\u624b\u63a5\u53e3",
+    "version": "1.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/v1/workspaces/{workspace_id}/work/approvals": {
+      "get": {
+        "operationId": "list_approvals_api_v1_workspaces__workspace_id__work_approvals_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ApprovalRecord"
+                  },
+                  "title": "Response List Approvals Api V1 Workspaces  Workspace Id  Work Approvals Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Approvals"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/approvals/{approval_id}": {
+      "get": {
+        "operationId": "get_approval_api_v1_workspaces__workspace_id__work_approvals__approval_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "approval_id",
+            "required": true,
+            "schema": {
+              "title": "Approval Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalRecord"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Approval"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/approvals/{approval_id}/resolve": {
+      "post": {
+        "operationId": "resolve_approval_api_v1_workspaces__workspace_id__work_approvals__approval_id__resolve_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "approval_id",
+            "required": true,
+            "schema": {
+              "title": "Approval Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApprovalResolve"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Resolve Approval"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/attachments": {
+      "post": {
+        "operationId": "upload_attachment_api_v1_workspaces__workspace_id__work_attachments_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AttachmentCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttachmentRecord"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Upload Attachment"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/attachments/{digest}": {
+      "get": {
+        "operationId": "download_attachment_api_v1_workspaces__workspace_id__work_attachments__digest__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "digest",
+            "required": true,
+            "schema": {
+              "title": "Digest",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Download Attachment"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/connectors": {
+      "get": {
+        "operationId": "list_connectors_api_v1_workspaces__workspace_id__work_connectors_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Connectors"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/connectors/{binding_id}/health": {
+      "get": {
+        "operationId": "connector_health_api_v1_workspaces__workspace_id__work_connectors__binding_id__health_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "binding_id",
+            "required": true,
+            "schema": {
+              "title": "Binding Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Connector Health Api V1 Workspaces  Workspace Id  Work Connectors  Binding Id  Health Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Connector Health"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/connectors/{binding_id}/login/poll": {
+      "post": {
+        "operationId": "connector_login_poll_api_v1_workspaces__workspace_id__work_connectors__binding_id__login_poll_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "binding_id",
+            "required": true,
+            "schema": {
+              "title": "Binding Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginPollRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Connector Login Poll Api V1 Workspaces  Workspace Id  Work Connectors  Binding Id  Login Poll Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Connector Login Poll"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/connectors/{binding_id}/login/qr": {
+      "post": {
+        "operationId": "connector_login_qr_api_v1_workspaces__workspace_id__work_connectors__binding_id__login_qr_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "binding_id",
+            "required": true,
+            "schema": {
+              "title": "Binding Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Connector Login Qr Api V1 Workspaces  Workspace Id  Work Connectors  Binding Id  Login Qr Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Connector Login Qr"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/connectors/{connector_id}/events": {
+      "get": {
+        "operationId": "list_connector_events_api_v1_workspaces__workspace_id__work_connectors__connector_id__events_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "title": "Connector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "After",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorEvents"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Connector Events"
+      },
+      "post": {
+        "operationId": "register_connector_event_api_v1_workspaces__workspace_id__work_connectors__connector_id__events_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "title": "Connector Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectorEventCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorEventReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Register Connector Event"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/connectors/{connector_id}/status": {
+      "post": {
+        "operationId": "update_connector_status_api_v1_workspaces__workspace_id__work_connectors__connector_id__status_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "title": "Connector Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectorStatusUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorRecord"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Connector Status"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/inputs": {
+      "get": {
+        "operationId": "list_input_requests_api_v1_workspaces__workspace_id__work_inputs_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InputList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Input Requests"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/inputs/{input_id}": {
+      "get": {
+        "operationId": "get_input_request_api_v1_workspaces__workspace_id__work_inputs__input_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "input_id",
+            "required": true,
+            "schema": {
+              "title": "Input Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InputRecord"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Input Request"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/inputs/{input_id}/resolve": {
+      "post": {
+        "operationId": "resolve_input_request_api_v1_workspaces__workspace_id__work_inputs__input_id__resolve_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "input_id",
+            "required": true,
+            "schema": {
+              "title": "Input Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InputResolve"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InputReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Resolve Input Request"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/memory/facts": {
+      "get": {
+        "operationId": "list_memory_facts_api_v1_workspaces__workspace_id__work_memory_facts_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_stale",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Include Stale",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryFacts"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Memory Facts"
+      },
+      "post": {
+        "operationId": "upsert_memory_fact_api_v1_workspaces__workspace_id__work_memory_facts_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryFactUpsert"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryFact"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Upsert Memory Fact"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/memory/query": {
+      "post": {
+        "operationId": "query_memory_api_v1_workspaces__workspace_id__work_memory_query_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryQuery"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryFacts"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Query Memory"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/notifications": {
+      "get": {
+        "operationId": "list_notifications_api_v1_workspaces__workspace_id__work_notifications_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Notifications"
+      },
+      "post": {
+        "operationId": "queue_notification_api_v1_workspaces__workspace_id__work_notifications_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NotificationCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationQueued"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Queue Notification"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/notifications/claim": {
+      "post": {
+        "operationId": "claim_notifications_api_v1_workspaces__workspace_id__work_notifications_claim_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NotificationClaim"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationClaimResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Claim Notifications"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/notifications/{notification_id}/finish": {
+      "post": {
+        "operationId": "finish_notification_api_v1_workspaces__workspace_id__work_notifications__notification_id__finish_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "notification_id",
+            "required": true,
+            "schema": {
+              "title": "Notification Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NotificationFinish"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationRecord"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Finish Notification"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/notifications/{notification_id}/start": {
+      "post": {
+        "operationId": "start_notification_api_v1_workspaces__workspace_id__work_notifications__notification_id__start_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "notification_id",
+            "required": true,
+            "schema": {
+              "title": "Notification Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NotificationStart"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationRecord"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Notification"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/operations": {
+      "post": {
+        "operationId": "create_operation_api_v1_workspaces__workspace_id__work_operations_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OperationCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Operation"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/operations/{operation_id}": {
+      "get": {
+        "operationId": "get_operation_api_v1_workspaces__workspace_id__work_operations__operation_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "operation_id",
+            "required": true,
+            "schema": {
+              "title": "Operation Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Operation"
+      },
+      "patch": {
+        "operationId": "update_operation_api_v1_workspaces__workspace_id__work_operations__operation_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "operation_id",
+            "required": true,
+            "schema": {
+              "title": "Operation Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OperationVerify"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Operation"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/schedule-events": {
+      "get": {
+        "operationId": "list_schedule_events_api_v1_workspaces__workspace_id__work_schedule_events_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "workflow_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Workflow Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 2000,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowScheduleEventList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Schedule Events"
+      },
+      "post": {
+        "operationId": "append_schedule_event_api_v1_workspaces__workspace_id__work_schedule_events_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkflowScheduleEvent"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowScheduleEvent"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Append Schedule Event"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/sources": {
+      "get": {
+        "operationId": "list_sources_api_v1_workspaces__workspace_id__work_sources_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Sources"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/sources/{source_id}/facts": {
+      "get": {
+        "operationId": "list_source_facts_api_v1_workspaces__workspace_id__work_sources__source_id__facts_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_missing",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Missing",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 1000,
+              "maximum": 5000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Source Facts Api V1 Workspaces  Workspace Id  Work Sources  Source Id  Facts Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Source Facts"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/sources/{source_id}/inventory": {
+      "post": {
+        "operationId": "ingest_source_page_api_v1_workspaces__workspace_id__work_sources__source_id__inventory_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceInventoryPage"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceInventoryReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Ingest Source Page"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/tasks": {
+      "get": {
+        "operationId": "list_tasks_api_v1_workspaces__workspace_id__work_tasks_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 2000,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Tasks"
+      },
+      "post": {
+        "operationId": "create_task_api_v1_workspaces__workspace_id__work_tasks_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskRecord"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Task"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/tasks/{task_id}": {
+      "get": {
+        "operationId": "get_task_api_v1_workspaces__workspace_id__work_tasks__task_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskRecord"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Task"
+      },
+      "patch": {
+        "operationId": "patch_task_api_v1_workspaces__workspace_id__work_tasks__task_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskRecord"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Patch Task"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/tasks/{task_id}/approvals": {
+      "post": {
+        "operationId": "create_approval_api_v1_workspaces__workspace_id__work_tasks__task_id__approvals_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApprovalCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Approval"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/tasks/{task_id}/claim": {
+      "post": {
+        "operationId": "claim_task_api_v1_workspaces__workspace_id__work_tasks__task_id__claim_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskClaimResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Claim Task"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/tasks/{task_id}/events": {
+      "get": {
+        "operationId": "get_task_events_api_v1_workspaces__workspace_id__work_tasks__task_id__events_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "After",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 1000,
+              "maximum": 10000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskEvents"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Task Events"
+      },
+      "post": {
+        "operationId": "append_task_event_api_v1_workspaces__workspace_id__work_tasks__task_id__events_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskEventAppend"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskEventReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Append Task Event"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/tasks/{task_id}/inputs": {
+      "post": {
+        "operationId": "create_input_request_api_v1_workspaces__workspace_id__work_tasks__task_id__inputs_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InputRequestCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InputReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Input Request"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/tool-providers": {
+      "get": {
+        "description": "Discover only local bindings in the authorized scope. | \u4ec5\u53d1\u73b0\u5df2\u6388\u6743\u672c\u5730\u7ed1\u5b9a\u3002",
+        "operationId": "list_providers_api_v1_workspaces__workspace_id__work_tool_providers_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Providers Api V1 Workspaces  Workspace Id  Work Tool Providers Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Providers"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/tool-providers/{binding_id}/tools": {
+      "get": {
+        "description": "Project the canonical provider catalog without accepting a provider URL.\n\n\u4e2d\u6587:\u6295\u5f71\u6807\u51c6\u5de5\u5177\u76ee\u5f55,\u4e0d\u63a5\u53d7\u8bf7\u6c42\u63d0\u4f9b\u7684 provider URL\u3002",
+        "operationId": "list_tools_api_v1_workspaces__workspace_id__work_tool_providers__binding_id__tools_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "binding_id",
+            "required": true,
+            "schema": {
+              "title": "Binding Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Tools Api V1 Workspaces  Workspace Id  Work Tool Providers  Binding Id  Tools Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Tools"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/tool-providers/{binding_id}/tools/{tool_id}/call": {
+      "post": {
+        "description": "Invoke the installed provider; its own operation allowlist remains authoritative.\n\n\u4e2d\u6587:\u8c03\u7528\u5df2\u5b89\u88c5\u63d0\u4f9b\u8005,\u5176\u81ea\u8eab\u64cd\u4f5c\u767d\u540d\u5355\u4ecd\u662f\u6267\u884c\u6743\u9650\u8fb9\u754c\u3002",
+        "operationId": "call_tool_api_v1_workspaces__workspace_id__work_tool_providers__binding_id__tools__tool_id__call_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "binding_id",
+            "required": true,
+            "schema": {
+              "title": "Binding Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "tool_id",
+            "required": true,
+            "schema": {
+              "title": "Tool Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ToolCallBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Call Tool Api V1 Workspaces  Workspace Id  Work Tool Providers  Binding Id  Tools  Tool Id  Call Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Call Tool"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/workflows": {
+      "get": {
+        "operationId": "list_workflows_api_v1_workspaces__workspace_id__work_workflows_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Workflows"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/workflows/{workflow_id}": {
+      "put": {
+        "operationId": "put_workflow_api_v1_workspaces__workspace_id__work_workflows__workflow_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "workflow_id",
+            "required": true,
+            "schema": {
+              "title": "Workflow Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkflowRecord"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowRecord"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Workflow"
+      }
+    }
+  },
+  "security": [
+    {
+      "NavigatorBearer": []
+    }
+  ]
+}

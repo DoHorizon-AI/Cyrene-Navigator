@@ -43,6 +43,8 @@ The response is a closed summary and omits arbitrary Harness header metadata.
 
 - `contracts/product/v1/persistence.openapi.yaml`: session persistence and the
   explicit `Send to Echo` handoff.
+- `contracts/product/v1/work.openapi.json`: scoped tasks, approval and input,
+  memory, notifications, attachments, workflows, and configured connector tools.
 - `src/cyrene_navigator/persistence`: session authority and the local Artifact
   adapter used by that handoff.
 - `native/crates/cyrene-native-host`: Navigator-owned Codex rollout import over
@@ -98,6 +100,8 @@ session ID 是唯一资源路径参数。响应为封闭摘要，不包含任意
 ## Navigator 所有的接口
 
 - `contracts/product/v1/persistence.openapi.yaml`：会话持久化和显式的 `Send to Echo` 交接。
+- `contracts/product/v1/work.openapi.json`：按 Workspace 隔离的任务、审批与人工输入、
+  记忆、通知、附件、工作流和已配置的连接器工具。
 - `src/cyrene_navigator/persistence`：会话权威以及交接使用的本地 Artifact 适配器。
 - `native/crates/cyrene-native-host`：Navigator 所有的 Codex rollout 导入，使用版本化 NDJSON 协议。
 - `harness`：可替换的 DeepSeek Harness 适配器和 Profile 集成。

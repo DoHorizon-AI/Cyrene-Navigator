@@ -41,12 +41,12 @@ const nativeBinary = process.env.CYRENE_NATIVE_HOST ?? join(repository, 'native/
 async function startService(directory, token) {
   const config = join(directory, 'principals.json');
   await writeFile(config, JSON.stringify({ principals: [{
-    token_env: 'CYRENE_TEST_SESSION_TOKEN', actor_id: 'import-owner', workspace_ids: ['import-proof'],
+    token_env: 'CYRENE_CODEX_TEST_SESSION_TOKEN', actor_id: 'import-owner', workspace_ids: ['import-proof'],
   }] }));
   const child = spawn(python, [join(repository, 'scripts/serve-persistence.py'),
     '--database', join(directory, 'sessions.sqlite'), '--principal-config', config,
     '--port', '0', '--lease-seconds', '5'], {
-    env: { ...process.env, CYRENE_TEST_SESSION_TOKEN: token },
+    env: { ...process.env, CYRENE_CODEX_TEST_SESSION_TOKEN: token },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let logs = '';
@@ -118,7 +118,7 @@ async function client(baseUrl, { agentRuntime = false } = {}) {
   await ctx.plugin(CyreneSessionPersistence, {
     baseUrl,
     workspaceId: 'import-proof',
-    tokenEnv: 'CYRENE_TEST_SESSION_TOKEN',
+    tokenEnv: 'CYRENE_CODEX_TEST_SESSION_TOKEN',
     clientId: 'import-proof',
     requestTimeoutMs: 2_000,
     heartbeatMs: 250,
@@ -139,7 +139,7 @@ async function client(baseUrl, { agentRuntime = false } = {}) {
 test('Codex import persists real upstream messages and never replays historical tools', { timeout: 30_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'cyrene-codex-import-test-'));
   const token = randomUUID();
-  process.env.CYRENE_TEST_SESSION_TOKEN = token;
+  process.env.CYRENE_CODEX_TEST_SESSION_TOKEN = token;
   let service;
   let mounted;
   try {
@@ -181,7 +181,8 @@ test('Codex import persists real upstream messages and never replays historical 
     assert.equal(mounted.ctx.get('agents'), undefined, 'the import did not start an AgentRun');
 
     const reader = await mounted.ctx.get('sessionPersistence').open(id, 'read');
-    const events = await reader.read();
+    const readResult = await reader.read();
+    const events = readResult.events ?? readResult;
     await reader.close();
     assert.ok(events.some(event => event.type === 'user/message' && event.surfaceOp === 'append'));
     assert.ok(events.some(event => event.type === 'assistant/message' && event.surfaceOp === 'append'));
@@ -209,7 +210,8 @@ test('Codex import persists real upstream messages and never replays historical 
     assert.equal(second.sessionId, first.sessionId);
     assert.equal(second.duplicate, true);
     const reread = await mounted.ctx.get('sessionPersistence').open(id, 'read');
-    assert.equal((await reread.read()).length, events.length);
+    const rereadRes = await reread.read();
+    assert.equal((rereadRes.events ?? rereadRes).length, events.length);
     await reread.close();
 
     // The desktop preview is a read-only projection over the same Cyrene log.
@@ -247,7 +249,7 @@ test('Codex import persists real upstream messages and never replays historical 
     if (mounted) outcomes.push(mounted.ctx.fiber.dispose());
     await Promise.allSettled(outcomes);
     if (service) await stopService(service);
-    delete process.env.CYRENE_TEST_SESSION_TOKEN;
+    delete process.env.CYRENE_CODEX_TEST_SESSION_TOKEN;
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -294,7 +296,7 @@ test('Codex import route rejects non-POST, malformed and oversized buffered requ
 test('Codex archive Continue creates a real seeded Agent and never executes archive history', { timeout: 30_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'cyrene-codex-continue-test-'));
   const token = randomUUID();
-  process.env.CYRENE_TEST_SESSION_TOKEN = token;
+  process.env.CYRENE_CODEX_TEST_SESSION_TOKEN = token;
   let service;
   let archive;
   let runtime;
@@ -369,7 +371,10 @@ test('Codex archive Continue creates a real seeded Agent and never executes arch
     await runtime.ctx.sessions.flush(target.session);
     const continuedEvents = await (async () => {
       const reader = await runtime.ctx.get('sessionPersistence').open(targetSessionId, 'read');
-      try { return await reader.read(); } finally { await reader.close(); }
+      try {
+        const res = await reader.read();
+        return res.events ?? res;
+      } finally { await reader.close(); }
     })();
     assert.ok(continuedEvents.some(event => event.type === 'user/message'
       && event.data.content.some(block => block.type === 'text' && block.text === 'Continue the manifest review.')));
@@ -383,7 +388,8 @@ test('Codex archive Continue creates a real seeded Agent and never executes arch
     const duplicate = await duplicateResponse.json();
     assert.equal(duplicate.duplicate, true);
     const reread = await runtime.ctx.get('sessionPersistence').open(targetSessionId, 'read');
-    assert.equal((await reread.read()).length, countAfterContinue);
+    const rereadRes = await reread.read();
+    assert.equal((rereadRes.events ?? rereadRes).length, countAfterContinue);
     await reread.close();
 
     // A process restart must recover the target through the upstream resume
@@ -405,7 +411,7 @@ test('Codex archive Continue creates a real seeded Agent and never executes arch
     if (archive) outcomes.push(archive.ctx.fiber.dispose());
     await Promise.allSettled(outcomes);
     if (service) await stopService(service);
-    delete process.env.CYRENE_TEST_SESSION_TOKEN;
+    delete process.env.CYRENE_CODEX_TEST_SESSION_TOKEN;
     await rm(directory, { recursive: true, force: true });
   }
 });

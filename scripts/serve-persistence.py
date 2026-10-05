@@ -9,10 +9,12 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import socket
 from pathlib import Path
+from typing import Any, Literal, cast
 
 import uvicorn
 from fastapi.responses import JSONResponse
@@ -21,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from cyrene_navigator import Product
 from cyrene_navigator import create_app as create_product_api_app
 from cyrene_navigator.persistence import PersistencePrincipal, create_persistence_app
+from cyrene_navigator.work.api import ConnectorBridge
 
 
 class PrincipalConfig(BaseModel):
@@ -37,6 +40,7 @@ class PrincipalConfig(BaseModel):
     workspace_ids: list[str] = Field(min_length=1)
     organization_id: str | None = None
     can_takeover: bool = False
+    can_write_harness: bool = False
 
 
 class ProductDirectoryConfig(BaseModel):
@@ -57,6 +61,20 @@ class ProductServiceCredentialConfig(BaseModel):
     token_env: str = Field(min_length=1)
 
 
+class WorkConnectorConfig(BaseModel):
+    """Host-owned optional connector binding; credentials use environment references.
+
+    中文:宿主配置的可选连接器 binding,凭据沿用环境引用。
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    kind: Literal["qq", "wecom"]
+    workspace_id: str = Field(min_length=1, max_length=200)
+    organization_id: str | None = Field(default=None, min_length=1, max_length=200)
+    connector_id: str = Field(min_length=1, max_length=200)
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
 class ServiceConfig(BaseModel):
     """Credential references are separate from the durable Session database.
 
@@ -69,6 +87,7 @@ class ServiceConfig(BaseModel):
     principals: list[PrincipalConfig] = Field(min_length=1)
     product_directory: list[ProductDirectoryConfig] = Field(default_factory=list)
     product_service_credentials: list[ProductServiceCredentialConfig] = Field(default_factory=list)
+    work_connectors: list[WorkConnectorConfig] = Field(default_factory=list)
 
 
 def main() -> None:
@@ -109,6 +128,7 @@ def main() -> None:
             workspace_ids=frozenset(row.workspace_ids),
             can_takeover=row.can_takeover,
             organization_id=row.organization_id,
+            can_write_harness=row.can_write_harness,
         )
     product_directory = _load_product_directory(config.product_directory)
     product_service_credentials = _load_product_service_credentials(
@@ -125,6 +145,7 @@ def main() -> None:
         lease_seconds=args.lease_seconds,
         artifact_root=args.artifact_root,
         echo_url=args.echo_url,
+        work_connector_bridges=_load_work_connectors(config.work_connectors, principals),
     )
 
     @app.get("/healthz", include_in_schema=False)
@@ -163,6 +184,53 @@ def main() -> None:
         print(json.dumps(address), flush=True)
         server = uvicorn.Server(uvicorn.Config(app, log_level="warning", access_log=False))
         server.run(sockets=[listener])
+
+
+def _load_work_connectors(
+    rows: list[WorkConnectorConfig], principals: dict[str, PersistencePrincipal]
+) -> dict[tuple[str | None, str, str], ConnectorBridge]:
+    """Load installed connector packages for explicitly authorized host bindings.
+
+    中文:仅为显式授权的本地 binding 加载已安装连接器包,浏览器不选择模块或 Host。
+    """
+
+    bridges: dict[tuple[str | None, str, str], ConnectorBridge] = {}
+    owners: dict[str, set[str | None]] = {}
+    for principal in principals.values():
+        if principal.can_takeover:
+            for workspace in principal.workspace_ids:
+                owners.setdefault(workspace, set()).add(principal.organization_id)
+    for row in rows:
+        organizations = owners.get(row.workspace_id, set())
+        organization = row.organization_id
+        if organization is None:
+            if len(organizations) != 1:
+                raise ValueError("Connector bindings require one explicit organization owner")
+            organization = next(iter(organizations))
+        if organization not in organizations:
+            raise ValueError("Connector binding has no configured Workspace owner")
+        key = (organization, row.workspace_id, row.connector_id)
+        if key in bridges:
+            raise ValueError("Connector bindings must be unique in their owner scope")
+        module_name, factory_name = (
+            ("qq_connector", "create_navigator_qq_bridge")
+            if row.kind == "qq"
+            else ("wecom_connector", "create_navigator_wecom_bridge")
+        )
+        try:
+            module = importlib.import_module(module_name)
+        except ModuleNotFoundError:
+            raise ValueError("Configured connector package is not installed") from None
+        factory = getattr(module, factory_name, None)
+        if not callable(factory):
+            raise ValueError("Installed connector lacks the Navigator bridge")
+        bridge = factory(row.config)
+        if not all(
+            callable(getattr(bridge, name, None)) for name in ("health", "request_qr", "poll_login")
+        ):
+            raise ValueError("Configured connector bridge is incompatible")
+        bridges[key] = cast(ConnectorBridge, bridge)
+    return bridges
 
 
 def _load_product_directory(rows: list[ProductDirectoryConfig]) -> dict[Product, str]:

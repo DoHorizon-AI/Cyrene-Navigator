@@ -26,7 +26,8 @@ from pathlib import Path
 
 import uvicorn
 
-from cyrene_navigator.web_host import create_web_host_app, generate_pairing_code
+from cyrene_navigator.web_host import ProxyTarget, create_web_host_app, generate_pairing_code
+from cyrene_navigator.work_runtime import work_proxy_targets
 
 PAIRING_CODE_FILE_ENV = "CYRENE_PAIR_CODE_FILE"
 PAIRING_CODE_MODE = 0o600
@@ -104,7 +105,14 @@ def main() -> None:
         action="store_true",
         help="allow non-Secure cookies for an explicitly local HTTP deployment",
     )
+    parser.add_argument("--work-url", help="local persistence service URL")
+    parser.add_argument("--executor-url", help="local dsh executor URL")
+    parser.add_argument("--workspace-id", default=os.environ.get("CYRENE_WORKSPACE_ID", "local"))
+    parser.add_argument("--work-token-env", default="CYRENE_SESSION_TOKEN")
+    parser.add_argument("--executor-token-env", default="CYRENE_EXECUTOR_TOKEN")
     args = parser.parse_args()
+    if bool(args.work_url) != bool(args.executor_url):
+        parser.error("--work-url and --executor-url must be supplied together")
     code_file: Path | None = None
     if args.pairing_code:
         pairing_code = args.pairing_code
@@ -118,13 +126,29 @@ def main() -> None:
             )
         pairing_code = generate_pairing_code()
         write_pairing_code(code_file, pairing_code)
-    proxy_targets = _parse_proxy_targets(args.proxy, parser)
+    proxy_targets: dict[str, str | ProxyTarget] = dict(_parse_proxy_targets(args.proxy, parser))
+    if args.work_url:
+        try:
+            work_targets = work_proxy_targets(
+                persistence_url=args.work_url,
+                executor_url=args.executor_url,
+                workspace_id=args.workspace_id,
+                persistence_token=os.environ.get(args.work_token_env, ""),
+                executor_token=os.environ.get(args.executor_token_env)
+                or os.environ.get(args.work_token_env, ""),
+            )
+        except ValueError as error:
+            parser.error(str(error))
+        if set(proxy_targets).intersection(work_targets):
+            parser.error("--proxy conflicts with a managed work route")
+        proxy_targets.update(work_targets)
     app = create_web_host_app(
         pairing_code=pairing_code,
         proxy_targets=proxy_targets,
         session_ttl_seconds=args.session_ttl_seconds,
         refresh_ttl_seconds=args.refresh_ttl_seconds,
         secure_cookies=not args.insecure_http,
+        workspace_id=args.workspace_id if args.work_url else None,
     )
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:

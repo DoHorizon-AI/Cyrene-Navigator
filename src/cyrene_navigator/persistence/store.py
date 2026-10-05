@@ -46,6 +46,7 @@ class PersistencePrincipal:
     workspace_ids: frozenset[str]
     can_takeover: bool = False
     organization_id: str | None = None
+    can_write_harness: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.actor_id, str) or not self.actor_id.strip():
@@ -54,6 +55,8 @@ class PersistencePrincipal:
             not isinstance(self.organization_id, str) or not self.organization_id.strip()
         ):
             raise ValueError("principal organization_id must be non-empty text when configured")
+        if not isinstance(self.can_write_harness, bool):
+            raise ValueError("principal can_write_harness must be a boolean")
 
 
 # The shorter name is convenient for callers while keeping the API contract explicit.
@@ -1150,8 +1153,8 @@ def _validate_header(
     normalized = dict(header)
     if normalized.get("id") != session_id:
         raise PersistenceError(SESSION_INVALID_HEADER, 422, "header.id must match sessionId")
-    if normalized.get("version") != 2:
-        raise PersistenceError(SESSION_INVALID_HEADER, 422, "header.version must be 2")
+    if normalized.get("version") not in (2, 4):
+        raise PersistenceError(SESSION_INVALID_HEADER, 422, "header.version must be 2 or 4")
     created_at = normalized.get("createdAt")
     if type(created_at) is not int or created_at < 0 or created_at > _MAX_SAFE_INTEGER:
         raise PersistenceError(

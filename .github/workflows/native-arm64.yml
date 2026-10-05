@@ -1,0 +1,102 @@
+name: native-arm64
+
+on:
+  pull_request:
+    branches: [develop, main, release]
+  push:
+    branches: [develop, main, release, 'feat/**', 'fix/**', 'refactor/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '24.13.0'
+  PNPM_VERSION: '11.7.0'
+  RUST_TOOLCHAIN: '1.97.1'
+
+jobs:
+  arm64-integration:
+    name: linux-arm64 / native-and-headless
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: '1'
+      CI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install locked Python tool and environment
+        run: |
+          python -m pip install --disable-pip-version-check uv==0.12.3
+          uv sync --frozen --group dev
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - name: Verify ARM64 and pinned toolchains
+        run: |
+          test "$(uname -m)" = 'aarch64'
+          test "$(node --version)" = "v${NODE_VERSION}"
+          test "$(pnpm --version)" = "${PNPM_VERSION}"
+          rustc --version | grep -F '1.97.1'
+          uv --version | grep -F '0.12.3'
+
+      - name: Rust format, lint, and tests on ARM64
+        run: |
+          cargo fmt --manifest-path native/Cargo.toml --all -- --check
+          rustfmt --edition 2021 --check harness/tests/fixtures/native-matrix-host.rs
+          cargo clippy --manifest-path native/Cargo.toml --workspace --all-targets --locked -- -D warnings
+          cargo test --manifest-path native/Cargo.toml --workspace --all-targets --locked
+
+      - name: Prepare and build the exact Harness for ARM64
+        run: node scripts/prepare-harness.mjs --root "$RUNNER_TEMP/deepseek-harness" --install --build --link
+
+      - name: Compile strict Navigator host and browser adapters
+        run: |
+          node "$RUNNER_TEMP/deepseek-harness/node_modules/typescript/bin/tsc" -p harness/tsconfig.json --pretty false
+          node "$RUNNER_TEMP/deepseek-harness/node_modules/typescript/bin/tsc" -p harness/tsconfig.client.json --pretty false
+          node scripts/windows/build-harness-client.mjs
+          node --check harness/dist/client.js
+
+      - name: Build native host and ARM64 protocol fixture
+        run: |
+          cargo build --manifest-path native/Cargo.toml --package cyrene-native-host --locked
+          rustc --edition 2021 -C opt-level=2 harness/tests/fixtures/native-matrix-host.rs -o "$RUNNER_TEMP/native-matrix-host"
+          echo "CYRENE_DSH_ROOT=$RUNNER_TEMP/deepseek-harness" >> "$GITHUB_ENV"
+          echo "CYRENE_TEST_PYTHON=$GITHUB_WORKSPACE/.venv/bin/python" >> "$GITHUB_ENV"
+          echo "CYRENE_NATIVE_HOST=$GITHUB_WORKSPACE/native/target/debug/cyrene-native-host" >> "$GITHUB_ENV"
+          test -x "$RUNNER_TEMP/native-matrix-host"
+          test -x "$GITHUB_WORKSPACE/native/target/debug/cyrene-native-host"
+
+      - name: Run ARM64 native, executor, workflow, and round-one fixtures
+        env:
+          CYRENE_NATIVE_MATRIX_BINARY: ${{ runner.temp }}/native-matrix-host
+        run: |
+          node --test \
+            harness/tests/native.integration.test.mjs \
+            harness/tests/executor.integration.test.mjs \
+            harness/tests/subagents.test.mjs \
+            harness/tests/tool-providers.test.mjs \
+            harness/tests/work-tools.test.mjs \
+            harness/tests/workflows.integration.test.mjs \
+            harness/tests/round1.integration.test.mjs

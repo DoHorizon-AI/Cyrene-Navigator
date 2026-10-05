@@ -1,0 +1,113 @@
+{
+  "schemaVersion": 1,
+  "profiles": [
+    {
+      "kind": "mcp",
+      "id": "microsoft-learn",
+      "name": "Microsoft Learn",
+      "description": "Search official Microsoft Learn documentation and code samples.",
+      "enabled": true,
+      "serverName": "microsoft_learn",
+      "source": {
+        "publisher": "Microsoft",
+        "endpoint": "https://learn.microsoft.com/api/mcp",
+        "documentation": "https://learn.microsoft.com/en-us/training/support/mcp"
+      },
+      "connection": {
+        "transport": "streamable-http",
+        "url": "https://learn.microsoft.com/api/mcp"
+      }
+    },
+    {
+      "kind": "mcp",
+      "id": "google-developer-knowledge",
+      "name": "Google Developer Knowledge",
+      "description": "Search, answer from, and retrieve official Google developer documentation.",
+      "enabled": true,
+      "serverName": "google_dev_knowledge",
+      "source": {
+        "publisher": "Google",
+        "endpoint": "https://developerknowledge.googleapis.com/mcp",
+        "documentation": "https://developers.google.com/knowledge/reference/mcp"
+      },
+      "connection": {
+        "transport": "streamable-http",
+        "url": "https://developerknowledge.googleapis.com/mcp",
+        "headerEnvRefs": {
+          "X-Goog-Api-Key": "DEVELOPERKNOWLEDGE_API_KEY"
+        }
+      }
+    },
+    {
+      "kind": "mcp",
+      "id": "huggingface",
+      "name": "Hugging Face Hub",
+      "description": "Search Hub models, datasets, papers, documentation, and explicitly configured Spaces.",
+      "enabled": false,
+      "serverName": "huggingface",
+      "source": {
+        "publisher": "Hugging Face",
+        "endpoint": "https://huggingface.co/mcp",
+        "documentation": "https://huggingface.co/docs/hub/agents-mcp"
+      },
+      "connection": {
+        "transport": "streamable-http",
+        "url": "https://huggingface.co/mcp?login",
+        "headerEnvRefs": {
+          "Authorization": "HF_TOKEN"
+        }
+      },
+      "allowedTools": []
+    },
+    {
+      "kind": "mcp",
+      "id": "azure",
+      "name": "Azure MCP",
+      "description": "Read-only Azure compute and monitor access through the official local MCP server.",
+      "enabled": false,
+      "serverName": "azure",
+      "source": {
+        "publisher": "Microsoft",
+        "endpoint": "https://www.npmjs.com/package/@azure/mcp",
+        "documentation": "https://learn.microsoft.com/en-us/azure/developer/azure-mcp-server/tools/"
+      },
+      "connection": {
+        "transport": "stdio",
+        "command": "npm",
+        "args": [
+          "exec",
+          "--no",
+          "--package=@azure/mcp@3.0.0-beta.49",
+          "--",
+          "azmcp",
+          "server",
+          "start",
+          "--mode",
+          "namespace",
+          "--namespace",
+          "compute",
+          "--namespace",
+          "monitor",
+          "--read-only"
+        ],
+        "namespaces": ["compute", "monitor"],
+        "envRefs": ["AZURE_CLIENT_ID", "IDENTITY_ENDPOINT", "IDENTITY_HEADER"]
+      },
+      "readOnly": true,
+      "namespaces": ["compute", "monitor"]
+    },
+    {
+      "kind": "gcloud-cli",
+      "id": "google-cloud-readonly",
+      "name": "Google Cloud readonly CLI",
+      "description": "Run fixed gcloud describe/list operations for explicitly configured project ids.",
+      "enabled": true,
+      "source": {
+        "publisher": "Google",
+        "endpoint": "https://cloud.google.com/sdk/gcloud",
+        "documentation": "https://cloud.google.com/sdk/gcloud/reference"
+      },
+      "allowedProjectIds": []
+    }
+  ]
+}

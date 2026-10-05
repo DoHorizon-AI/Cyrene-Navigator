@@ -96,12 +96,12 @@ export async function inputReceiptsRequest(
       // observed prefix as if they belonged to the same receipt observation.
       // 中文：`stat` 确定快照边界。并发追加可能在读取开始前扩大后端；不要把观测前缀外的事件归为同一份回执观测。
       const length = Math.min(MAX_INPUT_RECEIPT_EVENTS, eventCount - offset);
-      const events = await reader.read(offset, length, { signal: request.signal });
+      const readResult = await reader.read(offset, length, { signal: request.signal });
       request.signal.throwIfAborted();
       return Response.json({
         sessionId: id,
         eventCount,
-        completedRequestIds: completedRequestIds(events, new Set(input.requestIds)),
+        completedRequestIds: completedRequestIds(Array.isArray(readResult) ? readResult : (readResult?.events ?? []), new Set(input.requestIds)),
       } satisfies InputReceiptResponse);
     } finally {
       await reader.close();

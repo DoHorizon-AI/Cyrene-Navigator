@@ -1,0 +1,94 @@
+# Build the exact approved DSH source and Navigator's TypeScript adapters.
+FROM node:24.13.0-bookworm-slim AS harness-build
+
+ARG PNPM_VERSION=11.7.0
+ENV CI=true \
+    CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    PATH=/usr/local/cargo/bin:$PATH
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+      build-essential ca-certificates curl git musl-tools pkg-config \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --fail --location --proto '=https' --tlsv1.2 \
+      https://sh.rustup.rs -o /tmp/rustup-init.sh \
+    && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.97.1 \
+    && rm -f /tmp/rustup-init.sh \
+    && rustc --version | grep -F 'rustc 1.97.1 ' \
+    && npm install --global "pnpm@${PNPM_VERSION}" \
+    && test "$(node --version)" = "v24.13.0" \
+    && test "$(pnpm --version)" = "${PNPM_VERSION}"
+
+COPY harness/package.json harness/upstream.lock.json ./harness/
+COPY scripts/prepare-harness.mjs ./scripts/prepare-harness.mjs
+
+RUN node scripts/prepare-harness.mjs \
+      --root /opt/deepseek-harness \
+      --install \
+      --build \
+      --link
+
+# Keep the expensive pinned upstream build cached when only Navigator source
+# changes. This layer only recompiles our adapters against the same DSH files.
+COPY harness/tsconfig.json ./harness/
+COPY harness/src/ ./harness/src/
+COPY harness/presets/ ./harness/presets/
+
+RUN node /opt/deepseek-harness/node_modules/typescript/bin/tsc \
+      -p harness/tsconfig.json \
+      --pretty false
+
+
+# Python 3.12 hosts the persistent supervisor and FastAPI services. The Node
+# binary and exact DSH checkout are copied from the pinned build stage.
+FROM python:3.12-slim-bookworm AS runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app/src \
+    PATH=/app/.venv/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    NODE_ENV=production \
+    DSH_TELEMETRY_DISABLED=1
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libstdc++6 passwd \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m pip install --no-cache-dir --disable-pip-version-check uv==0.12.3 \
+    && useradd --system --uid 10001 --create-home --home-dir /home/navigator \
+      --shell /usr/sbin/nologin navigator \
+    && mkdir -p /data \
+    && chown navigator:navigator /data
+
+COPY pyproject.toml uv.lock README.md ./
+COPY src/ ./src/
+RUN uv sync --frozen --no-dev
+
+COPY --from=harness-build /usr/local/bin/node /usr/local/bin/node
+COPY --from=harness-build /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+COPY --from=harness-build /opt/deepseek-harness /opt/deepseek-harness
+COPY --from=harness-build /app/harness ./harness
+COPY scripts/serve-local.py scripts/serve-persistence.py scripts/serve-web.py ./scripts/
+COPY scripts/serve-executor.mjs ./scripts/serve-executor.mjs
+
+RUN ln -sfn /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -sfn /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+    && test "$(node --version)" = "v24.13.0" \
+    && python --version | grep -E '^Python 3\.12\.' \
+    && npm --version >/dev/null \
+    && npx --version >/dev/null \
+    && test -f harness/dist/serve.js \
+    && chown -R navigator:navigator /app
+
+USER navigator:navigator
+VOLUME ["/data"]
+EXPOSE 8080
+
+HEALTHCHECK --interval=20s --timeout=5s --start-period=30s --retries=3 \
+    CMD python -c "from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/api/v1/system/status', timeout=3).read()" || exit 1
+
+ENTRYPOINT ["python", "scripts/serve-local.py"]
+CMD ["--state-dir", "/data", "--host", "0.0.0.0", "--port", "8080"]

@@ -210,11 +210,11 @@ test('actual Session events survive service crash, reader restart and writer tak
     session.append('turn/end', { turn: 1, reason: { kind: 'completed' } });
     assert.equal(await first.sessions.flush(session), true);
     const expected = structuredClone(session.snapshotEvents());
-    assert.deepEqual(await writer.read(), expected);
+    assert.deepEqual((await writer.read()).events, expected);
 
     second = await client(service.baseUrl, 'device-two');
     const reader = await second.sessionPersistence.open(id, 'read');
-    assert.deepEqual(await reader.read(), expected);
+    assert.deepEqual((await reader.read()).events, expected);
     await assert.rejects(reader.append(expected), SessionReadOnlyError);
     await assert.rejects(second.sessionPersistence.open(id, 'write'), SessionAlreadyOwnedError);
     await reader.close();
@@ -224,11 +224,11 @@ test('actual Session events survive service crash, reader restart and writer tak
     const port = service.port;
     await stopService(service, 'SIGKILL');
     service = await startService(directory, token, port);
-    assert.deepEqual(await writer.read(), expected);
+    assert.deepEqual((await writer.read()).events, expected);
     second = await client(service.baseUrl, 'device-two-restarted');
     const cold = await second.sessionPersistence.open(id, 'read');
     const restored = second.sessions.prepare(id, {
-      seed: structuredClone(await cold.read()), meta: structuredClone(cold.header),
+      seed: structuredClone((await cold.read()).events), meta: structuredClone(cold.header),
       inheritedEventCount: cold.inheritedEventCount, seedSource: 'persistence',
     });
     assert.deepEqual(restored.snapshotEvents().slice(0, expected.length), expected);
@@ -246,7 +246,7 @@ test('actual Session events survive service crash, reader restart and writer tak
 
     last = await client(service.baseUrl, 'device-three');
     const resumedWriter = await last.sessionPersistence.open(id, 'write');
-    assert.equal((await resumedWriter.read()).length, expected.length + 1);
+    assert.equal((await resumedWriter.read()).events.length, expected.length + 1);
     await resumedWriter.close();
     assert.equal((await last.sessionPersistence.stat(id)).eventCount, expected.length + 1);
 
@@ -256,7 +256,7 @@ test('actual Session events survive service crash, reader restart and writer tak
     }), /upstream resume failed/);
     // A failed activation releases its reserved writer instead of stranding the Session.
     const afterFailure = await second.sessionPersistence.open(id, 'write');
-    assert.equal((await afterFailure.read()).length, expected.length + 1);
+    assert.equal((await afterFailure.read()).events.length, expected.length + 1);
     await afterFailure.close();
   } finally {
     const outcomes = await Promise.allSettled([first, second, last].filter(Boolean).map(ctx => ctx.fiber.dispose()));
@@ -322,7 +322,7 @@ test('a committed append remains one batch after an ambiguous lost ack and recon
     const reconnected = await client(service.baseUrl, 'reconnected-reader');
     contexts.push(reconnected);
     const reader = await reconnected.sessionPersistence.open(id, 'read');
-    assert.deepEqual(await reader.read(), firstBatch);
+    assert.deepEqual((await reader.read()).events, firstBatch);
     const successor = await reconnected.sessionPersistence.open(id, 'write');
     const secondBatch = [
       { type: 'turn/start', seq: 2, time: 3, data: { turn: 2 } },
@@ -331,13 +331,13 @@ test('a committed append remains one batch after an ambiguous lost ack and recon
     await successor.append(secondBatch);
     await successor.flush();
     await successor.close();
-    assert.deepEqual(await reader.read(firstBatch.length), secondBatch);
+    assert.deepEqual((await reader.read(firstBatch.length)).events, secondBatch);
     await reader.close();
 
     const observer = await client(service.baseUrl, 'fresh-observer');
     contexts.push(observer);
     const observed = await observer.sessionPersistence.open(id, 'read');
-    assert.deepEqual(await observed.read(), [...firstBatch, ...secondBatch]);
+    assert.deepEqual((await observed.read()).events, [...firstBatch, ...secondBatch]);
     await observed.close();
     assert.deepEqual((await observer.sessionPersistence.stat(id))?.eventCount, 4);
   } finally {
@@ -393,7 +393,7 @@ test('a persistence outage before append prevents the owning tool from executing
     service = await startService(directory, token, port);
     await writer.flush();
     const reader = await ctx.sessionPersistence.open(id, 'read');
-    const events = await reader.read();
+    const events = (await reader.read()).events;
     await reader.close();
     assert.deepEqual(events.map(event => event.type), ['turn/start']);
     await writer.close();
@@ -482,7 +482,7 @@ test('resume restores a historical tool result without replaying the tool', { ti
     assert.equal(executed, 0);
 
     const reader = await restarted.sessionPersistence.open(id, 'read');
-    const persisted = await reader.read();
+    const persisted = (await reader.read()).events;
     await reader.close();
     assert.equal(persisted.filter(event => event.type === 'tool/call').length, 1);
     assert.equal(persisted.filter(event => event.type === 'tool/result').length, 1);

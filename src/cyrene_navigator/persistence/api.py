@@ -18,7 +18,11 @@ from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from cyrene_navigator.persistence.echo_handoff import EchoHandoff, EchoReceipt, SendToEcho
+from cyrene_navigator.persistence.echo_handoff import (
+    EchoHandoff,
+    EchoReceipt,
+    SendToEcho,
+)
 from cyrene_navigator.persistence.errors import (
     WORKSPACE_FORBIDDEN,
     WORKSPACE_UNAUTHORIZED,
@@ -38,6 +42,7 @@ from cyrene_navigator.persistence.models import (
     WorkspaceSessionSummary,
 )
 from cyrene_navigator.persistence.store import PersistencePrincipal, PersistenceStore
+from cyrene_navigator.work.api import ConnectorBridge, mount_work_routes
 
 _SESSIONS_PATH = "/api/v1/harness/workspaces/{workspace_id}/sessions"
 
@@ -49,6 +54,8 @@ def create_persistence_app(
     *,
     artifact_root: Path | None = None,
     echo_url: str | None = None,
+    work_attachment_root: Path | None = None,
+    work_connector_bridges: Mapping[tuple[str | None, str, str], ConnectorBridge] | None = None,
 ) -> FastAPI:
     """Build the authoritative Harness persistence HTTP service. | 创建持久化 HTTP 服务。"""
 
@@ -157,9 +164,9 @@ def create_persistence_app(
         return principal
 
     def require_legacy_writer(principal: PersistencePrincipal) -> None:
-        """Keep scoped Product Bearers read-only until a trusted writer exists."""
+        """Require an explicit host writer grant for scoped Harness mutations. | 检查宿主写权限。"""
 
-        if principal.organization_id is not None:
+        if principal.organization_id is not None and not principal.can_write_harness:
             raise PersistenceError(
                 WORKSPACE_FORBIDDEN,
                 403,
@@ -384,4 +391,11 @@ def create_persistence_app(
         next_seq = store.release(workspace_id, session_id, principal, body.writer_token, body.epoch)
         return {"nextSeq": next_seq}
 
+    mount_work_routes(
+        app,
+        Path(db_path),
+        authenticate,
+        attachment_root=work_attachment_root,
+        connector_bridges=work_connector_bridges,
+    )
     return app

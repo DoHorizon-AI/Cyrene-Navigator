@@ -12,11 +12,13 @@ It provides the test and execution Harness runtime, Agent loop coordination, and
 
 - **Harness Runtime**: Secondary development on top of pinned DeepSeek harness packages (`@deepseek-ai/dsh-*`), managing out-of-tree Cordis plugins, Agent loop execution, and tool execution boundaries.
 - **Authoritative Session Persistence**: Stores canonical session headers and append-only event logs in local SQLite storage, providing deterministic session recovery and replay isolation.
+- **Autonomous Cloud Executor**: In addition to local client execution, Navigator functions as a standalone, headless agent executor service (via HTTP REST and SSE), supporting non-blocking task submission, streaming thought deltas, and dynamic Cordis plugin hot-reloading.
 - **Native Host & IPC**: The Rust `native/` workspace provides native process isolation, NDJSON supervisor primitives, and local tool execution hooks for the Harness.
 - **Integration with Products**: Connects directly to Exchange for LLM inference and Echo for post-session evaluations and feedback; it does not proxy or intermediate other product services.
 
 ## Documentation
 
+- [Cloud Executor & Dynamic Plugins](docs/cloud-executor.md)
 - [Harness Adoption & Architecture](docs/adoption/README.md)
 - [Product & Session API Contract](docs/API.md)
 - [Repository Lifecycle](docs/REPOSITORY-LIFECYCLE.md)
@@ -43,11 +45,13 @@ Navigator 是 Native Client（`Cyrene-Client`）的**内置 Harness 组件**，�
 
 - **Harness 运行时适配**：基于固定版本的 DeepSeek harness（`@deepseek-ai/dsh-*`）进行二次开发，提供 Cordis 插件组合、Agent 循环驱动及工具调用边界控制。
 - **权威会话持久化**：在本地 SQLite 中权威保存规范会话头（SessionHeader）及只追加原始事件日志（Append-only event envelope），提供可恢复的会话状态保障。
+- **独立云端无头执行器**：除本地客户端运行外，Navigator 支持作为独立无头 Agent 执行守护进程部署（暴露 REST 与 SSE 流式接口），支持非阻塞任务调度、实时思考/回复流式输出以及 Cordis 插件无感知热重载。
 - **原生宿主与 IPC**：Rust `native/` 工作区提供轻量原生进程宿主、NDJSON 监管原语及本地工具沙箱钩子。
 - **与其它服务交互**：仅作为客户端内置组件，按需直连 Exchange 进行模型推理，以及直连 Echo 提交会话评测和反馈。
 
 ## 文档索引
 
+- [云端执行器与动态插件](docs/cloud-executor.md)
 - [Harness 接入与架构说明](docs/adoption/README.md)
 - [API 与会话契约](docs/API.md)
 - [仓库生命周期](docs/REPOSITORY-LIFECYCLE.md)

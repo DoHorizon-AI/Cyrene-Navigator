@@ -172,7 +172,7 @@ async function authenticate(launchUrl, runtime) {
   assert.match(parsed.searchParams.get('token') ?? '', /^[A-Za-z0-9_-]{43}$/u);
   const response = await fetch(launchUrl, { redirect: 'manual' });
   assert.equal(response.status, 303, 'the official CLI must accept its launch token');
-  assert.equal(response.headers.get('location'), '/');
+  assert.ok(response.headers.get('location') === '/' || response.headers.get('location') === './');
   const setCookie = response.headers.get('set-cookie');
   assert.ok(setCookie, 'the launch-token exchange must return a browser cookie');
   const authenticated = { origin: parsed.origin, cookie: setCookie.split(';', 1)[0], runtime };

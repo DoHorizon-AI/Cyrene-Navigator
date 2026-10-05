@@ -29,11 +29,11 @@ jobs:
       - name: Install locked Python environment
         run: uv sync --frozen --group dev
       - name: Ruff lint
-        run: uv run ruff check src tests scripts/serve-persistence.py scripts/serve-web.py
+        run: uv run ruff check src tests scripts/serve-persistence.py scripts/serve-web.py scripts/serve-local.py scripts/export-work-openapi.py
       - name: Ruff format
-        run: uv run ruff format --check src tests scripts/serve-persistence.py scripts/serve-web.py
+        run: uv run ruff format --check src tests scripts/serve-persistence.py scripts/serve-web.py scripts/serve-local.py scripts/export-work-openapi.py
       - name: Mypy strict type check
-        run: uv run mypy src/cyrene_navigator scripts/serve-persistence.py scripts/serve-web.py
+        run: uv run mypy src/cyrene_navigator scripts/serve-persistence.py scripts/serve-web.py scripts/serve-local.py scripts/export-work-openapi.py
       - name: Python tests
         run: uv run pytest -q
       - name: Product boundary guard
@@ -123,7 +123,14 @@ jobs:
             harness/tests/compaction.test.mjs \
             harness/tests/session-titles.test.mjs \
             harness/tests/profile.integration.test.mjs \
-            harness/tests/native.integration.test.mjs
+            harness/tests/native.integration.test.mjs \
+            harness/tests/executor.integration.test.mjs \
+            harness/tests/subagents.test.mjs \
+            harness/tests/tool-providers.test.mjs \
+            harness/tests/work-tools.test.mjs \
+            harness/tests/workflows.integration.test.mjs \
+            harness/tests/cloud-connections.integration.test.mjs \
+            harness/tests/round1.integration.test.mjs
 
   publish-artifact:
     name: ci / immutable-artifact

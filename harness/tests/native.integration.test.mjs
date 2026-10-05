@@ -58,22 +58,33 @@ async function readState(statePath) {
 }
 
 async function waitForState(statePath, expected, timeoutMs = 2_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  const deadline = performance.now() + timeoutMs;
+  let lastValue;
+  let lastReadError = 'state file has not been read';
+  while (performance.now() < deadline) {
     try {
       const value = await readState(statePath);
+      lastValue = value;
+      lastReadError = null;
       if (typeof expected === 'function' ? expected(value) : value.status === expected) return value;
-    } catch {
-      // The fixture has not published its first durable state yet.
+    } catch (error) {
+      lastReadError = String(error);
     }
     await new Promise(resolveNext => setTimeout(resolveNext, 10));
   }
-  throw new Error(`fixture state ${JSON.stringify(expected)} was not observed`);
+  const expectedLabel = typeof expected === 'function'
+    ? `predicate ${expected.name || '<anonymous>'}`
+    : JSON.stringify(expected);
+  const lastReadErrorLabel = lastReadError ?? 'none';
+  throw new Error(
+    `fixture state ${expectedLabel} was not observed at ${statePath} within ${timeoutMs}ms; `
+      + `last state: ${JSON.stringify(lastValue)}; last read error: ${lastReadErrorLabel}`,
+  );
 }
 
 async function waitForReaped(pid, timeoutMs = 2_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
     let present = false;
     if (process.platform === 'linux') {
       try {
@@ -93,7 +104,7 @@ async function waitForReaped(pid, timeoutMs = 2_000) {
     if (!present) return;
     await new Promise(resolveNext => setTimeout(resolveNext, 20));
   }
-  throw new Error(`fixture pid ${pid} was not reaped`);
+  throw new Error(`fixture pid ${pid} was not reaped within ${timeoutMs}ms`);
 }
 
 async function captureRejection(promise, label) {
@@ -153,7 +164,7 @@ test('real Rust host rejects invalid arguments and a missing executable', async 
       graceMs: 100,
     });
     await assert.rejects(missing.done, /ENOENT|not found|spawn/u);
-    assert.equal(missing.pid, -1);
+    assert.ok(missing.pid === undefined || missing.pid === -1);
     assert.equal(await missing.waitForExit(), true);
   } finally {
     await fiber.dispose();

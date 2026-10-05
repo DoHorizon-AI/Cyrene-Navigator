@@ -29,6 +29,9 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - uses: pnpm/action-setup@v4
         with:
           version: ${{ env.PNPM_VERSION }}
@@ -38,6 +41,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
+
+      - name: Install locked Python tool and environment
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m pip install --disable-pip-version-check uv==0.12.3
+          if ($LASTEXITCODE -ne 0) { throw 'Locked uv installation failed.' }
+          uv sync --frozen --group dev
+          if ($LASTEXITCODE -ne 0) { throw 'Navigator Python environment setup failed.' }
 
       - name: Prepare exact Harness source
         run: |
@@ -77,6 +90,44 @@ jobs:
           $env:CYRENE_NATIVE_MATRIX_BINARY = $fixture
           node --test harness/tests/native.integration.test.mjs
           if ($LASTEXITCODE -ne 0) { throw 'Windows native supervisor matrix failed.' }
+
+      - name: Build portable subagent fixture wrapper
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          rustfmt --edition 2021 --check harness/tests/fixtures/node-subagent-wrapper.rs
+          $wrapper = Join-Path $env:RUNNER_TEMP 'node-subagent-wrapper.exe'
+          rustc --edition 2021 -C opt-level=2 harness/tests/fixtures/node-subagent-wrapper.rs -o $wrapper
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $wrapper -PathType Leaf)) { throw 'Portable subagent fixture wrapper build failed.' }
+          "CYRENE_TEST_SUBAGENT_WRAPPER=$wrapper" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Run Windows Python persistence and Work API fixtures
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          uv run pytest -q `
+            tests/test_persistence_api.py `
+            tests/test_serve_local.py `
+            tests/test_work_api.py `
+            tests/test_work_contract.py `
+            tests/test_work_runtime.py `
+            tests/test_work_tool_routes.py
+          if ($LASTEXITCODE -ne 0) { throw 'Windows persistence and Work API fixtures failed.' }
+
+      - name: Run Windows headless executor and Work fixtures
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          node --test `
+            harness/tests/executor.integration.test.mjs `
+            harness/tests/subagents.test.mjs `
+            harness/tests/tool-providers.test.mjs `
+            harness/tests/work-tools.test.mjs `
+            harness/tests/workflows.integration.test.mjs `
+            harness/tests/round1.integration.test.mjs `
+            harness/tests/cloud-connections.integration.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Windows headless executor and Work fixtures failed.' }
 
       - name: Verify native imports
         run: node --test harness/tests/windows-native-imports.test.mjs

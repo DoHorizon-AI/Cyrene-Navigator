@@ -40,7 +40,12 @@ def test_runtime_paths_match_frozen_persistence_openapi(tmp_path: Path) -> None:
     contract, _ = read_from_filename(
         str(Path(__file__).parents[1] / "contracts/product/v1/persistence.openapi.yaml")
     )
-    assert set(app.openapi()["paths"]) == set(contract["paths"])
+    # The separately published Work API does not weaken the frozen Harness gate.
+    # 中文:独立发布的 Work API 不应降低已有 Harness 契约的完整性检查。
+    harness_paths = {
+        path for path in app.openapi()["paths"] if not path.startswith("/api/v1/workspaces/")
+    }
+    assert set(contract["paths"]) == harness_paths
 
 
 def _headers(token: str = "alice-token") -> dict[str, str]:
@@ -385,3 +390,51 @@ def test_header_and_event_boundary_validation_does_not_create_partial_state(tmp_
     assert client.get(
         f"{BASE.format(workspace='w1')}/{handle['id']}/events", headers=_headers()
     ).json() == {"events": [], "nextSeq": 0}
+
+
+def test_scoped_harness_writer_requires_explicit_host_grant_and_keeps_org_isolation(
+    tmp_path: Path,
+) -> None:
+    """Host execution can persist Sessions without granting Product readers writes.
+
+    中文:宿主执行可持久化会话,普通 Product 读取凭据仍不能修改会话。
+    """
+
+    principals = {
+        "writer-a": PersistencePrincipal(
+            "executor-a", frozenset({"shared"}), True, "org-a", can_write_harness=True
+        ),
+        "writer-b": PersistencePrincipal(
+            "executor-b", frozenset({"shared"}), True, "org-b", can_write_harness=True
+        ),
+        "reader-a": PersistencePrincipal("reader", frozenset({"shared"}), True, "org-a"),
+    }
+    base = BASE.format(workspace="shared")
+    app = create_persistence_app(tmp_path / "scoped.sqlite3", principals)
+    with TestClient(app) as client:
+        denied = client.post(
+            base,
+            json={"header": _header("same-id"), "inheritedEventCount": 0, "clientId": "reader"},
+            headers=_headers("reader-a"),
+        )
+        assert denied.status_code == 403
+        for token in ("writer-a", "writer-b"):
+            _create(
+                client,
+                "same-id",
+                workspace="shared",
+                token=token,
+                header={**_header("same-id"), "origin": token},
+            )
+        for token in ("writer-a", "writer-b"):
+            snapshot = client.get(base + "/same-id", headers=_headers(token))
+            assert snapshot.status_code == 200
+            assert snapshot.json()["meta"]["origin"] == token
+        assert (
+            client.post(
+                base + "/same-id/handles",
+                json={"access": "write", "clientId": "reader"},
+                headers=_headers("reader-a"),
+            ).status_code
+            == 403
+        )
