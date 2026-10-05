@@ -37,8 +37,9 @@ stands in for an external account, a cloud deployment, or a real model call.
 | Organization and Workspace scope | Read-only principal cannot create a Harness Session; owner cannot read a task in another Workspace; Work records survive service restart. | `SIMULATED` — same round-one vertical, 1/1. |
 | Cloud profile surface | Local HTTP/stdio MCP and bounded read-only CLI fixtures; no resource mutation. | `SIMULATED` — `node --test harness/tests/cloud-connections.integration.test.mjs` (2/2); no cloud credentials used. The five combined cloud/workflow tests are included in the 32/32 command below. |
 
-The latest combined headless gate used Node 24.13.0 and passed 32/32 tests with
-no skips (31 core fixtures plus the round-one vertical):
+At `b15a2935d4e07967ab29ae08c3b43e70b1ecdf48`, the combined headless gate
+used Node 24.13.0 and passed 32/32 tests with no skips (31 core fixtures plus
+the round-one vertical):
 
 ```sh
 PATH="/home/baijin/.cache/cyrene-hermes-round1/toolchain/node-v24.13.0-linux-x64/bin:$PATH" \
@@ -52,8 +53,8 @@ PATH="/home/baijin/.cache/cyrene-hermes-round1/toolchain/node-v24.13.0-linux-x64
     harness/tests/round1.integration.test.mjs
 ```
 
-The local Python gate passed with `uv run pytest -q` (83 tests). These exact
-quality gates also passed:
+At the same revision, the local Python gate passed with `uv run pytest -q` (83
+tests). These exact quality gates also passed:
 
 ```sh
 uv run ruff check src tests scripts/serve-persistence.py scripts/serve-web.py scripts/serve-local.py scripts/export-work-openapi.py
@@ -63,11 +64,19 @@ PATH="/home/baijin/.cache/cyrene-hermes-round1/toolchain/node-v24.13.0-linux-x64
   node .upstream/deepseek-harness/node_modules/typescript/bin/tsc -p harness/tsconfig.json --pretty false
 ```
 
-All three Work OpenAPI contract validators passed. The Docker image built
-successfully before the final Work-state fixes, so that is intermediate
-evidence only. The final same-tree image rebuild and container
-startup/persistence smoke remain pending and are not counted as accepted
-package evidence.
+All three Work OpenAPI contract validators passed. The exact-head Docker image
+build and container smoke also passed at `b15a2935d4e07967ab29ae08c3b43e70b1ecdf48`:
+
+```sh
+docker build --quiet -f Dockerfile.executor -t cyrene-navigator-executor:round1-b15a2935 .
+```
+
+The smoke ran the paired stack as its non-root image user with a named `/data`
+volume, received HTTP 200 from `/api/v1/system/status` before and after a
+container restart, and verified that the SQLite file remained present. The
+Exchange endpoint was a local unused fixture; no model/provider request or
+external action occurred. This is local image and persistence evidence, not a
+hosted registry or deployment acceptance.
 
 Use the targeted commands recorded by each owning test module. The integration
 proof must report the exact commands and statuses; do not convert `SIMULATED`

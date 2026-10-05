@@ -21,17 +21,22 @@ RUN apt-get update \
     && test "$(node --version)" = "v24.13.0" \
     && test "$(pnpm --version)" = "${PNPM_VERSION}"
 
-COPY harness/package.json harness/upstream.lock.json harness/tsconfig.json ./harness/
-COPY harness/src/ ./harness/src/
-COPY harness/presets/ ./harness/presets/
+COPY harness/package.json harness/upstream.lock.json ./harness/
 COPY scripts/prepare-harness.mjs ./scripts/prepare-harness.mjs
 
 RUN node scripts/prepare-harness.mjs \
       --root /opt/deepseek-harness \
       --install \
       --build \
-      --link \
-    && node /opt/deepseek-harness/node_modules/typescript/bin/tsc \
+      --link
+
+# Keep the expensive pinned upstream build cached when only Navigator source
+# changes. This layer only recompiles our adapters against the same DSH files.
+COPY harness/tsconfig.json ./harness/
+COPY harness/src/ ./harness/src/
+COPY harness/presets/ ./harness/presets/
+
+RUN node /opt/deepseek-harness/node_modules/typescript/bin/tsc \
       -p harness/tsconfig.json \
       --pretty false
 
