@@ -13,6 +13,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
 import { performance } from 'node:perf_hooks';
 import { createExecutorApp } from '../dist/serve.js';
+import { installNativeProfileFixture } from './fixtures/antigravity-profile-host.mjs';
 
 const REPOSITORY = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const WORKSPACE_ID = 'round1-workspace';
@@ -84,9 +85,9 @@ function textCompletion(text) {
 }
 
 function createExchangeFixture() {
-  const calls = { approved: 0, denied: 0 };
-  const toolCalls = { approved: [], denied: [] };
-  const toolResults = { approved: [], denied: [] };
+  const calls = { approved: 0, denied: 0, blocked: 0 };
+  const toolCalls = { approved: [], denied: [], blocked: [] };
+  const toolResults = { approved: [], denied: [], blocked: [] };
   const authHeaders = [];
   const server = createServer(async (request, response) => {
     if (request.method !== 'POST' || request.url !== '/v1/chat/completions') {
@@ -96,7 +97,7 @@ function createExchangeFixture() {
     const body = await readRequest(request);
     authHeaders.push(request.headers.authorization);
     const history = JSON.stringify(body.messages ?? []);
-    const scenario = history.includes('ROUND1-APPROVED') ? 'approved' : 'denied';
+    const scenario = history.includes('ROUND1-BLOCKED') ? 'blocked' : history.includes('ROUND1-APPROVED') ? 'approved' : 'denied';
     toolResults[scenario] = (body.messages ?? [])
       .filter(message => message.role === 'tool')
       .map(message => ({
@@ -108,7 +109,15 @@ function createExchangeFixture() {
     let frame;
     let toolName;
 
-    if (scenario === 'approved' && index === 0) {
+    if (scenario === 'blocked') {
+      if (index === 0) {
+        toolName = 'subagent_antigravity';
+        frame = toolCompletion(toolName, 'blocked-subagent', { description: 'mixed sandbox work', prompt: 'ROUND1-BLOCKED: attempt a denied command, then complete the allowed fixture check.' });
+      } else if (index === 1) {
+        toolName = 'work_memory_remember';
+        frame = toolCompletion(toolName, 'blocked-remaining-memory', { namespace: 'sandbox-fixture', key: 'remaining-work', value: { completed: true } });
+      } else frame = textCompletion('The allowed fixture check and remaining memory task completed.');
+    } else if (scenario === 'approved' && index === 0) {
       toolName = 'subagent_antigravity';
       frame = toolCompletion(toolName, 'approved-subagent', {
         description: 'inspect fixture',
@@ -246,11 +255,14 @@ const conversationId = 'round1-native-fixture';
 const emit = value => process.stdout.write(JSON.stringify(value) + '\n');
 const input = createInterface({ input: process.stdin });
 emit({ event: 'init', conversation_id: conversationId,
-  init: { permission_mode: 'request-review', cwd: process.cwd(), tools: [] } });
+  init: { permission_mode: 'proceed-in-sandbox', cwd: process.cwd(), tools: [] } });
 input.on('line', line => {
   let request;
   try { request = JSON.parse(line); } catch { process.exit(21); }
   if (request.event !== 'user') process.exit(22);
+  if (request.message.content.includes('ROUND1-BLOCKED')) {
+    emit({ event: 'step_update', step_update: { step_type: 'tool', state: 'ERROR', tool_info: { name: 'command', error: { type: 'sandbox_denied', message: 'fixture boundary denied' } } } });
+  }
   emit({ event: 'step_update', step_update: {
     conversation_id: conversationId, step_type: 'agent_response', state: 'ACTIVE',
     text_delta: 'Fixture child answer',
@@ -262,6 +274,7 @@ input.on('line', line => {
 });`;
 
 test('round1 simulated connector-to-DSH approval and notification flow uses durable Work state', { timeout: 60_000 }, async t => {
+  await installNativeProfileFixture(t);
   const directory = await mkdtemp(join(tmpdir(), 'navigator-round1-'));
   const environment = {
     CYRENE_SESSION_TOKEN: priorEnvironment('CYRENE_SESSION_TOKEN'),
@@ -555,6 +568,23 @@ test('round1 simulated connector-to-DSH approval and notification flow uses dura
   assert.ok(exchange.toolCalls.denied.includes('work_request_approval'));
   assert.ok(!exchange.toolCalls.denied.includes('work_notify'), 'the DSH agent stops after the rejected approval');
 
+  const blockedOutcome = await app.executor.executeTask({
+    taskId: 'round1-blocked-task', sessionId: 'round1-blocked-session',
+    prompt: 'ROUND1-BLOCKED: delegate mixed sandbox work, then finish the allowed memory task.',
+  });
+  assert.equal(blockedOutcome.status, 'failed', 'incomplete batch is reported only after allowed work finishes');
+  assert.match(blockedOutcome.output, /remaining memory task completed/u);
+  assert.match(blockedOutcome.output, /无法执行项/u);
+  assert.match(blockedOutcome.output, /SANDBOX_BOUNDARY_DENIED/u);
+  assert.deepEqual(exchange.toolCalls.blocked, ['subagent_antigravity', 'work_memory_remember']);
+  assert.ok(exchange.toolResults.blocked.some(result => result.content.includes('Fixture child answer')), 'the parent keeps partial native output');
+  const memory = await requestWork(persistence.address, '/memory/query', { method: 'POST', body: { query: 'remaining-work', includeStale: true } });
+  assert.ok(JSON.stringify(memory.body).includes('remaining-work'), 'allowed work after the refused subagent committed to SQLite');
+  const blockedEvents = await requestWork(persistence.address, '/tasks/round1-blocked-task/events');
+  const blockedRows = blockedEvents.body.events.filter(row => row.event.type === 'subagent-blocked');
+  assert.equal(blockedRows.length, 1);
+  assert.equal(blockedRows[0].event.reasonCode, 'SANDBOX_BOUNDARY_DENIED');
+
   const crossWorkspace = await fetch(
     `${persistence.address}/api/v1/workspaces/round1-other/work/tasks/${admitted.body.task.id}`,
     { headers: { authorization: `Bearer ${OWNER_TOKEN}` } },
@@ -568,6 +598,11 @@ test('round1 simulated connector-to-DSH approval and notification flow uses dura
   await stopPersistence(persistence);
   persistence = await startPersistence(databasePath, principalConfigPath, process.env);
 
+  const reopenedBlocked = await requestWork(persistence.address, '/tasks/round1-blocked-task');
+  assert.equal(reopenedBlocked.body.status, 'failed');
+  assert.match(reopenedBlocked.body.output, /无法执行项/u);
+  const restoredEvents = await requestWork(persistence.address, `/tasks/round1-blocked-task/events?after=${blockedRows[0].seq - 1}`);
+  assert.ok(restoredEvents.body.events.some(row => row.event.type === 'subagent-blocked'));
   const reopenedTask = await requestWork(persistence.address, `/tasks/${admitted.body.task.id}`);
   assert.equal(reopenedTask.status, 200);
   assert.equal(reopenedTask.body.status, 'completed');

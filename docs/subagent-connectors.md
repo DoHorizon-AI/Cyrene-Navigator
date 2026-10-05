@@ -68,24 +68,83 @@ Navigator task.
 
 ## Native protocol and safety / 原生协议与安全
 
-Antigravity uses the documented stream-json stdin/stdout session. The adapter
-starts `agy` with `--input-format stream-json --output-format stream-json
---sandbox --mode default`, sends one text-only `user` event, and consumes the
-`init`, `step_update`, and terminal `result` events. It rejects startup unless
-the CLI reports a conversation id and the documented `request-review`
-permission mode. It rejects other or unknown modes and never sends
-`--dangerously-skip-permissions`. The CLI's headless policy handles Ask actions
-it cannot present interactively; the adapter has no native permission callback
-for Antigravity. Conversation IDs are associated with the parent DSH session
-and passed back with the documented `--conversation` flag on the next turn.
+Antigravity uses documented stream-json stdin/stdout, with adapter-owned
+`--sandbox --mode accept-edits` flags. Its default policy is full permitted
+execution inside the native terminal sandbox. Before each child starts,
+Navigator reads the official host profile and requires sandbox enabled,
+`toolPermission: "proceed-in-sandbox"`, workspace-only file access, automatic
+workspace edits, empty remembered allow/ask lists, and deny rules for
+`unsandboxed(*)` and `mcp(*)`. The workspace cannot contain that profile.
+The init handshake must also advertise `proceed-in-sandbox`; other values are
+refused before sending a model prompt. No dangerous permission flag or host
+fallback is used. Conversation IDs remain scoped to the parent DSH session.
 
-Antigravity 使用文档化的 stream-json stdin/stdout 会话。适配器以
-`--input-format stream-json --output-format stream-json --sandbox --mode default` 启动 `agy`，
-发送一个纯文本 `user` 事件，并消费 `init`、`step_update` 与终结 `result` 事件。除非 CLI 返回
-conversation id 和文档化的 `request-review` 权限模式，否则拒绝启动其他或未知模式。不会发送
-`--dangerously-skip-permissions`。CLI 会按 headless
-策略处理无法交互展示的 Ask 操作；Antigravity 当前协议没有可桥接的宿主权限回调。Conversation ID 与父级
-DSH Session 关联，并在后续任务中通过文档化的 `--conversation` 参数恢复。
+Antigravity 使用文档化的 stream-json stdin/stdout，并由适配器控制
+`--sandbox --mode accept-edits` 参数。默认策略是在原生终端沙箱允许范围内自动执行。
+每次启动前，Navigator 都校验官方宿主配置：启用沙箱、
+`toolPermission: "proceed-in-sandbox"`、仅访问 workspace、自动处理 workspace 编辑、
+清空旧的 allow/ask 授权，并拒绝 `unsandboxed(*)` 与 `mcp(*)`。
+Workspace 不得包含该配置文件。握手还必须声明 `proceed-in-sandbox`，否则在发送模型提示前拒绝。
+不会传入跳过权限参数或改到宿主执行。Conversation ID 仍按父级 DSH Session 隔离。
+
+The CLI currently documents its global settings file and does not document a
+per-invocation settings override. Prepare the profile explicitly on each
+execution host (this affects other CLI uses under the same OS account):
+
+CLI 目前文档化的入口是全局配置文件，没有文档化的单次调用 settings 覆盖参数。
+请在各实际执行宿主上显式初始化；这会影响同一系统账号下的其他 CLI 使用：
+
+```sh
+# Preview changed field names; no existing values or credentials are printed.
+node scripts/configure-antigravity-sandbox.mjs
+# Apply documented defaults, retaining unrelated settings and a private backup.
+node scripts/configure-antigravity-sandbox.mjs --apply
+```
+
+The setup command updates only security settings in
+`~/.gemini/antigravity-cli/settings.json`, clears remembered permission grants,
+and retains a private backup. It does not read credential files. Navigator
+startup never rewrites the native profile. Cloud executions use that cloud
+host's profile; local executions use the local host's profile.
+
+初始化命令只更新 `~/.gemini/antigravity-cli/settings.json` 中的安全设置，清空旧的记忆授权，
+并保留私有备份；不会读取认证文件。Navigator 启动不会重写原生配置。
+云端执行使用云端宿主配置，本地执行使用本地宿主配置。
+
+A native headless soft denial may still finish with `SUCCESS` and exit code 0.
+The adapter classifies bounded structured error fields and stderr denial
+notices, retains successful partial output, and lets the child finish its
+remaining allowed work. The parent receives a failed subagent result with a
+continue-and-summarize instruction. Navigator persists `subagent-blocked`
+events, continues parent execution, and appends a trusted cannot-execute
+summary to the final output. Only after remaining work finishes does an
+incomplete batch become `failed`; a denial never automatically cancels it.
+Explicit user cancellation and process/turn time limits still apply.
+
+For admitted tasks with an existing notification route, terminal failure
+notifications include the error and retained task output. Long notifications
+retain both ends of that output so completed work and the final cannot-execute
+summary remain visible. The existing recipient rules and deduplication apply.
+
+原生 headless 软拒绝后仍可能返回 `SUCCESS` 与退出码 0。适配器检查有界结构化错误字段和 stderr
+拒绝通知，保留已成功的部分输出，让子进程继续其余允许工作。父代理收到失败子任务结果，以及继续执行
+并汇总的指引。Navigator 持久化 `subagent-blocked` 事件，继续父任务，最后在输出中追加可信的
+“无法执行项”。有未完成项的整批任务只在其余工作结束后标为 `failed`，单项拒绝不会自动取消整批。
+用户明确取消及进程/单轮超时仍然有效。
+
+对于已有通知路由的任务，终态失败通知包含错误与保留的任务输出。超长通知保留输出首尾，
+使已完成工作与最终“无法执行项”都能展示；沿用现有收件人规则及去重机制。
+
+Receipts contain provider/run correlation, stable reason code, allowlisted tool
+category, and observation count. Counts describe native notices, which may
+repeat for one operation; they do not count distinct failed tasks. Raw stderr,
+paths, prompts, or tokens are not copied into receipts. Semantic task names
+and completed results are supplied by the agent's summary; run IDs allow
+correlation with the task event history.
+
+记录包含提供方/运行关联、固定原因码、允许的工具分类和观察次数。一次操作可能产生重复通知，
+次数不等于不同失败任务数。记录不复制原始 stderr、路径、提示或 token。
+具体任务名称和完成结果由代理总结提供；运行 ID 可关联任务事件历史。
 
 CodeBuddy uses the documented ACP-over-stdio transport with the native
 `default` permission mode. The adapter performs `initialize`, creates an ACP
@@ -119,16 +178,41 @@ stdin 并等待配置的宽限期，再终止并等待受管进程范围退出�
 the two official protocol shapes. It covers normal completion, native error,
 cancellation and child reaping, malformed and oversized streams, ACP approval
 rejection, event/task association, and native conversation resumption. The
-fixtures do not authenticate to either service. Live Antigravity and CodeBuddy
-authentication was not run.
+fixtures do not authenticate to either service. The mixed-work vertical fixture also verifies denial followed by allowed
+SQLite memory mutation, partial output reaching the parent, final blocked
+summary, and durable event/task read-back after restart. Profile and boundary
+fixtures run in the Linux x64, Linux ARM64, and Windows x64 CI suites.
+
+On Linux x64, the official host setup and no-prompt `agy 1.2.16` handshake
+were run successfully: init advertised `proceed-in-sandbox`. The native CLI
+rewrites omitted safe default fields on shutdown; preflight accepts documented
+`allowNonWorkspaceAccess=false` and absent empty grant lists. The real native
+mixed-work smoke was attempted but hit native startup/response time limits without completing permitted work; actual
+OS-boundary enforcement and continuation remain unverified. Windows/ARM64
+native-account sandbox execution and CodeBuddy authentication are **NOT_RUN**.
+A future CLI advertising a different init mode is refused.
+
+Opt-in real CLI validation uses the native subscription and only private test
+files; it is never part of automatic CI:
+
+```sh
+node harness/tests/antigravity-live-smoke.mjs --run /path/to/agy
+```
 
 `harness/tests/subagents.test.mjs` 使用本地可执行 fixture 模拟两种官方协议，覆盖正常完成、原生错误、
 取消与子进程回收、畸形和超限数据流、ACP 审批拒绝、事件与 task 关联，以及原生会话恢复。Fixture 不会
-对任一服务进行认证；本次未运行真实 Antigravity 或 CodeBuddy 认证。
+对任一服务进行认证；混合任务链路还验证拒绝后继续写入 SQLite 记忆、父代理收到部分输出、最终无法执行项以及重启后状态/事件
+读回。Profile 与拒绝测试接入 Linux x64、Linux ARM64、Windows x64 CI。本机 Linux x64 已执行官方配置
+初始化，`agy 1.2.16` 零提示握手返回 `proceed-in-sandbox`。CLI 退出时会省略安全默认字段，预检接受文档化的
+`allowNonWorkspaceAccess=false` 缺省和缺省空授权列表。真实混合任务烟测已尝试，但出现原生启动/响应超时、未完成允许工作，
+实际 OS 边界强制执行与拒绝后继续仍未验证。Windows/ARM64 原生账号执行和 CodeBuddy 认证为 **NOT_RUN**。
+上面的显式烟测命令使用原生订阅，只操作私有测试文件；不会加入自动 CI。后续 CLI 如声明不同 init 模式，
+会明确拒绝。
 
 Protocol references / 协议资料：
 
 - [Antigravity CLI headless and stream-json](https://antigravity.google/docs/cli/headless)
+- [Antigravity native terminal sandbox](https://antigravity.google/docs/sandbox?tab=cli)
 - [Antigravity CLI execution modes](https://antigravity.google/docs/cli/modes/)
 - [Antigravity permissions](https://antigravity.google/docs/permissions?tab=cli)
 - [CodeBuddy ACP](https://www.codebuddy.ai/docs/cli/acp)

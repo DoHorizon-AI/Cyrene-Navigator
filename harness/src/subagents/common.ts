@@ -180,8 +180,8 @@ export function spawnNativeChild(
     env: resolveChildEnvironment(deployment),
   }
   const child = ctx.subprocess.spawn(spec)
-  // stderr is diagnostic-only. Drain it into a fixed-size ring to avoid pipe backpressure,
-  // but do not retain or surface native CLI text, which may contain sensitive context.
+  // Drain diagnostic stderr to avoid backpressure. Providers may attach bounded
+  // classifiers; this shared lifecycle retains no native diagnostic text.
   if (child.stderr !== undefined) {
     child.stderr.on('data', () => {})
   }

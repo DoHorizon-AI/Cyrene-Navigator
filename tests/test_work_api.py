@@ -10,6 +10,7 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from cyrene_navigator.persistence import PersistencePrincipal, create_persistence_app
+from cyrene_navigator.work.store import _failed_task_result_notification_text
 
 TOKENS = {
     "writer": PersistencePrincipal(
@@ -364,6 +365,122 @@ def test_terminal_task_enqueues_wecom_reply_atomically(tmp_path: Path) -> None:
             "status": "completed",
         }
         assert notification["taskId"] == "reply-1"
+
+
+def test_failed_task_result_notification_keeps_partial_output_and_deduplicates(
+    tmp_path: Path,
+) -> None:
+    """A partial failure reply carries output once. | 部分失败回复保留摘要并仅入队一次。"""
+
+    with _client(tmp_path / "task-partial-failure.sqlite3") as client:
+        base = BASE.format(workspace="w1")
+        body = _task_body("partial-failure")
+        body["metadata"] = {
+            "notification": {
+                "type": "wecom.message",
+                "connectorId": "binding-1",
+                "recipient": "bot:7/group/room-1",
+                "payload": {
+                    "accountId": "account-7",
+                    "conversationId": "room-1",
+                    "chatType": "group",
+                    "senderId": "user-4",
+                },
+            }
+        }
+        created = client.post(base + "/tasks", json=body, headers=_headers())
+        assert created.status_code == 201, created.text
+        claimed = client.post(base + "/tasks/partial-failure/claim", headers=_headers())
+        assert claimed.json()["claimed"] is True
+
+        error = "部分子任务无法执行；已继续完成其余可执行工作，详见结果中的无法执行项。"  # noqa: RUF001
+        output = (
+            "已完成项：已生成目录清单。\n\n无法执行项：network / SANDBOX_BOUNDARY_DENIED count=1。"  # noqa: RUF001
+        )
+        failed = client.patch(
+            base + "/tasks/partial-failure",
+            json={"status": "failed", "error": error, "output": output},
+            headers=_headers(),
+        )
+        assert failed.status_code == 200, failed.text
+
+        notifications = client.get(base + "/notifications", headers=_headers())
+        items = notifications.json()["items"]
+        assert len(items) == 1
+        notification = items[0]
+        assert notification["deduplicationKey"] == "task-result:partial-failure:failed"
+        assert notification["payload"]["text"] == f"{error}\n\n{output}"
+        assert notification["payload"]["status"] == "failed"
+
+        replayed = client.patch(
+            base + "/tasks/partial-failure",
+            json={"status": "failed", "error": error, "output": output},
+            headers=_headers(),
+        )
+        assert replayed.status_code == 200, replayed.text
+        assert len(client.get(base + "/notifications", headers=_headers()).json()["items"]) == 1
+
+
+def test_failed_task_result_notification_truncation_preserves_output_tail(
+    tmp_path: Path,
+) -> None:
+    """The bounded reply retains the blocked-item summary. | 截断后保留无法执行摘要。"""
+
+    with _client(tmp_path / "task-partial-failure-truncated.sqlite3") as client:
+        base = BASE.format(workspace="w1")
+        body = _task_body("partial-failure-truncated")
+        body["metadata"] = {
+            "notification": {
+                "type": "wecom.message",
+                "connectorId": "binding-1",
+                "recipient": "bot:7/group/room-1",
+                "payload": {
+                    "accountId": "account-7",
+                    "conversationId": "room-1",
+                    "chatType": "group",
+                    "senderId": "user-4",
+                },
+            }
+        }
+        created = client.post(base + "/tasks", json=body, headers=_headers())
+        assert created.status_code == 201, created.text
+        claimed = client.post(base + "/tasks/partial-failure-truncated/claim", headers=_headers())
+        assert claimed.json()["claimed"] is True
+
+        error = "Partial execution failed; see blocked items in the result."
+        blocked_summary = "\n\n无法执行项：network / SANDBOX_BOUNDARY_DENIED count=1。"  # noqa: RUF001
+        output = (
+            "已完成项：已生成目录清单。\n"  # noqa: RUF001
+            + ("前序输出内容。" * 3_000)
+            + blocked_summary
+        )
+        failed = client.patch(
+            base + "/tasks/partial-failure-truncated",
+            json={"status": "failed", "error": error, "output": output},
+            headers=_headers(),
+        )
+        assert failed.status_code == 200, failed.text
+
+        notifications = client.get(base + "/notifications", headers=_headers())
+        text = notifications.json()["items"][0]["payload"]["text"]
+        assert len(text) <= 20_000
+        assert text.startswith(error + "\n\n已完成项：已生成目录清单。")  # noqa: RUF001
+        assert "...[middle task result truncated]..." in text
+        assert text.endswith(blocked_summary)
+
+
+def test_failed_task_result_notification_bounds_error_without_output_or_duplicate_text() -> None:
+    """Bound long errors and avoid duplicating short outputs. | 长错误限长且短输出不重复。"""
+
+    error = "e" * 25_000
+    without_output = _failed_task_result_notification_text(error, "")
+    assert len(without_output) == 19_992
+    assert without_output.endswith(" [truncated]")
+
+    with_short_output = _failed_task_result_notification_text(error, "short output")
+    assert len(with_short_output) < 20_000
+    assert with_short_output.endswith("\n\nshort output")
+    assert with_short_output.count("short output") == 1
 
 
 def test_notification_exact_replay_after_task_completion_is_read_only(tmp_path: Path) -> None:

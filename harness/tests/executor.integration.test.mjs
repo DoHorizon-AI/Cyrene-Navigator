@@ -258,6 +258,8 @@ test('NavigatorExecutor: recovery adopts safe queued rows and fails uncertain or
   const queued = await store.createTask({ id: 'recover-queued', sessionId: 'session-queued', prompt: 'Safe to start' });
   const running = await store.createTask({ id: 'recover-running', sessionId: 'session-running', prompt: 'Do not replay' });
   await store.claimTask(running.id);
+  await store.patchTask(running.id, { output: 'Completed allowed inspection before restart.' });
+  await store.appendEvent(running.id, { type: 'subagent-blocked', taskId: running.id, provider: 'antigravity', runId: 'fixture-blocked-run', reasonCode: 'SANDBOX_BOUNDARY_DENIED', toolCategory: 'command', count: 1, timestamp: Date.now() });
   const approval = await store.createTask({ id: 'recover-approval', sessionId: 'session-approval', prompt: 'Review first' });
   await store.claimTask(approval.id);
   await store.patchTask(approval.id, { status: 'waiting_approval' });
@@ -268,6 +270,8 @@ test('NavigatorExecutor: recovery adopts safe queued rows and fails uncertain or
     assert.equal(await executor.drainQueuedTasks(), 1);
     await waitForTask(executor, queued.id, task => task.status === 'completed');
     assert.equal((await executor.getTask(running.id)).status, 'failed');
+    assert.match((await executor.getTask(running.id)).output, /Completed allowed inspection.*无法执行项/su);
+    assert.match((await executor.getTask(running.id)).output, /SANDBOX_BOUNDARY_DENIED/u);
     assert.equal((await executor.getTask(approval.id)).status, 'failed');
     assert.equal(adapter.calls, 1, 'only a never-claimed queued row may run after restart');
     const interrupted = await store.getEvents(running.id, 0);
@@ -290,6 +294,10 @@ test('WorkStateClient: requests use the configured workspace bearer and decode n
       res.writeHead(404).end(JSON.stringify({ code: 'WORK_TASK_NOT_FOUND' }));
       return;
     }
+    if (req.url === '/api/v1/workspaces/acme/work/tasks/item/events?after=0') {
+      res.end(JSON.stringify({ events: [{ seq: 1, event: { type: 'task.created' }, createdAt: 10, messageId: null }], nextSeq: 1 }));
+      return;
+    }
     if (req.url === '/api/v1/workspaces/acme/work/tasks/item') {
       res.end(JSON.stringify({
         id: 'item', workspaceId: 'acme', sessionId: 'session-1', prompt: 'hi', status: 'queued',
@@ -306,7 +314,8 @@ test('WorkStateClient: requests use the configured workspace bearer and decode n
     const client = new WorkStateClient({ baseUrl: `http://127.0.0.1:${port}`, workspaceId: 'acme' });
     assert.equal((await client.getTask('item')).startedAt, undefined);
     assert.equal(await client.getTask('other'), undefined);
-    assert.equal(seen.length, 2);
+    assert.equal((await client.getEvents('item')).events[0].messageId, undefined);
+    assert.equal(seen.length, 3);
     assert.ok(seen.every(row => row.url.startsWith('/api/v1/workspaces/acme/work/tasks/')));
     assert.ok(seen.every(row => row.authorization === 'Bearer work-test-token'));
   } finally {

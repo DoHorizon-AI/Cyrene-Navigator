@@ -127,7 +127,7 @@ function decodeEventPage(value: unknown): TaskEventPage {
   const events = row.events.map(item => {
     const eventRow = object(item, 'Work Task event');
     const event = object(eventRow.event, 'Work Task event payload');
-    const messageId = eventRow.messageId === undefined ? undefined : stringField(eventRow.messageId, 'messageId');
+    const messageId = eventRow.messageId === undefined || eventRow.messageId === null ? undefined : stringField(eventRow.messageId, 'messageId');
     return {
       seq: timeField(eventRow.seq, 'event sequence')!,
       event,
