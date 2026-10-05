@@ -549,7 +549,11 @@ def _environment_references(config: dict[str, Any]) -> set[str]:
     def visit(value: object) -> None:
         if isinstance(value, dict):
             for key, child in value.items():
-                if isinstance(key, str) and key.endswith("_env") and isinstance(child, str):
+                if (
+                    isinstance(key, str)
+                    and key.endswith(("_env", "_env_ref"))
+                    and isinstance(child, str)
+                ):
                     if not _ENV_NAME_RE.fullmatch(child):
                         raise ValueError(
                             "principal config contains an invalid environment reference"

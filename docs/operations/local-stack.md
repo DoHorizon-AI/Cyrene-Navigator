@@ -99,13 +99,13 @@ uv pip install --python .venv/bin/python \
 Create an owner-managed principal configuration and pass its path with
 `--principal-config`. Set `--principal-token-env` to the owner row's token
 reference; the supervisor supplies its fresh internal value through that
-environment variable. Other `*_env` and `secret_refs` names in the file are
+environment variable. Other `*_env`, `*_env_ref`, and `secret_refs` names in the file are
 passed to persistence only when those variables exist in the supervisor's
 environment. The config itself contains references, not credential values.
 
 创建由 owner 管理的 principal 配置，并通过 `--principal-config` 传入路径。将
 `--principal-token-env` 设为 owner 行的 token reference；supervisor 会通过该环境变量提供新生成的
-内部值（若环境已有该引用则沿用其值）。配置中的其他 `*_env` 和 `secret_refs` 名称只会在
+内部值（若环境已有该引用则沿用其值）。配置中的其他 `*_env`、`*_env_ref` 和 `secret_refs` 名称只会在
 supervisor 环境存在对应变量时传给
 persistence。配置文件只保存引用，不保存凭据值。
 

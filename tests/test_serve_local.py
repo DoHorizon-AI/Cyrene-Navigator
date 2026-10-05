@@ -161,3 +161,37 @@ def test_generated_owner_is_harness_writer_and_custom_owner_must_opt_in(tmp_path
             actor_id="round1-owner",
             principal_token_env="CYRENE_SESSION_TOKEN",
         )
+
+
+def test_wecom_environment_references_reach_only_persistence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Forward explicit bot/CLI-host refs without leaking them to the Web Host."""
+
+    config = {
+        "principals": [{"token_env": "ROUND1_OWNER"}],
+        "work_connectors": [
+            {
+                "config": {
+                    "bot_secret_env_ref": "ROUND1_BOT_SECRET",
+                    "navigator": {"secret_env_ref": "ROUND1_OWNER"},
+                }
+            }
+        ],
+    }
+    monkeypatch.setenv("ROUND1_BOT_SECRET", "fixture-bot-secret")
+    monkeypatch.setenv("UNRELATED_SECRET", "do-not-forward")
+    references = serve_local._environment_references(config)
+    assert references == {"ROUND1_OWNER", "ROUND1_BOT_SECRET"}
+    persistence = serve_local._persistence_child_environment(
+        tmp_path, "fixture-owner", "ROUND1_OWNER", references
+    )
+    assert persistence["ROUND1_BOT_SECRET"] == "fixture-bot-secret"
+    assert "UNRELATED_SECRET" not in persistence
+    web = serve_local._web_child_environment(
+        repository=tmp_path,
+        session_token="fixture-owner",
+        executor_token="fixture-executor",
+        workspace_id="fixture-workspace",
+    )
+    assert "ROUND1_BOT_SECRET" not in web
