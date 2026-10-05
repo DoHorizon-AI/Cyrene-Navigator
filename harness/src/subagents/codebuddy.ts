@@ -305,12 +305,13 @@ export class CodeBuddySubagentProvider extends NativeSubagentProvider {
           return
         }
         if (kind === 'tool_call' || kind === 'tool_call_update') {
-          const toolCall = isJsonObject(update.toolCall) ? update.toolCall : {}
-          const phase = kind === 'tool_call_update' ? 'tool' : 'tool'
+          // ACP session updates carry tool fields directly; retain the older nested shape.
+          // 中文：标准 ACP 的 status/kind 位于 update 本身，而非 toolCall 子对象。
+          const toolCall = isJsonObject(update.toolCall) ? update.toolCall : update
           const status = safeLabel(toolCall.status, 128) ?? safeLabel(toolCall.kind, 128) ?? kind
           emitEvent(this.config, {
             type: 'progress', providerName: this.name, backend: 'codebuddy', parentSessionId, runId,
-            ...(conversationId === undefined ? {} : { conversationId }), phase, status,
+            ...(conversationId === undefined ? {} : { conversationId }), phase: 'tool', status,
           })
         }
       },
@@ -516,6 +517,12 @@ export class CodeBuddySubagentProvider extends NativeSubagentProvider {
       type: 'permission', providerName: this.name, backend: 'codebuddy', parentSessionId: request.parent.session.id, runId,
       ...(sessionId === undefined ? {} : { conversationId: sessionId }), tool, decision: 'denied',
     })
+    // Reject this operation without signalling cancellation of independent work.
+    // 中文：拒绝本次工具操作；只有实际取消或缺少拒绝选项时才回传 cancelled。
+    const rejectOnce = options.find(option => option.kind === 'reject_once' && typeof option.optionId === 'string')
+    if (!request.signal.aborted && rejectOnce !== undefined) {
+      return { outcome: { outcome: 'selected', optionId: rejectOnce.optionId } }
+    }
     return { outcome: { outcome: 'cancelled' } }
   }
 }

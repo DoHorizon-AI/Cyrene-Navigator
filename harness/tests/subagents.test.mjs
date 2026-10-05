@@ -109,8 +109,18 @@ if (!codebuddy) {
         const outcome = request.result?.outcome;
         record({ kind: 'permission-result', outcome });
         if (promptRequestId !== undefined) {
-          void respond(promptRequestId, { stopReason: outcome?.outcome === 'selected' ? 'end_turn' : 'cancelled' });
+          const completedRequestId = promptRequestId;
           promptRequestId = undefined;
+          void (async () => {
+            if (outcome?.outcome === 'selected' && outcome.optionId === 'reject') {
+              record({ kind: 'continued-after-denial' });
+              await writeFrame({ jsonrpc: '2.0', method: 'session/update', params: {
+                sessionId: 'codebuddy-conversation-fixture',
+                update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'completed independent work' } },
+              } });
+            }
+            await respond(completedRequestId, { stopReason: outcome?.outcome === 'selected' ? 'end_turn' : 'cancelled' });
+          })().catch(() => process.exit(33));
         }
       }
       return;
@@ -137,7 +147,7 @@ if (!codebuddy) {
       } else {
         void respond(request.id, {});
       }
-    } else if (request.method === 'session/prompt' && mode === 'cb-permission') {
+    } else if (request.method === 'session/prompt' && mode.startsWith('cb-permission')) {
       promptRequestId = request.id;
       void writeFrame({ jsonrpc: '2.0', id: 'fixture-permission', method: 'session/request_permission', params: {
         sessionId: 'codebuddy-conversation-fixture',
@@ -145,7 +155,7 @@ if (!codebuddy) {
         options: [
           { optionId: 'once', kind: 'allow_once' },
           { optionId: 'always', kind: 'allow_always' },
-          { optionId: 'reject', kind: 'reject_once' },
+          ...(mode === 'cb-permission-no-reject' ? [] : [{ optionId: 'reject', kind: 'reject_once' }]),
         ],
       } });
     } else if (request.method === 'session/prompt' && mode === 'cb-auth-required-prompt') {
@@ -154,6 +164,14 @@ if (!codebuddy) {
       } });
     } else if (request.method === 'session/prompt') {
       void (async () => {
+        if (mode === 'cb-flat-tools') {
+          for (const [sessionUpdate, status] of [['tool_call', 'pending'], ['tool_call_update', 'in_progress'], ['tool_call_update', 'completed']]) {
+            await writeFrame({ jsonrpc: '2.0', method: 'session/update', params: {
+              sessionId: 'codebuddy-conversation-fixture',
+              update: { sessionUpdate, toolCallId: 'fixture-tool', kind: 'read', status },
+            } });
+          }
+        }
         await writeFrame({ jsonrpc: '2.0', method: 'session/update', params: {
           sessionId: 'codebuddy-conversation-fixture',
           update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'buddy answer' } },
@@ -403,7 +421,7 @@ test('Antigravity rejects malformed startup and non-documented native permission
   }
 });
 
-test('CodeBuddy ACP rejects a native write approval and associates approved requests with the parent task', {
+test('CodeBuddy ACP rejects one native operation and continues independent work', {
   timeout: 20_000,
 }, async t => {
   const host = await fixtureHost(t, 'codebuddy', 'cb-permission', {
@@ -412,7 +430,8 @@ test('CodeBuddy ACP rejects a native write approval and associates approved requ
   const run = await host.provider.start(startRequest('navigator-task-parent', host.cwd, new AbortController().signal));
   try {
     const result = await run.result;
-    assert.equal(result.stopReason, 'aborted');
+    assert.equal(result.stopReason, 'completed');
+    assert.deepEqual(result.output, [{ type: 'text', text: 'completed independent work' }]);
     assert.equal(host.permissionRequests.length, 1);
     assert.equal(host.permissionRequests[0].parentSessionId, 'navigator-task-parent');
     assert.equal(host.permissionRequests[0].tool, 'edit');
@@ -420,10 +439,27 @@ test('CodeBuddy ACP rejects a native write approval and associates approved requ
     assert.ok(host.events.some(event => event.type === 'permission' && event.decision === 'denied'));
     const log = await readLog(host.logPath);
     const answer = log.find(entry => entry.kind === 'permission-result');
-    assert.deepEqual(answer.outcome, { outcome: 'cancelled' });
+    assert.deepEqual(answer.outcome, { outcome: 'selected', optionId: 'reject' });
+    assert.ok(log.some(entry => entry.kind === 'continued-after-denial'));
   } finally {
     await run.dispose();
   }
+});
+
+test('CodeBuddy ACP reports standard flat tool execution statuses', { timeout: 20_000 }, async t => {
+  const host = await fixtureHost(t, 'codebuddy', 'cb-flat-tools');
+  const { result } = await completeRun(host.provider, host.cwd);
+  assert.equal(result.stopReason, 'completed');
+  assert.deepEqual(host.events.filter(event => event.phase === 'tool').map(event => event.status), ['pending', 'in_progress', 'completed']);
+});
+
+test('CodeBuddy ACP fails closed without a native reject-once option', { timeout: 20_000 }, async t => {
+  const host = await fixtureHost(t, 'codebuddy', 'cb-permission-no-reject');
+  const { result } = await completeRun(host.provider, host.cwd);
+  assert.equal(result.stopReason, 'aborted');
+  const log = await readLog(host.logPath);
+  assert.deepEqual(log.find(entry => entry.kind === 'permission-result').outcome, { outcome: 'cancelled' });
+  assert.equal(log.some(entry => entry.kind === 'continued-after-denial'), false);
 });
 
 test('CodeBuddy ACP resumes only when loadSession is advertised', {
