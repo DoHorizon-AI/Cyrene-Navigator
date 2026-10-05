@@ -23,6 +23,8 @@ from cyrene_navigator.persistence.errors import PersistenceError
 
 JsonObject = dict[str, Any]
 _MAX_JSON_BYTES = 2_000_000
+_TASK_RESULT_NOTIFICATION_MAX_CHARS = 20_000
+_TASK_RESULT_NOTIFICATION_TRUNCATION = "\n...[middle task result truncated]...\n"
 _TERMINAL_TASK_STATES = frozenset({"completed", "failed", "aborted"})
 _TASK_TRANSITIONS: dict[str, frozenset[str]] = {
     "queued": frozenset({"running", "failed", "aborted", "waiting_approval", "waiting_input"}),
@@ -1659,11 +1661,13 @@ class WorkStore:
         if status == "completed":
             text = str(task["output"] or "").strip() or "Task completed."
         elif status == "failed":
-            text = str(task["error"] or "").strip() or "Task failed."
+            error = str(task["error"] or "").strip() or "Task failed."
+            output = str(task["output"] or "").strip()
+            text = _failed_task_result_notification_text(error, output)
         else:
             text = "Task aborted."
-        if len(text) > 20_000:
-            text = text[:19_980] + " [truncated]"
+        if status != "failed" and len(text) > _TASK_RESULT_NOTIFICATION_MAX_CHARS:
+            text = text[: _TASK_RESULT_NOTIFICATION_MAX_CHARS - 20] + " [truncated]"
         payload = {
             **descriptor["payload"],
             "text": text,
@@ -3187,6 +3191,44 @@ def _human_input_object(value: object, field: str) -> JsonObject:
 
     validate(normalized)
     return normalized
+
+
+def _failed_task_result_notification_text(error: str, output: str) -> str:
+    """Bound text while retaining both ends of the task output. | 限长并保留输出两端。"""
+
+    if not output:
+        if len(error) > _TASK_RESULT_NOTIFICATION_MAX_CHARS:
+            return error[: _TASK_RESULT_NOTIFICATION_MAX_CHARS - 20] + " [truncated]"
+        return error
+    separator = "\n\n"
+    if len(error) + len(separator) + len(output) <= _TASK_RESULT_NOTIFICATION_MAX_CHARS:
+        return error + separator + output
+
+    # Keep the output's start and end so both completed work and the trusted blocked-item
+    # summary appended by the executor remain visible.
+    error_prefix = error
+    error_limit = _TASK_RESULT_NOTIFICATION_MAX_CHARS // 4
+    if len(error_prefix) > error_limit:
+        error_prefix = (
+            error_prefix[: error_limit - len(" [error truncated]")] + " [error truncated]"
+        )
+    if len(error_prefix) + len(separator) + len(output) <= _TASK_RESULT_NOTIFICATION_MAX_CHARS:
+        return error_prefix + separator + output
+    output_budget = (
+        _TASK_RESULT_NOTIFICATION_MAX_CHARS
+        - len(error_prefix)
+        - len(separator)
+        - len(_TASK_RESULT_NOTIFICATION_TRUNCATION)
+    )
+    output_prefix_budget = output_budget // 2
+    output_suffix_budget = output_budget - output_prefix_budget
+    return (
+        error_prefix
+        + separator
+        + output[:output_prefix_budget]
+        + _TASK_RESULT_NOTIFICATION_TRUNCATION
+        + output[-output_suffix_budget:]
+    )
 
 
 def _task_notification_descriptor(metadata: Mapping[str, Any]) -> JsonObject | None:

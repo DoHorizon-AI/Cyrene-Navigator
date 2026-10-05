@@ -121,11 +121,19 @@ summary to the final output. Only after remaining work finishes does an
 incomplete batch become `failed`; a denial never automatically cancels it.
 Explicit user cancellation and process/turn time limits still apply.
 
+For admitted tasks with an existing notification route, terminal failure
+notifications include the error and retained task output. Long notifications
+retain both ends of that output so completed work and the final cannot-execute
+summary remain visible. The existing recipient rules and deduplication apply.
+
 原生 headless 软拒绝后仍可能返回 `SUCCESS` 与退出码 0。适配器检查有界结构化错误字段和 stderr
 拒绝通知，保留已成功的部分输出，让子进程继续其余允许工作。父代理收到失败子任务结果，以及继续执行
 并汇总的指引。Navigator 持久化 `subagent-blocked` 事件，继续父任务，最后在输出中追加可信的
 “无法执行项”。有未完成项的整批任务只在其余工作结束后标为 `failed`，单项拒绝不会自动取消整批。
 用户明确取消及进程/单轮超时仍然有效。
+
+对于已有通知路由的任务，终态失败通知包含错误与保留的任务输出。超长通知保留输出首尾，
+使已完成工作与最终“无法执行项”都能展示；沿用现有收件人规则及去重机制。
 
 Receipts contain provider/run correlation, stable reason code, allowlisted tool
 category, and observation count. Counts describe native notices, which may
