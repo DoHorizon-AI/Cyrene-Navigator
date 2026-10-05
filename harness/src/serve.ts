@@ -242,7 +242,7 @@ function parseHostSubagentConfig(value: unknown): SubagentAdapterConfig {
   const deployments = root.deployments.map((entry, index) => {
     const row = asObject(entry, `subagent deployment ${index}`);
     assertKeys(row, ['backend', 'providerName', 'command', 'argv', 'cwd', 'envRefs'], `subagent deployment ${index}`);
-    if (row.backend !== 'antigravity' && row.backend !== 'codebuddy') {
+    if (row.backend !== 'antigravity' && row.backend !== 'codebuddy' && row.backend !== 'acp') {
       throw new TypeError(`subagent deployment ${index} has an unsupported backend`);
     }
     const backend = row.backend as SubagentAdapterConfig['deployments'][number]['backend'];

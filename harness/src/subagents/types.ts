@@ -8,7 +8,7 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { SubagentStopReason } from '@deepseek-ai/dsh-subagent'
 
 /** Native agent transport selected by one approved deployment. */
-export type NativeSubagentBackend = 'antigravity' | 'codebuddy'
+export type NativeSubagentBackend = 'antigravity' | 'codebuddy' | 'acp'
 
 /** Safe lifecycle observations that Navigator may forward to its task stream. */
 export type SubagentAdapterEvent =
@@ -56,7 +56,7 @@ export type SubagentAdapterEvent =
 /** ACP permission request passed to Navigator's approval storage bridge. */
 export interface SubagentPermissionRequest {
   readonly providerName: string
-  readonly backend: 'codebuddy'
+  readonly backend: 'codebuddy' | 'acp'
   /** DSH parent session used to correlate the permission with its Navigator task. */
   readonly parentSessionId: SessionId
   readonly runId: SessionId
@@ -79,7 +79,7 @@ export interface SubagentDeployment {
   readonly providerName?: string
   /** Bare PATH command or an absolute executable path; never shell-interpreted. */
   readonly command: string
-  /** Additional native flags, restricted to model/effort/agent selectors. */
+  /** Static model/effort/agent selectors; generic ACP also accepts acp or --acp. */
   readonly argv?: readonly string[]
   /** Optional fixed workspace. Omission uses the delegating DSH session cwd. */
   readonly cwd?: string
@@ -87,7 +87,7 @@ export interface SubagentDeployment {
   readonly envRefs?: Readonly<Record<string, string>>
 }
 
-/** Registration configuration for the two native out-of-process providers. */
+/** Registration configuration for native out-of-process providers. */
 export interface SubagentAdapterConfig {
   /** Admin-approved native executable deployments. */
   readonly deployments: readonly SubagentDeployment[]

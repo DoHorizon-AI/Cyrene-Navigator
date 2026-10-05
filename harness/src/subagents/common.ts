@@ -70,10 +70,17 @@ function validateSelectorArgv(backend: NativeSubagentBackend, argv: readonly str
     : new Set(['--model', '--agent'])
   const seen = new Set<string>()
   const result: string[] = []
+  let transportSelected = false
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index]
     if (token === undefined || token.length === 0 || token.includes('\0')) {
       throw new Error(`navigator-subagent-${backend}: argv contains an empty or invalid value`)
+    }
+    if (backend === 'acp' && (token === 'acp' || token === '--acp')) {
+      if (transportSelected || index !== 0) throw new Error('navigator-subagent-acp: transport selector must appear once at the start')
+      transportSelected = true
+      result.push(token)
+      continue
     }
     const equalAt = token.indexOf('=')
     const flag = equalAt < 0 ? token : token.slice(0, equalAt)
@@ -230,7 +237,8 @@ export async function withDeadline<T>(
     signal.addEventListener('abort', onAbort, { once: true })
   })
   const timedOut = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label} timed out`)), timeoutMs)
+    timer = setTimeout(() => reject(new NativeSubagentFailure(`${label} timed out`,
+      'SUBAGENT_TIMEOUT: 原生操作超时，无法执行；已保留部分结果，请继续其他可执行任务，并在总结列出失败项。')), timeoutMs)
   })
   try {
     return await Promise.race([promise, cancelled, timedOut])

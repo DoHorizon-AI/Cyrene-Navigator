@@ -1,7 +1,7 @@
 // ┌─────────────────────────────────────────────────────────────────────┐
 // │ Module: Navigator native subagent registry                          │
-// │ Role: Register Antigravity and CodeBuddy on the DSH subagent seam.  │
-// │ 模块职责：在 DSH 子 Agent seam 注册 Antigravity 与 CodeBuddy。          │
+// │ Role: Register native CLI launch profiles on the DSH subagent seam.  │
+// │ 模块职责：在 DSH 子 Agent seam 注册原生 CLI 启动配置。          │
 // └─────────────────────────────────────────────────────────────────────┘
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -11,6 +11,7 @@ import type { SubagentRun } from '@deepseek-ai/dsh-subagent'
 import type {} from '@deepseek-ai/dsh-subagent/src/projection.ts'
 import { AntigravitySubagentProvider } from './antigravity.js'
 import { CodeBuddySubagentProvider } from './codebuddy.js'
+import { AcpSubagentProvider } from './acp.js'
 import {
   resolveTiming,
   validateDeployment,
@@ -50,8 +51,8 @@ export function registerSubagents(ctx: Context, config: SubagentAdapterConfig): 
   const deployments: ValidatedDeployment[] = []
 
   for (const deployment of config.deployments) {
-    if (deployment.backend !== 'antigravity' && deployment.backend !== 'codebuddy') {
-      throw new Error('navigator-subagents: deployment backend must be antigravity or codebuddy')
+    if (deployment.backend !== 'antigravity' && deployment.backend !== 'codebuddy' && deployment.backend !== 'acp') {
+      throw new Error('navigator-subagents: deployment backend must be antigravity, codebuddy or acp')
     }
     const validated = validateDeployment(deployment, names)
     deployments.push(validated)
@@ -62,6 +63,10 @@ export function registerSubagents(ctx: Context, config: SubagentAdapterConfig): 
     for (const deployment of deployments) {
       const provider = deployment.backend === 'antigravity'
         ? new AntigravitySubagentProvider(
+          ctx, deployment, config, timing.timeoutMs, timing.disposeGraceMs, activeRuns,
+        )
+        : deployment.backend === 'acp'
+        ? new AcpSubagentProvider(
           ctx, deployment, config, timing.timeoutMs, timing.disposeGraceMs, activeRuns,
         )
         : new CodeBuddySubagentProvider(

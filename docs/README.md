@@ -12,6 +12,8 @@ Navigator 是 Native Client（`Cyrene-Client`）的内置 Harness 组件，基�
 | [Repository lifecycle](REPOSITORY-LIFECYCLE.md) | Repository delivery conventions / 仓库交付约定 |
 | [Harness adoption](adoption/README.md) | DeepSeek Harness integration, compatibility & boundaries / DeepSeek Harness 接入、兼容性与边界 |
 | [Codex import](import/README.md) | Archive and explicit Continue semantics / 归档及显式 Continue |
+| [Native CLI adapter compatibility](cli-adapter-compatibility.md) | Shared ACP launch, permission, telemetry, and acceptance rules / 共享 ACP 启动、权限、遥测与验收规则 |
+| [Native subagent connectors](subagent-connectors.md) | Provider-specific native CLI behavior and runtime boundaries / 原生 CLI 提供方行为与运行边界 |
 | [Operations](operations/README.md) | Review-only service packaging and deployment gates / 仅供审查的服务打包与部署门槛 |
 | [Logging & Error Standards](logging-and-errors.md) | Cross-repository logging, error codes, and diagnostics specification / 跨仓日志、错误码与诊断规范 |
 

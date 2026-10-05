@@ -41,7 +41,7 @@ const writeFrame = async value => {
 
 const argv = process.argv.slice(2);
 const codebuddy = argv.includes('--acp');
-record({ kind: 'start', pid: process.pid, backend: codebuddy ? 'codebuddy' : 'antigravity', argv });
+record({ kind: 'start', pid: process.pid, backend: codebuddy ? 'acp' : 'antigravity', argv });
 
 if (!codebuddy) {
   const conversationId = 'agy-conversation-fixture';
@@ -67,6 +67,15 @@ if (!codebuddy) {
     }
     if (mode === 'ag-oversized') {
       process.stdout.write('x'.repeat(1_048_577) + '\n');
+      return;
+    }
+    if (mode === 'ag-output-limit') {
+      for (const prefix of ['a', 'b', 'c']) {
+        await writeFrame({ event: 'step_update', step_update: {
+          conversation_id: conversationId, step_type: 'agent_response', state: 'ACTIVE',
+          text_delta: prefix.repeat(768 * 1024),
+        } });
+      }
       return;
     }
     const status = mode.startsWith('ag-error') ? 'ERROR' : 'SUCCESS';
@@ -118,6 +127,11 @@ if (!codebuddy) {
                 sessionId: 'codebuddy-conversation-fixture',
                 update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'completed independent work' } },
               } });
+            } else if (outcome?.outcome === 'selected' && outcome.optionId === 'once') {
+              await writeFrame({ jsonrpc: '2.0', method: 'session/update', params: {
+                sessionId: 'codebuddy-conversation-fixture',
+                update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'approved fixture work' } },
+              } });
             }
             await respond(completedRequestId, { stopReason: outcome?.outcome === 'selected' ? 'end_turn' : 'cancelled' });
           })().catch(() => process.exit(33));
@@ -126,11 +140,15 @@ if (!codebuddy) {
       return;
     }
     record({ kind: 'rpc', method: request.method, params: request.params ?? {} });
-    if (request.method === 'initialize') {
-      const authMethods = mode === 'cb-auth-advertised'
+    if (request.method === 'session/cancel') {
+      record({ kind: 'cancel-notification', sessionId: request.params?.sessionId });
+    } else if (request.method === 'initialize') {
+      const protocolVersion = mode === 'acp-version-mismatch' ? 2 : 1;
+      const authMethods = mode === 'cb-auth-advertised' || mode === 'acp-generic'
         ? [{ id: 'native-login', name: 'Native CLI login' }]
         : [];
-      void respond(request.id, { protocolVersion: 1, agentCapabilities: { loadSession: true }, authMethods });
+      record({ kind: 'initialize-response', protocolVersion, authMethods });
+      void respond(request.id, { protocolVersion, agentCapabilities: { loadSession: true }, authMethods });
     } else if (request.method === 'session/new') {
       if (mode === 'cb-auth-required-session') {
         void writeFrame({ jsonrpc: '2.0', id: request.id, error: {
@@ -147,7 +165,7 @@ if (!codebuddy) {
       } else {
         void respond(request.id, {});
       }
-    } else if (request.method === 'session/prompt' && mode.startsWith('cb-permission')) {
+    } else if (request.method === 'session/prompt' && (mode.startsWith('cb-permission') || mode === 'acp-generic')) {
       promptRequestId = request.id;
       void writeFrame({ jsonrpc: '2.0', id: 'fixture-permission', method: 'session/request_permission', params: {
         sessionId: 'codebuddy-conversation-fixture',
@@ -158,17 +176,46 @@ if (!codebuddy) {
           ...(mode === 'cb-permission-no-reject' ? [] : [{ optionId: 'reject', kind: 'reject_once' }]),
         ],
       } });
+    } else if (request.method === 'session/prompt' && mode === 'cb-cancel') {
+      promptRequestId = request.id;
+      record({
+        kind: 'cancel-ready',
+        pid: process.pid,
+        sessionId: 'codebuddy-conversation-fixture',
+        promptActive: true,
+      });
+    } else if (request.method === 'session/prompt' && mode === 'cb-malformed-prompt') {
+      process.stdout.write('{"jsonrpc":"2.0","id":' + JSON.stringify(request.id) + ',"result":{"secret":"MALFORMED_JSON_FIXTURE_SECRET",}}}\n');
+    } else if (request.method === 'session/prompt' && mode === 'cb-output-limit') {
+      void (async () => {
+        for (const prefix of ['a', 'b', 'c']) {
+          await writeFrame({ jsonrpc: '2.0', method: 'session/update', params: {
+            sessionId: 'codebuddy-conversation-fixture',
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: prefix.repeat(768 * 1024) } },
+          } });
+        }
+      })().catch(() => process.exit(32));
     } else if (request.method === 'session/prompt' && mode === 'cb-auth-required-prompt') {
       void writeFrame({ jsonrpc: '2.0', id: request.id, error: {
         code: -32000, message: 'auth_required at /private token=mocksecret', data: { token: 'mocksecret' },
       } });
     } else if (request.method === 'session/prompt') {
       void (async () => {
-        if (mode === 'cb-flat-tools') {
-          for (const [sessionUpdate, status] of [['tool_call', 'pending'], ['tool_call_update', 'in_progress'], ['tool_call_update', 'completed']]) {
+        if (mode === 'cb-flat-tools' || mode === 'acp-flat-tools') {
+          const toolUpdates = mode === 'acp-flat-tools'
+            ? [
+              ['tool_call', 'pending'],
+              ['tool_call_update', undefined],
+              ['tool_call_update', 'pending'],
+              ['tool_call_update', 'in_progress'],
+              ['tool_call_update', 'in_progress'],
+              ['tool_call_update', 'completed'],
+            ]
+            : [['tool_call', 'pending'], ['tool_call_update', 'in_progress'], ['tool_call_update', 'completed']];
+          for (const [sessionUpdate, status] of toolUpdates) {
             await writeFrame({ jsonrpc: '2.0', method: 'session/update', params: {
               sessionId: 'codebuddy-conversation-fixture',
-              update: { sessionUpdate, toolCallId: 'fixture-tool', kind: 'read', status },
+              update: { sessionUpdate, toolCallId: 'fixture-tool', kind: 'read', ...(status === undefined ? {} : { status }) },
             } });
           }
         }
@@ -238,6 +285,20 @@ async function waitForProcessExit(pid, timeoutMs = 3_000) {
   assert.fail(`fixture process ${pid} was not reaped`);
 }
 
+async function settlesWithin(promise, timeoutMs, description) {
+  const deadline = new AbortController();
+  try {
+    return await Promise.race([
+      promise,
+      delay(timeoutMs, undefined, { signal: deadline.signal }).then(() => {
+        throw new Error(`${description} did not settle within ${timeoutMs} ms`);
+      }),
+    ]);
+  } finally {
+    deadline.abort();
+  }
+}
+
 function startRequest(parentSessionId, cwd, signal) {
   return {
     parent: { session: { id: parentSessionId, header: { cwd } } },
@@ -283,10 +344,13 @@ async function fixtureHost(t, backend, mode, overrides = {}) {
   };
   const events = [];
   const permissionRequests = [];
+  const providerName = overrides.providerName ?? backend;
   const disposeRegistration = registerSubagents(fakeHostContext, {
     deployments: [{
       backend,
+      ...(overrides.providerName === undefined ? {} : { providerName: overrides.providerName }),
       command,
+      ...(overrides.argv === undefined ? {} : { argv: overrides.argv }),
       cwd: directory,
       envRefs: {
         FIXTURE_MODE: FIXTURE_MODE_ENV,
@@ -319,7 +383,7 @@ async function fixtureHost(t, backend, mode, overrides = {}) {
     events,
     logPath,
     permissionRequests,
-    provider: providers.get(backend),
+    provider: providers.get(providerName),
   };
 }
 
@@ -332,6 +396,14 @@ async function completeRun(provider, cwd, parentSessionId = 'fixture-parent') {
   } finally {
     await run.dispose();
   }
+}
+
+function assertOutputLimitResult(result) {
+  assert.equal(result.stopReason, 'error');
+  assert.match(result.diagnostic, /NATIVE_OUTPUT_LIMIT/u);
+  const output = result.output.filter(part => part.type === 'text').map(part => part.text).join('');
+  assert.equal(output, 'a'.repeat(768 * 1024) + 'b'.repeat(768 * 1024));
+  assert.ok(Buffer.byteLength(output, 'utf8') <= 2 * 1024 * 1024);
 }
 
 test('Antigravity stream-json emits bounded deltas and resumes the associated conversation', {
@@ -361,6 +433,12 @@ test('Antigravity stream-json emits bounded deltas and resumes the associated co
   assert.deepEqual(host.events.filter(event => event.type === 'assistant-delta').map(event => event.text), ['hel', 'lo', 'hel', 'lo']);
   assert.ok(host.events.every(event => event.parentSessionId === 'fixture-parent'));
   assert.equal(host.events.some(event => event.phase === 'cancelled'), false);
+});
+
+test('Antigravity output overflow retains only prior valid text chunks', { timeout: 20_000 }, async t => {
+  const host = await fixtureHost(t, 'antigravity', 'ag-output-limit');
+  const { result } = await completeRun(host.provider, host.cwd);
+  assertOutputLimitResult(result);
 });
 
 test('Antigravity native error is surfaced and cancellation reaps its child', {
@@ -396,7 +474,7 @@ for (const [mode, label] of [['ag-malformed', 'malformed'], ['ag-oversized', 'ov
     try {
       const result = await run.result;
       assert.equal(result.stopReason, 'error');
-      assert.match(result.diagnostic, /byte limit|malformed|incomplete/iu);
+      assert.match(result.diagnostic, /NATIVE_INVALID_JSON|NATIVE_FRAME_LIMIT/u);
     } finally {
       await run.dispose();
     }
@@ -453,6 +531,12 @@ test('CodeBuddy ACP reports standard flat tool execution statuses', { timeout: 2
   assert.deepEqual(host.events.filter(event => event.phase === 'tool').map(event => event.status), ['pending', 'in_progress', 'completed']);
 });
 
+test('CodeBuddy ACP output overflow retains only prior valid text chunks', { timeout: 20_000 }, async t => {
+  const host = await fixtureHost(t, 'codebuddy', 'cb-output-limit');
+  const { result } = await completeRun(host.provider, host.cwd);
+  assertOutputLimitResult(result);
+});
+
 test('CodeBuddy ACP fails closed without a native reject-once option', { timeout: 20_000 }, async t => {
   const host = await fixtureHost(t, 'codebuddy', 'cb-permission-no-reject');
   const { result } = await completeRun(host.provider, host.cwd);
@@ -460,6 +544,132 @@ test('CodeBuddy ACP fails closed without a native reject-once option', { timeout
   const log = await readLog(host.logPath);
   assert.deepEqual(log.find(entry => entry.kind === 'permission-result').outcome, { outcome: 'cancelled' });
   assert.equal(log.some(entry => entry.kind === 'continued-after-denial'), false);
+});
+
+test('CodeBuddy ACP dispose cancels an active prompt and reaps its child', {
+  timeout: 20_000,
+}, async t => {
+  const host = await fixtureHost(t, 'codebuddy', 'cb-cancel', { timeoutMs: 60_000 });
+  const unhandled = [];
+  const onUnhandled = reason => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  const controller = new AbortController();
+  let run;
+  try {
+    run = await host.provider.start(startRequest('dispose-parent', host.cwd, controller.signal));
+    const ready = await waitForLog(host.logPath, entries => entries.some(entry => entry.kind === 'cancel-ready'));
+    const active = ready.find(entry => entry.kind === 'cancel-ready');
+    assert.equal(active.promptActive, true);
+    assert.equal(active.sessionId, 'codebuddy-conversation-fixture');
+
+    const resultPromise = run.result;
+    const [result] = await settlesWithin(
+      Promise.all([resultPromise, run.dispose()]),
+      1_000,
+      'CodeBuddy ACP dispose cancellation',
+    );
+    assert.equal(result.stopReason, 'aborted');
+    assert.ok(host.events.some(event => event.phase === 'cancelled' && event.status === 'aborted'));
+    await waitForProcessExit(active.pid);
+    await delay(0);
+    assert.deepEqual(unhandled, []);
+  } finally {
+    controller.abort(new Error('fixture cleanup cancellation'));
+    if (run) await run.dispose();
+    process.off('unhandledRejection', onUnhandled);
+  }
+});
+
+test('CodeBuddy ACP observes an independent AbortController abort after prompt readiness', {
+  timeout: 20_000,
+}, async t => {
+  const host = await fixtureHost(t, 'codebuddy', 'cb-cancel', { timeoutMs: 60_000 });
+  const unhandled = [];
+  const onUnhandled = reason => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  const controller = new AbortController();
+  let run;
+  try {
+    run = await host.provider.start(startRequest('abort-parent', host.cwd, controller.signal));
+    const ready = await waitForLog(host.logPath, entries => entries.some(entry => entry.kind === 'cancel-ready'));
+    const active = ready.find(entry => entry.kind === 'cancel-ready');
+    assert.equal(active.promptActive, true);
+    assert.equal(active.sessionId, 'codebuddy-conversation-fixture');
+
+    const resultPromise = run.result;
+    controller.abort(new Error('fixture cancellation'));
+    const [result] = await settlesWithin(
+      Promise.all([resultPromise, run.dispose()]),
+      1_000,
+      'CodeBuddy ACP AbortController cancellation',
+    );
+    assert.equal(result.stopReason, 'aborted');
+    assert.ok(host.events.some(event => event.phase === 'cancelled' && event.status === 'aborted'));
+    await waitForProcessExit(active.pid);
+    await delay(0);
+    assert.deepEqual(unhandled, []);
+  } finally {
+    controller.abort(new Error('fixture cleanup cancellation'));
+    if (run) await run.dispose();
+    process.off('unhandledRejection', onUnhandled);
+  }
+});
+
+test('disposing generic ACP aborts a pending host approval independently of the caller signal', {
+  timeout: 20_000,
+}, async t => {
+  let markApprovalStarted;
+  const approvalStarted = new Promise(resolve => { markApprovalStarted = resolve; });
+  let approvalSignal;
+  let approvalSignalAborted = false;
+  const host = await fixtureHost(t, 'acp', 'cb-permission', {
+    providerName: 'fixture-acp-pending-approval',
+    argv: ['--acp'],
+    timeoutMs: 60_000,
+    requestPermission: request => {
+      approvalSignal = request.signal;
+      markApprovalStarted();
+      return new Promise(resolve => {
+        const onAbort = () => {
+          approvalSignalAborted = true;
+          resolve('deny');
+        };
+        if (request.signal.aborted) onAbort();
+        else request.signal.addEventListener('abort', onAbort, { once: true });
+      });
+    },
+  });
+  const caller = new AbortController();
+  const unhandled = [];
+  const onUnhandled = reason => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  let run;
+  try {
+    run = await host.provider.start(startRequest('pending-approval-parent', host.cwd, caller.signal));
+    await settlesWithin(approvalStarted, 1_000, 'generic ACP host approval request');
+    assert.ok(approvalSignal);
+    assert.equal(caller.signal.aborted, false);
+
+    const resultPromise = run.result;
+    const [result] = await settlesWithin(
+      Promise.all([resultPromise, run.dispose()]),
+      1_000,
+      'generic ACP pending approval disposal',
+    );
+    assert.equal(result.stopReason, 'aborted');
+    assert.equal(approvalSignalAborted, true);
+    assert.equal(approvalSignal.aborted, true);
+    assert.equal(caller.signal.aborted, false);
+    assert.ok(host.events.some(event => event.phase === 'cancelled' && event.status === 'aborted'));
+    const start = (await readLog(host.logPath)).find(entry => entry.kind === 'start');
+    await waitForProcessExit(start.pid);
+    await delay(0);
+    assert.deepEqual(unhandled, []);
+  } finally {
+    caller.abort(new Error('fixture cleanup cancellation'));
+    if (run) await run.dispose();
+    process.off('unhandledRejection', onUnhandled);
+  }
 });
 
 test('CodeBuddy ACP resumes only when loadSession is advertised', {
@@ -557,6 +767,96 @@ test('CodeBuddy ACP reports auth_required from prompt without exposing RPC data 
   }
 });
 
+test('generic ACP registers its explicit provider, accepts native auth, and approves one request', {
+  timeout: 20_000,
+}, async t => {
+  const providerName = 'fixture-generic-acp';
+  const host = await fixtureHost(t, 'acp', 'acp-generic', {
+    providerName,
+    argv: ['--acp', '--model', 'fixture-model', '--agent', 'fixture-agent'],
+    requestPermission: async () => 'allow-once',
+  });
+  assert.ok(host.provider);
+  assert.equal(host.provider.name, providerName);
+
+  const run = await host.provider.start(startRequest('generic-acp-parent', host.cwd, new AbortController().signal));
+  try {
+    const result = await run.result;
+    assert.equal(result.stopReason, 'completed');
+    assert.deepEqual(result.output, [{ type: 'text', text: 'approved fixture work' }]);
+    assert.equal(host.permissionRequests.length, 1);
+    assert.equal(host.permissionRequests[0].backend, 'acp');
+    assert.equal(host.permissionRequests[0].providerName, providerName);
+    assert.equal(host.permissionRequests[0].parentSessionId, 'generic-acp-parent');
+    assert.equal(host.permissionRequests[0].tool, 'edit');
+    assert.deepEqual(host.permissionRequests[0].rawInput, { path: 'out.txt' });
+    assert.ok(host.events.some(event => event.backend === 'acp'));
+    assert.ok(host.events.every(event => event.providerName === providerName && event.backend === 'acp'));
+    assert.ok(host.events.some(event => event.type === 'permission' && event.decision === 'approved'));
+
+    const log = await readLog(host.logPath);
+    const start = log.find(entry => entry.kind === 'start');
+    assert.equal(start.backend, 'acp');
+    assert.deepEqual(start.argv, ['--acp', '--model', 'fixture-model', '--agent', 'fixture-agent']);
+    assert.equal(start.argv.includes('--permission-mode'), false);
+    assert.equal(start.argv.includes('--acp-transport'), false);
+    assert.deepEqual(log.find(entry => entry.kind === 'initialize-response').authMethods, [
+      { id: 'native-login', name: 'Native CLI login' },
+    ]);
+    assert.deepEqual(log.filter(entry => entry.kind === 'rpc').map(entry => entry.method), [
+      'initialize', 'session/new', 'session/prompt',
+    ]);
+    assert.deepEqual(log.find(entry => entry.kind === 'permission-result').outcome, {
+      outcome: 'selected', optionId: 'once',
+    });
+  } finally {
+    await run.dispose();
+  }
+});
+
+test('generic ACP ignores tool updates without status and duplicate statuses', { timeout: 20_000 }, async t => {
+  const host = await fixtureHost(t, 'acp', 'acp-flat-tools', {
+    providerName: 'fixture-acp-flat-tools',
+    argv: ['--acp'],
+  });
+  const { result } = await completeRun(host.provider, host.cwd);
+  assert.equal(result.stopReason, 'completed');
+  assert.deepEqual(host.events.filter(event => event.phase === 'tool').map(event => event.status), [
+    'pending', 'in_progress', 'completed',
+  ]);
+});
+
+test('generic ACP rejects an incompatible initialize protocol version', { timeout: 20_000 }, async t => {
+  const host = await fixtureHost(t, 'acp', 'acp-version-mismatch', {
+    providerName: 'fixture-acp-version-mismatch',
+    argv: ['--acp'],
+  });
+  await assert.rejects(
+    host.provider.start(startRequest('version-parent', host.cwd, new AbortController().signal)),
+    /protocol|version/iu,
+  );
+  const methods = (await readLog(host.logPath))
+    .filter(entry => entry.kind === 'rpc')
+    .map(entry => entry.method);
+  assert.deepEqual(methods, ['initialize']);
+});
+
+test('generic ACP reports a fixed malformed-frame code without exposing raw JSON', { timeout: 20_000 }, async t => {
+  const host = await fixtureHost(t, 'acp', 'cb-malformed-prompt', {
+    providerName: 'fixture-acp-malformed',
+    argv: ['--acp'],
+  });
+  const run = await host.provider.start(startRequest('malformed-parent', host.cwd, new AbortController().signal));
+  try {
+    const result = await run.result;
+    assert.equal(result.stopReason, 'error');
+    assert.match(result.diagnostic, /NATIVE_INVALID_JSON/u);
+    assert.doesNotMatch(result.diagnostic, /MALFORMED_JSON_FIXTURE_SECRET/u);
+  } finally {
+    await run.dispose();
+  }
+});
+
 test('native deployment validation rejects shell-like or unsupported argv and credential forwarding', () => {
   const providers = new Map();
   const fakeContext = {
@@ -569,6 +869,15 @@ test('native deployment validation rejects shell-like or unsupported argv and cr
   assert.throws(() => registerSubagents(fakeContext, {
     deployments: [{ backend: 'codebuddy', command: 'codebuddy', envRefs: { API_KEY: 'CYRENE_API_KEY' } }],
   }), /credential|secret|token|key/u);
+  for (const argv of [
+    ['--dangerously-skip-permissions'],
+    ['--permission-mode', 'bypass'],
+    ['--acp-transport', 'stdio'],
+  ]) {
+    assert.throws(() => registerSubagents(fakeContext, {
+      deployments: [{ backend: 'acp', command: 'approved-wrapper', argv }],
+    }), /not allowed/u);
+  }
   assert.equal(providers.size, 0);
 });
 
@@ -620,7 +929,7 @@ test('Antigravity timeout produces an explicit cannot-execute receipt and reaps 
   const host = await fixtureHost(t, 'antigravity', 'ag-timeout', { timeoutMs: 100 });
   const { result } = await completeRun(host.provider, host.cwd);
   assert.equal(result.stopReason, 'error');
-  assert.match(result.diagnostic, /NATIVE_RESPONSE_TIMEOUT.*无法执行/u);
+  assert.match(result.diagnostic, /SUBAGENT_TIMEOUT.*无法执行/u);
   assert.equal(host.events.find(event => event.type === 'blocked')?.reasonCode, 'SUBAGENT_TIMEOUT');
   const start = (await readLog(host.logPath)).find(entry => entry.kind === 'start');
   await waitForProcessExit(start.pid);

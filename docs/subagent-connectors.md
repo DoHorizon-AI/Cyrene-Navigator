@@ -244,3 +244,28 @@ Protocol references / 协议资料：
 - [Antigravity permissions](https://antigravity.google/docs/permissions?tab=cli)
 - [CodeBuddy ACP](https://www.codebuddy.ai/docs/cli/acp)
 - [CodeBuddy CLI reference](https://www.codebuddy.ai/docs/cli/cli-reference)
+
+## Generic ACP deployments / 通用 ACP 部署
+
+`backend: "acp"` reuses the shared stdio session, approval and cancellation implementation. Generic deployments do not receive CodeBuddy's launch or permission flags. Configure an official ACP executable or a host-approved wrapper; an optional first `acp` or `--acp` transport selector and static model/agent selectors are accepted. Other flags, credential forwarding and runtime permission bypass remain rejected. Native CLI login and sandbox setup belong to the execution host.
+
+`backend: "acp"` 复用共享 stdio 会话、审批和取消实现，不自动添加 CodeBuddy 的启动或权限参数。请配置官方 ACP 可执行程序或宿主审核的启动包装器；可使用首项 `acp` / `--acp` 及静态 model/agent 选择参数。其他参数、凭据转发和运行时权限绕过仍被拒绝，原生登录和沙箱配置由执行宿主管理。
+
+```json
+{
+  "deployments": [{
+    "backend": "acp",
+    "providerName": "official-cli",
+    "command": "/path/to/approved-acp-launcher",
+    "argv": []
+  }]
+}
+```
+
+Shared wire failures expose fixed `NATIVE_*` codes, with byte/frame counts for stream-limit diagnosis, while retaining partial assistant output. Raw protocol payloads and native error messages are excluded from diagnostics. Duplicate tool statuses and streaming input updates are suppressed in progress events. Bounds remain unchanged; an unspecified historical failure is not retroactively labelled as a stream-limit fault.
+
+共享协议故障输出固定 `NATIVE_*` 错误码，流限额故障提供字节与帧计数，并保留已收集的部分输出。诊断不包含原始协议内容或原生错误正文；进度去除重复工具状态和参数分片。限额保持有界，旧运行中原因未知的错误不会被追溯认定为超限。
+
+See [CLI compatibility and issue ledger](cli-adapter-compatibility.md) for evidence categories, remaining vendor limitations and acceptance requirements for new tools. Generic ACP fixture success is separate from native support claims for a new CLI.
+
+其他 CLI 的问题记录、证据分类与接入验收要求见[兼容性与问题清单](cli-adapter-compatibility.md)。通用 ACP 模拟测试通过，不等于某个新 CLI 的真实运行支持已经验收。
