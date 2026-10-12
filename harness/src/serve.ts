@@ -32,11 +32,20 @@ import type { SubagentAdapterConfig, SubagentAdapterEvent } from './subagents/ty
 import { WorkflowsClient } from './workflows/store.js';
 import { registerWorkflowRuntime } from './workflows/runtime.js';
 import { registerCloudConnections, validateCloudConnectionConfig } from './integrations/cloud-connections.js';
+import {
+  registerExchangeIssueTools,
+  resolveExchangeUserBearerProvider,
+} from './integrations/exchange-integration.js';
+import type { TrustedUserBearerProvider } from './integrations/exchange-integration.js';
 
 export interface CreateExecutorAppOptions {
   readonly persistenceUrl?: string;
   readonly workspaceId?: string;
   readonly exchangeUrl?: string;
+  readonly exchangeIntegrationUrl?: string;
+  readonly exchangeIntegrationWorkspaceId?: string;
+  readonly exchangeIntegrationUserBearerProvider?: TrustedUserBearerProvider;
+  readonly allowSingleSessionExchangeCliEnvironmentBearer?: boolean;
   readonly model?: string;
   readonly pluginsDir?: string;
   readonly watchPlugins?: boolean;
@@ -199,6 +208,24 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
     });
     await registerToolProviders(ctx, {
       bridge: workAssistantBridge,
+      taskIdForSession: sessionId => executor.activeTaskId(sessionId),
+    });
+  }
+
+  const exchangeIntegrationUrl = options.exchangeIntegrationUrl ?? process.env.CYRENE_EXCHANGE_INTEGRATION_URL;
+  if (exchangeIntegrationUrl) {
+    if (!workspaceId) throw new Error('Exchange issue tools require a configured Workspace');
+    if (!workAssistantBridge) throw new Error('Exchange issue tools require the durable Navigator approval bridge');
+    await registerExchangeIssueTools(ctx, {
+      baseUrl: exchangeIntegrationUrl,
+      workspaceId: options.exchangeIntegrationWorkspaceId
+        ?? process.env.CYRENE_EXCHANGE_INTEGRATION_WORKSPACE_ID
+        ?? workspaceId,
+      trustedUserBearerProvider: resolveExchangeUserBearerProvider(
+        options.exchangeIntegrationUserBearerProvider,
+        options.allowSingleSessionExchangeCliEnvironmentBearer === true,
+      ),
+      approvalBridge: workAssistantBridge,
       taskIdForSession: sessionId => executor.activeTaskId(sessionId),
     });
   }

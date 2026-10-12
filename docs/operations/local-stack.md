@@ -49,8 +49,27 @@ node "$CYRENE_DSH_ROOT/node_modules/typescript/bin/tsc" -p harness/tsconfig.json
 export CYRENE_EXCHANGE_URL="https://exchange.example.invalid"
 export CYRENE_EXCHANGE_TOKEN="<provided by the secret manager>"
 export CYRENE_HARNESS_MODEL="<approved model id>"
+# Optional: typed issue tools for this single-user local CLI session.
+export CYRENE_EXCHANGE_INTEGRATION_URL="https://exchange.example.invalid"
+export CYRENE_EXCHANGE_INTEGRATION_SESSION_ID="<exact active DSH session id>"
+export CYRENE_EXCHANGE_INTEGRATION_USER_TOKEN="<current first-party user bearer>"
 uv run python scripts/serve-local.py --state-dir "$HOME/.local/share/cyrene-navigator"
 ```
+
+The launcher binds this Bearer to the exact configured DSH session and
+Workspace. It reads the token for each tool call and sends it only to
+Exchange's user API. Keep it separate from `CYRENE_EXCHANGE_TOKEN`, which
+authenticates model inference. Multi-user and cloud hosts must inject a
+session-bound `trustedUserBearerProvider`; there is no process-token fallback.
+No first-party session Control Bridge is implemented or verified (`NOT_RUN`),
+so this CLI option requires an externally supplied current-user Bearer. The
+CLI never writes it to Navigator's database.
+
+launcher 会将此 Bearer 绑定到精确配置的 DSH Session 与 Workspace。token 在每次工具调用时读取，
+且只发送到 Exchange 用户 API。它必须与用于模型推理认证的 `CYRENE_EXCHANGE_TOKEN` 分开。
+多用户与云宿主必须注入绑定到 Session 的 `trustedUserBearerProvider`；系统没有进程令牌回退。
+first-party session Control Bridge 尚未实现或验证（`NOT_RUN`），因此此 CLI 选项要求外部提供
+当前用户 Bearer。CLI 不会把它写入 Navigator 数据库。
 
 The process prints one JSON line with the Web Host, persistence, and executor
 URLs after all three listeners pass readiness probes. Child logs are discarded

@@ -75,6 +75,43 @@ jobs:
       CI: 'true'
     steps:
       - uses: actions/checkout@v4
+      - name: Read the pinned Exchange contract source SHA
+        id: exchange-contract-pin
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          lock = json.loads(Path("harness/contracts/exchange-integration-v1.lock.json").read_text())
+          sha = lock["ownerCommitSha"]
+          if not isinstance(sha, str) or re.fullmatch(r"[0-9a-f]{40}", sha) is None:
+              raise SystemExit("Exchange owner merge SHA must be pinned before CI")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"sha={sha}\n")
+          PY
+      - uses: actions/checkout@v4
+        with:
+          repository: DoHorizon-AI/Cyrene-Exchange
+          ref: ${{ steps.exchange-contract-pin.outputs.sha }}
+          path: .ci/exchange-contract
+          persist-credentials: false
+      - name: Verify exact pinned Exchange checkout
+        env:
+          EXCHANGE_CONTRACT_SHA: ${{ steps.exchange-contract-pin.outputs.sha }}
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+
+          root = ".ci/exchange-contract"
+          actual = subprocess.check_output(
+              ["git", "-C", root, "rev-parse", "HEAD"], text=True
+          ).strip()
+          if actual != os.environ["EXCHANGE_CONTRACT_SHA"]:
+              raise SystemExit(f"Exchange source checkout mismatch: {actual}")
+          PY
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -115,6 +152,8 @@ jobs:
           test -d "$RUNNER_TEMP/deepseek-harness"
           test -x "$GITHUB_WORKSPACE/native/target/debug/cyrene-native-host"
       - name: Run real persistence, Rust IPC, Codex import and Web Profile integration
+        env:
+          CYRENE_EXCHANGE_CONTRACT_SOURCE: ${{ github.workspace }}/.ci/exchange-contract
         run: |
           node --test \
             harness/tests/persistence.integration.test.mjs \
@@ -130,6 +169,8 @@ jobs:
             harness/tests/antigravity-boundary.test.mjs \
             harness/tests/antigravity-profile.test.mjs \
             harness/tests/tool-providers.test.mjs \
+            harness/tests/exchange-integration.test.mjs \
+            harness/tests/exchange-integration-contract.tck.test.mjs \
             harness/tests/work-tools.test.mjs \
             harness/tests/workflows.integration.test.mjs \
             harness/tests/cloud-connections.integration.test.mjs \

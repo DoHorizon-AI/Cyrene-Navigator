@@ -25,3 +25,23 @@ export type {
   RemoteMcpProfile,
   StdioMcpProfile,
 } from './cloud-connections.js';
+export {
+  EXCHANGE_ISSUE_CONSUMER_OPERATIONS,
+  EXCHANGE_ISSUE_OPERATION_STATES,
+  EXCHANGE_ISSUE_SNAPSHOT_FRESHNESS,
+  EXCHANGE_ISSUE_STATES,
+  ExchangeIntegrationClient,
+  environmentExchangeUserBearerProvider,
+  registerExchangeIssueTools,
+  resolveExchangeUserBearerProvider,
+} from './exchange-integration.js';
+export type {
+  ExchangeIssueProjection,
+  ExchangeIssueQueryResult,
+  ExchangeIssueSnapshotFreshness,
+  ExchangeIssueState,
+  ExchangeIssueToolOptions,
+  ExchangeOperationProjection,
+  ExchangeOperationState,
+  TrustedUserBearerProvider,
+} from './exchange-integration.js';
