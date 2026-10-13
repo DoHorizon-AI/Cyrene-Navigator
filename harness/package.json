@@ -21,7 +21,8 @@
     "./workflows": "./dist/workflows/index.js",
     "./work-tools": "./dist/work-tools.js",
     "./executor-client": "./dist/executor-client.js",
-    "./tool-providers": "./dist/tool-providers.js"
+    "./tool-providers": "./dist/tool-providers.js",
+    "./exchange-integration": "./dist/integrations/exchange-integration.js"
   },
   "dsh": {
     "bundle": {

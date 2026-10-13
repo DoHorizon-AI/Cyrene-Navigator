@@ -15,6 +15,7 @@ const { values } = parseArgs({
     'plugins-dir': { type: 'string' },
     'watch-plugins': { type: 'boolean', default: true },
     'workspace-id': { type: 'string', default: process.env.CYRENE_WORKSPACE_ID },
+    'single-session-exchange-cli-auth': { type: 'boolean', default: false },
     'test-mode': { type: 'boolean', default: false },
     'test-echo-adapter': { type: 'boolean', default: false },
   },
@@ -23,6 +24,9 @@ const { values } = parseArgs({
 const port = Number(values.port);
 const host = values.host;
 if (!Number.isSafeInteger(port) || port < 0 || port > 65535) throw new TypeError('Invalid executor port');
+if (values['single-session-exchange-cli-auth'] && !['127.0.0.1', 'localhost'].includes(host)) {
+  throw new TypeError('Single-session Exchange CLI auth is limited to a loopback executor');
+}
 
 // Run as standalone process if invoked directly
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
@@ -30,6 +34,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     pluginsDir: values['plugins-dir'],
     watchPlugins: values['watch-plugins'],
     workspaceId: values['workspace-id'],
+    allowSingleSessionExchangeCliEnvironmentBearer: values['single-session-exchange-cli-auth'],
     testMode: values['test-mode'],
     enableTestEchoAdapter: values['test-echo-adapter'],
   }).then(async ({ executor, ctx, pluginsDir }) => {

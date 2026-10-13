@@ -67,10 +67,15 @@ def test_executor_profile_environment_contains_only_declared_references(tmp_path
         "ROUND1_SUBAGENT_TOKEN": "subagent-secret-value",
         "ROUND1_CLOUD_TOKEN": "cloud-secret-value",
         "ROUND1_AZURE_IDENTITY": "identity-secret-value",
+        "CYRENE_EXCHANGE_INTEGRATION_URL": "https://exchange.example.test",
+        "CYRENE_EXCHANGE_INTEGRATION_SESSION_ID": "navigator-session-42",
+        "CYRENE_EXCHANGE_INTEGRATION_USER_TOKEN": "current-user-bearer-value",
         "UNRELATED_SECRET": "must-not-cross-process-boundary",
     }
 
-    forwarded = serve_local._executor_integration_environment(host_environment)
+    forwarded = serve_local._executor_integration_environment(
+        host_environment, workspace_id="round1-workspace"
+    )
 
     assert forwarded["CYRENE_SUBAGENT_CONFIG"] == str(subagent_path.resolve())
     assert forwarded["CYRENE_CLOUD_PROFILE_CONFIG"] == str(cloud_path.resolve())
@@ -78,6 +83,11 @@ def test_executor_profile_environment_contains_only_declared_references(tmp_path
     assert forwarded["ROUND1_SUBAGENT_TOKEN"] == "subagent-secret-value"
     assert forwarded["ROUND1_CLOUD_TOKEN"] == "cloud-secret-value"
     assert forwarded["ROUND1_AZURE_IDENTITY"] == "identity-secret-value"
+    assert forwarded["CYRENE_EXCHANGE_INTEGRATION_URL"] == "https://exchange.example.test"
+    assert forwarded["CYRENE_EXCHANGE_INTEGRATION_SESSION_ID"] == "navigator-session-42"
+    assert forwarded["CYRENE_EXCHANGE_INTEGRATION_WORKSPACE_ID"] == "round1-workspace"
+    assert "CYRENE_EXCHANGE_INTEGRATION_AUTH_MODE" not in forwarded
+    assert forwarded["CYRENE_EXCHANGE_INTEGRATION_USER_TOKEN"] == "current-user-bearer-value"
     assert "ANTIGRAVITY_KEY" not in forwarded
     assert "UNRELATED_SECRET" not in forwarded
 
@@ -99,8 +109,15 @@ def test_executor_profile_environment_contains_only_declared_references(tmp_path
         workspace_id="round1-workspace",
     )
     assert executor_environment["ROUND1_CLOUD_TOKEN"] == "cloud-secret-value"
+    assert (
+        executor_environment["CYRENE_EXCHANGE_INTEGRATION_USER_TOKEN"]
+        == "current-user-bearer-value"
+    )
     assert "UNRELATED_SECRET" not in executor_environment
     assert "ROUND1_CLOUD_TOKEN" not in web_environment
+    assert "CYRENE_EXCHANGE_INTEGRATION_USER_TOKEN" not in web_environment
+    assert "CYRENE_EXCHANGE_INTEGRATION_SESSION_ID" not in web_environment
+    assert "CYRENE_EXCHANGE_INTEGRATION_WORKSPACE_ID" not in web_environment
     assert "CYRENE_SUBAGENT_CONFIG" not in web_environment
 
 
@@ -112,7 +129,8 @@ def test_executor_profile_environment_fails_closed_for_malformed_config(tmp_path
 
     with pytest.raises(ValueError, match="could not be read as valid JSON"):
         serve_local._executor_integration_environment(
-            {"CYRENE_CLOUD_PROFILE_CONFIG": str(config_path)}
+            {"CYRENE_CLOUD_PROFILE_CONFIG": str(config_path)},
+            workspace_id="round1-workspace",
         )
 
 
@@ -120,7 +138,22 @@ def test_workflow_flag_accepts_only_explicit_boolean_values() -> None:
     """The supervisor rejects ambiguous values before starting any child process."""
 
     with pytest.raises(ValueError, match="must be 'true' or 'false'"):
-        serve_local._executor_integration_environment({"CYRENE_WORKFLOWS_ENABLED": "yes"})
+        serve_local._executor_integration_environment(
+            {"CYRENE_WORKFLOWS_ENABLED": "yes"}, workspace_id="round1-workspace"
+        )
+
+
+def test_exchange_cli_bearer_requires_a_trusted_single_session_binding() -> None:
+    """The local supervisor rejects a process Bearer with no explicit DSH session."""
+
+    with pytest.raises(ValueError, match="explicit trusted DSH session binding"):
+        serve_local._executor_integration_environment(
+            {
+                "CYRENE_EXCHANGE_INTEGRATION_URL": "https://exchange.example.test",
+                "CYRENE_EXCHANGE_INTEGRATION_USER_TOKEN": "bearer-must-not-be-forwarded",
+            },
+            workspace_id="round1-workspace",
+        )
 
 
 def test_generated_owner_is_harness_writer_and_custom_owner_must_opt_in(tmp_path: Path) -> None:

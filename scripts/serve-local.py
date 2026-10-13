@@ -132,7 +132,9 @@ def main() -> int:
         parser.error("--host must resolve to an IPv4 listener address")
 
     try:
-        executor_integration_environment = _executor_integration_environment(os.environ)
+        executor_integration_environment = _executor_integration_environment(
+            os.environ, workspace_id=args.workspace_id
+        )
     except (OSError, ValueError) as error:
         parser.error(str(error))
 
@@ -239,20 +241,23 @@ def main() -> int:
                 node=args.node,
                 integration_environment=executor_integration_environment,
             )
+            executor_command = [
+                args.node,
+                str(repository / "scripts" / "serve-executor.mjs"),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "0",
+                "--plugins-dir",
+                str(plugins_dir),
+                "--workspace-id",
+                args.workspace_id,
+            ]
+            if "CYRENE_EXCHANGE_INTEGRATION_SESSION_ID" in executor_integration_environment:
+                executor_command.append("--single-session-exchange-cli-auth")
             executor = _start_child(
                 "executor",
-                [
-                    args.node,
-                    str(repository / "scripts" / "serve-executor.mjs"),
-                    "--host",
-                    "127.0.0.1",
-                    "--port",
-                    "0",
-                    "--plugins-dir",
-                    str(plugins_dir),
-                    "--workspace-id",
-                    args.workspace_id,
-                ],
+                executor_command,
                 cwd=repository,
                 env=executor_env,
                 secrets_to_check=(session_token, executor_token),
@@ -636,8 +641,10 @@ def _executor_child_environment(
     return environment
 
 
-def _executor_integration_environment(environment: Mapping[str, str]) -> dict[str, str]:
-    """Forward host integration config paths and only their declared secret references."""
+def _executor_integration_environment(
+    environment: Mapping[str, str], *, workspace_id: str
+) -> dict[str, str]:
+    """Forward fixed Product config and only declared integration secret references."""
 
     result: dict[str, str] = {}
     workflows_enabled = environment.get("CYRENE_WORKFLOWS_ENABLED")
@@ -645,6 +652,32 @@ def _executor_integration_environment(environment: Mapping[str, str]) -> dict[st
         if workflows_enabled not in {"true", "false"}:
             raise ValueError("CYRENE_WORKFLOWS_ENABLED must be 'true' or 'false'")
         result["CYRENE_WORKFLOWS_ENABLED"] = workflows_enabled
+
+    integration_url = environment.get("CYRENE_EXCHANGE_INTEGRATION_URL")
+    if integration_url is not None:
+        if not integration_url.strip():
+            raise ValueError("CYRENE_EXCHANGE_INTEGRATION_URL must name an Exchange API origin")
+        result["CYRENE_EXCHANGE_INTEGRATION_URL"] = integration_url
+
+    trusted_session_id = environment.get("CYRENE_EXCHANGE_INTEGRATION_SESSION_ID")
+    user_token = environment.get("CYRENE_EXCHANGE_INTEGRATION_USER_TOKEN")
+    if user_token is not None and not trusted_session_id:
+        raise ValueError("the Exchange CLI Bearer requires an explicit trusted DSH session binding")
+    if trusted_session_id:
+        if not _WORKSPACE_RE.fullmatch(trusted_session_id):
+            raise ValueError("CYRENE_EXCHANGE_INTEGRATION_SESSION_ID is invalid")
+        if not integration_url:
+            raise ValueError(
+                "Exchange CLI session binding requires CYRENE_EXCHANGE_INTEGRATION_URL"
+            )
+        if not _WORKSPACE_RE.fullmatch(workspace_id):
+            raise ValueError("the Exchange CLI Workspace binding is invalid")
+        result["CYRENE_EXCHANGE_INTEGRATION_SESSION_ID"] = trusted_session_id
+        result["CYRENE_EXCHANGE_INTEGRATION_WORKSPACE_ID"] = workspace_id
+        if user_token is not None:
+            if not user_token.strip():
+                raise ValueError("CYRENE_EXCHANGE_INTEGRATION_USER_TOKEN cannot be empty")
+            result["CYRENE_EXCHANGE_INTEGRATION_USER_TOKEN"] = user_token
 
     config_names = ("CYRENE_SUBAGENT_CONFIG", "CYRENE_CLOUD_PROFILE_CONFIG")
     for config_name in config_names:
