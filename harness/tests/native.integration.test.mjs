@@ -4,6 +4,7 @@
 // │ 模块职责：验证真实 Rust 宿主和受监督 stdio 故障路径。                │
 // └─────────────────────────────────────────────────────────────────────┘
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { existsSync, readFileSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -172,6 +173,52 @@ test('real Rust host rejects invalid arguments and a missing executable', async 
   }
 });
 
+test('a broken request pipe reports the normalized native host exit', async () => {
+  const stdin = new EventEmitter();
+  const stdout = new EventEmitter();
+  let outcome;
+  let resolveDone;
+  const done = new Promise(resolve => { resolveDone = resolve; });
+  const child = {
+    stdin,
+    stdout,
+    done,
+    terminate() {
+      if (outcome) return;
+      outcome = { exitCode: 17, signal: null };
+      resolveDone(outcome);
+    },
+    async waitForExit() { return true; },
+  };
+  stdin.destroyed = false;
+  stdin.end = () => { stdin.destroyed = true; };
+  stdin.write = value => {
+    const frame = JSON.parse(value);
+    if (frame.method === 'hello') {
+      stdout.emit('data', Buffer.from(JSON.stringify({
+        version: 1, id: frame.id, result: { protocol_version: 1 },
+      }) + '\n'));
+      return true;
+    }
+    stdin.destroyed = true;
+    stdin.emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+    return false;
+  };
+  const ctx = { subprocess: { spawn: () => child } };
+
+  await assert.rejects(
+    runNativeRequest(
+      ctx,
+      { binary: 'native-matrix-host', timeoutMs: 2_000, cancelGraceMs: 100, maxResponseBytes: 1_024 },
+      process.cwd(),
+      'fixture_operation',
+      {},
+      new AbortController().signal,
+    ),
+    /Native host exited before a result \(17\)/u,
+  );
+});
+
 test('cancelled calls do not launch a native host', async () => {
   const ctx = new Context();
   const fiber = await ctx.plugin(LocalSubprocessRuntime);
@@ -283,7 +330,7 @@ test('multiple pending requests reject independently when their hosts exit', asy
     );
     errors.forEach(error => assert.match(
       String(error?.message ?? error),
-      /Native host exited before a result|EPIPE/,
+      /Native host exited before a result/,
     ));
     for (const fixture of fixtures) {
       const stopped = await waitForState(fixture.statePath, 'exited');

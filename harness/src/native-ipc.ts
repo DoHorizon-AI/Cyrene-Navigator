@@ -63,7 +63,13 @@ export async function runNativeRequest(
       reject(error);
       child.terminate();
     };
-    child.stdin!.on('error', fail);
+    child.stdin!.on('error', error => {
+      if (isBrokenPipeError(error)) {
+        child.terminate();
+        return;
+      }
+      fail(error);
+    });
     child.stdout!.on('error', fail);
     child.stdout!.on('data', (bytes: Buffer) => {
       if (settled) return;
@@ -125,6 +131,11 @@ export async function runNativeRequest(
     if (!child.stdin.destroyed) child.stdin.end();
     await waitForQuiescence(child, config.cancelGraceMs);
   }
+}
+
+/** Identify a closed child stdin so the process-exit handler supplies the stable error. 中文：识别子进程关闭的 stdin，由退出处理器提供稳定错误。 */
+function isBrokenPipeError(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === 'EPIPE';
 }
 
 /** Escalate a host that does not exit after closing its request stream.  中文：请求流关闭后，若宿主仍未退出则升级处理。 */
