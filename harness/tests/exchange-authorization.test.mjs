@@ -23,7 +23,7 @@ const sessionId = 'navigator-session-owner';
 const connectionId = '7e1c50d2-b4f3-4d61-9302-9a0bd48d1991';
 const authorizationRef = 'authorization-refs-7a91';
 const operationId = 'cc49c3f4-08a7-4cae-bf89-90448cfbcb8f';
-const renewalSessionRef = 'renewal-session-51';
+const renewalSessionRef = '647fe9f4-8f28-441f-9a23-bb34f9d8c9c2';
 const privateLaunchUrl = 'https://identity.example/authorize?state=private-oauth-state';
 
 function authorizationHealth(overrides = {}) {
@@ -147,14 +147,14 @@ async function startExchangeFixture(options = {}) {
         assert.match(request.headers['idempotency-key'], /^navigator-exchange-auth-v1:[0-9a-f]{64}$/u);
         response.writeHead(202, {
           'content-type': 'application/json',
-          location: '/api/v1/accounts/authorizations/' + authorizationRef + '/renewal-sessions/' + renewalSessionRef,
+          location: '/api/v1/accounts/renewal-sessions/' + renewalSessionRef,
         });
         response.end(JSON.stringify(renewalSession()));
         return;
       }
 
       if (request.method === 'GET'
-        && request.url === '/api/v1/accounts/authorizations/' + authorizationRef + '/renewal-sessions/' + renewalSessionRef) {
+        && request.url === '/api/v1/accounts/renewal-sessions/' + renewalSessionRef) {
         response.writeHead(200, { 'content-type': 'application/json' });
         response.end(JSON.stringify(renewalSession()));
         return;
@@ -287,7 +287,7 @@ test('registers fixed authorization tools, requires approval, and hides renewal 
     assert.equal(exchange.requests[renewalRequestIndex].body, '');
 
     const status = await execute(ctx, 'exchange_reauthorization_status', {
-      authorizationRef, sessionRef: renewalSessionRef,
+      sessionRef: renewalSessionRef,
     }, 'renewal-status-1');
     assert.equal(status.isError, false);
     assert.equal(status.value.sessionRef, renewalSessionRef);

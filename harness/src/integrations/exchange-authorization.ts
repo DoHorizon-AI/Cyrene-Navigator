@@ -47,7 +47,7 @@ export const EXCHANGE_AUTHORIZATION_OPERATIONS = Object.freeze({
   renewalStatus: {
     operationId: 'accountGetRenewalSession',
     method: 'GET',
-    path: '/api/v1/accounts/authorizations/{authorization_id}/renewal-sessions/{session_id}',
+    path: '/api/v1/accounts/renewal-sessions/{session_id}',
   },
   connectionResources: {
     operationId: 'integrationListConnectionResources',
@@ -268,7 +268,7 @@ export class ExchangeAuthorizationClient {
     if (session.authorizationRef !== authorizationRef) {
       throw new TypeError('Exchange renewal session does not match the requested authorization');
     }
-    const expected = this.url(renewalStatusPath(authorizationRef, session.sessionRef));
+    const expected = this.url(renewalStatusPath(session.sessionRef));
     const location = response.headers.get('location');
     if (!location || !isSameResourceLocation(location, expected)) {
       throw new TypeError('Exchange returned an invalid renewal-session Location');
@@ -278,15 +278,13 @@ export class ExchangeAuthorizationClient {
 
   /** Read a Product-owned renewal session without exposing its browser launch material to DSH. */
   async getRenewalSession(
-    authorizationRef: string,
     sessionRef: string,
     identity: ExchangeAuthorizationRequestIdentity,
   ): Promise<ExchangeRenewalSession> {
-    assertIdentifier(authorizationRef, 'authorization reference');
-    assertIdentifier(sessionRef, 'renewal session reference');
-    const { payload } = await this.request(renewalStatusPath(authorizationRef, sessionRef), identity);
+    assertUuid(sessionRef, 'renewal session reference');
+    const { payload } = await this.request(renewalStatusPath(sessionRef), identity);
     const session = parseRenewalSession(payload);
-    if (session.authorizationRef !== authorizationRef || session.sessionRef !== sessionRef) {
+    if (session.sessionRef !== sessionRef) {
       throw new TypeError('Exchange renewal response does not match the requested session');
     }
     return session;
@@ -469,15 +467,13 @@ export function registerExchangeAuthorizationTools(
       name: 'exchange_reauthorization_status',
       description: 'Read the status of one Exchange-owned renewal session.',
       parameters: {
-        authorizationRef: { type: 'string', required: true, description: 'Authorization reference returned by Exchange.' },
-        sessionRef: { type: 'string', required: true, description: 'Renewal session reference returned by Exchange.' },
+        sessionRef: { type: 'string', required: true, description: 'Product renewal session UUID returned by Exchange.' },
       },
       output: renewalSessionOutput,
       execute: async (args, execution) => {
         const identity = requestIdentity(execution);
-        const authorizationRef = stringArg(args.authorizationRef, 'authorization reference');
         const sessionRef = stringArg(args.sessionRef, 'renewal session reference');
-        const session = await client.getRenewalSession(authorizationRef, sessionRef, identity);
+        const session = await client.getRenewalSession(sessionRef, identity);
         return renewalSessionProjection(session);
       },
     })),
@@ -738,7 +734,7 @@ function parseRenewalSession(value: unknown): ExchangeRenewalSession {
     }
   }
   return {
-    sessionRef: identifierField(row.sessionRef, 'renewal session reference'),
+    sessionRef: uuidField(row.sessionRef, 'renewal session reference'),
     authorizationRef: identifierField(row.authorizationRef, 'authorization reference'),
     state: enumField(row.state, 'renewal session state', EXCHANGE_RENEWAL_SESSION_STATES),
     createdAt: utcDateField(row.createdAt, 'renewal createdAt'),
@@ -889,9 +885,8 @@ function pathWithId(template: string, parameter: string, id: string): string {
   return template.replace(token, encodeURIComponent(id));
 }
 
-function renewalStatusPath(authorizationRef: string, sessionRef: string): string {
+function renewalStatusPath(sessionRef: string): string {
   return EXCHANGE_AUTHORIZATION_OPERATIONS.renewalStatus.path
-    .replace('{authorization_id}', encodeURIComponent(authorizationRef))
     .replace('{session_id}', encodeURIComponent(sessionRef));
 }
 
