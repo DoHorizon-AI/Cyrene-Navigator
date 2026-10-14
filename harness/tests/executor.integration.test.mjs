@@ -12,8 +12,9 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createExecutorApp } from '../dist/serve.js';
-import { InMemoryWorkStateStore, WorkStateClient } from '../dist/work-state-client.js';
-import { LlmAdapter } from '@deepseek-ai/dsh-llm';
+import { InMemoryWorkStateStore, WorkStateClient, WorkStateHttpError } from '../dist/work-state-client.js';
+import { LlmAdapter, ToolCallId } from '@deepseek-ai/dsh-llm';
+import { defineTool } from '@deepseek-ai/dsh-tools';
 
 const TEST_BEARER = 'executor-test-token';
 process.env.CYRENE_EXECUTOR_TOKEN = TEST_BEARER;
@@ -86,6 +87,44 @@ async function waitForTask(executor, taskId, predicate, timeoutMs = 3_000) {
     await delay(10);
   }
   throw new Error(`Task ${taskId} did not reach the expected state (last status: ${last?.status ?? 'missing'})`);
+}
+
+async function waitForActiveTask(executor, sessionId, expectedTaskId, timeoutMs = 3_000) {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
+    if (executor.activeTaskId(sessionId) === expectedTaskId) return;
+    await delay(10);
+  }
+  throw new Error('Task ' + expectedTaskId + ' did not acquire the active DSH session');
+}
+
+async function createPausedAuthorizationTask(store, taskId, sessionId) {
+  const record = await store.createTask({ id: taskId, sessionId, prompt: 'Original task prompt must not replay.' });
+  await store.claimTask(record.id);
+  await store.patchTask(record.id, {
+    status: 'awaiting_user_authorization',
+    output: 'Completed safe checks before the provider reauthorization wait.',
+  });
+  await store.appendEvent(record.id, {
+    type: 'authorization-required',
+    taskId: record.id,
+    callId: 'authorization-call-' + taskId,
+    code: 'EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED',
+    source: 'connection-resources',
+    connectionId: '7e1c50d2-b4f3-4d61-9302-9a0bd48d1991',
+    authorizationRef: 'native-authorization-ref',
+    generation: 4,
+    timestamp: Date.now(),
+  });
+  await store.appendEvent(record.id, {
+    type: 'finish',
+    taskId: record.id,
+    status: 'awaiting_user_authorization',
+    output: 'Completed safe checks before the provider reauthorization wait.',
+    durationMs: 10,
+    timestamp: Date.now(),
+  });
+  return record;
 }
 
 test('NavigatorExecutor: executes one-shot work and persists truthful output and events', async () => {
@@ -233,6 +272,16 @@ test('NavigatorExecutor: queued API admissions stay queued until dispatch and al
     assert.equal(evilOrigin.headers.get('access-control-allow-origin'), null);
     const allowedOrigin = await fetch(`${url}/api/v1/health`, { headers: { Origin: 'https://trusted.example' } });
     assert.equal(allowedOrigin.headers.get('access-control-allow-origin'), 'https://trusted.example');
+    const resumePreflight = await fetch(`${url}/api/v1/tasks/source/resume`, {
+      method: 'OPTIONS',
+      headers: {
+        Origin: 'https://trusted.example',
+        'Access-Control-Request-Method': 'POST',
+        'Access-Control-Request-Headers': 'authorization,content-type,idempotency-key',
+      },
+    });
+    assert.equal(resumePreflight.status, 204);
+    assert.match(resumePreflight.headers.get('access-control-allow-headers') ?? '', /Idempotency-Key/iu);
   } finally {
     await close();
     await disposeApp(app);
@@ -288,8 +337,30 @@ test('WorkStateClient: requests use the configured workspace bearer and decode n
   process.env.CYRENE_SESSION_TOKEN = 'work-test-token';
   const seen = [];
   const server = createServer(async (req, res) => {
-    seen.push({ url: req.url, authorization: req.headers.authorization, method: req.method });
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    seen.push({
+      url: req.url, authorization: req.headers.authorization, method: req.method,
+      idempotencyKey: req.headers['idempotency-key'],
+      body: Buffer.concat(chunks).toString('utf8'),
+    });
     res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/api/v1/workspaces/acme/work/tasks/source/resume/check') {
+      res.writeHead(204).end();
+      return;
+    }
+    if (req.url === '/api/v1/workspaces/acme/work/tasks/source/resume') {
+      res.end(JSON.stringify({
+        duplicate: false,
+        task: {
+          id: 'continuation-1', workspaceId: 'acme', sessionId: 'session-source',
+          prompt: 'Continue safely.', status: 'queued', createdAt: 20,
+          startedAt: null, endedAt: null, output: '', reasoning: '', error: null,
+          durationMs: 0, sequence: 2, continuationOfTaskId: 'source', continuationMode: 'read_only',
+        },
+      }));
+      return;
+    }
     if (req.url === '/api/v1/workspaces/acme/work/tasks/other') {
       res.writeHead(404).end(JSON.stringify({ code: 'WORK_TASK_NOT_FOUND' }));
       return;
@@ -315,13 +386,60 @@ test('WorkStateClient: requests use the configured workspace bearer and decode n
     assert.equal((await client.getTask('item')).startedAt, undefined);
     assert.equal(await client.getTask('other'), undefined);
     assert.equal((await client.getEvents('item')).events[0].messageId, undefined);
-    assert.equal(seen.length, 3);
+    await client.verifyContinuationOwnership('source');
+    const continuation = await client.createContinuationTask('source', {
+      prompt: 'Continue safely.',
+      idempotencyKey: 'resume-1',
+    });
+    assert.equal(continuation.continuationOfTaskId, 'source');
+    assert.equal(continuation.continuationMode, 'read_only');
+    assert.equal(seen.length, 5);
+    const ownershipCheck = seen.find(row => row.url.endsWith('/tasks/source/resume/check'));
+    assert.equal(ownershipCheck.method, 'POST');
+    assert.equal(ownershipCheck.body, '');
+    const resume = seen.find(row => row.url.endsWith('/tasks/source/resume'));
+    assert.equal(resume.idempotencyKey, 'resume-1');
+    assert.deepEqual(JSON.parse(resume.body), { prompt: 'Continue safely.' });
     assert.ok(seen.every(row => row.url.startsWith('/api/v1/workspaces/acme/work/tasks/')));
     assert.ok(seen.every(row => row.authorization === 'Bearer work-test-token'));
   } finally {
     await new Promise(resolve => server.close(resolve));
     if (previousToken === undefined) delete process.env.CYRENE_SESSION_TOKEN;
     else process.env.CYRENE_SESSION_TOKEN = previousToken;
+  }
+});
+
+test('continuation verifies Work ownership before using a stored session with Exchange', async () => {
+  const store = new InMemoryWorkStateStore();
+  const source = await createPausedAuthorizationTask(store, 'foreign-source', 'foreign-session');
+  store.verifyContinuationOwnership = async () => {
+    throw new WorkStateHttpError(404, 'WORK_TASK_NOT_FOUND');
+  };
+  let exchangeReads = 0;
+  const app = await createTestApp(new TestMockAdapter(), {
+    workStateStore: store,
+    revalidateExchangeAuthorization: async () => {
+      exchangeReads += 1;
+      throw new Error('must not call Exchange before ownership is verified');
+    },
+  });
+  try {
+    await assert.rejects(
+      app.executor.resumeTask(source.id, 'Read only continuation.', 'foreign-owner-check'),
+      error => error.status === 404 && error.code === 'TASK_NOT_FOUND',
+    );
+    assert.equal(exchangeReads, 0);
+
+    store.verifyContinuationOwnership = async () => {
+      throw new WorkStateHttpError(404, 'HTTP_ERROR');
+    };
+    await assert.rejects(
+      app.executor.resumeTask(source.id, 'Do not use an older Work API.', 'old-work-api-check'),
+      error => error.status === 503 && error.code === 'SAFE_CONTINUATION_UNAVAILABLE',
+    );
+    assert.equal(exchangeReads, 0, 'an older Work API must fail closed before Exchange is called');
+  } finally {
+    await disposeApp(app);
   }
 });
 
@@ -390,5 +508,202 @@ test('DynamicPluginManager: hot-reloads a plugin while a durable session remains
   } finally {
     await disposeApp(app);
     await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('Exchange reauthorization wait stops its DSH turn, preserves progress through restart, streams, and cancels', async () => {
+  const store = new InMemoryWorkStateStore();
+  const adapter = new TestMockAdapter({ delayMs: 200 });
+  const app = await createTestApp(adapter, { workStateStore: store });
+  try {
+    const pausedExecution = app.executor.executeTask({
+      taskId: 'auth-wait-live',
+      sessionId: 'auth-wait-session',
+      prompt: 'Inspect the configured resource and continue independent work.',
+    });
+    await waitForTask(app.executor, 'auth-wait-live', task => task.status === 'running');
+    await store.patchTask('auth-wait-live', { output: 'Completed safe inspection before authorization.' });
+    const marked = await app.executor.markTaskAwaitingUserAuthorization('auth-wait-session', {
+      callId: 'cloud-query-call',
+      connectionId: '7e1c50d2-b4f3-4d61-9302-9a0bd48d1991',
+      authorizationRef: 'native-authorization-ref',
+      generation: 4,
+      source: 'connection-resources',
+      code: 'EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED',
+    });
+    assert.equal(marked, true);
+
+    const independent = app.executor.executeTask({
+      taskId: 'auth-independent-task',
+      sessionId: 'independent-session',
+      prompt: 'Finish an unrelated safe task.',
+    });
+    const [paused, unrelated] = await Promise.all([pausedExecution, independent]);
+    assert.equal(paused.status, 'awaiting_user_authorization');
+    assert.match(paused.output, /Completed safe inspection/u);
+    assert.equal(unrelated.status, 'completed');
+    assert.equal((await app.executor.getTask('auth-wait-live')).status, 'awaiting_user_authorization');
+    const events = await store.getEvents('auth-wait-live');
+    assert.ok(events.events.some(row => row.event.type === 'authorization-required'
+      && row.event.code === 'EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED'
+      && row.event.callId === 'cloud-query-call'));
+    assert.ok(events.events.some(row => row.event.type === 'finish'
+      && row.event.status === 'awaiting_user_authorization'));
+    assert.ok(!events.events.some(row => row.event.type === 'finish' && row.event.status === 'completed'));
+  } finally {
+    await disposeApp(app);
+  }
+
+  const restarted = await createTestApp(new TestMockAdapter(), { workStateStore: store });
+  const { url, close } = await restarted.executor.startServer(0, '127.0.0.1');
+  try {
+    assert.equal((await restarted.executor.getTask('auth-wait-live')).status, 'awaiting_user_authorization');
+    const replay = await fetch(url + '/api/v1/tasks/auth-wait-live/events?after=0', {
+      headers: { Authorization: 'Bearer ' + TEST_BEARER },
+    });
+    assert.equal(replay.status, 200);
+    const stream = await replay.text();
+    assert.match(stream, /event: authorization-required/u);
+    assert.match(stream, /"status":"awaiting_user_authorization"/u);
+    assert.equal(await restarted.executor.cancelTask('auth-wait-live'), true);
+    assert.equal((await restarted.executor.getTask('auth-wait-live')).status, 'aborted');
+    const cancelled = await store.getEvents('auth-wait-live');
+    assert.ok(cancelled.events.some(row => row.event.type === 'finish' && row.event.status === 'aborted'));
+  } finally {
+    await close();
+    await disposeApp(restarted);
+  }
+});
+
+test('safe authorization continuation revalidates exact generations and blocks unknown Exchange writes', async () => {
+  const store = new InMemoryWorkStateStore();
+  const revalidated = [];
+  let operationState = 'SUCCEEDED';
+  let authorizationGeneration = 5;
+  const adapter = new TestMockAdapter({ delayMs: 800 });
+  const app = await createTestApp(adapter, {
+    workStateStore: store,
+    revalidateExchangeAuthorization: async (sessionId, connectionId) => {
+      revalidated.push({ sessionId, connectionId });
+      return {
+        connectionId,
+        authorizationRef: 'native-authorization-ref',
+        loginState: 'PRESENT',
+        authorizationState: 'VALID',
+        generation: authorizationGeneration,
+      };
+    },
+    readExchangeOperationState: async (_sessionId, _operationId) => operationState,
+  });
+  const disposeUnsafeTools = [];
+  let closeServer;
+  try {
+    const source = await createPausedAuthorizationTask(store, 'safe-resume-source', 'safe-resume-session');
+    const server = await app.executor.startServer(0, '127.0.0.1');
+    closeServer = server.close;
+    const response = await fetch(server.url + '/api/v1/tasks/' + source.id + '/resume', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer ' + TEST_BEARER,
+        'Content-Type': 'application/json',
+        'Idempotency-Key': 'safe-resume-idempotency',
+      },
+      body: JSON.stringify({ prompt: 'Continue with read-only resource verification.' }),
+    });
+    assert.equal(response.status, 202);
+    const continuation = await response.json();
+    await closeServer();
+    closeServer = undefined;
+    assert.equal(continuation.continuationOfTaskId, source.id);
+    assert.equal(continuation.continuationMode, 'read_only');
+    assert.equal(continuation.sessionId, source.sessionId);
+    assert.notEqual(continuation.prompt, source.prompt);
+    assert.deepEqual(revalidated, [{
+      sessionId: source.sessionId,
+      connectionId: '7e1c50d2-b4f3-4d61-9302-9a0bd48d1991',
+    }]);
+    const childEvents = await store.getEvents(continuation.id);
+    assert.ok(childEvents.events.some(row => row.event.type === 'task.authorization_revalidated'
+      && row.event.connections[0].generation === 5));
+
+    let writes = 0;
+    for (const name of ['work_memory_remember', 'shell_execute', 'subagent']) {
+      disposeUnsafeTools.push(app.ctx.tools.register(defineTool({
+        name,
+        description: 'Test-only tool that must be denied in a read-only continuation.',
+        parameters: {},
+        output: {
+          schema: { type: 'object', additionalProperties: true },
+          render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+        },
+        execute: () => {
+          writes += 1;
+          return { executed: true };
+        },
+      })));
+    }
+    assert.equal(await app.executor.drainQueuedTasks(), 1);
+    await waitForTask(app.executor, continuation.id, task => task.status === 'running');
+    await waitForActiveTask(app.executor, continuation.sessionId, continuation.id);
+    await delay(30);
+    const continuationAgent = app.ctx.get('agents').get(continuation.sessionId);
+    assert.ok(continuationAgent, 'continuation agent should own the scoped read-only guard');
+    for (const name of ['work_memory_remember', 'shell_execute', 'subagent']) {
+      const deniedWrite = await app.ctx.tools.execute({
+        name,
+        callId: ToolCallId('read-only-write-attempt-' + name),
+        arguments: {},
+        signal: new AbortController().signal,
+        agent: continuationAgent,
+      });
+      assert.equal(deniedWrite.isError, true, name + ' must be denied');
+    }
+    assert.equal(writes, 0);
+    await waitForTask(app.executor, continuation.id, task => task.status === 'completed');
+
+    const unknown = await store.createTask({
+      id: 'unknown-write-source', sessionId: 'unknown-write-session', prompt: 'Do not repeat the prior write.',
+    });
+    await store.claimTask(unknown.id);
+    await store.patchTask(unknown.id, { status: 'awaiting_user_authorization' });
+    await store.appendEvent(unknown.id, {
+      type: 'authorization-required', taskId: unknown.id,
+      callId: 'unknown-auth-call',
+      code: 'EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED',
+      source: 'issue-action',
+      connectionId: '7e1c50d2-b4f3-4d61-9302-9a0bd48d1991',
+      authorizationRef: 'native-authorization-ref',
+      generation: 4,
+    });
+    await store.appendEvent(unknown.id, {
+      type: 'tool-call', taskId: unknown.id, callId: 'unknown-write-call',
+      tool: 'exchange_issue_comment', args: '{"body":"private comment"}',
+    });
+    await store.appendEvent(unknown.id, {
+      type: 'tool-result', taskId: unknown.id, callId: 'unknown-write-call',
+      result: JSON.stringify({ operationId: 'exchange-op-unknown', action: 'integration.issue.comment', state: 'UNKNOWN' }),
+    });
+    await store.appendEvent(unknown.id, {
+      type: 'finish', taskId: unknown.id, status: 'awaiting_user_authorization',
+      output: '', durationMs: 1, timestamp: Date.now(),
+    });
+    operationState = 'UNKNOWN';
+    await assert.rejects(
+      app.executor.resumeTask(unknown.id, 'Read only after reauthorization.', 'unknown-write-resume'),
+      error => error.code === 'EXCHANGE_WRITE_UNKNOWN',
+    );
+    const tasks = await store.listTasks();
+    assert.ok(!tasks.items.some(task => task.continuationOfTaskId === unknown.id));
+
+    const stale = await createPausedAuthorizationTask(store, 'stale-generation-source', 'stale-generation-session');
+    authorizationGeneration = 4;
+    await assert.rejects(
+      app.executor.resumeTask(stale.id, 'Do not continue on the old generation.', 'stale-generation-resume'),
+      error => error.code === 'AUTHORIZATION_NOT_READY',
+    );
+  } finally {
+    await closeServer?.();
+    for (const dispose of disposeUnsafeTools.reverse()) dispose();
+    await disposeApp(app);
   }
 });

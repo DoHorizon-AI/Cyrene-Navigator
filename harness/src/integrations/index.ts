@@ -45,3 +45,32 @@ export type {
   ExchangeOperationState,
   TrustedUserBearerProvider,
 } from './exchange-integration.js';
+export {
+  EXCHANGE_AUTHORIZATION_OPERATIONS,
+  EXCHANGE_AUTHORIZATION_STATES,
+  EXCHANGE_CLOUD_RESOURCE_STATES,
+  EXCHANGE_LOGIN_STATES,
+  EXCHANGE_RENEWAL_SESSION_STATES,
+  EXCHANGE_SNAPSHOT_FRESHNESS,
+  ExchangeAuthorizationClient,
+  ExchangeConnectionReauthorizationRequiredError,
+  exchangeReauthorizationFromProblem,
+  registerExchangeAuthorizationTools,
+} from './exchange-authorization.js';
+export type {
+  CapabilityAuthorizationHealth,
+  ExchangeAuthorizationHealth,
+  ExchangeAuthorizationRequestIdentity,
+  ExchangeAuthorizationToolOptions,
+  ExchangeAuthorizationWaitReceipt,
+  ExchangeAuthorizationWaitReporter,
+  ExchangeCloudObservation,
+  ExchangeCloudQueryResult,
+  ExchangeConnectionSummary,
+  ExchangeProvider,
+  ExchangeCloudResourceState,
+  ExchangeLoginState,
+  ExchangeRenewalSession,
+  ExchangeRenewalSessionState,
+  ExchangeSnapshotFreshness,
+} from './exchange-authorization.js';

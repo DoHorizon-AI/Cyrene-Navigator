@@ -83,10 +83,57 @@ Navigator CI 会依据
 [`harness/contracts/exchange-integration-v1.lock.json`](../../harness/contracts/exchange-integration-v1.lock.json)
 中固定的 owner fixture，校验五个消费者路由、请求/响应 DTO、状态域及 202 `Location`。
 
+Authorization and cloud observation integration uses a separate fixed
+Exchange client. It exposes the actor-scoped safe connection list,
+authorization health, human-approved renewal start, renewal status, and the
+latest cached resource projection. It does not expose a generic HTTP tool or ask
+DSH to poll or compare cloud resources. Renewal accepts
+only the native authorization reference returned by a recent actor-scoped
+health read in the same DSH session. Listed IDs are Exchange Product connection
+UUIDs; binding, target, account, actor, and tenant references remain server-side.
+Exchange returns browser launch URLs and
+QR attachment references only to the host; Navigator omits them from model
+results.
+
+Navigator moves a task to awaiting_user_authorization only for Exchange HTTP
+409 code EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED, or an authenticated
+health result with authorizationState REAUTHORIZATION_REQUIRED. Principal 401,
+generic 403, unknown/unavailable authorization, and Platform AWAITING_AUTHORITY
+are not provider reauthorization. The task keeps its output and events, stops
+its current DSH turn, and remains durable through restart.
+
+An explicit continuation is a new task with a new bounded prompt and the same
+persisted DSH session. Before creating it, Navigator reads the exact connection
+and native authorization references from the wait event, verifies the current
+first-party principal, and requires PRESENT, VALID health at a newer generation.
+Known Exchange write operations are reconciled through their Product references;
+UNKNOWN, in-flight, or missing write receipts block continuation for manual
+review. Work atomically links the new row and sets read_only mode before queued
+work is visible. The executor allows only fixed read-only tools in that mode.
+It never replays the old prompt or carries approvals from the paused task.
+
 Capability providers own their operation; Navigator owns user intent,
 presentation, and client-side coordination.
 
 能力提供方负责自身操作；Navigator 负责用户意图、呈现与客户端协调。
+
+授权与云资源观察使用独立的固定 Exchange 客户端，暴露调用者范围内的安全连接列表、授权健康、人工审批后的
+续期启动、续期状态和最新缓存资源投影。它不提供通用 HTTP 工具，也不让 DSH 轮询或比较云资源。续期只接受同一 DSH
+Session 最近一次调用者隔离健康查询返回的原生授权引用。浏览器启动 URL 与二维码附件引用只交给
+宿主，Navigator 不把它们放入模型结果。连接 ID 是 Exchange Product UUID；binding、target、account、actor
+和 tenant 引用只保留在服务端。
+
+只有 Exchange HTTP 409 code EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED，或经过认证的健康结果
+authorizationState 为 REAUTHORIZATION_REQUIRED 时，Navigator 才把任务置为
+awaiting_user_authorization。principal 401、一般 403、未知/不可用授权状态和 Platform
+AWAITING_AUTHORITY 均不会被映射为 Provider 续期。任务保留输出与事件，停止当前 DSH 回合，并在重启后
+继续保持持久等待。
+
+显式续接会创建新任务，使用新的有界提示词和原持久 DSH Session。创建前，Navigator 从等待事件读取准确
+连接及原生授权引用，重新验证当前 first-party principal，并要求授权状态为 PRESENT、VALID 且处于更高
+generation。Exchange 写操作通过 Product 操作引用核对；UNKNOWN、仍在运行或缺少写回执时会阻止续接并
+要求人工核对。Work 在队列可见前原子链接新任务并设置 read_only 模式；执行器在该模式下只开放固定只读
+工具，不会重放旧提示词，也不继承暂停任务的审批记录。
 
 ## Intended resolution sequence / 预期解析时序（V1 未接入）
 

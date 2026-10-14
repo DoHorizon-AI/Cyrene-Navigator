@@ -16,10 +16,22 @@ import {
   EXCHANGE_ISSUE_SNAPSHOT_FRESHNESS,
   EXCHANGE_ISSUE_STATES,
 } from '../dist/integrations/exchange-integration.js';
+import {
+  EXCHANGE_AUTHORIZATION_OPERATIONS,
+  EXCHANGE_AUTHORIZATION_STATES,
+  EXCHANGE_CLOUD_RESOURCE_STATES,
+  EXCHANGE_LOGIN_STATES,
+  EXCHANGE_RENEWAL_SESSION_STATES,
+  EXCHANGE_SNAPSHOT_FRESHNESS,
+} from '../dist/integrations/exchange-authorization.js';
 
 const lock = JSON.parse(readFileSync(new URL('../contracts/exchange-integration-v1.lock.json', import.meta.url), 'utf8'));
 const fixtureBytes = readFileSync(new URL('../contracts/exchange-integration-v1.consumer.json', import.meta.url));
 const ownerContract = JSON.parse(fixtureBytes.toString('utf8'));
+const consumerOperations = Object.freeze({
+  ...EXCHANGE_ISSUE_CONSUMER_OPERATIONS,
+  ...EXCHANGE_AUTHORIZATION_OPERATIONS,
+});
 
 test('consumer fixture is byte-pinned to the raw Exchange OpenAPI and catalog digests', () => {
   assert.equal(lock.schemaVersion, 1);
@@ -58,19 +70,28 @@ test('pinned Exchange checkout reproduces every locked source artifact digest', 
 test('the fixed Navigator operations match the owner OpenAPI and catalog routes', () => {
   assert.deepEqual(
     Object.keys(ownerContract.operations).sort(),
-    Object.values(EXCHANGE_ISSUE_CONSUMER_OPERATIONS).map(operation => operation.operationId).sort(),
+    Object.values(consumerOperations).map(operation => operation.operationId).sort(),
   );
-  for (const operation of Object.values(EXCHANGE_ISSUE_CONSUMER_OPERATIONS)) {
+  const resourcePathParameters = {
+    integrationGetOperation: 'operation_id',
+    integrationListConnections: null,
+    integrationGetAuthorizationHealth: 'connection_id',
+    accountBeginRenewalSession: 'authorization_id',
+    accountGetRenewalSession: 'session_id',
+    integrationListConnectionResources: 'connection_id',
+    integrationQueryIssue: 'binding_id',
+    integrationGetIssue: 'binding_id',
+    integrationCreateIssueComment: 'binding_id',
+    integrationUpdateIssueState: 'binding_id',
+  };
+  for (const operation of Object.values(consumerOperations)) {
     const ownerOperation = ownerContract.operations[operation.operationId];
     assert.ok(ownerOperation, `owner fixture omitted ${operation.operationId}`);
     assert.equal(ownerOperation.method, operation.method);
     assert.equal(ownerOperation.path, operation.path);
     assert.equal(ownerOperation.definition.operationId, operation.operationId);
     assert.equal(ownerOperation.catalog.operationId, operation.operationId);
-    assert.equal(
-      ownerOperation.catalog.resourceId.pathParameter,
-      operation.operationId === 'integrationGetOperation' ? 'operation_id' : 'binding_id',
-    );
+    assert.equal(ownerOperation.catalog.resourceId.pathParameter, resourcePathParameters[operation.operationId]);
     assert.ok(
       ownerOperation.definition.parameters.some(parameter =>
         parameter.name === 'X-Cyrene-Workspace-Id' && parameter.in === 'header' && parameter.required === false),
@@ -80,7 +101,7 @@ test('the fixed Navigator operations match the owner OpenAPI and catalog routes'
 });
 
 test('catalog request schema pointers target the operation request body path', () => {
-  for (const operation of Object.values(EXCHANGE_ISSUE_CONSUMER_OPERATIONS)) {
+  for (const operation of Object.values(consumerOperations)) {
     const ownerOperation = ownerContract.operations[operation.operationId];
     assert.ok(ownerOperation, `owner fixture omitted ${operation.operationId}`);
     if (!ownerOperation.definition.requestBody) {
@@ -181,6 +202,99 @@ test('query 202 Location and cached issue/operation response fields match owner 
   assert.deepEqual(issue.properties.state.enum, [...EXCHANGE_ISSUE_STATES]);
   assert.deepEqual(issue.properties.freshness.enum, [...EXCHANGE_ISSUE_SNAPSHOT_FRESHNESS]);
   assert.equal(issue.additionalProperties, false);
+});
+
+test('authorization and cloud reads match the owner DTOs and operation grant boundaries', () => {
+  const schemas = ownerContract.schemas;
+  const responseSchema = (operationId, status) => {
+    const response = ownerContract.operations[operationId].definition.responses[String(status)];
+    const schema = response.content['application/json'].schema;
+    if (schema.$ref) {
+      const name = schema.$ref.split('/').at(-1);
+      assert.ok(name && schemas[name], `${operationId} response schema is missing`);
+      return { response, schema: schemas[name] };
+    }
+    return { response, schema };
+  };
+  const hasIdempotencyHeader = operationId => ownerContract.operations[operationId]
+    .definition.parameters.some(parameter => parameter.name === 'Idempotency-Key' && parameter.required === true);
+
+  const list = responseSchema('integrationListConnections', 200).schema;
+  assert.equal(list.type, 'array', 'the existing connection-list wire shape remains a JSON array');
+  assert.equal(list.items.$ref, '#/components/schemas/IntegrationConnectionResponse');
+  const connection = schemas.IntegrationConnectionResponse;
+  assert.deepEqual(connection.required, [
+    'id', 'provider', 'displayName', 'repositoryId', 'repositoryName', 'enabled', 'createdAt', 'updatedAt',
+  ]);
+  assert.deepEqual(Object.keys(connection.properties).sort(), [
+    'createdAt', 'displayName', 'enabled', 'id', 'provider', 'repositoryId', 'repositoryName', 'updatedAt',
+  ]);
+  assert.equal(connection.additionalProperties, false);
+
+  const health = responseSchema('integrationGetAuthorizationHealth', 200).schema;
+  assert.deepEqual(health.required, [
+    'connectionId', 'provider', 'authorizationRef', 'loginState', 'authorizationState',
+    'checkedAt', 'expiresAt', 'generation', 'capabilities', 'reasonCode',
+  ]);
+  assert.deepEqual(health.properties.loginState.enum, [...EXCHANGE_LOGIN_STATES]);
+  assert.deepEqual(health.properties.authorizationState.enum, [...EXCHANGE_AUTHORIZATION_STATES]);
+  assert.equal(health.properties.capabilities.items.$ref, '#/components/schemas/AuthorizationCapabilityResponse');
+  assert.deepEqual(schemas.AuthorizationCapabilityResponse.properties.state.enum, [...EXCHANGE_AUTHORIZATION_STATES]);
+  assert.equal(health.properties.authorizationRef.anyOf.some(branch => branch.type === 'null'), true);
+  assert.equal(health.additionalProperties, false);
+
+  for (const operationId of [
+    'integrationListConnections',
+    'integrationGetAuthorizationHealth',
+    'accountBeginRenewalSession',
+    'accountGetRenewalSession',
+    'integrationListConnectionResources',
+  ]) {
+    assert.equal(ownerContract.operations[operationId].definition.requestBody, undefined);
+  }
+
+  const renewal = responseSchema('accountBeginRenewalSession', 202);
+  assert.ok(renewal.response.headers?.Location, 'renewal 202 must publish its status Location');
+  assert.equal(renewal.response.headers.Location.schema.format, 'uri-reference');
+  assert.deepEqual(renewal.schema.properties.state.enum, [...EXCHANGE_RENEWAL_SESSION_STATES]);
+  assert.deepEqual(renewal.schema.required, [
+    'sessionRef', 'authorizationRef', 'state', 'createdAt', 'expiresAt',
+    'authorizationUrl', 'qrAttachmentRef', 'generation', 'reasonCode',
+  ]);
+  assert.equal(renewal.schema.additionalProperties, false);
+  assert.equal(hasIdempotencyHeader('accountBeginRenewalSession'), true);
+  assert.equal(hasIdempotencyHeader('accountGetRenewalSession'), false);
+
+  const resources = responseSchema('integrationListConnectionResources', 200).schema;
+  assert.deepEqual(resources.required, ['connectionId', 'provider', 'checkedAt', 'resources']);
+  assert.equal(resources.properties.resources.items.$ref, '#/components/schemas/CloudResourceResponse');
+  const observation = schemas.CloudResourceResponse;
+  assert.deepEqual(observation.properties.status.enum, [...EXCHANGE_CLOUD_RESOURCE_STATES]);
+  assert.deepEqual(observation.properties.freshness.enum, [...EXCHANGE_SNAPSHOT_FRESHNESS]);
+  assert.deepEqual(observation.required, [
+    'externalRef', 'kind', 'displayName', 'status', 'providerStatus', 'collectedAt',
+    'observedAt', 'source', 'freshness', 'attributes', 'platformResourceRef', 'platformGeneration',
+  ]);
+  assert.equal(observation.additionalProperties, false);
+
+  const resourceReauthorization = ownerContract.operations.integrationListConnectionResources
+    .definition.responses['409'];
+  assert.equal(resourceReauthorization.$ref, '#/components/responses/Problem');
+  const problem = schemas.ProblemDetails;
+  assert.ok(problem, 'the owner fixture must include the shared ProblemDetails schema');
+  assert.equal(problem.properties.context.properties.connectionId.format, 'uuid');
+  assert.equal(problem.properties.context.properties.authorizationRef.maxLength, 300);
+  assert.equal(problem.properties.context.additionalProperties, false);
+
+  for (const operationId of [
+    'integrationListConnections',
+    'integrationGetAuthorizationHealth',
+    'accountGetRenewalSession',
+    'integrationListConnectionResources',
+  ]) {
+    assert.equal(hasIdempotencyHeader(operationId), false);
+    assert.equal(ownerContract.operations[operationId].catalog.idempotency.required, false);
+  }
 });
 
 test('owner merge SHA is populated before delivery', () => {

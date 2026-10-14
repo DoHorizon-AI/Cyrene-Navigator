@@ -16,7 +16,9 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { SessionId, SessionSeq } from '@deepseek-ai/dsh-session';
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
 import type { DynamicPluginManager } from './plugin-manager.js';
+import { WorkStateHttpError } from './work-state-client.js';
 import type { ExecutionStatus, TaskRecord, WorkStateStore } from './work-state-client.js';
+import type { ExchangeAuthorizationWaitReceipt } from './integrations/exchange-authorization.js';
 
 export type TaskStatus = ExecutionStatus;
 
@@ -40,6 +42,7 @@ export type ExecutorStreamEvent =
   | { type: 'subagent-assistant-delta'; taskId: string; provider: string; text: string; timestamp: number; seq?: number }
   | { type: 'subagent-blocked'; taskId: string; provider: string; runId: string; reasonCode: 'SANDBOX_BOUNDARY_DENIED' | 'SANDBOX_PROFILE_UNAVAILABLE' | 'SANDBOX_MODE_UNVERIFIED' | 'SUBAGENT_TIMEOUT' | 'SUBAGENT_FAILED'; toolCategory: 'file' | 'command' | 'network' | 'other' | 'unknown'; count: number; timestamp: number; seq?: number }
   | { type: 'permission'; taskId: string; provider: string; tool?: string; decision: 'approved' | 'denied'; timestamp: number; seq?: number }
+  | { type: 'authorization-required'; taskId: string; code: string; source: string; callId?: string; connectionId?: string; authorizationRef?: string; generation?: number; timestamp: number; seq?: number }
   | { type: 'finish'; taskId: string; status: TaskStatus; output: string; durationMs: number; timestamp: number; seq?: number }
   | { type: 'error'; taskId: string; message: string; code?: string; timestamp: number; seq?: number };
 
@@ -63,9 +66,11 @@ interface InternalTaskState {
   output: string;
   reasoning: string;
   blocked?: Map<string, Extract<ExecutorStreamEvent, { type: 'subagent-blocked' }>>;
+  authorizationWaits?: Map<string, ExchangeAuthorizationWaitReceipt>;
   agentError?: string;
   error?: string;
   agent?: Agent;
+  authorizationPause?: boolean;
   eventChain: Promise<void>;
   eventFailure?: unknown;
   patchChain: Promise<void>;
@@ -82,10 +87,48 @@ export interface ExecutorConfig {
   readonly workspaceId: string;
   readonly authTokenEnv?: string;
   readonly allowedOrigins?: readonly string[];
+  readonly revalidateExchangeAuthorization?: (
+    sessionId: string,
+    connectionId: string,
+  ) => Promise<{
+    readonly connectionId: string;
+    readonly authorizationRef: string | null;
+    readonly loginState: string;
+    readonly authorizationState: string;
+    readonly generation: number;
+  }>;
+  readonly readExchangeOperationState?: (
+    sessionId: string,
+    operationId: string,
+  ) => Promise<string>;
+}
+
+class ExecutorRequestError extends Error {
+  constructor(readonly status: number, readonly code: string, message: string) {
+    super(message);
+    this.name = 'ExecutorRequestError';
+  }
 }
 
 const TERMINAL_STATUSES = new Set<TaskStatus>(['completed', 'failed', 'aborted']);
 const INTERRUPTED_STATUSES = new Set<TaskStatus>(['running', 'waiting_approval', 'waiting_input']);
+const PAUSED_STATUSES = new Set<TaskStatus>(['waiting_approval', 'waiting_input', 'awaiting_user_authorization']);
+const SAFE_CONTINUATION_TOOLS = new Set([
+  'work_memory_search',
+  'work_sources',
+  'exchange_connections_list',
+  'exchange_issue_query',
+  'exchange_operation_read',
+  'exchange_authorization_health',
+  'exchange_reauthorization_status',
+  'exchange_cloud_resources_query',
+  'gcloud_readonly',
+]);
+const EXCHANGE_MUTATING_TOOLS = new Set([
+  'exchange_issue_comment',
+  'exchange_issue_state_update',
+  'exchange_reauthorization_start',
+]);
 
 /** Run an autonomous agent against durable Work Task state and an authenticated REST/SSE boundary.  中文：基于持久 Work Task 执行 Agent，并提供认证 REST/SSE 边界。 */
 export class NavigatorExecutor {
@@ -145,7 +188,7 @@ export class NavigatorExecutor {
     this.disposeSessionListener = this.ctx.on('session/event', (session: Session, event: SessionEvent) => {
       const taskId = this.sessionTaskMap.get(session);
       const task = taskId ? this.tasks.get(taskId) : undefined;
-      if (!task || task.record.status !== 'running') return;
+      if (!task || (task.record.status !== 'running' && task.record.status !== 'awaiting_user_authorization')) return;
       if (event.type === 'tool/result') {
         const data = event.data as SessionEvent<'tool/result'>['data'];
         const blocks = data.message.content;
@@ -169,6 +212,23 @@ export class NavigatorExecutor {
     for (;;) {
       const page = await this.config.workState.listTasks({ cursor, limit: 100 });
       for (const row of page.items) {
+        if (row.status === 'awaiting_user_authorization') {
+          const events = await this.readAllTaskEvents(row.id);
+          const hasPauseFinish = events.some(item => item.event.type === 'finish'
+            && item.event.status === 'awaiting_user_authorization');
+          if (!hasPauseFinish) {
+            const now = Date.now();
+            await this.config.workState.appendEvent(row.id, {
+              type: 'finish',
+              taskId: row.id,
+              status: 'awaiting_user_authorization',
+              output: row.output,
+              durationMs: Math.max(row.durationMs, now - (row.startedAt ?? row.createdAt)),
+              timestamp: now,
+            });
+          }
+          continue;
+        }
         if (INTERRUPTED_STATUSES.has(row.status)) {
           const now = Date.now();
           const startedAt = row.startedAt ?? row.createdAt;
@@ -379,6 +439,7 @@ export class NavigatorExecutor {
     const timeoutMs = params.timeoutMs ?? this.defaultTimeoutMs;
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new TypeError('timeoutMs must be a positive number');
     const timeoutId = setTimeout(() => task.abortController.abort(new Error(`Task timed out after ${timeoutMs}ms`)), timeoutMs);
+    let disposeContinuationGuard: (() => void) | undefined;
     let claimed = false;
     try {
       task.abortController.signal.throwIfAborted();
@@ -436,6 +497,13 @@ export class NavigatorExecutor {
       task.agent = agent;
       this.agentTaskMap.set(agent, task.id);
       this.sessionTaskMap.set(agent.session, task.id);
+      if (isReadOnlyContinuation(task.record)) {
+        // Agent-scoped guards are inherited by child-agent contexts, without blocking unrelated sessions.
+        disposeContinuationGuard = agent.ctx.tools.guard(execution => {
+          if (SAFE_CONTINUATION_TOOLS.has(execution.name)) return undefined;
+          return 'This authorization continuation is read-only; start a separately approved task for writes.';
+        });
+      }
       task.abortController.signal.throwIfAborted();
       agent.followup(createUserMessage({
         content: [{ type: 'text', text: params.prompt }],
@@ -449,8 +517,15 @@ export class NavigatorExecutor {
       await sessions.flush(agent.session);
       const latestRecord = await this.config.workState.getTask(task.id);
       if (latestRecord) task.record = latestRecord;
-      if (task.record.status === 'waiting_approval' || task.record.status === 'waiting_input') {
+      if (PAUSED_STATUSES.has(task.record.status)) {
         if (task.blocked?.size) await this.patch(task, { output: appendBlockedSummary(task.output, task.blocked) });
+        const pausedAt = Date.now();
+        await this.publish(task, {
+          type: 'finish', taskId: task.id, status: task.record.status,
+          output: task.record.output, durationMs: Math.max(0, pausedAt - (task.record.startedAt ?? task.record.createdAt)),
+          timestamp: pausedAt,
+        });
+        await this.flushEvents(task);
         return outcome(task.record);
       }
       if (TERMINAL_STATUSES.has(task.record.status)) return outcome(task.record);
@@ -499,8 +574,12 @@ export class NavigatorExecutor {
       }
       const endedAt = Date.now();
       const isAborted = task.abortController.signal.aborted;
-      const status: TaskStatus = isAborted ? 'aborted' : 'failed';
-      const message = task.error ?? (isAborted ? abortMessage(task.abortController.signal.reason) : safeErrorMessage(err));
+      const awaitingAuthorization = !isAborted
+        && (task.authorizationPause || task.record.status === 'awaiting_user_authorization');
+      const status: TaskStatus = isAborted ? 'aborted' : awaitingAuthorization ? 'awaiting_user_authorization' : 'failed';
+      const message = task.error ?? (awaitingAuthorization
+        ? task.record.error ?? 'Exchange connection authorization is required. Progress is preserved and automatic replay is disabled.'
+        : isAborted ? abortMessage(task.abortController.signal.reason) : safeErrorMessage(err));
       const durationMs = endedAt - (task.record.startedAt ?? task.record.createdAt);
       task.output ||= task.agent ? this.extractLatestAssistantText(task.agent.session) : '';
       task.output = appendBlockedSummary(task.output, task.blocked);
@@ -511,10 +590,12 @@ export class NavigatorExecutor {
         task.record = await this.config.workState.patchTask(task.id, {
           status, output: task.output, reasoning: task.reasoning, error: message,
         });
-        await this.publish(task, {
-          type: 'error', taskId: task.id, message,
-          code: isAborted ? 'TASK_ABORTED' : 'EXECUTION_FAILED', timestamp: endedAt,
-        });
+        if (!awaitingAuthorization) {
+          await this.publish(task, {
+            type: 'error', taskId: task.id, message,
+            code: isAborted ? 'TASK_ABORTED' : 'EXECUTION_FAILED', timestamp: endedAt,
+          });
+        }
         await this.publish(task, {
           type: 'status', taskId: task.id, sessionId: task.sessionId, status, timestamp: endedAt,
         });
@@ -527,6 +608,7 @@ export class NavigatorExecutor {
       }
       return outcome(task.record, message, status, durationMs);
     } finally {
+      disposeContinuationGuard?.();
       clearTimeout(timeoutId);
     }
   }
@@ -552,7 +634,7 @@ export class NavigatorExecutor {
       }
       const record = await this.config.workState.getTask(taskId);
       if (!record) throw new Error('Task disappeared from durable work state');
-      if (TERMINAL_STATUSES.has(record.status) || record.status === 'waiting_approval' || record.status === 'waiting_input') {
+      if (TERMINAL_STATUSES.has(record.status) || PAUSED_STATUSES.has(record.status)) {
         return outcome(record);
       }
       await delay(250);
@@ -614,6 +696,245 @@ export class NavigatorExecutor {
   async listTasks(options: { cursor?: string; limit?: number } = {}): Promise<{ items: readonly TaskRecord[]; nextCursor: string | null }> {
     await this.ready;
     return this.config.workState.listTasks(options);
+  }
+
+  /** Persist an exact Exchange reauthorization wait and stop this DSH turn at the tool boundary. */
+  async markTaskAwaitingUserAuthorization(
+    sessionId: string,
+    receipt: ExchangeAuthorizationWaitReceipt,
+  ): Promise<boolean> {
+    if (receipt.code !== 'EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED') {
+      throw new TypeError('Exchange authorization wait reason is invalid');
+    }
+    for (const value of [receipt.connectionId, receipt.authorizationRef]) {
+      if (value !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,299}$/u.test(value)) {
+        throw new TypeError('Exchange authorization wait reference is invalid');
+      }
+    }
+    if (receipt.callId !== undefined && !/^[A-Za-z0-9._:-]{1,200}$/u.test(receipt.callId)) {
+      throw new TypeError('Exchange authorization call reference is invalid');
+    }
+    if (receipt.generation !== undefined && (!Number.isSafeInteger(receipt.generation) || receipt.generation < 0)) {
+      throw new TypeError('Exchange authorization generation is invalid');
+    }
+    const taskId = this.activeTaskId(sessionId);
+    const task = taskId === undefined ? undefined : this.tasks.get(taskId);
+    if (!task || (task.record.status !== 'running' && task.record.status !== 'awaiting_user_authorization')) return false;
+
+    const key = (receipt.connectionId ?? '') + '\0' + (receipt.authorizationRef ?? '')
+      + '\0' + (receipt.callId ?? '');
+    task.authorizationWaits ??= new Map();
+    if (task.authorizationWaits.has(key)) return true;
+    task.authorizationPause = true;
+    try {
+      await this.flushPatches(task);
+      if (task.record.status === 'running') {
+        const timestamp = Date.now();
+        await this.patch(task, {
+          status: 'awaiting_user_authorization',
+          error: 'Exchange connection authorization is required. Progress is preserved and automatic replay is disabled.',
+        });
+        await this.publish(task, {
+          type: 'status', taskId: task.id, sessionId: task.sessionId,
+          status: 'awaiting_user_authorization', timestamp,
+        });
+      }
+      task.authorizationWaits.set(key, receipt);
+      await this.publish(task, {
+        type: 'authorization-required',
+        taskId: task.id,
+        code: receipt.code,
+        source: receipt.source,
+        ...(receipt.callId === undefined ? {} : { callId: receipt.callId }),
+        ...(receipt.connectionId === undefined ? {} : { connectionId: receipt.connectionId }),
+        ...(receipt.authorizationRef === undefined ? {} : { authorizationRef: receipt.authorizationRef }),
+        ...(receipt.generation === undefined ? {} : { generation: receipt.generation }),
+        timestamp: Date.now(),
+      });
+      await this.flushEvents(task);
+    } catch (error: unknown) {
+      task.authorizationPause = false;
+      task.error = 'Exchange authorization wait could not be persisted safely.';
+      task.abortController.abort(new Error(task.error));
+      task.agent?.cancel({ kind: 'hook', reason: 'exchange_authorization_wait_persist_failed' });
+      throw error;
+    }
+    task.agent?.cancel({ kind: 'hook', reason: 'exchange_reauthorization_required' });
+    return true;
+  }
+
+  /** Create a new read-only task only after exact Exchange authorization and prior writes revalidate. */
+  async resumeTask(taskId: string, prompt: string, idempotencyKey: string): Promise<TaskRecord> {
+    await this.ready;
+    if (!prompt.trim() || prompt.length > 20_000) {
+      throw new ExecutorRequestError(400, 'CONTINUATION_PROMPT_INVALID', 'A bounded new continuation prompt is required.');
+    }
+    if (!/^[\x21-\x7e]{1,200}$/u.test(idempotencyKey)) {
+      throw new ExecutorRequestError(400, 'IDEMPOTENCY_KEY_REQUIRED', 'A bounded Idempotency-Key is required.');
+    }
+    const source = await this.config.workState.getTask(taskId);
+    if (!source) throw new ExecutorRequestError(404, 'TASK_NOT_FOUND', 'Task not found.');
+    if (source.status !== 'awaiting_user_authorization') {
+      throw new ExecutorRequestError(409, 'TASK_NOT_AWAITING_USER_AUTHORIZATION', 'Task is not waiting for user authorization.');
+    }
+
+    const events = await this.readAllTaskEvents(taskId);
+    const pauseFinished = events.some(row => row.event.type === 'finish'
+      && row.event.status === 'awaiting_user_authorization');
+    if (!pauseFinished || this.tasks.has(taskId)) {
+      throw new ExecutorRequestError(409, 'TASK_TURN_NOT_SETTLED', 'The paused task turn has not settled yet.');
+    }
+    try {
+      // Verify the Work bearer owns this source before using its stored DSH session identity with Exchange.
+      await this.config.workState.verifyContinuationOwnership(taskId);
+    } catch (error: unknown) {
+      if (error instanceof WorkStateHttpError) {
+        if (error.status === 404 && error.code === 'WORK_TASK_NOT_FOUND') {
+          throw new ExecutorRequestError(404, 'TASK_NOT_FOUND', 'Task not found.');
+        }
+        if (error.status === 404) {
+          throw new ExecutorRequestError(503, 'SAFE_CONTINUATION_UNAVAILABLE', 'Work service does not support safe task continuation.');
+        }
+        throw new ExecutorRequestError(error.status, error.code, error.message);
+      }
+      throw error;
+    }
+    const waits = authorizationWaitReceipts(events);
+    if (waits.length === 0 || waits.some(receipt =>
+      !receipt.connectionId || !receipt.authorizationRef || receipt.generation === undefined)) {
+      throw new ExecutorRequestError(
+        409, 'AUTHORIZATION_TARGET_UNAVAILABLE',
+        'The task has no complete server-derived connection authorization target to revalidate.',
+      );
+    }
+    if (!this.config.revalidateExchangeAuthorization) {
+      throw new ExecutorRequestError(503, 'AUTHORIZATION_REVALIDATION_UNAVAILABLE', 'Exchange authorization revalidation is unavailable.');
+    }
+
+    const revalidated = new Map<string, { connectionId: string; authorizationRef: string; generation: number }>();
+    for (const receipt of waits) {
+      const connectionId = receipt.connectionId!;
+      const authorizationRef = receipt.authorizationRef!;
+      let health: Awaited<ReturnType<NonNullable<ExecutorConfig['revalidateExchangeAuthorization']>>>;
+      try {
+        health = await this.config.revalidateExchangeAuthorization(source.sessionId, connectionId);
+      } catch {
+        throw new ExecutorRequestError(409, 'AUTHORIZATION_REVALIDATION_FAILED', 'Current Exchange authorization could not be verified.');
+      }
+      if (health.connectionId !== connectionId || health.authorizationRef !== authorizationRef
+        || health.loginState !== 'PRESENT' || health.authorizationState !== 'VALID'
+        || health.generation <= receipt.generation!) {
+        throw new ExecutorRequestError(409, 'AUTHORIZATION_NOT_READY', 'Exchange authorization or generation is not ready for continuation.');
+      }
+      revalidated.set(connectionId, { connectionId, authorizationRef, generation: health.generation });
+    }
+
+    await this.assertNoUnresolvedExchangeWrites(source.sessionId, events, waits);
+    let continuation: TaskRecord;
+    try {
+      continuation = await this.config.workState.createContinuationTask(taskId, { prompt, idempotencyKey });
+    } catch (error: unknown) {
+      if (error instanceof WorkStateHttpError) {
+        if (error.status === 404) {
+          throw new ExecutorRequestError(503, 'SAFE_CONTINUATION_UNAVAILABLE', 'Work service does not support safe task continuation.');
+        }
+        throw new ExecutorRequestError(error.status, error.code, error.message);
+      }
+      throw error;
+    }
+    if (continuation.continuationOfTaskId !== taskId || !isReadOnlyContinuation(continuation)) {
+      throw new ExecutorRequestError(503, 'SAFE_CONTINUATION_UNAVAILABLE', 'Work service did not create the required read-only continuation marker.');
+    }
+    await this.config.workState.appendEvent(continuation.id, {
+      type: 'task.authorization_revalidated',
+      sourceTaskId: taskId,
+      connections: [...revalidated.values()],
+    });
+    return continuation;
+  }
+
+  /** Read a bounded durable event history for one continuation decision. */
+  private async readAllTaskEvents(taskId: string): Promise<Awaited<ReturnType<WorkStateStore['getEvents']>>['events']> {
+    const events: Awaited<ReturnType<WorkStateStore['getEvents']>>['events'][number][] = [];
+    let cursor = 0;
+    for (;;) {
+      const page = await this.config.workState.getEvents(taskId, cursor);
+      events.push(...page.events);
+      if (events.length > 100_000) {
+        throw new ExecutorRequestError(409, 'TASK_EVIDENCE_LIMIT_EXCEEDED', 'Task evidence is too large to revalidate safely.');
+      }
+      const last = page.events.at(-1)?.seq;
+      if (last === undefined || last <= cursor) return events;
+      cursor = last;
+    }
+  }
+
+  /** Reconcile every prior Exchange mutation or leave the continuation manual. */
+  private async assertNoUnresolvedExchangeWrites(
+    sessionId: string,
+    events: Awaited<ReturnType<WorkStateStore['getEvents']>>['events'],
+    waits: readonly ExchangeAuthorizationWaitReceipt[],
+  ): Promise<void> {
+    const calls = new Map<string, string>();
+    const results = new Map<string, { readonly isError: boolean; readonly result: string }>();
+    for (const row of events) {
+      const event = row.event;
+      if (event.type === 'tool-call' && typeof event.callId === 'string' && typeof event.tool === 'string') {
+        calls.set(event.callId, event.tool);
+      } else if (event.type === 'tool-result' && typeof event.callId === 'string'
+        && typeof event.result === 'string') {
+        results.set(event.callId, { isError: event.isError === true, result: event.result });
+      }
+    }
+    const confirmedAuthCalls = new Set(waits
+      .filter(receipt => receipt.source === 'issue-action' && receipt.callId !== undefined)
+      .map(receipt => receipt.callId!));
+
+    for (const [callId, tool] of calls) {
+      if (!EXCHANGE_MUTATING_TOOLS.has(tool)) continue;
+      const result = results.get(callId);
+      if (!result) {
+        if (confirmedAuthCalls.has(callId)) continue;
+        throw new ExecutorRequestError(409, 'EXCHANGE_WRITE_UNRESOLVED', 'A prior Exchange write has no durable outcome and needs manual reconciliation.');
+      }
+      if (result.isError) {
+        if (confirmedAuthCalls.has(callId) || resultIsConfirmedAuthWait(result.result)) continue;
+        throw new ExecutorRequestError(409, 'EXCHANGE_WRITE_UNRESOLVED', 'A prior Exchange write failed without a reconciled outcome.');
+      }
+      const value = parseJsonObject(result.result);
+      if (resultIsConfirmedAuthWait(result.result)) continue;
+      if (tool === 'exchange_reauthorization_start') {
+        if (typeof value.sessionRef !== 'string'
+          || !['WAITING_USER', 'VERIFYING', 'SUCCEEDED', 'FAILED', 'EXPIRED', 'CANCELLED'].includes(String(value.state))) {
+          throw new ExecutorRequestError(409, 'EXCHANGE_RENEWAL_UNRESOLVED', 'A prior renewal session has no durable outcome.');
+        }
+        if (value.state === 'VERIFYING') {
+          throw new ExecutorRequestError(409, 'EXCHANGE_RENEWAL_UNKNOWN', 'A prior renewal session has an unknown start outcome and needs manual reconciliation.');
+        }
+        continue;
+      }
+      if (typeof value.operationId !== 'string' || typeof value.state !== 'string') {
+        throw new ExecutorRequestError(409, 'EXCHANGE_WRITE_UNRESOLVED', 'A prior Exchange write has no operation reference to reconcile.');
+      }
+      let state = value.state;
+      if (!isTerminalExchangeOperationState(state)) {
+        if (!this.config.readExchangeOperationState) {
+          throw new ExecutorRequestError(409, 'EXCHANGE_WRITE_UNRESOLVED', 'Exchange operation reconciliation is unavailable.');
+        }
+        try {
+          state = await this.config.readExchangeOperationState(
+            sessionId,
+            value.operationId,
+          );
+        } catch {
+          throw new ExecutorRequestError(409, 'EXCHANGE_WRITE_UNRESOLVED', 'Exchange operation could not be reconciled.');
+        }
+      }
+      if (!isTerminalExchangeOperationState(state)) {
+        throw new ExecutorRequestError(409, state === 'UNKNOWN' ? 'EXCHANGE_WRITE_UNKNOWN' : 'EXCHANGE_WRITE_IN_FLIGHT',
+          'A prior Exchange write remains unresolved and needs manual reconciliation.');
+      }
+    }
   }
 
   /** Persist a safe subagent lifecycle fact on the active parent task.  中文：将子 Agent 生命周期事件写入活动父任务。 */
@@ -747,6 +1068,23 @@ export class NavigatorExecutor {
         return;
       }
 
+      const resumeMatch = url.pathname.match(/^\/api\/v1\/tasks\/([^/]+)\/resume$/u);
+      if (method === 'POST' && resumeMatch) {
+        const taskId = decodeURIComponent(resumeMatch[1]!);
+        const idempotencyKey = req.headers['idempotency-key'];
+        if (typeof idempotencyKey !== 'string' || !/^[\x21-\x7e]{1,200}$/u.test(idempotencyKey)) {
+          throw new ExecutorRequestError(400, 'IDEMPOTENCY_KEY_REQUIRED', 'A bounded Idempotency-Key is required.');
+        }
+        const body = await this.readJsonBody(req);
+        if (Object.keys(body).some(key => key !== 'prompt')
+          || typeof body.prompt !== 'string' || !body.prompt.trim() || body.prompt.length > 20_000) {
+          throw new ExecutorRequestError(400, 'CONTINUATION_PROMPT_INVALID', 'A bounded new continuation prompt is required.');
+        }
+        const continuation = await this.resumeTask(taskId, body.prompt, idempotencyKey);
+        this.sendJson(res, 202, continuation);
+        return;
+      }
+
       const statusMatch = url.pathname.match(/^\/api\/v1\/tasks\/([^/]+)(?:\/status)?$/u);
       if (method === 'GET' && statusMatch) {
         const taskId = decodeURIComponent(statusMatch[1]!);
@@ -800,6 +1138,10 @@ export class NavigatorExecutor {
         if (!res.writableEnded) res.end();
         return;
       }
+      if (err instanceof ExecutorRequestError) {
+        this.sendJson(res, err.status, { code: err.code, error: err.message });
+        return;
+      }
       const message = err instanceof Error ? err.message : 'Request failed';
       const status = err instanceof TypeError ? 400 : 500;
       this.sendJson(res, status, { error: message });
@@ -813,14 +1155,20 @@ export class NavigatorExecutor {
     res.once('close', () => { closed = true; });
     while (!closed && !res.writableEnded) {
       const page = await this.config.workState.getEvents(taskId, cursor);
+      let pausedTurnFinished = false;
       for (const row of page.events) {
         const eventType = typeof row.event.type === 'string' ? row.event.type : 'message';
         this.writeSseEvent(res, row.seq, eventType, { ...row.event, seq: row.seq });
+        if (row.event.type === 'finish' && PAUSED_STATUSES.has(row.event.status as TaskStatus)) {
+          pausedTurnFinished = true;
+        }
         cursor = row.seq;
       }
+      if (pausedTurnFinished) return;
       const record = await this.config.workState.getTask(taskId);
       if (!record) return;
       if (TERMINAL_STATUSES.has(record.status) && cursor >= page.nextSeq - 1) return;
+      if (PAUSED_STATUSES.has(record.status) && !this.tasks.has(taskId) && cursor >= page.nextSeq - 1) return;
       if (Date.now() - lastHeartbeat >= 15_000 && !res.writableEnded) {
         res.write(': keep-alive\n\n');
         lastHeartbeat = Date.now();
@@ -870,7 +1218,7 @@ export class NavigatorExecutor {
     if (typeof origin !== 'string' || !this.isAllowedOrigin(origin)) return;
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, Last-Event-ID');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, Last-Event-ID, Idempotency-Key');
     res.setHeader('Vary', 'Origin');
   }
 
@@ -999,6 +1347,62 @@ function stateFromRecord(record: TaskRecord): InternalTaskState {
     output: record.output, reasoning: record.reasoning, abortController: new AbortController(),
     subscribers: new Set(), eventChain: Promise.resolve(), patchChain: Promise.resolve(),
   };
+}
+
+/** Treat an explicit persisted marker or server-reserved ID prefix as read-only. */
+function isReadOnlyContinuation(record: TaskRecord): boolean {
+  return record.continuationMode === 'read_only' || record.id.startsWith('continuation-');
+}
+
+/** Recover only stable, server-derived Exchange authorization wait fields. */
+function authorizationWaitReceipts(
+  events: readonly { readonly event: Record<string, unknown> }[],
+): ExchangeAuthorizationWaitReceipt[] {
+  const unique = new Map<string, ExchangeAuthorizationWaitReceipt>();
+  for (const row of events) {
+    const event = row.event;
+    if (event.type !== 'authorization-required'
+      || event.code !== 'EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED'
+      || !['authorization-health', 'connection-resources', 'issue-action'].includes(String(event.source))) continue;
+    const receipt: ExchangeAuthorizationWaitReceipt = {
+      code: 'EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED',
+      source: event.source as ExchangeAuthorizationWaitReceipt['source'],
+      ...(typeof event.callId === 'string' ? { callId: event.callId } : {}),
+      ...(typeof event.connectionId === 'string' ? { connectionId: event.connectionId } : {}),
+      ...(typeof event.authorizationRef === 'string' ? { authorizationRef: event.authorizationRef } : {}),
+      ...(typeof event.generation === 'number' ? { generation: event.generation } : {}),
+    };
+    const key = (receipt.connectionId ?? '') + '\0' + (receipt.authorizationRef ?? '')
+      + '\0' + (receipt.callId ?? '');
+    const previous = unique.get(key);
+    if (previous === undefined || (receipt.generation ?? -1) > (previous.generation ?? -1)) {
+      unique.set(key, receipt);
+    }
+  }
+  return [...unique.values()];
+}
+
+/** Parse one rendered tool result without trusting non-JSON text. */
+function parseJsonObject(value: string): Record<string, unknown> {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // The caller treats an unreadable receipt as unresolved and requires manual review.
+  }
+  return {};
+}
+
+function resultIsConfirmedAuthWait(value: string): boolean {
+  const parsed = parseJsonObject(value);
+  return parsed.status === 'awaiting_user_authorization'
+    && parsed.code === 'EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED';
+}
+
+function isTerminalExchangeOperationState(state: string): boolean {
+  return state === 'SUCCEEDED' || state === 'FAILED';
 }
 
 function outcome(record: TaskRecord, error?: string, status?: TaskStatus, durationMs?: number): TaskOutcome {

@@ -33,6 +33,7 @@ TaskStatus = Literal[
     "aborted",
     "waiting_approval",
     "waiting_input",
+    "awaiting_user_authorization",
 ]
 
 
@@ -45,6 +46,15 @@ class TaskCreate(WorkModel):
     title: str | None = Field(default=None, max_length=512)
     description: str | None = Field(default=None, max_length=20_000)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class TaskContinuationCreate(WorkModel):
+    """Create one explicit read-only continuation from an owned paused task.
+
+    中文：请求体只有新的提示词，来源、Session 与权限由服务端派生。
+    """
+
+    prompt: str = Field(min_length=1, max_length=20_000)
 
 
 class TaskPatch(WorkModel):
@@ -79,6 +89,18 @@ class TaskRecord(WorkModel):
     title: str | None = None
     description: str | None = None
     metadata: dict[str, Any]
+    continuation_of_task_id: str | None = None
+    continuation_mode: Literal["read_only"] | None = None
+
+
+class TaskContinuationReceipt(WorkModel):
+    """Atomic child-task receipt with its server-derived source and mode.
+
+    中文：回执包含原子创建的新任务与是否为幂等重放。
+    """
+
+    task: TaskRecord
+    duplicate: bool
 
 
 class TaskList(WorkModel):

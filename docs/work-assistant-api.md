@@ -49,6 +49,8 @@ Base path: `/api/v1/workspaces/{workspaceId}/work`.
 | `GET /tasks/{taskId}` | Read one task. |
 | `PATCH /tasks/{taskId}` | Update prompt/results and perform a valid state transition. Timestamps are server-owned. |
 | `POST /tasks/{taskId}/claim` | Atomically claim only a `queued` task; exactly one caller receives `claimed:true`. |
+| `POST /tasks/{taskId}/resume/check` | Verify that the current writer owns a paused source before Navigator uses its stored DSH session identity with Exchange; returns `204`. |
+| `POST /tasks/{taskId}/resume` | Create an idempotent, read-only child from an owned task in `awaiting_user_authorization`; body contains only a new prompt. |
 | `GET /tasks/{taskId}/events?after=0&limit=1000` | Read events after the exclusive sequence cursor. |
 | `POST /tasks/{taskId}/events` | Append an event, optionally deduplicated by `messageId`. |
 
@@ -76,12 +78,21 @@ The executor record preserves these camelCase fields:
 ```
 
 The supported statuses are `queued`, `running`, `completed`, `failed`, `aborted`,
-`waiting_approval`, and `waiting_input`. A full TaskRecord also contains
-`workspaceId`, `sequence`, `title`, `description`, and `metadata`. `output` and
-`reasoning` are always strings. `startedAt`, `endedAt`, and `durationMs` are set
+`waiting_approval`, `waiting_input`, and `awaiting_user_authorization`. A TaskRecord also contains
+`workspaceId`, `sequence`, `title`, `description`, `metadata`, `continuationOfTaskId`, and
+`continuationMode`. The continuation fields are `null` for ordinary tasks. `output` and `reasoning`
+are always strings. `startedAt`, `endedAt`, and `durationMs` are set
 by the backend; callers cannot supply them. A queued task must use `/claim` to
 enter `running`. Approval routes own entry to and release from
 `waiting_approval`.
+
+A continuation request requires `Idempotency-Key` and accepts only a prompt. The Work service
+inherits the source session and derives the child link and `read_only` mode inside the same
+SQLite transaction that creates the queued TaskRecord. The source task remains paused, and its
+approvals are never copied. Navigator verifies the current Exchange principal and authorization
+generation before calling this route; old persistence servers without the route fail closed.
+Before contacting Exchange, Navigator calls `resume/check` with the configured persistence
+principal so a task lookup cannot be used to probe Exchange under a foreign stored session.
 
 事件追加请求和回执：
 
@@ -110,10 +121,18 @@ retry returns the original timestamp. GET returns
 Reusing a message id with different event content returns `409`.
 
 状态只能使用 `queued`、`running`、`completed`、`failed`、`aborted`、
-`waiting_approval` 和 `waiting_input`。完整 TaskRecord 还包含 `workspaceId`、
-`sequence`、`title`、`description`、`metadata`。`output` 和 `reasoning` 始终是字符串；
+`waiting_approval`、`waiting_input` 和 `awaiting_user_authorization`。TaskRecord 还包含 `workspaceId`、
+`sequence`、`title`、`description`、`metadata`、`continuationOfTaskId` 和 `continuationMode`。
+普通任务的两个续接字段为 `null`；`output` 和 `reasoning` 始终是字符串；
 时间戳和耗时由后端设置。queued 任务必须通过 `/claim` 开始执行；审批路由管理
 `waiting_approval` 状态。事件消息 id 可用于安全重试；相同 id 但内容不同会返回 `409`。
+
+续接请求必须带 `Idempotency-Key`，请求体只包含新提示词。Work 服务会在同一个 SQLite 事务中
+从源任务继承 Session 并设置子任务关系与 `read_only` 模式，然后才让 queued TaskRecord 可见。
+源任务保持暂停，原审批不会复制。Navigator 会先通过 Exchange 校验当前 principal 和授权世代；
+不支持此路由的旧 persistence 服务会失败关闭。
+在访问 Exchange 前，Navigator 先用当前 persistence principal 调用 `resume/check`，确认其拥有
+暂停任务，避免用其他用户保存的 Session 身份查询 Exchange。
 
 ## Approvals and operation receipts / 审批与操作回执
 

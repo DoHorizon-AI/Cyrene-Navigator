@@ -28,9 +28,19 @@ _TASK_RESULT_NOTIFICATION_TRUNCATION = "\n...[middle task result truncated]...\n
 _TERMINAL_TASK_STATES = frozenset({"completed", "failed", "aborted"})
 _TASK_TRANSITIONS: dict[str, frozenset[str]] = {
     "queued": frozenset({"running", "failed", "aborted", "waiting_approval", "waiting_input"}),
-    "running": frozenset({"completed", "failed", "aborted", "waiting_approval", "waiting_input"}),
+    "running": frozenset(
+        {
+            "completed",
+            "failed",
+            "aborted",
+            "waiting_approval",
+            "waiting_input",
+            "awaiting_user_authorization",
+        }
+    ),
     "waiting_approval": frozenset({"running", "failed", "aborted"}),
     "waiting_input": frozenset({"running", "failed", "aborted"}),
+    "awaiting_user_authorization": frozenset({"aborted"}),
     "completed": frozenset(),
     "failed": frozenset(),
     "aborted": frozenset(),
@@ -58,7 +68,11 @@ class WorkStore:
         self._initialize()
 
     def create_task(
-        self, organization_id: str | None, workspace_id: str, body: Mapping[str, Any]
+        self,
+        organization_id: str | None,
+        workspace_id: str,
+        body: Mapping[str, Any],
+        actor_id: str | None = None,
     ) -> tuple[JsonObject, bool]:
         """Create or safely replay one task admission. | 创建或安全重放任务接纳。"""
 
@@ -70,7 +84,18 @@ class WorkStore:
         description = _optional_text(body.get("description"), "description", 20_000)
         metadata = _json_object(body.get("metadata", {}), "metadata")
         _task_notification_descriptor(metadata)
+        created_by_actor_id = _identifier(actor_id, "actorId") if actor_id else ""
         create_digest = _digest(
+            {
+                "sessionId": session_id,
+                "prompt": prompt,
+                "title": title,
+                "description": description,
+                "metadata": metadata,
+                "createdByActorId": created_by_actor_id,
+            }
+        )
+        legacy_create_digest = _digest(
             {
                 "sessionId": session_id,
                 "prompt": prompt,
@@ -87,7 +112,10 @@ class WorkStore:
                 (org, workspace, task_id),
             ).fetchone()
             if row is not None:
-                if str(row["creation_digest"]) != create_digest:
+                if str(row["creation_digest"]) != create_digest and not (
+                    not str(row["created_by_actor_id"] or "")
+                    and str(row["creation_digest"]) == legacy_create_digest
+                ):
                     raise _conflict(
                         "WORK_TASK_ID_CONFLICT",
                         "The task id already names another task.",
@@ -97,8 +125,8 @@ class WorkStore:
                 """INSERT INTO work_tasks (
                     organization_id,workspace_id,task_id,session_id,prompt,status,
                     created_at,started_at,ended_at,output,reasoning,error,duration_ms,
-                    sequence,title,description,metadata_json,creation_digest
-                ) VALUES (?,?,?,?,?,'queued',?,NULL,NULL,'','',NULL,0,0,?,?,?,?)""",
+                    sequence,title,description,metadata_json,creation_digest,created_by_actor_id
+                ) VALUES (?,?,?,?,?,'queued',?,NULL,NULL,'','',NULL,0,0,?,?,?,?,?)""",
                 (
                     org,
                     workspace,
@@ -110,11 +138,176 @@ class WorkStore:
                     description,
                     _json_text(metadata),
                     create_digest,
+                    created_by_actor_id,
                 ),
             )
             self._append_event(conn, org, workspace, task_id, {"type": "task.created"}, None, now)
             row = self._require_task(conn, org, workspace, task_id)
             return self._task_view(row), False
+
+    def create_task_continuation(
+        self,
+        organization_id: str | None,
+        workspace_id: str,
+        source_task_id: str,
+        actor_id: str,
+        prompt: str,
+        idempotency_key: str,
+    ) -> tuple[JsonObject, bool]:
+        """Atomically create a read-only child from the same actor's auth-wait task.
+
+        Args:
+            organization_id: Authenticated organization scope.
+            workspace_id: Configured Workspace scope.
+            source_task_id: The actor-owned task waiting for user authorization.
+            actor_id: Authenticated persistence actor.
+            prompt: Bounded new continuation prompt.
+            idempotency_key: Stable key for this child task admission.
+        Returns:
+            The created TaskRecord projection and whether it was an idempotent replay.
+        Raises:
+            PersistenceError: If scope, owner, source state, or key is invalid.
+
+        中文：在一个事务中验证任务所有权并持久化只读续接标记。
+        """
+
+        org, workspace = _scope(organization_id, workspace_id)
+        source_task_id = _identifier(source_task_id, "source task id")
+        actor = _identifier(actor_id, "actorId")
+        continuation_prompt = _bounded_text(prompt, "prompt", 20_000)
+        key = _bounded_text(idempotency_key, "Idempotency-Key", 200)
+        digest = _digest({"sourceTaskId": source_task_id, "actorId": actor, "idempotencyKey": key})
+        task_id = "continuation-" + digest
+        now = _unix_ms()
+        with self._mutation() as conn:
+            source = self._require_task(conn, org, workspace, source_task_id)
+            if str(source["created_by_actor_id"] or "") != actor:
+                raise _not_found(
+                    "WORK_TASK_NOT_FOUND", "The source task does not exist in this Workspace."
+                )
+            if str(source["status"]) != "awaiting_user_authorization":
+                raise _conflict(
+                    "WORK_TASK_NOT_AWAITING_AUTHORIZATION",
+                    "Only authorization-waiting tasks can start an explicit continuation.",
+                )
+            session_id = str(source["session_id"])
+            create_digest = _digest(
+                {
+                    "sessionId": session_id,
+                    "prompt": continuation_prompt,
+                    "sourceTaskId": source_task_id,
+                    "continuationMode": "read_only",
+                    "actorId": actor,
+                    "idempotencyKey": key,
+                }
+            )
+            existing = conn.execute(
+                """SELECT * FROM work_tasks
+                   WHERE organization_id=? AND workspace_id=? AND task_id=?""",
+                (org, workspace, task_id),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["creation_digest"]) != create_digest:
+                    raise _conflict(
+                        "WORK_TASK_ID_CONFLICT", "The continuation key already names another task."
+                    )
+                return self._task_view(existing), True
+            conn.execute(
+                """INSERT INTO work_tasks(
+                    organization_id,workspace_id,task_id,session_id,prompt,status,
+                    created_at,started_at,ended_at,output,reasoning,error,duration_ms,sequence,
+                    title,description,metadata_json,creation_digest,created_by_actor_id,
+                    continuation_of_task_id,continuation_mode)
+                   VALUES(?,?,?,?,?,'queued',?,NULL,NULL,'','',NULL,0,0,NULL,NULL,'{}',?,?,?,?)""",
+                (
+                    org,
+                    workspace,
+                    task_id,
+                    session_id,
+                    continuation_prompt,
+                    now,
+                    create_digest,
+                    actor,
+                    source_task_id,
+                    "read_only",
+                ),
+            )
+            self._append_event(
+                conn,
+                org,
+                workspace,
+                task_id,
+                {
+                    "type": "task.created",
+                    "continuationOfTaskId": source_task_id,
+                    "continuationMode": "read_only",
+                },
+                None,
+                now,
+            )
+            self._append_event(
+                conn,
+                org,
+                workspace,
+                task_id,
+                {
+                    "type": "task.continuation_started",
+                    "sourceTaskId": source_task_id,
+                    "mode": "read_only",
+                },
+                None,
+                now,
+            )
+            self._append_event(
+                conn,
+                org,
+                workspace,
+                source_task_id,
+                {
+                    "type": "task.continuation_started",
+                    "continuationTaskId": task_id,
+                    "mode": "read_only",
+                },
+                None,
+                now,
+            )
+            row = self._require_task(conn, org, workspace, task_id)
+            return self._task_view(row), False
+
+    def verify_task_continuation_owner(
+        self,
+        organization_id: str | None,
+        workspace_id: str,
+        source_task_id: str,
+        actor_id: str,
+    ) -> None:
+        """Confirm ownership before Navigator revalidates the source DSH identity.
+
+        Args:
+            organization_id: Authenticated organization scope.
+            workspace_id: Configured Workspace scope.
+            source_task_id: Paused source task to validate.
+            actor_id: Authenticated persistence actor.
+        Raises:
+            PersistenceError: If the task is missing, unowned, or no longer waiting.
+
+        中文：在 Navigator 将保存的 DSH Session 用于 Exchange 前校验当前调用者。
+        """
+
+        org, workspace = _scope(organization_id, workspace_id)
+        source_task_id = _identifier(source_task_id, "source task id")
+        actor = _identifier(actor_id, "actorId")
+        with self._read() as conn:
+            source = self._require_task(conn, org, workspace, source_task_id)
+            if str(source["created_by_actor_id"] or "") != actor:
+                raise _not_found(
+                    "WORK_TASK_NOT_FOUND", "The source task does not exist in this Workspace."
+                )
+            if str(source["status"]) != "awaiting_user_authorization":
+                raise _conflict(
+                    "WORK_TASK_NOT_AWAITING_AUTHORIZATION",
+                    "Only authorization-waiting tasks can start an explicit continuation.",
+                )
 
     def get_task(self, organization_id: str | None, workspace_id: str, task_id: str) -> JsonObject:
         """Read one task from the exact tenant scope. | 读取精确租户范围内的任务。"""
@@ -2018,6 +2211,7 @@ class WorkStore:
         workspace_id: str,
         connector_id: str,
         body: Mapping[str, Any],
+        actor_id: str | None = None,
     ) -> tuple[JsonObject, JsonObject | None]:
         """Register a deduplicated connector event and optional task atomically. |
         原子接收连接事件。"""
@@ -2090,7 +2284,7 @@ class WorkStore:
             task_id: str | None = None
             if task_digest_body is not None:
                 task_view, _duplicate = self._create_task_in_transaction(
-                    conn, org, workspace, task_digest_body, now
+                    conn, org, workspace, task_digest_body, now, actor_id
                 )
                 task_id = str(task_view["id"])
             event_id = uuid4().hex
@@ -2421,6 +2615,11 @@ class WorkStore:
         try:
             conn.executescript(_WORK_SCHEMA_SQL)
             migrations = {
+                "work_tasks": {
+                    "created_by_actor_id": "TEXT NOT NULL DEFAULT ''",
+                    "continuation_of_task_id": "TEXT",
+                    "continuation_mode": "TEXT",
+                },
                 "work_notifications": {"connector_id": "TEXT", "task_id": "TEXT"},
                 "work_operations": {"task_id": "TEXT"},
                 "work_connector_states": {"configured": "INTEGER NOT NULL DEFAULT 0"},
@@ -2533,6 +2732,7 @@ class WorkStore:
         workspace: str,
         body: Mapping[str, Any],
         now: int,
+        actor_id: str | None = None,
     ) -> tuple[JsonObject, bool]:
         """Create or replay a task while connector intake owns its transaction. | 原子接纳任务。"""
 
@@ -2543,7 +2743,18 @@ class WorkStore:
         description = _optional_text(body.get("description"), "description", 20_000)
         metadata = _json_object(body.get("metadata", {}), "metadata")
         _task_notification_descriptor(metadata)
+        created_by_actor_id = _identifier(actor_id, "actorId") if actor_id else ""
         digest = _digest(
+            {
+                "sessionId": session_id,
+                "prompt": prompt,
+                "title": title,
+                "description": description,
+                "metadata": metadata,
+                "createdByActorId": created_by_actor_id,
+            }
+        )
+        legacy_digest = _digest(
             {
                 "sessionId": session_id,
                 "prompt": prompt,
@@ -2557,14 +2768,17 @@ class WorkStore:
             (org, workspace, task_id),
         ).fetchone()
         if prior is not None:
-            if str(prior["creation_digest"]) != digest:
+            if str(prior["creation_digest"]) != digest and not (
+                not str(prior["created_by_actor_id"] or "")
+                and str(prior["creation_digest"]) == legacy_digest
+            ):
                 raise _conflict("WORK_TASK_ID_CONFLICT", "The task id already names another task.")
             return self._task_view(prior), True
         conn.execute(
             """INSERT INTO work_tasks(organization_id,workspace_id,task_id,session_id,prompt,status,
                created_at,started_at,ended_at,output,reasoning,error,duration_ms,sequence,title,
-               description,metadata_json,creation_digest)
-               VALUES(?,?,?,?,?,'queued',?,NULL,NULL,'','',NULL,0,0,?,?,?,?)""",
+               description,metadata_json,creation_digest,created_by_actor_id)
+               VALUES(?,?,?,?,?,'queued',?,NULL,NULL,'','',NULL,0,0,?,?,?,?,?)""",
             (
                 org,
                 workspace,
@@ -2576,6 +2790,7 @@ class WorkStore:
                 description,
                 _json_text(metadata),
                 digest,
+                created_by_actor_id,
             ),
         )
         self._append_event(conn, org, workspace, task_id, {"type": "task.created"}, None, now)
@@ -2602,6 +2817,8 @@ class WorkStore:
             "title": row["title"],
             "description": row["description"],
             "metadata": _stored_object(row["metadata_json"], "task metadata"),
+            "continuationOfTaskId": row["continuation_of_task_id"],
+            "continuationMode": row["continuation_mode"],
         }
 
     @staticmethod
@@ -2934,6 +3151,7 @@ CREATE TABLE IF NOT EXISTS work_tasks (
  output TEXT NOT NULL DEFAULT '', reasoning TEXT NOT NULL DEFAULT '', error TEXT,
  duration_ms INTEGER NOT NULL DEFAULT 0, sequence INTEGER NOT NULL DEFAULT 0,
  title TEXT, description TEXT, metadata_json TEXT NOT NULL, creation_digest TEXT NOT NULL,
+ created_by_actor_id TEXT NOT NULL DEFAULT '', continuation_of_task_id TEXT, continuation_mode TEXT,
  PRIMARY KEY(organization_id,workspace_id,task_id));
 CREATE INDEX IF NOT EXISTS work_tasks_order
  ON work_tasks(organization_id,workspace_id,created_at DESC,task_id);

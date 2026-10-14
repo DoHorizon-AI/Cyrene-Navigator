@@ -23,6 +23,8 @@ import {
 const workspaceId = 'workspace-42';
 const bindingId = '0c55f617-199f-4e36-8a2d-45a0d2f4b1ae';
 const operationId = '7c9f4339-f824-4d99-b436-e6ca9020984e';
+const connectionId = '7e1c50d2-b4f3-4d61-9302-9a0bd48d1991';
+const authorizationRef = 'native-authorization-ref';
 const sessionId = 'navigator-session-42';
 const issueNumber = 17;
 
@@ -87,6 +89,15 @@ async function startExchangeFixture(options = {}) {
           response.end('{}');
           return;
         }
+        if (options.reauthorizationRequired === true) {
+          response.writeHead(409, { 'content-type': 'application/problem+json' });
+          response.end(JSON.stringify({
+            code: 'EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED',
+            context: { connectionId, authorizationRef },
+            detail: 'Provider credentials and private diagnostic details are omitted.',
+          }));
+          return;
+        }
         if (options.invalidLocation === true) {
           response.writeHead(202, { location: 'https://attacker.example/steal' });
           response.end(JSON.stringify(operationProjection()));
@@ -146,6 +157,9 @@ async function createToolContext(exchange, options = {}) {
       },
     },
     taskIdForSession: id => id === sessionId ? 'task-42' : undefined,
+    onAuthorizationRequired: async (actualSessionId, receipt) => {
+      events.push({ type: 'authorization-required', sessionId: actualSessionId, receipt });
+    },
   });
   return { ctx, dispose, events };
 }
@@ -249,6 +263,38 @@ test('rejects writes before Exchange when approval is denied', async () => {
     }, 'rejected-comment');
     assert.equal(result.isError, true);
     assert.equal(exchange.requests.length, 0);
+  } finally {
+    dispose();
+    await ctx.fiber.dispose();
+    await exchange.close();
+  }
+});
+
+test('confirmed provider reauthorization returns a durable wait receipt for an approved Exchange write', async () => {
+  const exchange = await startExchangeFixture({ reauthorizationRequired: true });
+  const { ctx, dispose, events } = await createToolContext(exchange);
+  try {
+    const result = await execute(ctx, toolName(ctx, 'exchange_issue_comment'), {
+      bindingId, issueNumber, body: 'Approved comment awaiting provider reauthorization.',
+    }, 'reauthorization-comment');
+    assert.equal(result.isError, false);
+    assert.deepEqual(result.value, {
+      status: 'awaiting_user_authorization',
+      code: 'EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED',
+      connectionId,
+      authorizationRef,
+    });
+    const wait = events.find(event => event.type === 'authorization-required');
+    assert.equal(wait.sessionId, sessionId);
+    assert.deepEqual(wait.receipt, {
+      callId: 'reauthorization-comment',
+      connectionId,
+      authorizationRef,
+      source: 'issue-action',
+      code: 'EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED',
+    });
+    assert.equal(exchange.requests.filter(request => request.method === 'POST').length, 1);
+    assert.equal(JSON.stringify(result.value).includes('Provider credentials'), false);
   } finally {
     dispose();
     await ctx.fiber.dispose();
