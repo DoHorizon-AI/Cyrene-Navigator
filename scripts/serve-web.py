@@ -101,6 +101,14 @@ def main() -> None:
         help="fixed Web Host proxy prefix and credential-free HTTP(S) origin",
     )
     parser.add_argument(
+        "--proxy-product-auth",
+        metavar="PREFIX",
+        help=(
+            "opt in to per-request first-party Product authorization for the registered "
+            "Exchange prefix; currently only /api/v1/exchange is supported"
+        ),
+    )
+    parser.add_argument(
         "--insecure-http",
         action="store_true",
         help="allow non-Secure cookies for an explicitly local HTTP deployment",
@@ -127,6 +135,10 @@ def main() -> None:
         pairing_code = generate_pairing_code()
         write_pairing_code(code_file, pairing_code)
     proxy_targets: dict[str, str | ProxyTarget] = dict(_parse_proxy_targets(args.proxy, parser))
+    try:
+        proxy_targets = _enable_product_auth_proxy_target(proxy_targets, args.proxy_product_auth)
+    except ValueError as error:
+        parser.error(str(error))
     if args.work_url:
         try:
             work_targets = work_proxy_targets(
@@ -177,6 +189,26 @@ def _parse_proxy_targets(values: list[str], parser: argparse.ArgumentParser) -> 
             parser.error(f"duplicate --proxy prefix: {prefix}")
         result[prefix] = origin
     return result
+
+
+def _enable_product_auth_proxy_target(
+    proxy_targets: dict[str, str | ProxyTarget], prefix: str | None
+) -> dict[str, str | ProxyTarget]:
+    """Enable the request-scoped Product bearer only on a registered Exchange target.
+
+    中文:只在已注册 Exchange target 上显式启用按请求转发的 Product bearer。
+    """
+
+    resolved = dict(proxy_targets)
+    if prefix is None:
+        return resolved
+    if prefix != "/api/v1/exchange":
+        raise ValueError("--proxy-product-auth only supports /api/v1/exchange")
+    base_url = resolved.get(prefix)
+    if not isinstance(base_url, str):
+        raise ValueError("--proxy-product-auth requires a matching --proxy /api/v1/exchange=URL")
+    resolved[prefix] = ProxyTarget(base_url, forward_product_authorization=True)
+    return resolved
 
 
 if __name__ == "__main__":

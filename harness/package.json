@@ -22,7 +22,8 @@
     "./work-tools": "./dist/work-tools.js",
     "./executor-client": "./dist/executor-client.js",
     "./tool-providers": "./dist/tool-providers.js",
-    "./exchange-integration": "./dist/integrations/exchange-integration.js"
+    "./exchange-integration": "./dist/integrations/exchange-integration.js",
+    "./exchange-authorization": "./dist/integrations/exchange-authorization.js"
   },
   "dsh": {
     "bundle": {

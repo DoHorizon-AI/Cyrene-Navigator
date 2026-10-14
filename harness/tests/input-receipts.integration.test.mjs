@@ -26,14 +26,14 @@ const tokenEnv = 'CYRENE_RECEIPT_SESSION_TOKEN';
 const workspaceId = 'proof';
 
 /** Start the actual SQLite-backed persistence authority used by this suite. */
-async function startService(directory, token) {
+async function startService(directory, token, leaseSeconds = 30) {
   const config = join(directory, 'principals.json');
   await writeFile(config, JSON.stringify({ principals: [{
     token_env: tokenEnv, actor_id: 'receipt-owner', workspace_ids: [workspaceId],
   }] }));
   const child = spawn(python, [join(repository, 'scripts/serve-persistence.py'),
     '--database', join(directory, 'sessions.sqlite'), '--principal-config', config,
-    '--port', '0', '--lease-seconds', '30'], {
+    '--port', '0', '--lease-seconds', String(leaseSeconds)], {
     env: { ...process.env, [tokenEnv]: token },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -79,7 +79,7 @@ async function stopService(service) {
 }
 
 /** Mount the real SessionStore and Cyrene persistence client. */
-async function client(baseUrl, token, device, selectedWorkspace = workspaceId, selectedTokenEnv = tokenEnv, batchDelayMs = 1_000) {
+async function client(baseUrl, token, device, selectedWorkspace = workspaceId, selectedTokenEnv = tokenEnv, batchDelayMs = 1_000, heartbeatMs = 250) {
   process.env[selectedTokenEnv] = token;
   const ctx = new Context();
   await ctx.plugin(SessionStore);
@@ -89,7 +89,7 @@ async function client(baseUrl, token, device, selectedWorkspace = workspaceId, s
     tokenEnv: selectedTokenEnv,
     clientId: device,
     requestTimeoutMs: 2_000,
-    heartbeatMs: 250,
+    heartbeatMs,
     batchDelayMs,
     maxPendingEvents: 8_192,
     batchSize: 256,
@@ -136,8 +136,11 @@ test('receipt confirms only durable completed turns and remains read-only', { ti
   let service;
   let ctx;
   try {
-    service = await startService(directory, token);
-    ctx = await client(service.baseUrl, token, 'receipt-writer');
+    // This receipt test does not exercise lease expiry. Keep renewal outside
+    // its window so aggregate CPU scheduling cannot turn a read-only check
+    // into a test of heartbeat timing.
+    service = await startService(directory, token, 300);
+    ctx = await client(service.baseUrl, token, 'receipt-writer', workspaceId, tokenEnv, 1_000, 60_000);
     const id = SessionId(`receipt-${randomUUID()}`);
     const session = ctx.sessions.create(id, { meta: { cwd: directory } });
     const writer = await ctx.sessionPersistence.create(session.header);
@@ -203,8 +206,8 @@ test('receipt tail is bounded and cannot confirm a request outside the retained 
   let service;
   let ctx;
   try {
-    service = await startService(directory, token);
-    ctx = await client(service.baseUrl, token, 'receipt-tail-writer');
+    service = await startService(directory, token, 300);
+    ctx = await client(service.baseUrl, token, 'receipt-tail-writer', workspaceId, tokenEnv, 1_000, 60_000);
     const id = SessionId(`receipt-tail-${randomUUID()}`);
     const session = ctx.sessions.create(id, { meta: { cwd: directory } });
     const writer = await ctx.sessionPersistence.create(session.header);

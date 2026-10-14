@@ -14,6 +14,7 @@ either integration.
 
 | File | Responsibility / 职责 |
 | --- | --- |
+| exchange-authorization.ts | Actor-scoped Exchange authorization health, approved renewal sessions, and cached cloud reads / 调用者隔离的授权健康、审批续期和云资源缓存读取 |
 | `cloud-connections.ts` | Profile validation, MCP startup, health, and source-classified readonly workflow tools / 配置校验、MCP 启动、健康状态和按来源分类的只读工作流工具 |
 | `exchange-integration.ts` | Typed Exchange issue client and four fixed DSH tools / 类型化 Exchange issue 客户端与四个固定 DSH 工具 |
 | `index.ts` | Public package exports for cloud and Exchange integration / 云与 Exchange 集成的公开导出 |
@@ -49,6 +50,38 @@ rechecks the Platform identity, operation grant, account binding, and delegation
 before provider execution. Actor binding setup belongs to the non-AI management
 surface. Navigator stores no Exchange sync rows or issue snapshots.
 
+Authorization integration adds five fixed tools: exchange_connections_list,
+exchange_authorization_health, exchange_reauthorization_start,
+exchange_reauthorization_status, and exchange_cloud_resources_query. Connection,
+health, and resource reads use the actual DSH
+session's current user Bearer and configured Workspace. Renewal start accepts
+only a recent authorization reference returned by that same session's scoped
+health read, then waits for Navigator's existing human approval before sending an
+empty typed Product request with Idempotency-Key. Browser authorization URLs
+and QR attachment references stay out of model results. The resource tool reads
+Exchange's latest projection; Exchange owns polling, comparison, refresh jobs,
+and notification delivery.
+The connection-list tool returns Product-generated connection IDs with only
+provider, display, repository, enabled, and timestamp fields. Binding, target,
+account, actor, and tenant references do not enter the model surface.
+
+Only HTTP 409 with Product code
+EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED enters durable
+awaiting_user_authorization. Structured connection and native authorization
+references are verified against a fresh health read before continuation. A
+first-party 401, generic 403, network failure, unknown health, and Platform
+AWAITING_AUTHORITY remain separate outcomes.
+
+After health returns PRESENT and VALID at a newer generation, Client can make
+POST /api/v1/tasks/{taskId}/resume with only a new bounded prompt and
+Idempotency-Key. Navigator creates a new task linked to the paused task and
+original DSH session. The old prompt and approvals are not replayed. The new
+task is atomically marked continuationMode=read_only before queue visibility;
+the executor allows only its fixed read-only tools. Unknown, in-flight, or
+unrecorded Exchange writes prevent continuation until an operator reconciles
+them. Navigator does not claim a DSH checkpoint or automatically replay a
+claimed turn.
+
 Exchange 工具通过 `CYRENE_EXCHANGE_INTEGRATION_URL` 与宿主管理的
 `CYRENE_WORKSPACE_ID` 配置。宿主必须提供
 `trustedUserBearerProvider(sessionId, workspaceId, signal)`，为每次请求解析当前用户的
@@ -64,3 +97,24 @@ operation、短暂轮询，并且只在 Exchange 返回 `SUCCEEDED` 后读取缓
 结果只包含 operation 引用。评论和状态变更使用现有 Navigator 审批流程，并返回 Exchange 的
 202 operation 引用。Exchange 在 Provider 执行前会重新验证 Platform 身份、操作授权、账号绑定
 和 delegation。Actor binding 配置归非 AI 管理界面。Navigator 不保存 Exchange 同步行或 issue 快照。
+
+授权集成额外提供五个固定工具：exchange_connections_list、
+exchange_authorization_health、exchange_reauthorization_start、
+exchange_reauthorization_status 和 exchange_cloud_resources_query。连接列表、健康与资源读取使用当前 DSH Session 的 user Bearer 及宿主配置的
+Workspace。续期启动只接受同一 Session 最近一次受范围保护的健康查询返回的授权引用，并在发送无
+请求体、带 Idempotency-Key 的 Product 请求前等待 Navigator 现有人工审批。浏览器授权 URL 与
+二维码附件引用不会进入模型结果。资源工具只读取 Exchange 最新投影；轮询、比较、刷新任务与通知
+投递由 Exchange 负责。
+连接列表只返回 Product 生成的连接 ID 及 Provider、显示名、仓库、启用状态和时间戳；模型看不到
+binding、target、account、actor 或 tenant 引用。
+
+只有 HTTP 409 且 Product code 为
+EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED 才会进入持久状态
+awaiting_user_authorization。结构化连接及原生授权引用会先通过新的健康查询再次校验，才能用于续接。
+first-party 401、一般 403、网络错误、未知健康状态和 Platform AWAITING_AUTHORITY 是不同结果。
+
+健康状态在更新世代返回 PRESENT 与 VALID 后，Client 可以显式调用
+POST /api/v1/tasks/{taskId}/resume，请求只包含有界的新提示词和 Idempotency-Key。Navigator
+会创建链接到暂停任务及原 DSH Session 的新任务，不会重放原提示词或旧审批。新任务在进入队列前
+原子标记 continuationMode=read_only；执行器只开放固定只读工具。Exchange 写操作未知、仍在运行或
+没有回执时，必须由操作员核对后再续接。Navigator 不声称 DSH 提供了检查点，也不会自动重放已认领的回合。

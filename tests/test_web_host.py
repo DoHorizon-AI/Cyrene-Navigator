@@ -10,14 +10,16 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from cyrene_navigator.web_host import create_web_host_app
+from cyrene_navigator.web_host import ProxyTarget, create_web_host_app
 
 PAIRING_CODE = "pairing-code-for-tests"
 SECRET = "hf_test_secret_value"
@@ -33,6 +35,17 @@ def _login(client: TestClient) -> dict[str, str]:
     response = client.post("/api/v1/auth/pair", json={"pairingCode": PAIRING_CODE})
     assert response.status_code == 200, response.text
     return {"X-CSRF-Token": response.json()["csrfToken"]}
+
+
+def _start_http_fixture(
+    handler: type[BaseHTTPRequestHandler],
+) -> tuple[ThreadingHTTPServer, threading.Thread, str]:
+    """Serve a fixture on loopback so Web Host proxy tests cross a real socket."""
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, f"http://127.0.0.1:{server.server_port}"
 
 
 def test_pairing_is_one_time_and_session_cookies_are_scoped() -> None:
@@ -169,6 +182,576 @@ def test_system_status_is_safe_and_proxy_is_fixed_allowlist_with_csrf() -> None:
         import asyncio
 
         asyncio.run(async_client.aclose())
+
+
+def test_product_auth_proxy_is_opt_in_and_cannot_fall_back_to_static_credentials() -> None:
+    assert ProxyTarget("http://127.0.0.1:8000/api/v1").forward_product_authorization is False
+    for credential in (
+        {"bearer_token": "static-product-token"},
+        {"credential_ref": "credential://product-user"},
+    ):
+        with pytest.raises(ValueError, match="cannot use a configured proxy credential"):
+            ProxyTarget(
+                "http://127.0.0.1:8000/api/v1",
+                forward_product_authorization=True,
+                **credential,
+            )
+    with pytest.raises(ValueError, match="HTTPS or loopback HTTP"):
+        ProxyTarget(
+            "http://exchange.example.invalid",
+            forward_product_authorization=True,
+        )
+    with pytest.raises(ValueError, match="origin-only proxy URL"):
+        ProxyTarget(
+            "http://127.0.0.1:8000/api/v1",
+            forward_product_authorization=True,
+        )
+    with pytest.raises(ValueError, match="restricted to /api/v1/exchange"):
+        create_web_host_app(
+            proxy_targets={
+                "/api/v1/other": ProxyTarget(
+                    "http://127.0.0.1:8000",
+                    forward_product_authorization=True,
+                )
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "credential",
+    (
+        {"bearer_token": "static-product-token"},
+        {"credential_ref": "credential://product-user"},
+    ),
+)
+def test_static_exchange_credentials_cannot_authorize_product_routes(
+    credential: dict[str, str],
+) -> None:
+    captured: list[httpx.Request] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"unexpected": True})
+
+    import asyncio
+
+    async_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    app = create_web_host_app(
+        pairing_code=PAIRING_CODE,
+        proxy_targets={"/api/v1/exchange": ProxyTarget("http://backend.test", **credential)},
+        http_client=async_client,
+    )
+    try:
+        with TestClient(app) as client:
+            _login(client)
+            response = client.get("/api/v1/exchange/api/v1/integrations/connections")
+            assert response.status_code == 401
+            assert response.json()["code"] == "NAVIGATOR_PRODUCT_AUTH_REQUIRED"
+            assert captured == []
+    finally:
+        asyncio.run(async_client.aclose())
+
+
+@pytest.mark.parametrize(
+    "client_options",
+    (
+        {"auth": ("default-user", "default-password")},
+        {"headers": {"Authorization": "Bearer default-token"}},
+        {"headers": {"Cookie": "session=default-cookie"}},
+        {"headers": {"X-Cyrene-Workspace-Id": "default-workspace"}},
+    ),
+)
+def test_product_auth_proxy_rejects_clients_with_default_identity_headers(
+    client_options: dict[str, object],
+) -> None:
+    import asyncio
+
+    async_client = httpx.AsyncClient(**client_options)
+    try:
+        with pytest.raises(ValueError, match="default-auth HTTP client"):
+            create_web_host_app(
+                pairing_code=PAIRING_CODE,
+                proxy_targets={
+                    "/api/v1/exchange": ProxyTarget(
+                        "http://127.0.0.1:8000",
+                        forward_product_authorization=True,
+                    )
+                },
+                http_client=async_client,
+            )
+    finally:
+        asyncio.run(async_client.aclose())
+
+
+def test_web_launcher_requires_a_registered_exact_exchange_product_auth_target() -> None:
+    repository = Path(__file__).parents[1]
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(repository / "src"), environment.get("PYTHONPATH", "")]
+    )
+    base_command = [
+        sys.executable,
+        str(repository / "scripts" / "serve-web.py"),
+        "--pairing-code",
+        PAIRING_CODE,
+        "--insecure-http",
+    ]
+    cases = (
+        ([], "/api/v1/exchange", "requires a matching --proxy"),
+        (
+            ["--proxy", "/api/v1/other=http://127.0.0.1:8000"],
+            "/api/v1/other",
+            "only supports /api/v1/exchange",
+        ),
+        (
+            ["--proxy", "/api/v1/exchange=http://exchange.example.invalid"],
+            "/api/v1/exchange",
+            "HTTPS or loopback HTTP",
+        ),
+    )
+    for proxy_arguments, prefix, expected_error in cases:
+        result = subprocess.run(
+            [*base_command, *proxy_arguments, "--proxy-product-auth", prefix],
+            cwd=repository,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        assert result.returncode != 0
+        assert expected_error in result.stderr
+        assert PAIRING_CODE not in result.stderr
+
+
+def test_product_auth_bridge_forwards_only_to_exchange_over_real_loopback() -> None:
+    captured: list[dict[str, str | None]] = []
+    attacker_requests: list[str] = []
+    product_token = "first-party-user-token-not-control"
+    product_workspace = "workspace-bridge-test"
+
+    class AttackerHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            attacker_requests.append(self.path)
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    attacker_server, attacker_thread, attacker_origin = _start_http_fixture(AttackerHandler)
+
+    class ExchangeHandler(BaseHTTPRequestHandler):
+        def _dispatch(self) -> None:
+            body_size = int(self.headers.get("Content-Length", "0"))
+            if body_size:
+                self.rfile.read(body_size)
+            authorization = self.headers.get("Authorization")
+            captured.append(
+                {
+                    "path": self.path,
+                    "authorization": authorization,
+                    "workspace": self.headers.get("X-Cyrene-Workspace-Id"),
+                    "productAuthorization": self.headers.get("X-Cyrene-Product-Authorization"),
+                    "cookie": self.headers.get("Cookie"),
+                    "accept": self.headers.get("Accept"),
+                    "lastEventId": self.headers.get("Last-Event-ID"),
+                }
+            )
+            if self.path == "/v1/models" and authorization is None:
+                payload = b'{"legacyModelRoute":true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            if self.path in {"/v1/embeddings", "/v1/responses"} and authorization is None:
+                payload = json.dumps({"legacyModelRoute": self.path}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            if (
+                self.path == "/v1/chat/completions"
+                and authorization == "Bearer exchange-gateway-key"
+                and self.headers.get("Accept") == "text/event-stream"
+            ):
+                payload = b'data: {"choices":[]}\n\ndata: [DONE]\n\n'
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            if (
+                self.path == "/v1/chat/completions"
+                and authorization is None
+                and self.headers.get("Accept") == "text/event-stream"
+            ):
+                payload = b'data: {"choices":[]}\n\ndata: [DONE]\n\n'
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            if authorization != f"Bearer {product_token}":
+                payload = b'{"code":"EXCHANGE_PRINCIPAL_UNAUTHENTICATED"}'
+                self.send_response(401)
+                self.send_header("Content-Type", "application/problem+json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            if self.path == (
+                "/api/v1/integrations/connections/7e1c50d2-b4f3-4d61-9302-9a0bd48d1991/authorization-health"
+            ):
+                self.send_response(302)
+                self.send_header("Location", f"{attacker_origin}/capture")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if self.path == "/api/v1/integrations/notifications/events":
+                payload = b'id: 8\ndata: {"kind":"authorization.required"}\n\n'
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            payload = json.dumps({"ok": True, "path": self.path}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_GET(self) -> None:
+            self._dispatch()
+
+        def do_POST(self) -> None:
+            self._dispatch()
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    exchange_server, exchange_thread, exchange_origin = _start_http_fixture(ExchangeHandler)
+    repository = Path(__file__).parents[1]
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(repository / "src"), environment.get("PYTHONPATH", "")]
+    )
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(repository / "scripts" / "serve-web.py"),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--pairing-code",
+            PAIRING_CODE,
+            "--insecure-http",
+            "--proxy",
+            f"/api/v1/exchange={exchange_origin}",
+            "--proxy-product-auth",
+            "/api/v1/exchange",
+            "--proxy",
+            f"/api/v1/other={exchange_origin}",
+            "--proxy",
+            f"/api/proxy/exchange-gateway={exchange_origin}",
+        ],
+        cwd=repository,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    try:
+        assert process.stdout is not None
+        startup_line = process.stdout.readline()
+        if not startup_line:
+            _, stderr = process.communicate(timeout=5)
+            pytest.fail(f"Web Host did not start: {stderr}")
+        startup = json.loads(startup_line)
+        web_origin = f"http://127.0.0.1:{startup['port']}"
+
+        with httpx.Client(base_url=web_origin, timeout=5.0) as client:
+            paired = client.post("/api/v1/auth/pair", json={"pairingCode": PAIRING_CODE})
+            assert paired.status_code == 200, paired.text
+            csrf = {"X-CSRF-Token": paired.json()["csrfToken"]}
+            product_headers = {
+                "X-Cyrene-Product-Authorization": f"Bearer {product_token}",
+                "X-Cyrene-Workspace-Id": product_workspace,
+            }
+
+            unauthenticated = httpx.get(
+                f"{web_origin}/api/v1/exchange/api/v1/integrations/connections",
+                headers=product_headers,
+                timeout=5.0,
+            )
+            assert unauthenticated.status_code == 401
+            assert unauthenticated.json()["code"] == "NAVIGATOR_AUTH_REQUIRED"
+            assert captured == []
+
+            missing_bearer = client.get(
+                "/api/v1/exchange/api/v1/integrations/connections",
+                headers={
+                    "Authorization": "Bearer control-session-token",
+                    "X-Cyrene-Workspace-Id": product_workspace,
+                },
+            )
+            assert missing_bearer.status_code == 401
+            assert missing_bearer.json()["code"] == "NAVIGATOR_PRODUCT_AUTH_REQUIRED"
+            assert captured == []
+
+            missing_workspace = client.get(
+                "/api/v1/exchange/api/v1/integrations/connections",
+                headers={"X-Cyrene-Product-Authorization": f"Bearer {product_token}"},
+            )
+            assert missing_workspace.status_code == 400
+            assert missing_workspace.json()["code"] == "NAVIGATOR_PRODUCT_WORKSPACE_REQUIRED"
+            assert captured == []
+
+            invalid_bearer = client.get(
+                "/api/v1/exchange/api/v1/integrations/connections",
+                headers={
+                    "X-Cyrene-Product-Authorization": "Basic not-a-product-bearer",
+                    "X-Cyrene-Workspace-Id": product_workspace,
+                },
+            )
+            assert invalid_bearer.status_code == 401
+            assert captured == []
+
+            unapproved_path = client.get(
+                "/api/v1/exchange/api/v1/accounts/authorizations/native-authref/unapproved",
+                headers=product_headers,
+            )
+            assert unapproved_path.status_code == 404
+            assert unapproved_path.json()["code"] == "NAVIGATOR_PRODUCT_AUTH_ROUTE_NOT_ALLOWED"
+            assert captured == []
+
+            unsupported_without_identity = client.get(
+                "/api/v1/exchange/api/v1/integrations/arbitrary"
+            )
+            assert unsupported_without_identity.status_code == 404
+            assert (
+                unsupported_without_identity.json()["code"]
+                == "NAVIGATOR_PRODUCT_AUTH_ROUTE_NOT_ALLOWED"
+            )
+            assert captured == []
+
+            unsupported_account_route = client.get(
+                "/api/v1/exchange/api/v1/accounts/authorizations/native-authref/unapproved"
+            )
+            assert unsupported_account_route.status_code == 404
+            assert (
+                unsupported_account_route.json()["code"]
+                == "NAVIGATOR_PRODUCT_AUTH_ROUTE_NOT_ALLOWED"
+            )
+            assert captured == []
+
+            unauthenticated_renewal_status = client.get(
+                "/api/v1/exchange/api/v1/accounts/renewal-sessions/7e1c50d2-b4f3-4d61-9302-9a0bd48d1991"
+            )
+            assert unauthenticated_renewal_status.status_code == 401
+            assert (
+                unauthenticated_renewal_status.json()["code"] == "NAVIGATOR_PRODUCT_AUTH_REQUIRED"
+            )
+            assert captured == []
+
+            wrong_token = "wrong-product-token"
+            rejected = client.get(
+                "/api/v1/exchange/api/v1/integrations/connections",
+                headers={
+                    "X-Cyrene-Product-Authorization": f"Bearer {wrong_token}",
+                    "X-Cyrene-Workspace-Id": product_workspace,
+                },
+            )
+            assert rejected.status_code == 401
+            assert captured[-1]["authorization"] == f"Bearer {wrong_token}"
+            assert wrong_token not in rejected.text
+
+            control_authorization = "Bearer control-session-token"
+            connections = client.get(
+                "/api/v1/exchange/api/v1/integrations/connections",
+                headers={**product_headers, "Authorization": control_authorization},
+            )
+            assert connections.status_code == 200
+            connection_request = captured[-1]
+            assert connection_request["path"] == "/api/v1/integrations/connections"
+            assert connection_request["authorization"] == f"Bearer {product_token}"
+            assert connection_request["workspace"] == product_workspace
+            assert connection_request["productAuthorization"] is None
+            assert connection_request["cookie"] is None
+            assert control_authorization not in connections.text
+
+            legacy_chat = client.post(
+                "/api/v1/exchange/v1/chat/completions",
+                headers={
+                    **csrf,
+                    "Accept": "text/event-stream",
+                    "Content-Type": "application/json",
+                },
+                json={"stream": True},
+            )
+            assert legacy_chat.status_code == 200
+            assert legacy_chat.text == 'data: {"choices":[]}\n\ndata: [DONE]\n\n'
+            legacy_chat_request = captured[-1]
+            assert legacy_chat_request["path"] == "/v1/chat/completions"
+            assert legacy_chat_request["authorization"] is None
+            assert legacy_chat_request["workspace"] is None
+            assert legacy_chat_request["productAuthorization"] is None
+
+            before_csrf = len(captured)
+            csrf_rejected = client.post(
+                "/api/v1/exchange/api/v1/integrations/notifications/n1/ack",
+                headers=product_headers,
+                json={},
+            )
+            assert csrf_rejected.status_code == 403
+            assert csrf_rejected.json()["code"] == "NAVIGATOR_CSRF_INVALID"
+            assert len(captured) == before_csrf
+
+            acknowledged = client.post(
+                "/api/v1/exchange/api/v1/integrations/notifications/n1/ack",
+                headers={**product_headers, **csrf},
+                json={},
+            )
+            assert acknowledged.status_code == 200
+            assert captured[-1]["path"] == "/api/v1/integrations/notifications/n1/ack"
+            assert captured[-1]["authorization"] == f"Bearer {product_token}"
+            assert captured[-1]["workspace"] == product_workspace
+
+            renewal_started = client.post(
+                "/api/v1/exchange/api/v1/accounts/authorizations/native-authref/renewal-sessions",
+                headers={**product_headers, **csrf},
+                json={},
+            )
+            assert renewal_started.status_code == 200
+            assert captured[-1]["path"] == (
+                "/api/v1/accounts/authorizations/native-authref/renewal-sessions"
+            )
+
+            renewal_status = client.get(
+                "/api/v1/exchange/api/v1/accounts/renewal-sessions/7e1c50d2-b4f3-4d61-9302-9a0bd48d1991",
+                headers=product_headers,
+            )
+            assert renewal_status.status_code == 200
+            assert captured[-1]["path"] == (
+                "/api/v1/accounts/renewal-sessions/7e1c50d2-b4f3-4d61-9302-9a0bd48d1991"
+            )
+
+            events = client.get(
+                "/api/v1/exchange/api/v1/integrations/notifications/events",
+                headers={
+                    **product_headers,
+                    "Accept": "text/event-stream",
+                    "Last-Event-ID": "7",
+                },
+            )
+            assert events.status_code == 200
+            assert events.text == 'id: 8\ndata: {"kind":"authorization.required"}\n\n'
+            assert captured[-1]["accept"] == "text/event-stream"
+            assert captured[-1]["lastEventId"] == "7"
+            assert captured[-1]["authorization"] == f"Bearer {product_token}"
+
+            before_legacy_model = len(captured)
+            legacy_model = client.get(
+                "/api/v1/exchange/v1/models",
+                headers={"Authorization": control_authorization},
+            )
+            assert legacy_model.status_code == 200
+            assert captured[-1]["path"] == "/v1/models"
+            assert captured[-1]["authorization"] is None
+            assert captured[-1]["productAuthorization"] is None
+            assert len(captured) == before_legacy_model + 1
+
+            for legacy_path in ("/v1/embeddings", "/v1/responses"):
+                legacy_response = client.post(
+                    f"/api/v1/exchange{legacy_path}",
+                    headers={**csrf, "Content-Type": "application/json"},
+                    json={"model": "test"},
+                )
+                assert legacy_response.status_code == 200
+                assert captured[-1]["path"] == legacy_path
+                assert captured[-1]["authorization"] is None
+                assert captured[-1]["workspace"] is None
+                assert captured[-1]["productAuthorization"] is None
+
+            before_product_to_model = len(captured)
+            product_to_model = client.get(
+                "/api/v1/exchange/v1/models",
+                headers=product_headers,
+            )
+            assert product_to_model.status_code == 404
+            assert product_to_model.json()["code"] == "NAVIGATOR_PRODUCT_AUTH_ROUTE_NOT_ALLOWED"
+            assert len(captured) == before_product_to_model
+
+            before_other_target = len(captured)
+            other_target = client.get(
+                "/api/v1/other/integrations/connections",
+                headers={
+                    **product_headers,
+                    "Authorization": control_authorization,
+                },
+            )
+            assert other_target.status_code == 404
+            assert other_target.json()["code"] == "NAVIGATOR_PRODUCT_AUTH_ROUTE_NOT_ALLOWED"
+            assert len(captured) == before_other_target
+
+            before_gateway = len(captured)
+            gateway_product = client.get(
+                "/api/proxy/exchange-gateway/v1/models",
+                headers=product_headers,
+            )
+            assert gateway_product.status_code == 404
+            assert gateway_product.json()["code"] == "NAVIGATOR_PRODUCT_AUTH_ROUTE_NOT_ALLOWED"
+            assert len(captured) == before_gateway
+
+            gateway = client.post(
+                "/api/proxy/exchange-gateway/v1/chat/completions",
+                headers={
+                    **csrf,
+                    "Authorization": "Bearer exchange-gateway-key",
+                    "Accept": "text/event-stream",
+                    "Content-Type": "application/json",
+                },
+                json={"stream": True},
+            )
+            assert gateway.status_code == 200
+            assert gateway.text == 'data: {"choices":[]}\n\ndata: [DONE]\n\n'
+            gateway_request = captured[-1]
+            assert len(captured) == before_gateway + 1
+            assert gateway_request["path"] == "/v1/chat/completions"
+            assert gateway_request["authorization"] == "Bearer exchange-gateway-key"
+            assert gateway_request["workspace"] is None
+            assert gateway_request["productAuthorization"] is None
+
+            redirected = client.get(
+                "/api/v1/exchange/api/v1/integrations/connections/7e1c50d2-b4f3-4d61-9302-9a0bd48d1991/authorization-health",
+                headers=product_headers,
+            )
+            assert redirected.status_code == 502
+            assert redirected.json()["code"] == "NAVIGATOR_PRODUCT_PROXY_REDIRECT_BLOCKED"
+            assert "location" not in redirected.headers
+            assert attacker_requests == []
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        _stdout, stderr = process.communicate(timeout=5)
+        assert product_token not in stderr
+        exchange_server.shutdown()
+        exchange_server.server_close()
+        exchange_thread.join(timeout=5)
+        attacker_server.shutdown()
+        attacker_server.server_close()
+        attacker_thread.join(timeout=5)
 
 
 def test_web_launcher_banner_never_carries_the_pairing_secret() -> None:

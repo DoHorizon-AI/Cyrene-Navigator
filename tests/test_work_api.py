@@ -10,7 +10,7 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from cyrene_navigator.persistence import PersistencePrincipal, create_persistence_app
-from cyrene_navigator.work.store import _failed_task_result_notification_text
+from cyrene_navigator.work.store import _digest, _failed_task_result_notification_text
 
 TOKENS = {
     "writer": PersistencePrincipal(
@@ -19,6 +19,9 @@ TOKENS = {
     "reader": PersistencePrincipal("reader", frozenset({"w1"}), organization_id="org-a"),
     "other-org": PersistencePrincipal(
         "other-owner", frozenset({"w1"}), can_takeover=True, organization_id="org-b"
+    ),
+    "other-writer": PersistencePrincipal(
+        "another-owner", frozenset({"w1"}), can_takeover=True, organization_id="org-a"
     ),
 }
 BASE = "/api/v1/workspaces/{workspace}/work"
@@ -108,6 +111,186 @@ def test_task_scope_approval_replay_and_conflict(tmp_path: Path) -> None:
             headers=_headers("other-org"),
         )
         assert cross_scope.status_code == 404
+
+
+def test_authorization_wait_and_read_only_continuation_are_atomic_and_actor_scoped(
+    tmp_path: Path,
+) -> None:
+    """A continuation inherits only its owned session and read-only mode.
+
+    续接只继承本人会话并强制只读。
+    """
+
+    db_path = tmp_path / "authorization-continuation.sqlite3"
+    task_url = BASE.format(workspace="w1") + "/tasks/task-auth"
+    with _client(db_path) as client:
+        created = client.post(
+            BASE.format(workspace="w1") + "/tasks",
+            json={"id": "task-auth", "sessionId": "session-auth", "prompt": "Original request"},
+            headers=_headers(),
+        )
+        assert created.status_code == 201
+        claim = client.post(task_url + "/claim", headers=_headers())
+        assert claim.status_code == 200 and claim.json()["claimed"] is True
+        approval = client.post(
+            task_url + "/approvals",
+            json={"kind": "external_write", "summary": "Previously approved action."},
+            headers=_headers(),
+        )
+        assert approval.status_code == 201
+        approval_id = approval.json()["approval"]["id"]
+        resolved = client.post(
+            BASE.format(workspace="w1") + f"/approvals/{approval_id}/resolve",
+            json={"decision": "approved", "messageId": "previous-task-approval"},
+            headers=_headers(),
+        )
+        assert resolved.status_code == 200
+        assert resolved.json()["task"]["status"] == "running"
+        paused = client.patch(
+            task_url,
+            json={
+                "status": "awaiting_user_authorization",
+                "output": "Read-only progress is preserved.",
+            },
+            headers=_headers(),
+        )
+        assert paused.status_code == 200, paused.text
+        assert paused.json()["status"] == "awaiting_user_authorization"
+        assert paused.json()["output"] == "Read-only progress is preserved."
+        cannot_replay_source = client.patch(
+            task_url,
+            json={"status": "running"},
+            headers=_headers(),
+        )
+        assert cannot_replay_source.status_code == 409
+
+        owner_check = client.post(task_url + "/resume/check", headers=_headers())
+        assert owner_check.status_code == 204
+        other_owner_check = client.post(
+            task_url + "/resume/check", headers=_headers("other-writer")
+        )
+        assert other_owner_check.status_code == 404
+
+        resume_url = task_url + "/resume"
+        resume_headers = {**_headers(), "Idempotency-Key": "client-resume-1"}
+        resumed = client.post(
+            resume_url, json={"prompt": "Continue with read-only checks."}, headers=resume_headers
+        )
+        assert resumed.status_code == 201, resumed.text
+        receipt = resumed.json()
+        continuation = receipt["task"]
+        assert receipt["duplicate"] is False
+        assert continuation["sessionId"] == "session-auth"
+        assert continuation["prompt"] == "Continue with read-only checks."
+        assert continuation["status"] == "queued"
+        assert continuation["continuationOfTaskId"] == "task-auth"
+        assert continuation["continuationMode"] == "read_only"
+
+        marker = client.get(
+            BASE.format(workspace="w1") + f"/tasks/{continuation['id']}/events",
+            headers=_headers(),
+        ).json()["events"]
+        assert any(
+            row["event"].get("type") == "task.continuation_started"
+            and row["event"].get("sourceTaskId") == "task-auth"
+            for row in marker
+        )
+        with sqlite3.connect(db_path) as connection:
+            inherited_approvals = connection.execute(
+                "SELECT COUNT(*) FROM work_approvals "
+                "WHERE organization_id='org-a' AND workspace_id='w1' AND task_id=?",
+                (continuation["id"],),
+            ).fetchone()[0]
+        assert inherited_approvals == 0
+
+        replay = client.post(
+            resume_url,
+            json={"prompt": "Continue with read-only checks."},
+            headers=resume_headers,
+        )
+        assert replay.status_code == 200
+        assert replay.json()["duplicate"] is True
+        assert replay.json()["task"]["id"] == continuation["id"]
+        conflicting = client.post(
+            resume_url,
+            json={"prompt": "A different continuation."},
+            headers=resume_headers,
+        )
+        assert conflicting.status_code == 409
+        spoofed = client.post(
+            resume_url,
+            json={"prompt": "Continue.", "sessionId": "another-session"},
+            headers={**_headers(), "Idempotency-Key": "client-resume-spoof"},
+        )
+        assert spoofed.status_code == 422
+        other_owner = client.post(
+            resume_url,
+            json={"prompt": "Continue."},
+            headers={**_headers("other-writer"), "Idempotency-Key": "other-owner-resume"},
+        )
+        assert other_owner.status_code == 404
+
+    # A second Work API instance can claim the queued row and sees the guard in its first read.
+    with _client(db_path) as replica:
+        claim = replica.post(
+            BASE.format(workspace="w1") + f"/tasks/{continuation['id']}/claim",
+            headers=_headers(),
+        )
+        assert claim.status_code == 200, claim.text
+        assert claim.json()["claimed"] is True
+        assert claim.json()["task"]["continuationOfTaskId"] == "task-auth"
+        assert claim.json()["task"]["continuationMode"] == "read_only"
+
+
+def test_legacy_task_retry_remains_idempotent_but_ownerless_rows_cannot_continue(
+    tmp_path: Path,
+) -> None:
+    """Migration preserves legacy retries without inventing a continuation owner.
+
+    保留旧重试，但不猜测旧任务所有者。
+    """
+
+    db_path = tmp_path / "legacy-task.sqlite3"
+    body = _task_body("legacy-task")
+    with _client(db_path) as client:
+        created = client.post(BASE.format(workspace="w1") + "/tasks", json=body, headers=_headers())
+        assert created.status_code == 201
+        legacy_digest = _digest(
+            {
+                "sessionId": body["sessionId"],
+                "prompt": body["prompt"],
+                "title": None,
+                "description": None,
+                "metadata": {},
+            }
+        )
+        with sqlite3.connect(db_path) as connection:
+            connection.execute(
+                """UPDATE work_tasks SET created_by_actor_id='',creation_digest=?
+                   WHERE organization_id='org-a' AND workspace_id='w1' AND task_id='legacy-task'""",
+                (legacy_digest,),
+            )
+            connection.commit()
+        replay = client.post(BASE.format(workspace="w1") + "/tasks", json=body, headers=_headers())
+        assert replay.status_code == 200
+        assert replay.json()["id"] == "legacy-task"
+
+        client.post(
+            BASE.format(workspace="w1") + "/tasks/legacy-task/claim",
+            headers=_headers(),
+        ).raise_for_status()
+        paused = client.patch(
+            BASE.format(workspace="w1") + "/tasks/legacy-task",
+            json={"status": "awaiting_user_authorization"},
+            headers=_headers(),
+        )
+        assert paused.status_code == 200
+        no_owner = client.post(
+            BASE.format(workspace="w1") + "/tasks/legacy-task/resume",
+            json={"prompt": "Continue safely."},
+            headers={**_headers(), "Idempotency-Key": "legacy-resume"},
+        )
+        assert no_owner.status_code == 404
 
 
 def test_task_events_survive_reopen_and_deduplicate(tmp_path: Path) -> None:

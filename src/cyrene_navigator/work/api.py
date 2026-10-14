@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Protocol
 
-from fastapi import FastAPI, Query, Request, Response
+from fastapi import FastAPI, Header, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse
 
@@ -59,6 +59,8 @@ from cyrene_navigator.work.models import (
     SourceInventoryReceipt,
     SourceList,
     TaskClaimResult,
+    TaskContinuationCreate,
+    TaskContinuationReceipt,
     TaskCreate,
     TaskEventAppend,
     TaskEventReceipt,
@@ -166,10 +168,82 @@ def mount_work_routes(
             principal.organization_id,
             workspace_id,
             body.model_dump(by_alias=True, exclude_none=True),
+            principal.actor_id,
         )
         if duplicate:
             response.status_code = 200
         return record
+
+    @app.post(
+        base + "/tasks/{task_id}/resume/check",
+        status_code=204,
+    )
+    def verify_task_continuation_owner(
+        workspace_id: str,
+        task_id: str,
+        request: Request,
+    ) -> Response:
+        """Check ownership before Navigator uses the stored DSH session identity.
+
+        Args:
+            workspace_id: Authenticated Workspace from the route.
+            task_id: Paused source task identifier.
+            request: Bearer-authenticated Work request.
+        Returns:
+            An empty 204 response after actor and status validation.
+
+        中文：在访问 Exchange 前验证当前 persistence principal 对源任务的所有权。
+        """
+
+        principal = principal_for(request, workspace_id, write=True)
+        store.verify_task_continuation_owner(
+            principal.organization_id,
+            workspace_id,
+            task_id,
+            principal.actor_id,
+        )
+        return Response(status_code=204)
+
+    @app.post(
+        base + "/tasks/{task_id}/resume",
+        response_model=TaskContinuationReceipt,
+        status_code=201,
+    )
+    def create_task_continuation(
+        workspace_id: str,
+        task_id: str,
+        body: TaskContinuationCreate,
+        request: Request,
+        response: Response,
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ) -> dict[str, Any]:
+        """Create an atomic, actor-owned, read-only child of a paused task.
+
+        Args:
+            workspace_id: Authenticated Workspace from the route.
+            task_id: Paused source task identifier.
+            body: New prompt only; source identity and continuation mode are server-derived.
+            request: Bearer-authenticated Work request.
+            response: Response whose status distinguishes creation from replay.
+            idempotency_key: Stable client key for this continuation request.
+        Returns:
+            The atomically created TaskRecord and replay indicator.
+
+        中文：服务端从调用者与源任务派生 Session、父任务关系和只读模式。
+        """
+
+        principal = principal_for(request, workspace_id, write=True)
+        task, duplicate = store.create_task_continuation(
+            principal.organization_id,
+            workspace_id,
+            task_id,
+            principal.actor_id,
+            body.prompt,
+            idempotency_key,
+        )
+        if duplicate:
+            response.status_code = 200
+        return {"task": task, "duplicate": duplicate}
 
     @app.get(base + "/tasks", response_model=TaskList)
     def list_tasks(
@@ -613,6 +687,7 @@ def mount_work_routes(
             workspace_id,
             connector_id,
             body.model_dump(by_alias=True, exclude_none=True),
+            principal.actor_id,
         )
         if receipt["duplicate"]:
             response.status_code = 200

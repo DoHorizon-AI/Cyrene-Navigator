@@ -12,6 +12,11 @@ import { defineTool } from '@deepseek-ai/dsh-tools';
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools';
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
 import type { WorkAssistantBridge } from '../work-tools.js';
+import {
+  ExchangeConnectionReauthorizationRequiredError,
+  exchangeReauthorizationFromProblem,
+} from './exchange-authorization.js';
+import type { ExchangeAuthorizationWaitReceipt } from './exchange-authorization.js';
 
 const REQUEST_TIMEOUT_MS = 15_000;
 const QUERY_POLL_WINDOW_MS = 3_000;
@@ -116,6 +121,7 @@ export interface ExchangeIssueToolOptions {
   readonly trustedUserBearerProvider: TrustedUserBearerProvider;
   readonly approvalBridge: Pick<WorkAssistantBridge, 'requestApproval'>;
   readonly taskIdForSession: (sessionId: string) => string | undefined;
+  readonly onAuthorizationRequired?: (sessionId: string, receipt: ExchangeAuthorizationWaitReceipt) => void | Promise<void>;
 }
 
 /** Read-only issue projection returned by the Exchange REST contract. */
@@ -319,7 +325,8 @@ export class ExchangeIntegrationClient {
     try {
       const issue = await this.getIssueSnapshot(bindingId, issueNumber, identity);
       return { status: 'completed', operation, issue };
-    } catch {
+    } catch (error: unknown) {
+      if (error instanceof ExchangeConnectionReauthorizationRequiredError) throw error;
       return { status: 'snapshot-unavailable', operation };
     }
   }
@@ -364,6 +371,8 @@ export class ExchangeIntegrationClient {
 
     const payload = await readResponse(response);
     if (!response.ok && response.status !== 202) {
+      const reauthorization = exchangeReauthorizationFromProblem(response.status, payload);
+      if (reauthorization) throw reauthorization;
       throw new Error(`Exchange integration request failed (${response.status})`);
     }
     return { payload, response };
@@ -392,12 +401,17 @@ export function registerExchangeIssueTools(
       output: issueQueryOutput,
       execute: async (args, execution) => {
         const identity = requestIdentity(execution);
-        return client.queryIssue(
-          stringArg(args.bindingId, 'binding id'),
-          integerArg(args.issueNumber, 'issue number'),
-          idempotencyKey('query', identity.sessionId, String(execution.callId)),
-          identity,
-        );
+        try {
+          return await client.queryIssue(
+            stringArg(args.bindingId, 'binding id'),
+            integerArg(args.issueNumber, 'issue number'),
+            idempotencyKey('query', identity.sessionId, String(execution.callId)),
+            identity,
+          );
+        } catch (error: unknown) {
+          if (!(error instanceof ExchangeConnectionReauthorizationRequiredError)) throw error;
+          return authorizationRequiredResult(options, identity.sessionId, String(execution.callId), error);
+        }
       },
     })),
     ctx.tools.register(defineTool({
@@ -426,9 +440,14 @@ export function registerExchangeIssueTools(
           execution.signal,
           String(execution.callId),
         );
-        return client.createIssueComment(
-          bindingId, issueNumber, body, idempotencyKey('comment', identity.sessionId, String(execution.callId)), identity,
-        );
+        try {
+          return await client.createIssueComment(
+            bindingId, issueNumber, body, idempotencyKey('comment', identity.sessionId, String(execution.callId)), identity,
+          );
+        } catch (error: unknown) {
+          if (!(error instanceof ExchangeConnectionReauthorizationRequiredError)) throw error;
+          return authorizationRequiredResult(options, identity.sessionId, String(execution.callId), error);
+        }
       },
     })),
     ctx.tools.register(defineTool({
@@ -459,10 +478,15 @@ export function registerExchangeIssueTools(
           execution.signal,
           String(execution.callId),
         );
-        return client.updateIssueState(
-          bindingId, issueNumber, state as ExchangeIssueState,
-          idempotencyKey('state', identity.sessionId, String(execution.callId)), identity,
-        );
+        try {
+          return await client.updateIssueState(
+            bindingId, issueNumber, state as ExchangeIssueState,
+            idempotencyKey('state', identity.sessionId, String(execution.callId)), identity,
+          );
+        } catch (error: unknown) {
+          if (!(error instanceof ExchangeConnectionReauthorizationRequiredError)) throw error;
+          return authorizationRequiredResult(options, identity.sessionId, String(execution.callId), error);
+        }
       },
     })),
     ctx.tools.register(defineTool({
@@ -470,9 +494,15 @@ export function registerExchangeIssueTools(
       description: 'Read the Exchange status of a previously queued integration operation.',
       parameters: { operationId: { type: 'string', required: true, description: 'Exchange operation UUID.' } },
       output: jsonOutput,
-      execute: (args, execution) => client.getOperation(
-        stringArg(args.operationId, 'operation id'), requestIdentity(execution),
-      ),
+      execute: async (args, execution) => {
+        const identity = requestIdentity(execution);
+        try {
+          return await client.getOperation(stringArg(args.operationId, 'operation id'), identity);
+        } catch (error: unknown) {
+          if (!(error instanceof ExchangeConnectionReauthorizationRequiredError)) throw error;
+          return authorizationRequiredResult(options, identity.sessionId, String(execution.callId), error);
+        }
+      },
     })),
   ];
 
@@ -488,49 +518,103 @@ export function registerExchangeIssueTools(
 
 const jsonOutput = {
   schema: {
-    type: 'object',
-    additionalProperties: false,
-    properties: OPERATION_OUTPUT_PROPERTIES,
+    oneOf: [
+      { type: 'object', additionalProperties: false, properties: OPERATION_OUTPUT_PROPERTIES },
+      authorizationWaitOutputSchema(),
+    ],
   } as const,
   render: (_args: unknown, value: unknown) => [{ type: 'text' as const, text: JSON.stringify(value) }],
 };
 
 const queuedOperationOutput = {
   schema: {
-    type: 'object',
-    additionalProperties: false,
-    properties: { ...OPERATION_OUTPUT_PROPERTIES, location: { type: 'string', required: true } },
+    oneOf: [
+      {
+        type: 'object',
+        additionalProperties: false,
+        properties: { ...OPERATION_OUTPUT_PROPERTIES, location: { type: 'string', required: true } },
+      },
+      authorizationWaitOutputSchema(),
+    ],
   } as const,
   render: (_args: unknown, value: unknown) => [{ type: 'text' as const, text: JSON.stringify(value) }],
 };
 
 const issueQueryOutput = {
   schema: {
-    type: 'object',
-    additionalProperties: false,
-    properties: {
-      status: { type: 'string', required: true, enum: ['completed', 'pending', 'failed', 'unknown', 'snapshot-unavailable'] },
-      operation: {
-        type: 'object',
-        additionalProperties: false,
-        properties: { ...OPERATION_OUTPUT_PROPERTIES, location: { type: 'string', required: true } },
-        required: true,
-      },
-      issue: {
+    oneOf: [
+      {
         type: 'object',
         additionalProperties: false,
         properties: {
-          issueNumber: { type: 'integer', required: true },
-          state: { type: 'string', required: true, enum: EXCHANGE_ISSUE_STATES },
-          title: { type: 'string', required: true },
-          version: { type: 'string', required: true },
-          freshness: { type: 'string', required: true, enum: EXCHANGE_ISSUE_SNAPSHOT_FRESHNESS },
-          observedAt: { type: 'string', required: true },
+          status: { type: 'string', required: true, enum: ['completed', 'pending', 'failed', 'unknown', 'snapshot-unavailable'] },
+          operation: {
+            type: 'object',
+            additionalProperties: false,
+            properties: { ...OPERATION_OUTPUT_PROPERTIES, location: { type: 'string', required: true } },
+            required: true,
+          },
+          issue: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              issueNumber: { type: 'integer', required: true },
+              state: { type: 'string', required: true, enum: EXCHANGE_ISSUE_STATES },
+              title: { type: 'string', required: true },
+              version: { type: 'string', required: true },
+              freshness: { type: 'string', required: true, enum: EXCHANGE_ISSUE_SNAPSHOT_FRESHNESS },
+              observedAt: { type: 'string', required: true },
+            },
+          },
         },
       },
-    },
+      authorizationWaitOutputSchema(),
+    ],
   } as const,
   render: (_args: unknown, value: unknown) => [{ type: 'text' as const, text: JSON.stringify(value) }],
+};
+
+function authorizationWaitOutputSchema() {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      status: { type: 'string', required: true, enum: ['awaiting_user_authorization'] },
+      code: { type: 'string', required: true, enum: ['EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED'] },
+      connectionId: { type: 'string' },
+      authorizationRef: { type: 'string' },
+    },
+  } as const;
+}
+
+/** Convert only Exchange's exact confirmed provider-reauthentication problem into a durable wait receipt. */
+async function authorizationRequiredResult(
+  options: ExchangeIssueToolOptions,
+  sessionId: string,
+  callId: string,
+  error: ExchangeConnectionReauthorizationRequiredError,
+): Promise<ExchangeAuthorizationWaitToolResult> {
+  const receipt: ExchangeAuthorizationWaitReceipt = {
+    callId,
+    ...(error.connectionId === undefined ? {} : { connectionId: error.connectionId }),
+    ...(error.authorizationRef === undefined ? {} : { authorizationRef: error.authorizationRef }),
+    source: 'issue-action',
+    code: error.code,
+  };
+  await options.onAuthorizationRequired?.(sessionId, receipt);
+  return {
+    status: 'awaiting_user_authorization',
+    code: error.code,
+    ...(error.connectionId === undefined ? {} : { connectionId: error.connectionId }),
+    ...(error.authorizationRef === undefined ? {} : { authorizationRef: error.authorizationRef }),
+  };
+}
+
+type ExchangeAuthorizationWaitToolResult = {
+  readonly status: 'awaiting_user_authorization';
+  readonly code: 'EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED';
+  readonly connectionId?: string;
+  readonly authorizationRef?: string;
 };
 
 /** Construct the per-call identity context from the actual DSH execution. */

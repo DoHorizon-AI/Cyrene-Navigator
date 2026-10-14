@@ -1761,6 +1761,42 @@
         "title": "TaskClaimResult",
         "type": "object"
       },
+      "TaskContinuationCreate": {
+        "additionalProperties": false,
+        "description": "Create one explicit read-only continuation from an owned paused task.\n\n\u4e2d\u6587\uff1a\u8bf7\u6c42\u4f53\u53ea\u6709\u65b0\u7684\u63d0\u793a\u8bcd\uff0c\u6765\u6e90\u3001Session \u4e0e\u6743\u9650\u7531\u670d\u52a1\u7aef\u6d3e\u751f\u3002",
+        "properties": {
+          "prompt": {
+            "maxLength": 20000,
+            "minLength": 1,
+            "title": "Prompt",
+            "type": "string"
+          }
+        },
+        "required": [
+          "prompt"
+        ],
+        "title": "TaskContinuationCreate",
+        "type": "object"
+      },
+      "TaskContinuationReceipt": {
+        "additionalProperties": false,
+        "description": "Atomic child-task receipt with its server-derived source and mode.\n\n\u4e2d\u6587\uff1a\u56de\u6267\u5305\u542b\u539f\u5b50\u521b\u5efa\u7684\u65b0\u4efb\u52a1\u4e0e\u662f\u5426\u4e3a\u5e42\u7b49\u91cd\u653e\u3002",
+        "properties": {
+          "duplicate": {
+            "title": "Duplicate",
+            "type": "boolean"
+          },
+          "task": {
+            "$ref": "#/components/schemas/TaskRecord"
+          }
+        },
+        "required": [
+          "task",
+          "duplicate"
+        ],
+        "title": "TaskContinuationReceipt",
+        "type": "object"
+      },
       "TaskCreate": {
         "additionalProperties": false,
         "description": "Create one durable executor task. | \u521b\u5efa\u4e00\u4e2a\u6301\u4e45\u6267\u884c\u4efb\u52a1\u3002",
@@ -2068,7 +2104,8 @@
                   "failed",
                   "aborted",
                   "waiting_approval",
-                  "waiting_input"
+                  "waiting_input",
+                  "awaiting_user_authorization"
                 ],
                 "type": "string"
               },
@@ -2098,6 +2135,29 @@
         "additionalProperties": false,
         "description": "Public execution record with server-owned timestamps. | \u6267\u884c\u4efb\u52a1\u516c\u5f00\u8bb0\u5f55\u3002",
         "properties": {
+          "continuationMode": {
+            "anyOf": [
+              {
+                "const": "read_only",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Continuationmode"
+          },
+          "continuationOfTaskId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Continuationoftaskid"
+          },
           "createdAt": {
             "title": "Createdat",
             "type": "integer"
@@ -2187,7 +2247,8 @@
               "failed",
               "aborted",
               "waiting_approval",
-              "waiting_input"
+              "waiting_input",
+              "awaiting_user_authorization"
             ],
             "title": "Status",
             "type": "string"
@@ -4878,6 +4939,118 @@
           }
         },
         "summary": "Create Input Request"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/tasks/{task_id}/resume": {
+      "post": {
+        "description": "Create an atomic, actor-owned, read-only child of a paused task.\n\nArgs:\n    workspace_id: Authenticated Workspace from the route.\n    task_id: Paused source task identifier.\n    body: New prompt only; source identity and continuation mode are server-derived.\n    request: Bearer-authenticated Work request.\n    response: Response whose status distinguishes creation from replay.\n    idempotency_key: Stable client key for this continuation request.\nReturns:\n    The atomically created TaskRecord and replay indicator.\n\n\u4e2d\u6587\uff1a\u670d\u52a1\u7aef\u4ece\u8c03\u7528\u8005\u4e0e\u6e90\u4efb\u52a1\u6d3e\u751f Session\u3001\u7236\u4efb\u52a1\u5173\u7cfb\u548c\u53ea\u8bfb\u6a21\u5f0f\u3002",
+        "operationId": "create_task_continuation_api_v1_workspaces__workspace_id__work_tasks__task_id__resume_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 200,
+              "minLength": 1,
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskContinuationCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskContinuationReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Task Continuation"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/tasks/{task_id}/resume/check": {
+      "post": {
+        "description": "Check ownership before Navigator uses the stored DSH session identity.\n\nArgs:\n    workspace_id: Authenticated Workspace from the route.\n    task_id: Paused source task identifier.\n    request: Bearer-authenticated Work request.\nReturns:\n    An empty 204 response after actor and status validation.\n\n\u4e2d\u6587\uff1a\u5728\u8bbf\u95ee Exchange \u524d\u9a8c\u8bc1\u5f53\u524d persistence principal \u5bf9\u6e90\u4efb\u52a1\u7684\u6240\u6709\u6743\u3002",
+        "operationId": "verify_task_continuation_owner_api_v1_workspaces__workspace_id__work_tasks__task_id__resume_check_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Verify Task Continuation Owner"
       }
     },
     "/api/v1/workspaces/{workspace_id}/work/tool-providers": {

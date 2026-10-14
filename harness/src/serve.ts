@@ -33,6 +33,11 @@ import { WorkflowsClient } from './workflows/store.js';
 import { registerWorkflowRuntime } from './workflows/runtime.js';
 import { registerCloudConnections, validateCloudConnectionConfig } from './integrations/cloud-connections.js';
 import {
+  ExchangeAuthorizationClient,
+  registerExchangeAuthorizationTools,
+} from './integrations/exchange-authorization.js';
+import type { ExchangeAuthorizationWaitReceipt } from './integrations/exchange-authorization.js';
+import {
   registerExchangeIssueTools,
   resolveExchangeUserBearerProvider,
 } from './integrations/exchange-integration.js';
@@ -46,6 +51,17 @@ export interface CreateExecutorAppOptions {
   readonly exchangeIntegrationWorkspaceId?: string;
   readonly exchangeIntegrationUserBearerProvider?: TrustedUserBearerProvider;
   readonly allowSingleSessionExchangeCliEnvironmentBearer?: boolean;
+  readonly revalidateExchangeAuthorization?: (
+    sessionId: string,
+    connectionId: string,
+  ) => Promise<{
+    readonly connectionId: string;
+    readonly authorizationRef: string | null;
+    readonly loginState: string;
+    readonly authorizationState: string;
+    readonly generation: number;
+  }>;
+  readonly readExchangeOperationState?: (sessionId: string, operationId: string) => Promise<string>;
   readonly model?: string;
   readonly pluginsDir?: string;
   readonly watchPlugins?: boolean;
@@ -74,6 +90,23 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
 
   const persistenceUrl = options.persistenceUrl ?? process.env.CYRENE_PERSISTENCE_URL;
   const workspaceId = options.workspaceId ?? process.env.CYRENE_WORKSPACE_ID;
+  const exchangeIntegrationUrl = options.exchangeIntegrationUrl ?? process.env.CYRENE_EXCHANGE_INTEGRATION_URL;
+  const exchangeIntegrationWorkspaceId = options.exchangeIntegrationWorkspaceId
+    ?? process.env.CYRENE_EXCHANGE_INTEGRATION_WORKSPACE_ID ?? workspaceId;
+  if (exchangeIntegrationUrl && !exchangeIntegrationWorkspaceId) {
+    throw new Error('Exchange integration tools require a configured Workspace');
+  }
+  const exchangeIntegrationUserBearerProvider = resolveExchangeUserBearerProvider(
+    options.exchangeIntegrationUserBearerProvider,
+    options.allowSingleSessionExchangeCliEnvironmentBearer === true,
+  );
+  const exchangeAuthorizationClient = exchangeIntegrationUrl && exchangeIntegrationWorkspaceId
+    ? new ExchangeAuthorizationClient({
+      baseUrl: exchangeIntegrationUrl,
+      workspaceId: exchangeIntegrationWorkspaceId,
+      trustedUserBearerProvider: exchangeIntegrationUserBearerProvider,
+    })
+    : undefined;
   const dshHome = options.dshHome ?? process.env.DSH_HOME;
   const workflowsEnabled = options.enableWorkflows ?? (
     process.env.CYRENE_WORKFLOWS_ENABLED === 'true'
@@ -184,6 +217,17 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
     watch: options.watchPlugins ?? true,
   });
 
+  const revalidateExchangeAuthorization = options.revalidateExchangeAuthorization
+    ?? (exchangeAuthorizationClient === undefined ? undefined : async (sessionId: string, connectionId: string) =>
+      exchangeAuthorizationClient.getAuthorizationHealth(connectionId, {
+        sessionId, signal: AbortSignal.timeout(15_000),
+      }));
+  const readExchangeOperationState = options.readExchangeOperationState
+    ?? (exchangeAuthorizationClient === undefined ? undefined : async (sessionId: string, operationId: string) =>
+      exchangeAuthorizationClient.getOperationState(operationId, {
+        sessionId, signal: AbortSignal.timeout(15_000),
+      }));
+
   // Autonomous Cloud Executor Daemon service
   applyExecutor(ctx, {
     defaultCwd: options.defaultCwd ?? process.cwd(),
@@ -191,6 +235,8 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
     workState,
     authTokenEnv: publicTokenEnv,
     allowedOrigins: options.allowedOrigins,
+    ...(revalidateExchangeAuthorization === undefined ? {} : { revalidateExchangeAuthorization }),
+    ...(readExchangeOperationState === undefined ? {} : { readExchangeOperationState }),
   });
 
   const executor = ctx.get('executor');
@@ -212,21 +258,48 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
     });
   }
 
-  const exchangeIntegrationUrl = options.exchangeIntegrationUrl ?? process.env.CYRENE_EXCHANGE_INTEGRATION_URL;
   if (exchangeIntegrationUrl) {
-    if (!workspaceId) throw new Error('Exchange issue tools require a configured Workspace');
     if (!workAssistantBridge) throw new Error('Exchange issue tools require the durable Navigator approval bridge');
+    const recordAuthorizationWait = async (
+      sessionId: string,
+      receipt: ExchangeAuthorizationWaitReceipt,
+    ): Promise<void> => {
+      let enriched = receipt;
+      if (exchangeAuthorizationClient && receipt.connectionId && receipt.generation === undefined) {
+        try {
+          const health = await exchangeAuthorizationClient.getAuthorizationHealth(receipt.connectionId, {
+            sessionId, signal: AbortSignal.timeout(15_000),
+          });
+          if (health.authorizationRef !== null
+            && (receipt.authorizationRef === undefined || health.authorizationRef === receipt.authorizationRef)
+            && health.authorizationState === 'REAUTHORIZATION_REQUIRED') {
+            enriched = {
+              ...receipt,
+              authorizationRef: health.authorizationRef,
+              generation: health.generation,
+            };
+          }
+        } catch {
+          // A wait without current generation remains non-resumable until a trusted health read succeeds.
+        }
+      }
+      await executor.markTaskAwaitingUserAuthorization(sessionId, enriched);
+    };
     await registerExchangeIssueTools(ctx, {
       baseUrl: exchangeIntegrationUrl,
-      workspaceId: options.exchangeIntegrationWorkspaceId
-        ?? process.env.CYRENE_EXCHANGE_INTEGRATION_WORKSPACE_ID
-        ?? workspaceId,
-      trustedUserBearerProvider: resolveExchangeUserBearerProvider(
-        options.exchangeIntegrationUserBearerProvider,
-        options.allowSingleSessionExchangeCliEnvironmentBearer === true,
-      ),
+      workspaceId: exchangeIntegrationWorkspaceId!,
+      trustedUserBearerProvider: exchangeIntegrationUserBearerProvider,
       approvalBridge: workAssistantBridge,
       taskIdForSession: sessionId => executor.activeTaskId(sessionId),
+      onAuthorizationRequired: recordAuthorizationWait,
+    });
+    await registerExchangeAuthorizationTools(ctx, {
+      baseUrl: exchangeIntegrationUrl,
+      workspaceId: exchangeIntegrationWorkspaceId!,
+      trustedUserBearerProvider: exchangeIntegrationUserBearerProvider,
+      approvalBridge: workAssistantBridge,
+      taskIdForSession: sessionId => executor.activeTaskId(sessionId),
+      onAuthorizationRequired: recordAuthorizationWait,
     });
   }
 

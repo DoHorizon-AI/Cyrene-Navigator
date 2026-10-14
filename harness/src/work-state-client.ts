@@ -5,6 +5,7 @@
 // └─────────────────────────────────────────────────────────────────────┘
 
 import { randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 
 export type ExecutionStatus =
   | 'queued'
@@ -13,7 +14,8 @@ export type ExecutionStatus =
   | 'failed'
   | 'aborted'
   | 'waiting_approval'
-  | 'waiting_input';
+  | 'waiting_input'
+  | 'awaiting_user_authorization';
 
 /** Durable executor record; the Work service is the production authority.  中文：持久化执行器记录；生产环境以 Work service 为准。 */
 export interface TaskRecord {
@@ -30,6 +32,8 @@ export interface TaskRecord {
   readonly durationMs: number;
   readonly workspaceId?: string;
   readonly sequence?: number;
+  readonly continuationOfTaskId?: string | null;
+  readonly continuationMode?: 'read_only' | null;
 }
 
 /** One ordered durable event attached to a task.  中文：与任务关联的一条有序持久化事件。 */
@@ -53,6 +57,11 @@ export interface TaskEventPage {
 /** Narrow storage contract shared by the HTTP service and explicit test store.  中文：HTTP 服务和显式测试存储共用的最小存储契约。 */
 export interface WorkStateStore {
   createTask(input: { id?: string; sessionId: string; prompt: string }): Promise<TaskRecord>;
+  createContinuationTask(
+    sourceTaskId: string,
+    input: { prompt: string; idempotencyKey: string },
+  ): Promise<TaskRecord>;
+  verifyContinuationOwnership(sourceTaskId: string): Promise<void>;
   getTask(taskId: string): Promise<TaskRecord | undefined>;
   listTasks(options?: { cursor?: string; limit?: number }): Promise<TaskPage>;
   claimTask(taskId: string): Promise<{ claimed: boolean; task: TaskRecord }>;
@@ -94,6 +103,7 @@ function decodeTask(value: unknown): TaskRecord {
   const row = object(value, 'Work Task');
   const statuses: ExecutionStatus[] = [
     'queued', 'running', 'completed', 'failed', 'aborted', 'waiting_approval', 'waiting_input',
+    'awaiting_user_authorization',
   ];
   if (!statuses.includes(row.status as ExecutionStatus)) throw new TypeError('Invalid Work Task status');
   const task: TaskRecord = {
@@ -111,6 +121,14 @@ function decodeTask(value: unknown): TaskRecord {
   const error = row.error === undefined || row.error === null ? undefined : stringField(row.error, 'error', true);
   const workspaceId = row.workspaceId === undefined ? undefined : stringField(row.workspaceId, 'workspaceId');
   const sequence = row.sequence === undefined ? undefined : timeField(row.sequence, 'sequence');
+  const continuationOfTaskId = row.continuationOfTaskId === undefined
+    ? undefined
+    : row.continuationOfTaskId === null ? null : stringField(row.continuationOfTaskId, 'continuationOfTaskId');
+  const continuationMode = row.continuationMode === undefined
+    ? undefined
+    : row.continuationMode === null ? null
+      : row.continuationMode === 'read_only' ? 'read_only'
+        : (() => { throw new TypeError('Invalid Work Task continuationMode'); })();
   return {
     ...task,
     ...(startedAt === undefined ? {} : { startedAt }),
@@ -118,6 +136,8 @@ function decodeTask(value: unknown): TaskRecord {
     ...(error === undefined ? {} : { error }),
     ...(workspaceId === undefined ? {} : { workspaceId }),
     ...(sequence === undefined ? {} : { sequence }),
+    ...(continuationOfTaskId === undefined ? {} : { continuationOfTaskId }),
+    ...(continuationMode === undefined ? {} : { continuationMode }),
   };
 }
 
@@ -155,6 +175,34 @@ export class WorkStateClient implements WorkStateStore {
   /** Create one durable task. The server binds organization and workspace from the bearer principal.  中文：创建持久任务；服务端从 bearer principal 绑定组织和 Workspace。 */
   async createTask(input: { id?: string; sessionId: string; prompt: string }): Promise<TaskRecord> {
     return decodeTask(await this.request('', 'POST', input));
+  }
+
+  /** Ask Work to create a server-linked read-only task from one owned authorization wait. */
+  async createContinuationTask(
+    sourceTaskId: string,
+    input: { prompt: string; idempotencyKey: string },
+  ): Promise<TaskRecord> {
+    if (!input.idempotencyKey || input.idempotencyKey.length > 200
+      || /[\u0000-\u001f\u007f]/u.test(input.idempotencyKey)) {
+      throw new TypeError('Invalid continuation Idempotency-Key');
+    }
+    const receipt = object(await this.request(
+      '/' + encodeURIComponent(sourceTaskId) + '/resume',
+      'POST',
+      { prompt: input.prompt },
+      undefined,
+      { 'idempotency-key': input.idempotencyKey },
+    ), 'Work Task continuation receipt');
+    const task = decodeTask(receipt.task);
+    if (task.continuationOfTaskId !== sourceTaskId || task.continuationMode !== 'read_only') {
+      throw new TypeError('Work service does not support atomic read-only task continuation');
+    }
+    return task;
+  }
+
+  /** Confirm that this persistence principal owns the paused source before Exchange revalidation. */
+  async verifyContinuationOwnership(sourceTaskId: string): Promise<void> {
+    await this.request('/' + encodeURIComponent(sourceTaskId) + '/resume/check', 'POST');
   }
 
   /** Read one task; cross-workspace identities are intentionally indistinguishable from missing IDs.  中文：读取任务；跨 Workspace 的标识按不存在处理。 */
@@ -225,20 +273,27 @@ export class WorkStateClient implements WorkStateStore {
     return decodeEventPage(await this.request(`/${encodeURIComponent(taskId)}/events?${query}`, 'GET'));
   }
 
-  private async request(path: string, method: string, body?: unknown): Promise<unknown> {
+  private async request(
+    path: string,
+    method: string,
+    body?: unknown,
+    timeoutMs?: number,
+    extraHeaders: Readonly<Record<string, string>> = {},
+  ): Promise<unknown> {
     const tokenEnv = this.connection.tokenEnv ?? 'CYRENE_SESSION_TOKEN';
     const token = process.env[tokenEnv];
     if (!token) throw new Error(`Missing persistence credential in ${tokenEnv}`);
-    const timeoutMs = this.connection.requestTimeoutMs ?? 10_000;
+    const requestTimeoutMs = timeoutMs ?? this.connection.requestTimeoutMs ?? 10_000;
     const response = await fetch(this.tasksUrl + path, {
       method,
       headers: {
         Authorization: `Bearer ${token}`,
         Accept: 'application/json',
         ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+        ...extraHeaders,
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: AbortSignal.timeout(requestTimeoutMs),
       redirect: 'error',
     });
     const text = await response.text();
@@ -264,7 +319,7 @@ function errorCode(value: unknown): string {
 
 /** Sanitized HTTP failure with no response body or credential details.  中文：不携带响应正文或凭据细节的安全 HTTP 错误。 */
 export class WorkStateHttpError extends Error {
-  constructor(readonly status: number, code: string) {
+  constructor(readonly status: number, readonly code: string) {
     super(`Work state request failed (${status}, ${code})`);
     this.name = 'WorkStateHttpError';
   }
@@ -286,6 +341,61 @@ export class InMemoryWorkStateStore implements WorkStateStore {
     this.records.set(id, row);
     this.events.set(id, []);
     return row;
+  }
+
+  async createContinuationTask(
+    sourceTaskId: string,
+    input: { prompt: string; idempotencyKey: string },
+  ): Promise<TaskRecord> {
+    const source = this.records.get(sourceTaskId);
+    if (!source) throw new WorkStateHttpError(404, 'TASK_NOT_FOUND');
+    if (source.status !== 'awaiting_user_authorization') {
+      throw new WorkStateHttpError(409, 'TASK_NOT_AWAITING_AUTHORIZATION');
+    }
+    const digest = createHash('sha256')
+      .update(sourceTaskId).update('\0').update(input.idempotencyKey).digest('hex');
+    const id = 'continuation-' + digest;
+    const prior = this.records.get(id);
+    if (prior) {
+      if (prior.prompt !== input.prompt || prior.sessionId !== source.sessionId
+        || prior.continuationOfTaskId !== sourceTaskId || prior.continuationMode !== 'read_only') {
+        throw new WorkStateHttpError(409, 'TASK_ID_CONFLICT');
+      }
+      return prior;
+    }
+    const now = Date.now();
+    const task: TaskRecord = {
+      id,
+      sessionId: source.sessionId,
+      prompt: input.prompt,
+      status: 'queued',
+      createdAt: now,
+      output: '',
+      reasoning: '',
+      durationMs: 0,
+      continuationOfTaskId: sourceTaskId,
+      continuationMode: 'read_only',
+    };
+    this.records.set(id, task);
+    this.events.set(id, [
+      { seq: 1, event: { type: 'task.created', continuationOfTaskId: sourceTaskId, continuationMode: 'read_only' }, createdAt: now },
+      { seq: 2, event: { type: 'task.continuation_started', sourceTaskId, mode: 'read_only' }, createdAt: now },
+    ]);
+    const sourceEvents = this.events.get(sourceTaskId)!;
+    sourceEvents.push({
+      seq: sourceEvents.length + 1,
+      event: { type: 'task.continuation_started', continuationTaskId: id, mode: 'read_only' },
+      createdAt: now,
+    });
+    return task;
+  }
+
+  async verifyContinuationOwnership(sourceTaskId: string): Promise<void> {
+    const source = this.records.get(sourceTaskId);
+    if (!source) throw new WorkStateHttpError(404, 'TASK_NOT_FOUND');
+    if (source.status !== 'awaiting_user_authorization') {
+      throw new WorkStateHttpError(409, 'TASK_NOT_AWAITING_AUTHORIZATION');
+    }
   }
 
   async getTask(taskId: string): Promise<TaskRecord | undefined> { return this.records.get(taskId); }
