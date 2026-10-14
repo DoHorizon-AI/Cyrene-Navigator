@@ -28,14 +28,14 @@ import CyreneSessionPersistence from '../dist/persistence.js';
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const python = process.env.CYRENE_TEST_PYTHON ?? join(repository, '.venv/bin/python');
 
-async function startService(directory, token, port = 0) {
+async function startService(directory, token, port = 0, { leaseSeconds = 30 } = {}) {
   const config = join(directory, 'principals.json');
   await writeFile(config, JSON.stringify({ principals: [{
     token_env: 'CYRENE_TEST_SESSION_TOKEN', actor_id: 'test-owner', workspace_ids: ['proof'],
   }] }));
   const child = spawn(python, [join(repository, 'scripts/serve-persistence.py'),
     '--database', join(directory, 'sessions.sqlite'), '--principal-config', config,
-    '--port', String(port), '--lease-seconds', '30'], {
+    '--port', String(port), '--lease-seconds', String(leaseSeconds)], {
     env: { ...process.env, CYRENE_TEST_SESSION_TOKEN: token }, stdio: ['ignore', 'pipe', 'pipe'],
   });
   let logs = '';
@@ -182,12 +182,12 @@ async function agentClient(baseUrl, device) {
   return ctx;
 }
 
-async function client(baseUrl, device) {
+async function client(baseUrl, device, { heartbeatMs = 250 } = {}) {
   const ctx = new Context();
   await ctx.plugin(SessionStore);
   await ctx.plugin(CyreneSessionPersistence, {
     baseUrl, workspaceId: 'proof', tokenEnv: 'CYRENE_TEST_SESSION_TOKEN', clientId: device,
-    requestTimeoutMs: 2000, heartbeatMs: 250, batchDelayMs: 5,
+    requestTimeoutMs: 2000, heartbeatMs, batchDelayMs: 5,
     maxPendingEvents: 128, batchSize: 2,
   });
   return ctx;
@@ -271,12 +271,15 @@ test('a committed append remains one batch after an ambiguous lost ack and recon
   const directory = await mkdtemp(join(tmpdir(), 'cyrene-persistence-ack-loss-'));
   const token = randomUUID();
   process.env.CYRENE_TEST_SESSION_TOKEN = token;
-  let service = await startService(directory, token);
+  // This test verifies idempotent append recovery, not lease expiry. Keep its writer lease and
+  // heartbeat interval outside the test window so event-loop scheduling cannot race a renewal.
+  const leaseSeconds = 300;
+  let service = await startService(directory, token, 0, { leaseSeconds });
   let proxy;
   const contexts = [];
   try {
     proxy = await startAppendAckDropProxy(service.baseUrl);
-    const first = await client(proxy.baseUrl, 'ack-loss-writer');
+    const first = await client(proxy.baseUrl, 'ack-loss-writer', { heartbeatMs: 60_000 });
     contexts.push(first);
     const id = SessionId(`ack-loss-${randomUUID()}`);
     const session = first.sessions.create(id, {
@@ -318,7 +321,7 @@ test('a committed append remains one batch after an ambiguous lost ack and recon
     // exactly the suffix and a new reader must see one contiguous log.
     const port = service.port;
     await stopService(service, 'SIGKILL');
-    service = await startService(directory, token, port);
+    service = await startService(directory, token, port, { leaseSeconds });
     const reconnected = await client(service.baseUrl, 'reconnected-reader');
     contexts.push(reconnected);
     const reader = await reconnected.sessionPersistence.open(id, 'read');
