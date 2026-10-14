@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import math
 import os
@@ -49,6 +50,12 @@ _REFRESH_COOKIE = "cyrene_refresh"
 _CSRF_COOKIE = "cyrene_csrf"
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _TRACEPARENT = r"^00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$"
+_PRODUCT_AUTH_PROXY_PREFIX = "/api/v1/exchange"
+_PRODUCT_AUTH_HEADER = "x-cyrene-product-authorization"
+_PRODUCT_WORKSPACE_HEADER = "x-cyrene-workspace-id"
+_PRODUCT_BEARER = re.compile(r"Bearer ([A-Za-z0-9._~+/-]{1,4096}=*)\Z")
+_PRODUCT_WORKSPACE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}\Z")
+_PRODUCT_UUID = r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}"
 _PROXY_REQUEST_HEADERS = frozenset(
     {"accept", "content-type", "idempotency-key", "last-event-id", "traceparent", "tracestate"}
 )
@@ -507,6 +514,7 @@ class ProxyTarget:
     credential_ref: str | None = None
     bearer_token: str | None = field(default=None, repr=False)
     timeout_seconds: float = 10.0
+    forward_product_authorization: bool = False
 
     def __post_init__(self) -> None:
         """Reject origin changes, embedded credentials, and invalid timeouts.
@@ -523,6 +531,14 @@ class ProxyTarget:
             raise ValueError("bearer_token must be non-empty")
         if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive and finite")
+        if not isinstance(self.forward_product_authorization, bool):
+            raise ValueError("forward_product_authorization must be a boolean")
+        if self.forward_product_authorization:
+            if self.credential_ref is not None or self.bearer_token is not None:
+                raise ValueError(
+                    "per-request Product authorization cannot use a configured proxy credential"
+                )
+            _validate_product_auth_proxy_url(self.base_url)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1145,6 +1161,17 @@ def create_web_host_app(
     )
     credentials = credential_store or CredentialStore(clock=clock)
     configured_proxies = _normalize_proxy_targets(proxy_targets or {})
+    if http_client is not None and any(
+        entry.target.forward_product_authorization for entry in configured_proxies
+    ):
+        sensitive_defaults = {
+            "authorization",
+            "cookie",
+            _PRODUCT_AUTH_HEADER,
+            _PRODUCT_WORKSPACE_HEADER,
+        }
+        if http_client.auth is not None or sensitive_defaults.intersection(http_client.headers):
+            raise ValueError("a Product authorization proxy cannot use a default-auth HTTP client")
     activity = RuntimeActivityTracker()
     activity.start()
     app = FastAPI(title="Cyrene Navigator Web Host", version=app_version)
@@ -1559,12 +1586,45 @@ def create_web_host_app(
         upstream_url = target.base_url + (suffix or empty_suffix)
         if request.url.query:
             upstream_url += "?" + request.url.query
+        product_auth_forwarding = False
+        product_authorization_values = request.headers.getlist(_PRODUCT_AUTH_HEADER)
+        upstream_path = urlsplit(upstream_url).path
+        product_route = _is_product_auth_route(request.method, upstream_path)
+        product_api_area = _is_product_api_area(upstream_path)
+        if product_authorization_values and not (
+            target.forward_product_authorization and product_route
+        ):
+            raise WebHostError(
+                "NAVIGATOR_PRODUCT_AUTH_ROUTE_NOT_ALLOWED",
+                404,
+                "Product authorization is not accepted for this proxy route.",
+            )
+        if target.forward_product_authorization and product_api_area:
+            if not product_route:
+                raise WebHostError(
+                    "NAVIGATOR_PRODUCT_AUTH_ROUTE_NOT_ALLOWED",
+                    404,
+                    "The opted Exchange proxy does not expose this route.",
+                )
+            product_authorization, product_workspace = _product_authorization_headers(request)
+            product_auth_forwarding = True
+        elif product_route:
+            raise WebHostError(
+                "NAVIGATOR_PRODUCT_AUTH_REQUIRED",
+                401,
+                "A first-party Product user authorization is required.",
+            )
         headers = {
             name: value for name, value in request.headers.items() if name in _PROXY_REQUEST_HEADERS
         }
         headers.setdefault("traceparent", request.state.traceparent)
         if request.state.tracestate:
             headers.setdefault("tracestate", request.state.tracestate)
+        if product_auth_forwarding:
+            # Translate only the dedicated first-party input. Ordinary browser Authorization
+            # and cookie headers never become an Exchange Product principal.
+            headers["authorization"] = product_authorization
+            headers[_PRODUCT_WORKSPACE_HEADER] = product_workspace
         if target_entry.prefix.rstrip("/") == "/api/proxy/exchange-gateway":
             if "authorization" in request.headers:
                 headers["authorization"] = request.headers["authorization"]
@@ -1610,7 +1670,20 @@ def create_web_host_app(
                 req = client.build_request(
                     request.method, upstream_url, content=body, headers=headers, timeout=600.0
                 )
-                upstream_stream = await client.send(req, stream=True)
+                upstream_stream = await client.send(
+                    req,
+                    stream=True,
+                    follow_redirects=(
+                        False if product_auth_forwarding else httpx.USE_CLIENT_DEFAULT
+                    ),
+                )
+                if product_auth_forwarding and 300 <= upstream_stream.status_code < 400:
+                    await upstream_stream.aclose()
+                    raise WebHostError(
+                        "NAVIGATOR_PRODUCT_PROXY_REDIRECT_BLOCKED",
+                        502,
+                        "Exchange Product authorization cannot be forwarded across redirects.",
+                    )
 
                 async def stream_activity() -> Any:
                     try:
@@ -1656,6 +1729,7 @@ def create_web_host_app(
                     activity.finish(activity_task_id)
                 raise
         try:
+            follow_redirects = False if product_auth_forwarding else httpx.USE_CLIENT_DEFAULT
             if http_client is None:
                 async with httpx.AsyncClient(follow_redirects=False) as client:
                     upstream = await client.request(
@@ -1664,6 +1738,7 @@ def create_web_host_app(
                         content=body,
                         headers=headers,
                         timeout=target.timeout_seconds,
+                        follow_redirects=follow_redirects,
                     )
             else:
                 upstream = await http_client.request(
@@ -1672,6 +1747,7 @@ def create_web_host_app(
                     content=body,
                     headers=headers,
                     timeout=target.timeout_seconds,
+                    follow_redirects=follow_redirects,
                 )
         except httpx.RequestError as exc:
             raise WebHostError(
@@ -1682,6 +1758,13 @@ def create_web_host_app(
             ) from exc
         finally:
             activity.finish(activity_task_id)
+        if product_auth_forwarding and 300 <= upstream.status_code < 400:
+            await upstream.aclose()
+            raise WebHostError(
+                "NAVIGATOR_PRODUCT_PROXY_REDIRECT_BLOCKED",
+                502,
+                "Exchange Product authorization cannot be forwarded across redirects.",
+            )
         response_headers = {
             name: value
             for name, value in upstream.headers.items()
@@ -1762,7 +1845,10 @@ def _normalize_proxy_targets(
         key = _normalize_prefix(prefix)
         if key in normalized:
             raise ValueError(f"duplicate proxy prefix: {key}")
-        normalized[key] = ProxyTarget(target) if isinstance(target, str) else target
+        resolved = ProxyTarget(target) if isinstance(target, str) else target
+        if resolved.forward_product_authorization and key != _PRODUCT_AUTH_PROXY_PREFIX:
+            raise ValueError("per-request Product authorization is restricted to /api/v1/exchange")
+        normalized[key] = resolved
     return tuple(
         _ConfiguredProxy(prefix, normalized[prefix])
         for prefix in sorted(normalized, key=lambda item: (-len(item), item))
@@ -1848,6 +1934,95 @@ def _validate_base_url(value: str) -> str:
         raise ValueError("proxy base URLs must be credential-free HTTP(S) URLs")
     _validate_proxy_path(parsed.path or "/")
     return value.rstrip("/")
+
+
+def _validate_product_auth_proxy_url(value: str) -> None:
+    """Require HTTPS, except for explicit loopback test or local-service URLs."""
+
+    parsed = urlsplit(value)
+    if parsed.path:
+        raise ValueError("per-request Product authorization requires an origin-only proxy URL")
+    hostname = parsed.hostname
+    if hostname is None:
+        raise ValueError("per-request Product authorization requires a valid proxy host")
+    try:
+        _ = parsed.port
+    except ValueError:
+        raise ValueError("per-request Product authorization requires a valid proxy port") from None
+    if parsed.scheme == "https":
+        return
+    if parsed.scheme != "http":
+        raise ValueError("per-request Product authorization requires HTTPS or loopback HTTP")
+    try:
+        loopback = ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        loopback = hostname.lower() == "localhost"
+    if not loopback:
+        raise ValueError("per-request Product authorization requires HTTPS or loopback HTTP")
+
+
+def _product_authorization_headers(request: Request) -> tuple[str, str]:
+    """Validate the dedicated first-party bearer and resource Workspace selector.
+
+    The standard browser Authorization and Cookie headers are intentionally not
+    considered Product identity; Exchange validates the forwarded bearer.
+    """
+
+    authorization_values = request.headers.getlist(_PRODUCT_AUTH_HEADER)
+    if len(authorization_values) != 1 or _PRODUCT_BEARER.fullmatch(authorization_values[0]) is None:
+        raise WebHostError(
+            "NAVIGATOR_PRODUCT_AUTH_REQUIRED",
+            401,
+            "A first-party Product user authorization is required.",
+        )
+    workspace_values = request.headers.getlist(_PRODUCT_WORKSPACE_HEADER)
+    if len(workspace_values) != 1 or _PRODUCT_WORKSPACE.fullmatch(workspace_values[0]) is None:
+        raise WebHostError(
+            "NAVIGATOR_PRODUCT_WORKSPACE_REQUIRED",
+            400,
+            "A valid Product Workspace selector is required.",
+        )
+    return authorization_values[0], workspace_values[0]
+
+
+def _is_product_auth_route(method: str, path: str) -> bool:
+    """Admit only published Exchange routes used by the Client integration API."""
+
+    if method == "GET":
+        if path in {
+            "/api/v1/integrations/connections",
+            "/api/v1/integrations/notifications",
+            "/api/v1/integrations/notifications/events",
+        }:
+            return True
+        get_patterns = (
+            rf"/api/v1/integrations/connections/{_PRODUCT_UUID}/(?:health|authorization-health|resources)",
+            r"/api/v1/integrations/operations/[^/]{1,300}",
+            rf"/api/v1/accounts/renewal-sessions/{_PRODUCT_UUID}",
+        )
+        return any(re.fullmatch(pattern, path) is not None for pattern in get_patterns)
+    if method != "POST":
+        return False
+    post_patterns = (
+        r"/api/v1/accounts/authorizations/[^/]{1,300}/renewal-sessions",
+        rf"/api/v1/integrations/connections/{_PRODUCT_UUID}/actions/refresh",
+        r"/api/v1/integrations/notifications/[^/]{1,300}/ack",
+        rf"/api/v1/integrations/sync-bindings/{_PRODUCT_UUID}/issues/actions/(?:comment|state|snapshot|query)",
+    )
+    return any(re.fullmatch(pattern, path) is not None for pattern in post_patterns)
+
+
+def _is_product_api_area(path: str) -> bool:
+    """Identify only API namespaces where Product identity may be forwarded."""
+
+    return any(
+        path == prefix or path.startswith(prefix + "/")
+        for prefix in (
+            "/api/v1/integrations",
+            "/api/v1/accounts/authorizations",
+            "/api/v1/accounts/renewal-sessions",
+        )
+    )
 
 
 def _validate_credential_text(value: str, field: str, *, max_length: int) -> None:

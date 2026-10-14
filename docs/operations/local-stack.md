@@ -19,6 +19,56 @@ is always generated internally.
 Only the Web Host accepts a configurable bind address. The default is
 `127.0.0.1`; bind to a remote interface only when explicitly required.
 
+## First-party Exchange API proxy / First-party Exchange API 代理
+
+`scripts/serve-web.py` can opt one registered Exchange proxy into request-scoped
+first-party Product authorization. Configure the fixed prefix at the Exchange
+origin (without an API path) and enable that exact prefix:
+
+```sh
+uv run python scripts/serve-web.py \
+  --proxy "/api/v1/exchange=${CYRENE_EXCHANGE_PRODUCT_URL}" \
+  --proxy-product-auth /api/v1/exchange
+```
+
+The Client sends a personal Platform user bearer in
+`X-Cyrene-Product-Authorization: Bearer …` and selects its Workspace with
+`X-Cyrene-Workspace-Id`. The Web Host forwards these values only for Exchange
+integration routes and the current account-renewal routes; the bearer becomes
+the upstream `Authorization` header. Exchange verifies the user and Workspace
+membership. The Web Host still requires its paired session and CSRF token for
+mutations. A browser `Authorization` or cookie is never treated as a Product
+identity.
+
+Product authorization is opt-in, is not persisted by Navigator, and cannot use
+a configured proxy credential as a fallback. Use HTTPS for remote Exchange
+origins; HTTP is accepted only for a loopback target. Redirects are blocked on
+these requests so a personal bearer cannot follow an origin change. The same
+Exchange prefix keeps its existing model/gateway proxy behavior when no
+dedicated Product authorization header is present. Do not send that dedicated
+header on model, gateway, or other proxy routes.
+
+`scripts/serve-web.py` 可在一个已注册的 Exchange 代理上显式启用按请求转发的 first-party
+Product authorization。固定代理前缀应指向 Exchange origin（不包含 API 路径），并启用同一个前缀：
+
+```sh
+uv run python scripts/serve-web.py \
+  --proxy "/api/v1/exchange=${CYRENE_EXCHANGE_PRODUCT_URL}" \
+  --proxy-product-auth /api/v1/exchange
+```
+
+Client 将个人 Platform 用户 bearer 放在
+`X-Cyrene-Product-Authorization: Bearer …` 中，并通过
+`X-Cyrene-Workspace-Id` 选择 Workspace。Web Host 只为 Exchange integrations 路由和当前账户续期
+路由转发这些值，并将 bearer 转为上游 `Authorization`。Exchange 会验证用户身份与 Workspace 成员关系。
+写操作仍要求已配对的 Web Host session 和 CSRF token；浏览器 `Authorization` 或 cookie 不会被视为
+Product 身份。
+
+Product authorization 默认关闭，不由 Navigator 持久化，也不会回退到已配置的代理凭据。远程
+Exchange origin 必须使用 HTTPS；HTTP 仅允许 loopback target。这些请求会阻止重定向，避免个人 bearer
+跟随 origin 变化。同一 Exchange 前缀在没有专用 Product authorization header 时仍保留现有模型/gateway
+代理行为。不要在模型、gateway 或其他代理路由上发送该专用 header。
+
 `scripts/serve-local.py` 在同一台机器上监督 SQLite 持久化服务、DSH executor 和配对的 Web
 Host。SQLite 数据库、附件、DSH home 和插件目录都保存在 `--state-dir` 下；重启 supervisor
 会轮换只驻留内存的服务凭据，但保留这些数据。若所选环境引用没有值，则生成 session principal
@@ -61,15 +111,15 @@ Workspace. It reads the token for each tool call and sends it only to
 Exchange's user API. Keep it separate from `CYRENE_EXCHANGE_TOKEN`, which
 authenticates model inference. Multi-user and cloud hosts must inject a
 session-bound `trustedUserBearerProvider`; there is no process-token fallback.
-No first-party session Control Bridge is implemented or verified (`NOT_RUN`),
-so this CLI option requires an externally supplied current-user Bearer. The
-CLI never writes it to Navigator's database.
+The local CLI does not implement the Client's session-bound Control bridge, so
+this integration option still requires an externally supplied current-user
+Bearer. The CLI never writes it to Navigator's database.
 
 launcher 会将此 Bearer 绑定到精确配置的 DSH Session 与 Workspace。token 在每次工具调用时读取，
 且只发送到 Exchange 用户 API。它必须与用于模型推理认证的 `CYRENE_EXCHANGE_TOKEN` 分开。
 多用户与云宿主必须注入绑定到 Session 的 `trustedUserBearerProvider`；系统没有进程令牌回退。
-first-party session Control Bridge 尚未实现或验证（`NOT_RUN`），因此此 CLI 选项要求外部提供
-当前用户 Bearer。CLI 不会把它写入 Navigator 数据库。
+本地 CLI 尚未实现 Client 的 session-bound Control bridge，因此此集成选项仍要求外部提供当前用户
+Bearer。CLI 不会把它写入 Navigator 数据库。
 
 The process prints one JSON line with the Web Host, persistence, and executor
 URLs after all three listeners pass readiness probes. Child logs are discarded

@@ -33,6 +33,17 @@ plugin directory under `--state-dir`, and keeps generated credentials in child
 environment variables. Its default generated principal has no connector
 binding. Optional QQ bridges require an explicit owner `--principal-config` and
 an installed `qq_connector` package; see [`local-stack.md`](../docs/operations/local-stack.md).
+
+For the Client's first-party Exchange API calls, `serve-web.py` accepts
+`--proxy-product-auth /api/v1/exchange` only when that exact prefix is registered
+with `--proxy /api/v1/exchange=ORIGIN`. The origin must be HTTPS, except for
+loopback HTTP during local development. The Client supplies the personal bearer
+and Workspace selector per request using `X-Cyrene-Product-Authorization` and
+`X-Cyrene-Workspace-Id`; Web Host forwards them only to the fixed Exchange
+integration and account-renewal routes. The Web Host session remains required,
+mutations retain CSRF checks, and static proxy credentials cannot authorize these
+routes. Other target/path requests cannot receive the dedicated bearer. See
+[`local-stack.md`](../docs/operations/local-stack.md) for the full boundary.
 ---
 <!-- Chinese Translation / 中文翻译 -->
 
@@ -47,3 +58,12 @@ an installed `qq_connector` package; see [`local-stack.md`](../docs/operations/l
 `DSH_HOME` 与插件目录都保存在 `--state-dir` 下，生成的凭据只通过子进程环境变量传递。默认生成的
 principal 不配置连接器。可选 QQ bridge 要求显式提供 owner `--principal-config`，并安装
 `qq_connector` package；参见 [`local-stack.md`](../docs/operations/local-stack.md)。
+
+Client 的 first-party Exchange API 请求可通过 `serve-web.py` 显式启用
+`--proxy-product-auth /api/v1/exchange`，但必须同时以
+`--proxy /api/v1/exchange=ORIGIN` 注册完全相同的前缀。origin 必须使用 HTTPS；本地开发时才允许
+loopback HTTP。Client 按请求通过 `X-Cyrene-Product-Authorization` 和 `X-Cyrene-Workspace-Id` 提供个人
+bearer 与 Workspace selector；Web Host 只将它们转发到固定 Exchange integrations 和账户续期路由。
+Web Host session 仍是必需条件，写操作继续校验 CSRF，静态代理凭据不能为这些路由授权。其他 target
+或 path 不会收到该专用 bearer。完整边界参见
+[`local-stack.md`](../docs/operations/local-stack.md)。
