@@ -391,7 +391,7 @@ export function registerExchangeAuthorizationTools(
       output: connectionListOutput,
       execute: async (_args, execution) => {
         const identity = requestIdentity(execution);
-        return { connections: [...await client.listConnections(identity)] };
+        return [...await client.listConnections(identity)];
       },
     })),
     ctx.tools.register(defineTool({
@@ -559,22 +559,17 @@ export const authorizationHealthOutput = {
 
 const connectionListOutput = {
   schema: {
-    type: 'object', additionalProperties: false,
-    properties: {
-      connections: {
-        type: 'array', required: true, items: {
-          type: 'object', additionalProperties: false,
-          properties: {
-            id: { type: 'string', required: true },
-            provider: { type: 'string', required: true, enum: EXCHANGE_PROVIDERS },
-            displayName: { type: 'string', required: true },
-            repositoryId: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true },
-            repositoryName: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true },
-            enabled: { type: 'boolean', required: true },
-            createdAt: { type: 'string', required: true },
-            updatedAt: { type: 'string', required: true },
-          },
-        },
+    type: 'array', items: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        id: { type: 'string', required: true },
+        provider: { type: 'string', required: true, enum: EXCHANGE_PROVIDERS },
+        displayName: { type: 'string', required: true },
+        repositoryId: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true },
+        repositoryName: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true },
+        enabled: { type: 'boolean', required: true },
+        createdAt: { type: 'string', required: true },
+        updatedAt: { type: 'string', required: true },
       },
     },
   } as const,

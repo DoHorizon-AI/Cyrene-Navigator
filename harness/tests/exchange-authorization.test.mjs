@@ -269,7 +269,7 @@ test('registers fixed authorization tools, requires approval, and hides renewal 
 
     const connections = await execute(ctx, 'exchange_connections_list', {}, 'connections-1');
     assert.equal(connections.isError, false);
-    assert.deepEqual(connections.value.connections, [connectionSummary()]);
+    assert.deepEqual(connections.value, [connectionSummary()]);
     assert.equal(JSON.stringify(connections.value).includes('tenantId'), false);
     assert.equal(JSON.stringify(connections.value).includes('private-binding-ref'), false);
 
