@@ -73,7 +73,8 @@ jobs:
       CHANNEL: ${{ github.ref == 'refs/heads/develop' && 'preview' || 'stable' }}
       RELEASE_ID: ${{ (github.ref == 'refs/heads/develop' && 'preview-' || 'stable-') }}${{ github.sha }}
       TARGET_PROFILE: ${{ matrix.target_profile }}
-      CATALOG_HELPER_SOURCE_COMMIT: 098ce4affb2fac38754eb18bd40ed679377d4c25
+      # Generation-12 catalog schema with strict deploymentRoles validation.
+      CATALOG_HELPER_SOURCE_COMMIT: aa35c08060210f4986eb7d5a45cb7210917f684d
       CATALOG_RELEASE_ID: ${{ inputs.catalog_release_id || (github.ref == 'refs/heads/develop' && vars.CYRENE_PREVIEW_COMPONENT_CATALOG_RELEASE_ID) || (github.ref != 'refs/heads/develop' && vars.CYRENE_STABLE_COMPONENT_CATALOG_RELEASE_ID) || '' }}
       WORKSPACE_BUILDER_COMMIT: cda6fb5104373293575342b2e6868cdd98a3d626
     steps:
