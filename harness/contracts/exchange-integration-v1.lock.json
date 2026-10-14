@@ -1,13 +1,13 @@
 {
   "schemaVersion": 1,
   "ownerRepository": "DoHorizon-AI/Cyrene-Exchange",
-  "ownerCommitSha": "caa92a8c426212c61c253853614073881ae63c86",
+  "ownerCommitSha": "b7f59cfebe7c817783d915b073bcf6ffee0bdc03",
   "sourceArtifacts": {
-    "contracts/product/v1/openapi.yaml": "d7baa08b1c912d8ff71d5c20989dde76122dbbf2c1f4f22835496330b4a950b9",
-    "contracts/product/v2/catalog.json": "4571bf9de28914e524e001d0857e1009b9feb8c3f60b4f5e8b89727dcbca4205"
+    "contracts/product/v1/openapi.yaml": "9e3512a005095d7c7bfe45e75d1e6fdbb9d187e7a1c4ce315f2ab83da853bc66",
+    "contracts/product/v2/catalog.json": "8b3234e85810d5bf09da7e1f6532423914a5e2aa3ba43b7061a241332b11d645"
   },
   "consumerFixture": {
     "path": "harness/contracts/exchange-integration-v1.consumer.json",
-    "sha256": "385231619c701b050dabb8e201f53cc6c04634423ee997329f96644273615062"
+    "sha256": "0b6957626c911c9272730786230d193b4336bb3b533ae3f349e50be4ab1854cb"
   }
 }
