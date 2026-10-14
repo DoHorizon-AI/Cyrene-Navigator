@@ -123,6 +123,8 @@ jobs:
           # 多个文件各自启动 Python/MCP 进程，串行执行避免冷启动资源竞争。
           node --test --test-concurrency=1 `
             harness/tests/executor.integration.test.mjs `
+            harness/tests/exchange-integration.test.mjs `
+            harness/tests/exchange-authorization.test.mjs `
             harness/tests/subagents.test.mjs `
             harness/tests/subagent-wire.test.mjs `
             harness/tests/antigravity-boundary.test.mjs `
