@@ -202,6 +202,28 @@ arguments to the model; Navigator keeps their profile outside the payload and
 binds it in the grant. Their CLI tools expose only `argv`, and Exchange uses an
 empty Account Center lease target for those CLI calls.
 
+### Teams text-only chat / Teams 纯文字对话
+
+Set `CYRENE_TEAMS_CHAT_ONLY=true` to admit authenticated Teams conversations
+without enabling connector tools. `TEAMS_CHAT_ONLY=true` is a supported alias;
+if both variables are set, their values must agree. The default is `false`.
+The connector binding map must be empty, and any configured tool catalog must
+use `schemaVersion: 1` with an empty `items` array. This mode exposes no model
+tools and must not be used to claim that an external resource was checked or an
+operation completed.
+
+Keep `TEAMS_ENABLED=true`, the existing tenant/team and Directory actor
+authorization, durable Work state, and the fixed Exchange Teams reply profile
+(`TEAMS_EXCHANGE_CONNECTION_REF` / `TEAMS_EXCHANGE_PROFILE_REF`) configured.
+Use the selected real model adapter as usual. Leave
+`CYRENE_WORKFLOWS_ENABLED` unset or set it to `false`; leave
+`NAVIGATOR_PLUGINS_DIR`, `CYRENE_EXCHANGE_INTEGRATION_URL`,
+`CYRENE_CLOUD_PROFILE_CONFIG`, and `CYRENE_SUBAGENT_CONFIG` unset. The stock
+Docker command includes `--plugins-dir`; override the Compose command for this
+mode and omit that argument. Startup rejects any configured dynamic plugin
+directory or business-tool configuration, then verifies the model tool list is
+empty.
+
 Teams 默认关闭。设置 `TEAMS_ENABLED=true` 后，executor 只接受带时间戳 HMAC 的 Teams adapter
 回调，核对配置的 tenant/team allowlist，并在持久接纳事件后才返回成功。通过 secret manager 配置
 `TEAMS_NAVIGATOR_HMAC_KEY`（至少 32 字节）、`TEAMS_TENANT_ID`、`TEAMS_ALLOWED_TEAM_IDS`、
@@ -227,6 +249,20 @@ Exchange 私有 snapshot；Compose 挂载路径为 `/run/config/connector-tool-c
 校验它是有界普通 JSON 文件并转发解析后的路径，Node 会验证完整 catalog 和精确 binding 交集。
 GitHub 和 Hugging Face provider tools 只向模型暴露各自的标准 operation 参数；Navigator 不把 profile 写进参数，
 而是在 grant 中单独绑定。两类 CLI 只暴露 `argv`，Exchange 对它们使用空的 Account Center lease target。
+
+### Teams 纯文字对话
+
+设置 `CYRENE_TEAMS_CHAT_ONLY=true`，可接收经过身份校验的 Teams 对话而不开放连接器工具。也支持别名
+`TEAMS_CHAT_ONLY=true`；若同时设置，两个值必须一致。默认值为 `false`。连接器 binding map 必须为空；若配置了
+tool catalog，必须使用 `schemaVersion: 1` 且 `items` 为空。此模式不向模型提供工具，因此不能声称已检查外部资源
+或完成了某项操作。
+
+仍须保留 `TEAMS_ENABLED=true`、现有 tenant/team 与 Directory 执行者授权、持久 Work 状态，以及固定的 Exchange
+Teams 回复 profile（`TEAMS_EXCHANGE_CONNECTION_REF` / `TEAMS_EXCHANGE_PROFILE_REF`），并按常规配置真实模型适配器。
+`CYRENE_WORKFLOWS_ENABLED` 应未设置或设为 `false`；`NAVIGATOR_PLUGINS_DIR`、
+`CYRENE_EXCHANGE_INTEGRATION_URL`、`CYRENE_CLOUD_PROFILE_CONFIG` 和 `CYRENE_SUBAGENT_CONFIG` 应保持未设置。
+标准 Docker 命令带有 `--plugins-dir`；使用此模式时要覆盖 Compose command 并移除该参数。启动会拒绝动态插件目录和
+业务工具配置，并在启动完成前验证模型工具列表为空。
 
 The process prints one JSON line with the Web Host, persistence, and executor
 URLs after all three listeners pass readiness probes. Child logs are discarded
