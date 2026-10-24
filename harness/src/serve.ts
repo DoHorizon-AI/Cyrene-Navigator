@@ -4,7 +4,7 @@
 // │ 模块职责：在 Harness 作用域内装配并导出 Cloud Executor 运行时。         │
 // └─────────────────────────────────────────────────────────────────────┘
 
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, statSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -86,10 +86,12 @@ export interface CreateExecutorAppOptions {
   readonly subagentConfigPath?: string;
   readonly teams?: TeamsExecutorConfig;
   readonly connectorBindingsPath?: string;
+  readonly connectorToolCatalogPath?: string;
 }
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repository = resolve(__dirname, '../..');
+const MAX_CONNECTOR_TOOL_CATALOG_BYTES = 32 * 1024 * 1024;
 
 export async function createExecutorApp(options: CreateExecutorAppOptions = {}) {
   const testMode = options.testMode === true;
@@ -109,6 +111,13 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
   if (teams !== undefined && production && connectorBindings.size === 0) {
     throw new Error('CYRENE_CONNECTOR_BINDINGS_FILE is required when Teams connector execution is enabled');
   }
+  const connectorToolCatalogPath = options.connectorToolCatalogPath ?? process.env.CYRENE_CONNECTOR_TOOL_CATALOG_FILE;
+  if (teams !== undefined && production && connectorToolCatalogPath === undefined) {
+    throw new Error('CYRENE_CONNECTOR_TOOL_CATALOG_FILE is required when Teams connector execution is enabled');
+  }
+  const connectorToolCatalogSnapshot = connectorToolCatalogPath === undefined
+    ? undefined
+    : await readHostConnectorToolCatalog(resolve(connectorToolCatalogPath));
   const exchangeIntegrationUrl = options.exchangeIntegrationUrl ?? process.env.CYRENE_EXCHANGE_INTEGRATION_URL;
   const exchangeIntegrationWorkspaceId = options.exchangeIntegrationWorkspaceId
     ?? process.env.CYRENE_EXCHANGE_INTEGRATION_WORKSPACE_ID ?? workspaceId;
@@ -159,6 +168,19 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
   await ctx.plugin(SessionStore);
   await ctx.plugin(SessionProjectionRegistry);
   await ctx.plugin(SystemPrompt);
+  if (teams !== undefined) {
+    ctx.systemPrompt.section({
+      name: 'navigator:teams-connector-execution-policy',
+      order: ctx.systemPrompt.getSectionOrder('TEAM_POLICY'),
+      text: [
+        'For a task admitted from an authenticated Teams caller, treat a clear instruction from the configured authorized operator as direct authorization to execute the requested connector action.',
+        'Call the matching connector tool directly when the target and required arguments are present. Do not ask for an extra per-action confirmation or create an approval request.',
+        'Use work_request_input only when a required target or argument is missing or ambiguous; ask only for the missing information and never guess it.',
+        'This task policy does not grant connector access: each call still requires the trusted task identity, launcher-owned binding, and a fresh Exchange/Directory grant. If authorization is denied, report the denial and do not bypass it.',
+        'An unknown or uncertain remote write result is never success. Do not replay that write or claim it succeeded. Read its exact Work operation receipt with work_operation_read, perform a separate read-only check for the same configured provider/profile scope, then explicitly reconcile with work_operation_verify using that read receipt ID and what the returned state proves. Leave the receipt uncertain when the independent read does not settle the outcome.',
+      ].join('\n'),
+    });
+  }
   await ctx.plugin(ToolRuntime);
   await ctx.plugin(AgentRegistry);
 
@@ -294,6 +316,7 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
           bindings: connectorBindings,
         },
       }),
+      ...(connectorToolCatalogSnapshot === undefined ? {} : { connectorToolCatalogSnapshot }),
     });
   }
 
@@ -583,6 +606,19 @@ function configText(value: unknown, label: string, maximum: number): string {
   if (typeof value !== 'string' || value.length === 0 || value.trim() !== value || value.length > maximum
     || /[\u0000-\u001f\u007f]/u.test(value)) throw new TypeError(`Invalid connector ${label}`);
   return value;
+}
+
+/** Load the private Exchange-exported provider catalog without inline secrets. | 读取私有 Exchange provider catalog。 */
+async function readHostConnectorToolCatalog(path: string): Promise<unknown> {
+  try {
+    const metadata = statSync(path);
+    if (!metadata.isFile() || metadata.size < 1 || metadata.size > MAX_CONNECTOR_TOOL_CATALOG_BYTES) {
+      throw new TypeError('Connector tool catalog must be a bounded regular file');
+    }
+    return JSON.parse(await readFile(path, 'utf8')) as unknown;
+  } catch {
+    throw new Error('CYRENE_CONNECTOR_TOOL_CATALOG_FILE is unavailable or invalid');
+  }
 }
 
 /** Parse the host-only CLI deployment file without accepting inline secret values. | 解析仅由宿主管理且不含内联凭据的部署文件。 */

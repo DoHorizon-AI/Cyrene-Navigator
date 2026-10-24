@@ -45,6 +45,8 @@ export interface ToolProviderRegistrationOptions {
     readonly workspaceId: string;
     readonly bindings: ReadonlyMap<string, ConnectorBindingAuthorization>;
   };
+  /** Private Exchange-exported ListTools snapshot; still intersected with host authorization. */
+  readonly connectorToolCatalogSnapshot?: unknown;
 }
 
 export type ConnectorResourceProjection =
@@ -128,8 +130,8 @@ interface OperationReceipt {
 
 /**
  * Discover configured provider bindings and register their JSON Schema tools
- * on DSH's existing ToolRuntime. Write calls require Navigator approval and
- * a durable operation receipt before reaching the canonical provider.
+ * on DSH's existing ToolRuntime. Non-Teams writes require Navigator approval;
+ * trusted Teams calls use fresh grants and durable operation receipts.
  *
  * @param ctx - DSH context whose tool registrations share the active runtime.
  * @param options - authenticated Work bridge and host-owned session/task map.
@@ -141,8 +143,27 @@ export async function registerToolProviders(
   options: ToolProviderRegistrationOptions,
 ): Promise<() => void> {
   const signal = AbortSignal.timeout(15_000);
-  const rawBindings = await options.bridge.request('/tool-providers', 'GET', undefined, signal);
-  const bindings = parseBindings(rawBindings);
+  const snapshot = options.connectorToolCatalogSnapshot === undefined
+    ? undefined
+    : parseConnectorToolCatalogSnapshot(options.connectorToolCatalogSnapshot);
+  if (snapshot !== undefined && options.connectorAuthorization === undefined) {
+    throw new TypeError('A private connector tool catalog requires launcher-owned connector authorization');
+  }
+  const snapshotByBinding = snapshot === undefined
+    ? undefined
+    : new Map(snapshot.map(item => [item.binding.bindingId, item]));
+  let bindings: ProviderBinding[];
+  if (snapshotByBinding !== undefined) {
+    const authorizedBindings = options.connectorAuthorization!.bindings;
+    const absent = [...authorizedBindings.keys()].find(bindingId => !snapshotByBinding.has(bindingId));
+    if (absent !== undefined) throw new TypeError(`Private connector tool catalog omitted launcher binding ${absent}`);
+    const untrusted = [...snapshotByBinding.keys()].find(bindingId => !authorizedBindings.has(bindingId));
+    if (untrusted !== undefined) throw new TypeError(`Private connector tool catalog contains unbound binding ${untrusted}`);
+    bindings = snapshot!.map(item => item.binding);
+  } else {
+    const rawBindings = await options.bridge.request('/tool-providers', 'GET', undefined, signal);
+    bindings = parseBindings(rawBindings);
+  }
   if (bindings.length > MAX_PROVIDER_COUNT) throw new TypeError('Tool provider catalog exceeds its configured limit');
 
   const registrations: Array<() => void> = [];
@@ -153,10 +174,17 @@ export async function registerToolProviders(
       const trustedBinding = options.connectorAuthorization?.bindings.get(binding.bindingId);
       if (options.connectorAuthorization !== undefined && trustedBinding === undefined) continue;
       if (trustedBinding !== undefined) assertCatalogBinding(binding, trustedBinding);
-      const rawCatalog = await options.bridge.request(
-        `/tool-providers/${encodeURIComponent(binding.bindingId)}/tools`, 'GET', undefined, signal,
-      );
+      const rawCatalog = snapshotByBinding?.get(binding.bindingId)?.toolCatalog
+        ?? await options.bridge.request(
+          `/tool-providers/${encodeURIComponent(binding.bindingId)}/tools`, 'GET', undefined, signal,
+        );
       const tools = parseTools(rawCatalog, binding.bindingId);
+      if (snapshotByBinding !== undefined && trustedBinding !== undefined) {
+        const absentTool = trustedBinding.tools.find(item => !tools.some(tool => tool.id === item.toolId));
+        if (absentTool !== undefined) {
+          throw new TypeError(`Private connector tool catalog omitted authorized tool ${absentTool.toolId}`);
+        }
+      }
       for (const tool of tools) {
         const trustedTool = trustedBinding?.tools.find(item => item.toolId === tool.id);
         if (trustedBinding !== undefined && trustedTool === undefined) continue;
@@ -207,7 +235,8 @@ function assertCatalogTool(
     || (tool.providerId !== undefined && tool.providerId !== trustedBinding.providerId)
     || (tool.connectionRef !== undefined && tool.connectionRef !== trustedBinding.connectionRef)
     || (tool.profileRef !== undefined && tool.profileRef !== trustedBinding.profileRef)
-    || (tool.operationId !== undefined && tool.operationId !== trustedTool.operationId)) {
+    || (tool.operationId !== undefined && tool.operationId !== trustedTool.operationId)
+    || tool.readOnly === trustedTool.mutating) {
     throw new TypeError('Provider catalog operation does not match its launcher-owned connector grant');
   }
 }
@@ -373,7 +402,9 @@ async function executeTeamsProviderCall(
   const operationId = toolAuthorization.operationId;
   const target = connectorTargetProjection(toolAuthorization.resourceProjection, profileRef, actualArguments);
   const resourceRef = `sha256:${sha256(canonicalJson({ providerId, profileRef, operationId, target }))}`;
+  const targetDigestSha256 = sha256(canonicalJson({ providerId, profileRef, target }));
   const receiptTarget = `connector-target:${sha256(canonicalJson({ providerId, profileRef, target }))}`;
+  const readbackReceiptTarget = `connector-readback:${targetDigestSha256}`;
   const requestId = boundedText(String(execution.callId), 'connector request id', 512);
   const grantRequest: ConnectorGrantRequest = {
     requestId,
@@ -389,16 +420,25 @@ async function executeTeamsProviderCall(
     arguments: actualArguments,
   };
   let operation: OperationReceipt | undefined;
+  const unresolved = await listUnresolvedOperations(
+    options.bridge,
+    toolAuthorization.mutating ? receiptTarget : undefined,
+    execution.signal,
+  );
   if (toolAuthorization.mutating) {
-    const unresolved = await listUnresolvedOperations(options.bridge, receiptTarget, execution.signal);
     if (unresolved.length > 0) {
-      throw new Error('A prior operation on this exact provider target has no reconciled outcome; read its operation status before retrying');
+      const priorReceiptId = unresolved.find(item => typeof item.id === 'string')?.id;
+      const receiptHint = typeof priorReceiptId === 'string' ? ` Work operation ID: ${priorReceiptId}.` : '';
+      throw new Error(`A prior operation on this exact provider target has no reconciled outcome; read its operation status before retrying, then reconcile its receipt with an independent readback.${receiptHint}`);
     }
   }
+  const readbackForUnresolvedWrite = !toolAuthorization.mutating
+    && unresolved.some(item => isMatchingUnresolvedConnectorWrite(item, taskId, providerId, profileRef));
   const grant = await authorization.client.mintGrant(grantRequest, execution.signal);
-  if (toolAuthorization.mutating) {
+  if (toolAuthorization.mutating || readbackForUnresolvedWrite) {
     operation = await beginOperation(
-      options.bridge, execution, taskId, binding, tool, actualArguments, operationId, receiptTarget,
+      options.bridge, execution, taskId, binding, tool, actualArguments, operationId,
+      toolAuthorization.mutating ? receiptTarget : readbackReceiptTarget,
     );
     if (operation.duplicate || operation.status !== 'started') {
       throw new Error('An operation receipt already exists; reconcile it before retrying this provider call');
@@ -407,7 +447,15 @@ async function executeTeamsProviderCall(
   if (execution.signal.aborted) {
     if (operation) {
       await options.bridge.request(`/operations/${encodeURIComponent(operation.id)}`, 'PATCH', {
-        status: 'verified', evidence: { outcome: 'cancelled_before_invoke' },
+        status: 'verified', evidence: {
+          outcome: 'cancelled_before_invoke',
+          effect: toolAuthorization.mutating ? 'write' : 'read',
+          bindingId: binding.bindingId,
+          providerId,
+          profileRef,
+          operationId,
+          targetDigestSha256,
+        },
       }, AbortSignal.timeout(5_000));
     }
     throw abortError(execution.signal);
@@ -430,37 +478,65 @@ async function executeTeamsProviderCall(
     if (operation) {
       if (error instanceof ExchangeConnectorRequestError && !error.outcomeUnknown) {
         await options.bridge.request(`/operations/${encodeURIComponent(operation.id)}`, 'PATCH', {
-          status: 'verified', evidence: { outcome: 'rejected', status: error.status ?? null },
+          status: 'verified', evidence: {
+            outcome: 'rejected',
+            effect: toolAuthorization.mutating ? 'write' : 'read',
+            bindingId: binding.bindingId,
+            providerId,
+            profileRef,
+            operationId,
+            targetDigestSha256,
+            status: error.status ?? null,
+          },
         }, AbortSignal.timeout(5_000)).catch(() => undefined);
       } else {
         await markUncertain(options.bridge, operation.id, {
+          outcome: 'unknown_after_provider_call',
+          effect: toolAuthorization.mutating ? 'write' : 'read',
+          bindingId: binding.bindingId,
           providerId,
           profileRef,
           operationId,
+          targetDigestSha256,
           ...(error instanceof ExchangeConnectorRequestError ? { status: error.status ?? null } : {}),
         });
+        if (toolAuthorization.mutating) {
+          throw new Error(
+            `The remote write outcome is unknown. Work operation ID: ${operation.id}. Do not retry until an independent readback is reconciled.`,
+            { cause: error },
+          );
+        }
       }
     }
     throw error;
   }
   const operationRef = providerResponse.operationRef ?? providerResultOperationRef(result);
   const effectiveOutcome = effectiveProviderOutcome(providerResponse.outcome, result, operationRef);
+  const knownOutcome = effectiveOutcome === 'verified' || effectiveOutcome === 'failed';
   if (operation) {
-    const knownOutcome = effectiveOutcome === 'verified' || effectiveOutcome === 'failed';
+    const receiptEvidence: Record<string, unknown> = {
+      outcome: effectiveOutcome,
+      effect: toolAuthorization.mutating ? 'write' : 'read',
+      bindingId: binding.bindingId,
+      providerId,
+      profileRef,
+      operationId,
+      targetDigestSha256,
+      ...(operationRef === undefined ? {} : { operationRef }),
+      isError: result.isError === true,
+      ...(toolAuthorization.mutating || !knownOutcome ? {} : {
+        resultSha256: sha256(canonicalJson(result)),
+      }),
+    };
     try {
       await options.bridge.request(`/operations/${encodeURIComponent(operation.id)}`, 'PATCH', {
         status: knownOutcome ? 'verified' : 'uncertain',
-        evidence: {
-          outcome: effectiveOutcome,
-          providerId,
-          profileRef,
-          operationId,
-          ...(operationRef === undefined ? {} : { operationRef }),
-          isError: result.isError === true,
-        },
+        evidence: receiptEvidence,
       }, AbortSignal.timeout(5_000));
     } catch {
-      throw new Error('Canonical connector response arrived but its receipt could not be finalized; reconcile before retrying');
+      throw new Error(
+        `Canonical connector response arrived but Work receipt ${operation.id} could not be finalized; reconcile before retrying`,
+      );
     }
   }
   if (operationId === 'cloud.operation.status.read'
@@ -476,12 +552,25 @@ async function executeTeamsProviderCall(
   }
   if (effectiveOutcome === 'uncertain') {
     const operationHint = operationRef === undefined ? '' : ` (operationRef: ${operationRef})`;
-    throw new Error(`Exchange reports an unknown remote operation result${operationHint}; the receipt is blocked pending status reconciliation`);
+    const effectHint = toolAuthorization.mutating ? 'write' : 'read';
+    const receiptHint = operation === undefined ? '' : ` Work operation ID: ${operation.id}.`;
+    throw new Error(`Exchange reports an unknown remote ${effectHint} result${operationHint}.${receiptHint} The receipt remains blocked pending independent status reconciliation.`);
   }
   if (effectiveOutcome === 'failed' && result.isError !== true) {
     throw new Error('Exchange reports a failed remote operation');
   }
-  return successfulResult(withProviderOutcome(result, effectiveOutcome, operationRef));
+  const returned = withProviderOutcome(result, effectiveOutcome, operationRef);
+  let finalResult = returned;
+  if (!toolAuthorization.mutating && operation !== undefined) {
+    const structured = returned.structuredContent !== undefined
+      && returned.structuredContent !== null && typeof returned.structuredContent === 'object'
+      && !Array.isArray(returned.structuredContent)
+      ? { ...(returned.structuredContent as Record<string, JsonValue>) }
+      : {};
+    structured.workOperationId = operation.id;
+    finalResult = { ...returned, structuredContent: structured };
+  }
+  return successfulResult(finalResult);
 }
 
 function connectorTargetProjection(
@@ -591,13 +680,30 @@ async function markUncertain(
 
 async function listUnresolvedOperations(
   bridge: ToolProviderRegistrationOptions['bridge'],
-  target: string,
+  target: string | undefined,
   signal: AbortSignal,
 ): Promise<readonly Record<string, unknown>[]> {
-  const query = new URLSearchParams({ target, limit: '500' });
+  const query = new URLSearchParams({ limit: '500' });
+  if (target !== undefined) query.set('target', target);
   const response = objectValue(await bridge.request(`/operations/unresolved?${query}`, 'GET', undefined, signal), 'unresolved provider operations');
   if (!Array.isArray(response.items)) throw new TypeError('Work omitted unresolved provider operation rows');
   return response.items.map((item, index) => objectValue(item, `unresolved provider operation ${index}`));
+}
+
+function isMatchingUnresolvedConnectorWrite(
+  operation: Record<string, unknown>,
+  taskId: string,
+  providerId: string,
+  profileRef: string,
+): boolean {
+  const evidence = operation.evidence;
+  if (operation.taskId !== taskId || evidence === null || typeof evidence !== 'object' || Array.isArray(evidence)) {
+    return false;
+  }
+  const row = evidence as Record<string, unknown>;
+  return row.effect !== 'read'
+    && row.providerId === providerId
+    && row.profileRef === profileRef;
 }
 
 async function reconcileTerminalOperation(
@@ -812,6 +918,57 @@ function parseBindings(value: unknown): ProviderBinding[] {
     });
   }
   return bindings;
+}
+
+function parseConnectorToolCatalogSnapshot(value: unknown): Array<{ binding: ProviderBinding; toolCatalog: unknown }> {
+  const root = objectValue(value, 'private connector tool catalog');
+  assertExactKeys(root, ['schemaVersion', 'items'], 'private connector tool catalog');
+  if (root.schemaVersion !== 1 || !Array.isArray(root.items) || root.items.length > MAX_PROVIDER_COUNT) {
+    throw new TypeError('Private connector tool catalog has an unsupported version or item count');
+  }
+  const rows = root.items.map((item, index) => {
+    const row = objectValue(item, `private connector catalog binding ${index}`);
+    assertExactKeys(row, [
+      'bindingId', 'capabilityId', 'providerId', 'connectionRef', 'profileRef', 'tools',
+    ], `private connector catalog binding ${index}`);
+    if (row.capabilityId !== 'tool.provider.v1' || !Array.isArray(row.tools)
+      || row.tools.length > MAX_TOOL_COUNT) {
+      throw new TypeError(`Private connector catalog binding ${index} is invalid`);
+    }
+    for (const [toolIndex, tool] of row.tools.entries()) {
+      const toolRow = objectValue(tool, `private connector catalog tool ${index}:${toolIndex}`);
+      assertExactKeys(toolRow, ['id', 'name', 'description', 'readOnly', 'inputSchema'],
+        `private connector catalog tool ${index}:${toolIndex}`);
+    }
+    return {
+      binding: {
+        bindingId: row.bindingId,
+        capabilityId: row.capabilityId,
+        providerId: row.providerId,
+        connectionRef: row.connectionRef,
+        profileRef: row.profileRef,
+      },
+      toolCatalog: { tools: row.tools },
+    };
+  });
+  const parsedBindings = parseBindings({ items: rows.map(row => row.binding) });
+  if (parsedBindings.length !== rows.length) {
+    throw new TypeError('Private connector catalog contains an unsupported capability');
+  }
+  return rows.map((row, index) => {
+    const binding = parsedBindings[index];
+    if (binding === undefined) throw new TypeError('Private connector catalog binding is invalid');
+    return { binding, toolCatalog: row.toolCatalog };
+  });
+}
+
+function assertExactKeys(value: Record<string, unknown>, expected: readonly string[], label: string): void {
+  const actual = Object.keys(value).sort();
+  const orderedExpected = [...expected].sort();
+  if (actual.length !== orderedExpected.length
+    || actual.some((key, index) => key !== orderedExpected[index])) {
+    throw new TypeError(`${label} contains missing or unsupported fields`);
+  }
 }
 
 /** Validate tool metadata and provider-supplied JSON Schema before registration. */

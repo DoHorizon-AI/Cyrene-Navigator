@@ -797,7 +797,7 @@ def test_teams_thread_mapping_keeps_member_messages_as_context_without_admitting
     db_path = tmp_path / "teams-thread-context.sqlite3"
     base = BASE.format(workspace="w1")
     tenant_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-    owner_id = "d83aeb27-ff11-46d7-b0f7-af8da8d5b8ec"
+    owner_id = "11111111-1111-4111-8111-111111111111"
     member_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
     thread = {
         "threadId": "a" * 64,

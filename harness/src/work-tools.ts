@@ -9,6 +9,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools';
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
+import { canonicalJson, sha256 } from './connector-authorization.ts';
 
 export interface WorkToolsConfig {
   readonly baseUrl: string;
@@ -59,6 +60,114 @@ export class WorkAssistantBridge {
       throw new Error('This task is paused or closed; further mutations are denied');
     }
     return this.request(path, method, taskLinked ? { ...body, taskId } : body, exec.signal);
+  }
+
+  /** Read a minimal operation receipt owned by the active durable task. | 读取当前任务的最小回执。 */
+  async readCurrentTaskOperation(
+    sessionId: string,
+    operationId: string,
+    signal: AbortSignal,
+  ): Promise<Record<string, JsonValue>> {
+    const { taskId, operation } = await this.readOwnedOperation(sessionId, operationId, signal);
+    return projectCurrentTaskOperation(taskId, operationId, operation);
+  }
+
+  private async readOwnedOperation(
+    sessionId: string,
+    operationId: string,
+    signal: AbortSignal,
+  ): Promise<{ taskId: string; operation: Record<string, JsonValue> }> {
+    const taskId = this.config.taskIdForSession(sessionId);
+    if (!taskId) throw new Error('Operation receipt reads require an active durable Navigator task');
+    const response = await this.request(`/operations/${encodeURIComponent(operationId)}`, 'GET', undefined, signal);
+    const operation = asRecord(response.operation ?? response);
+    if (operation.id !== operationId || operation.taskId !== taskId) {
+      throw new Error('Operation receipt does not belong to the active durable task');
+    }
+    if (operation.status !== 'started' && operation.status !== 'uncertain' && operation.status !== 'verified') {
+      throw new Error('Operation receipt has an invalid lifecycle state');
+    }
+    if (typeof operation.operationType !== 'string'
+      || typeof operation.createdAt !== 'number' || !Number.isSafeInteger(operation.createdAt)
+      || typeof operation.updatedAt !== 'number' || !Number.isSafeInteger(operation.updatedAt)) {
+      throw new Error('Operation receipt is incomplete');
+    }
+    return { taskId, operation };
+  }
+
+  /** Explicitly reconcile only a receipt owned by the active task. | 显式对账当前任务回执。 */
+  async verifyCurrentTaskOperation(
+    exec: ToolRunContext,
+    operationId: string,
+    status: 'uncertain' | 'verified',
+    evidence: Record<string, unknown>,
+  ): Promise<Record<string, JsonValue>> {
+    const session = sessionId(exec);
+    const { taskId, operation: rawReceipt } = await this.readOwnedOperation(session, operationId, exec.signal);
+    const receipt = projectCurrentTaskOperation(taskId, operationId, rawReceipt);
+    if (receipt.status === 'verified') {
+      if (status !== 'verified') throw new Error('A verified operation receipt cannot move backward');
+      return { operation: receipt, duplicate: true };
+    }
+    if (receipt.status === 'uncertain' && status === 'uncertain') {
+      return { operation: receipt, duplicate: true };
+    }
+    if (receipt.status !== 'started' && receipt.status !== 'uncertain') {
+      throw new Error('Operation receipt is not eligible for reconciliation');
+    }
+    let verifiedEvidence = evidence;
+    const writeEvidence = recordValue(receipt.evidence);
+    const operationType = typeof receipt.operationType === 'string' ? receipt.operationType : '';
+    const connectorOperation = operationType.startsWith('tool.provider.v1:');
+    const connectorWrite = connectorOperation && writeEvidence.effect !== 'read';
+    if (status === 'verified' && connectorWrite) {
+      const requestedReadback = recordValue(evidence.independentRead);
+      const readbackOperationId = textValue(requestedReadback.operationId, 'independent read receipt ID');
+      if (requestedReadback.confirmed !== true) {
+        throw new Error('Connector write reconciliation requires an explicit confirmed independent readback');
+      }
+      const observation = textValue(requestedReadback.observation, 'independent readback observation');
+      if (observation.length > 1_000) throw new Error('Independent readback observation is too long');
+      const { operation: rawReadback } = await this.readOwnedOperation(session, readbackOperationId, exec.signal);
+      const readback = projectCurrentTaskOperation(taskId, readbackOperationId, rawReadback);
+      const readEvidence = recordValue(readback.evidence);
+      const resultSha256 = readEvidence.resultSha256;
+      const writeOperationId = typeof writeEvidence.operationId === 'string'
+        ? writeEvidence.operationId
+        : operationType.slice('tool.provider.v1:'.length);
+      const writeTargetDigest = typeof writeEvidence.targetDigestSha256 === 'string'
+        ? writeEvidence.targetDigestSha256
+        : connectorTargetDigest(receipt.target);
+      const relation = matchVerifiedReadback(rawReceipt, rawReadback, writeEvidence, readEvidence, writeTargetDigest);
+      if (readback.status !== 'verified'
+        || readEvidence.effect !== 'read'
+        || readEvidence.outcome !== 'verified'
+        || typeof readEvidence.operationId !== 'string'
+        || readEvidence.operationId === writeOperationId
+        || relation === undefined
+        || typeof resultSha256 !== 'string' || !/^[0-9a-f]{64}$/u.test(resultSha256)) {
+        throw new Error('Connector operation verification requires a completed read receipt for the same provider/profile target');
+      }
+      verifiedEvidence = {
+        ...evidence,
+        independentRead: {
+          operationId: readback.id,
+          providerId: readEvidence.providerId,
+          profileRef: readEvidence.profileRef,
+          operation: readEvidence.operationId,
+          targetDigestSha256: readEvidence.targetDigestSha256,
+          resultSha256,
+          match: relation.kind,
+          ...(relation.repository === undefined ? {} : { repository: relation.repository }),
+          confirmed: true,
+          observation,
+        },
+      };
+    }
+    return this.mutate(exec, `/operations/${encodeURIComponent(operationId)}`, 'PATCH', {
+      status,
+      evidence: verifiedEvidence,
+    });
   }
 
   /** Wait for a human-owned decision; there is deliberately no model resolve tool. | 等待人工决策。 */
@@ -184,16 +293,24 @@ export function registerWorkTools(ctx: Context, config: WorkToolsConfig): WorkAs
     execute: (args, exec) => bridge.mutate(exec, '/operations', 'POST', args, true),
   }));
   ctx.tools.register(defineTool({
+    name: 'work_operation_read',
+    description: 'Read a minimal operation receipt by its exact ID. Only receipts created by the active durable task are visible; original arguments are never returned.',
+    parameters: { operationId: { type: 'string', required: true } }, output,
+    execute: (args, exec) => bridge.readCurrentTaskOperation(
+      sessionId(exec), args.operationId, exec.signal,
+    ),
+  }));
+  ctx.tools.register(defineTool({
     name: 'work_operation_verify',
-    description: 'Record independently checked result evidence. Use uncertain when remote delivery or outcome is unknown.',
+    description: 'Explicitly reconcile one operation receipt from the active task. Before verifying a connector write, perform a separate read-only provider tool call for the same provider/profile target, then provide that call’s workOperationId, confirmed=true, and a short observation. The host validates the read receipt and supplies its stored result digest; it never replays the write.',
     parameters: {
       operationId: { type: 'string', required: true },
       status: { type: 'string', enum: ['verified', 'uncertain'], required: true },
       evidence: { type: 'object', additionalProperties: true, required: true },
     }, output,
-    execute: (args, exec) => bridge.request(`/operations/${encodeURIComponent(args.operationId)}`, 'PATCH', {
-      status: args.status, evidence: args.evidence,
-    }, exec.signal),
+    execute: (args, exec) => bridge.verifyCurrentTaskOperation(
+      exec, args.operationId, args.status, args.evidence,
+    ),
   }));
   ctx.tools.register(defineTool({
     name: 'work_notify',
@@ -205,4 +322,127 @@ export function registerWorkTools(ctx: Context, config: WorkToolsConfig): WorkAs
     execute: (args, exec) => bridge.mutate(exec, '/notifications', 'POST', args, true),
   }));
   return bridge;
+}
+
+function recordValue(value: unknown): Record<string, JsonValue> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return {};
+  return value as Record<string, JsonValue>;
+}
+
+function projectCurrentTaskOperation(
+  taskId: string,
+  operationId: string,
+  operation: Record<string, JsonValue>,
+): Record<string, JsonValue> {
+  return {
+    id: operationId,
+    taskId,
+    operationType: operation.operationType as string,
+    ...(typeof operation.target === 'string'
+      && (operation.target.startsWith('connector-target:') || operation.target.startsWith('connector-readback:'))
+      ? { target: operation.target }
+      : {}),
+    status: operation.status as string,
+    evidence: projectOperationEvidence(operation.evidence),
+    createdAt: operation.createdAt as number,
+    updatedAt: operation.updatedAt as number,
+  };
+}
+
+function matchVerifiedReadback(
+  writeReceipt: Record<string, JsonValue>,
+  readReceipt: Record<string, JsonValue>,
+  writeEvidence: Record<string, JsonValue>,
+  readEvidence: Record<string, JsonValue>,
+  writeTargetDigest: string | undefined,
+): { kind: string; repository?: string } | undefined {
+  const providerId = writeEvidence.providerId;
+  const profileRef = writeEvidence.profileRef;
+  const writeOperationId = writeEvidence.operationId;
+  const readOperationId = readEvidence.operationId;
+  if (typeof providerId !== 'string' || typeof profileRef !== 'string'
+    || readEvidence.providerId !== providerId || readEvidence.profileRef !== profileRef
+    || typeof writeOperationId !== 'string' || typeof readOperationId !== 'string'
+    || writeReceipt.operationType !== `tool.provider.v1:${writeOperationId}`
+    || readReceipt.operationType !== `tool.provider.v1:${readOperationId}`) return undefined;
+
+  const writeRequest = recordValue(writeReceipt.request);
+  const readRequest = recordValue(readReceipt.request);
+  if (typeof writeRequest.bindingId !== 'string' || writeRequest.bindingId.length === 0
+    || readRequest.bindingId !== writeRequest.bindingId
+    || writeRequest.operationId !== writeOperationId
+    || readRequest.operationId !== readOperationId) return undefined;
+
+  const readTargetDigest = readEvidence.targetDigestSha256;
+  const isVendorCliWrite = writeOperationId === 'github.vendor.cli.execute'
+    || writeOperationId === 'huggingface.vendor.cli.execute'
+    || writeOperationId === 'cloud.vendor.cli.execute';
+  if (!isVendorCliWrite && writeTargetDigest !== undefined && readTargetDigest === writeTargetDigest) {
+    return { kind: 'exact_resource_projection' };
+  }
+
+  const writeArguments = recordValue(writeRequest.arguments);
+  const readArguments = recordValue(readRequest.arguments);
+  if (providerId !== 'github'
+    || writeOperationId !== 'github.vendor.cli.execute'
+    || writeRequest.toolId !== 'github_vendor_cli'
+    || readOperationId !== 'github.branches.list'
+    || readRequest.toolId !== 'github.branches.list'
+    ) return undefined;
+
+  const repository = writeArguments.argv === undefined
+    ? undefined
+    : githubCliBranchesRepository(writeArguments.argv);
+  const readRepository = readArguments.repository;
+  const repositoryId = readArguments.repository_id;
+  if (repository === undefined || readRepository !== repository
+    || typeof repositoryId !== 'string' || !/^[0-9]+$/u.test(repositoryId)) return undefined;
+  const expectedReadTargetDigest = sha256(canonicalJson({
+    providerId,
+    profileRef,
+    target: { repository_id: repositoryId, repository },
+  }));
+  if (readTargetDigest !== expectedReadTargetDigest) return undefined;
+  return { kind: 'github_cli_api_repo_to_branches_list', repository };
+}
+
+function githubCliBranchesRepository(value: JsonValue): string | undefined {
+  if (!Array.isArray(value) || value.length < 2 || value[0] !== 'api'
+    || value.some(item => typeof item !== 'string')) return undefined;
+  const argv = value as string[];
+  const endpoint = argv.slice(1).find(item => !item.startsWith('-'));
+  if (endpoint === undefined || endpoint.includes('%')) return undefined;
+  const path = endpoint.split(/[?#]/u, 1)[0];
+  if (path === undefined) return undefined;
+  const match = /^repos\/([A-Za-z0-9_.-]{1,100})\/([A-Za-z0-9_.-]{1,100})\/(?:branches(?:\/[^?#]+)?|git\/refs(?:\/heads(?:\/[^?#]+)?)?)\/?$/iu.exec(path);
+  return match === null ? undefined : `${match[1]}/${match[2]}`;
+}
+
+function textValue(value: unknown, label: string): string {
+  if (typeof value !== 'string' || value.length === 0 || value.trim() !== value
+    || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new TypeError(`${label} must be non-empty text`);
+  }
+  return value;
+}
+
+function connectorTargetDigest(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const match = /^connector-target:([0-9a-f]{64})$/u.exec(value);
+  return match?.[1];
+}
+
+function projectOperationEvidence(value: unknown): Record<string, JsonValue> {
+  const source = recordValue(value);
+  const allowed = new Set([
+    'outcome', 'effect', 'providerId', 'profileRef', 'operationId', 'targetDigestSha256',
+    'operationRef', 'isError', 'status', 'resultSha256', 'reconciliationState', 'reconciledByOperationRef',
+  ]);
+  const projected: Record<string, JsonValue> = {};
+  for (const [key, item] of Object.entries(source)) {
+    if (!allowed.has(key)) continue;
+    if (typeof item === 'string' || typeof item === 'boolean'
+      || typeof item === 'number' && Number.isFinite(item)) projected[key] = item;
+  }
+  return projected;
 }

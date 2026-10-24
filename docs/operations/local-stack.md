@@ -181,6 +181,11 @@ to `1`; the launcher accepts values from 1 to 32.
 `schemaVersion: 1` binding rows map a Tool Provider `bindingId` to an Exchange
 connection UUID, provider ID, fixed profile reference, and a list of fixed
 `toolId → operationId` mappings with `resourceProjection` and `mutating` fields.
+`CYRENE_CONNECTOR_TOOL_CATALOG_FILE` is also required for Teams deployments; it
+points to the private Exchange snapshot with `schemaVersion: 1` and an `items`
+array (mounted in Compose at `/run/config/connector-tool-catalog.json`). The
+Python supervisor checks that it is a bounded regular JSON file and forwards its
+resolved path. Node validates the full catalog and exact binding intersection.
 Navigator validates every operation and mutability flag against its closed
 table before it registers these mappings. It rejects unknown operations or a
 projection/mutability mismatch at startup. With connector authorization enabled,
@@ -217,6 +222,9 @@ outbox dispatcher 使用 `CYRENE_EXCHANGE_CONNECTOR_INTERNAL_URL`、
 校验每项 operation 和 mutability；未知操作或投影/权限标记不匹配会阻止启动。模型无法更改 binding、
 profile、operation ID 或调用者身份。CLI 操作绑定固定 profile，并在 exact argument digest 中签入完整
 `argv`。
+Teams 部署还必须设置 `CYRENE_CONNECTOR_TOOL_CATALOG_FILE`，指向包含 `schemaVersion: 1` 与 `items` 数组的
+Exchange 私有 snapshot；Compose 挂载路径为 `/run/config/connector-tool-catalog.json`。Python supervisor 只
+校验它是有界普通 JSON 文件并转发解析后的路径，Node 会验证完整 catalog 和精确 binding 交集。
 GitHub 和 Hugging Face provider tools 只向模型暴露各自的标准 operation 参数；Navigator 不把 profile 写进参数，
 而是在 grant 中单独绑定。两类 CLI 只暴露 `argv`，Exchange 对它们使用空的 Account Center lease target。
 

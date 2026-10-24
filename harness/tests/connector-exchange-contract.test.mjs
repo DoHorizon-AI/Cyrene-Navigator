@@ -424,7 +424,7 @@ contractTest('unknown GitHub write result is an error and leaves its DSH receipt
     issue_number: 1,
     body: 'Synthetic unknown-result probe; no GitHub write is performed.',
   });
-  assert.match(String(result.error?.message ?? result.value?.content?.[0]?.text ?? ''), /unknown remote operation result|uncertain/u);
+  assert.match(String(result.error?.message ?? result.value?.content?.[0]?.text ?? ''), /unknown remote (?:operation|write) result|uncertain/u);
   assert.equal(receipts.length, 1);
   assert.equal(receipts[0].status, 'uncertain');
   assert.equal(receipts[0].evidence?.outcome, 'uncertain');

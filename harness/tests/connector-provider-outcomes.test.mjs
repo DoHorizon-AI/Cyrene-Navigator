@@ -5,6 +5,7 @@
 // └─────────────────────────────────────────────────────────────────────┘
 
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
 import { test } from 'node:test';
 import { Context } from '@deepseek-ai/cordis';
 import { ToolCallId } from '@deepseek-ai/dsh-llm';
@@ -13,11 +14,12 @@ import ToolRuntime from '@deepseek-ai/dsh-tools';
 import { canonicalJson, sha256 } from '../dist/connector-authorization.js';
 import { validateConnectorBindingMap } from '../dist/serve.js';
 import { registerToolProviders } from '../dist/tool-providers.js';
+import { registerWorkTools, WorkAssistantBridge } from '../dist/work-tools.js';
 
 const bindingId = 'exchange-azure-11111111-1111-4111-8111-111111111111';
 const connectionRef = '11111111-1111-4111-8111-111111111111';
 const profileRef = 'azure-profile-1';
-const ownerId = 'd83aeb27-ff11-46d7-b0f7-af8da8d5b8ec';
+const ownerId = '11111111-1111-4111-8111-111111111111';
 const tenantId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const issuer = `https://login.microsoftonline.com/${tenantId}/v2.0`;
 const sessionId = 'teams-session-1';
@@ -496,5 +498,331 @@ test('projected cloud profile pattern and target length are enforced before gran
   } finally {
     dispose();
     await ctx.fiber.dispose();
+  }
+});
+
+test('unknown GitHub CLI write can be reconciled only from a same-task read receipt and never auto-replays', async () => {
+  const githubBindingId = 'exchange-github-33333333-3333-4333-8333-333333333333';
+  const githubConnectionRef = '33333333-3333-4333-8333-333333333333';
+  const githubProfileRef = 'github-profile-production';
+  const githubSession = 'teams-github-session';
+  const githubTask = 'teams-github-task';
+  const githubCatalog = {
+    tools: [
+      {
+        id: 'github_vendor_cli',
+        name: 'Run GitHub CLI',
+        description: 'Run one authorized argv vector.',
+        readOnly: false,
+        inputSchema: {
+          type: 'object',
+          properties: { argv: { type: 'array', minItems: 1, maxItems: 128, items: { type: 'string', maxLength: 4096 } } },
+          required: ['argv'],
+          additionalProperties: false,
+        },
+      },
+      {
+        id: 'github.branches.list',
+        name: 'List GitHub branches',
+        description: 'Read branches for one exact repository target.',
+        readOnly: true,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            repository_id: { type: 'string', pattern: '^[0-9]+$' },
+            repository: { type: 'string', pattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' },
+          },
+          required: ['repository_id', 'repository'],
+          additionalProperties: false,
+        },
+      },
+    ],
+  };
+  const operations = new Map();
+  let nextOperation = 0;
+  let approvalCalls = 0;
+  const workRoot = '/api/v1/workspaces/github-workspace/work';
+  const expectedIndependentReadResult = {
+    content: [{ type: 'text', text: JSON.stringify({ branches: [{ name: 'test-branch', commit_sha: '0123456789abcdef' }] }) }],
+    structuredContent: { branches: [{ name: 'test-branch', commit_sha: '0123456789abcdef' }] },
+    isError: false,
+  };
+  const server = createServer(async (request, response) => {
+    let rawBody = '';
+    for await (const chunk of request) rawBody += chunk;
+    const body = rawBody ? JSON.parse(rawBody) : undefined;
+    const path = request.url ?? '';
+    response.setHeader('content-type', 'application/json');
+    const send = (value, status = 200) => {
+      response.statusCode = status;
+      response.end(JSON.stringify(value));
+    };
+    if (path === `${workRoot}/tool-providers` && request.method === 'GET') {
+      return send({ items: [{
+        bindingId: githubBindingId,
+        capabilityId: 'tool.provider.v1',
+        providerId: 'github',
+        connectionRef: githubConnectionRef,
+        profileRef: githubProfileRef,
+      }] });
+    }
+    if (path === `${workRoot}/tool-providers/${encodeURIComponent(githubBindingId)}/tools` && request.method === 'GET') {
+      return send(githubCatalog);
+    }
+    if (path === `${workRoot}/tasks/${githubTask}` && request.method === 'GET') {
+      return send({
+        id: githubTask,
+        status: 'running',
+        metadata: { teamsCaller: { issuer, subject: ownerId, tenantId } },
+      });
+    }
+    if (path.startsWith(`${workRoot}/tasks/${githubTask}/approvals`)) {
+      approvalCalls += 1;
+      return send({ approval: { id: 'unexpected-approval', status: 'approved' } });
+    }
+    if (path.startsWith(`${workRoot}/operations/unresolved?`) && request.method === 'GET') {
+      const query = new URL(path, 'http://127.0.0.1').searchParams;
+      const target = query.get('target');
+      return send({ items: [...operations.values()]
+        .filter(row => row.status === 'started' || row.status === 'uncertain')
+        .filter(row => target === null || row.target === target)
+        .map(({ id, operationType, taskId, target: receiptTarget, status, evidence, createdAt, updatedAt }) => ({
+          id, operationType, taskId, target: receiptTarget, status, evidence, createdAt, updatedAt,
+        })) });
+    }
+    if (path === `${workRoot}/operations` && request.method === 'POST') {
+      const id = `github-work-operation-${++nextOperation}`;
+      const operation = {
+        id,
+        taskId: body.taskId,
+        operationType: body.operationType,
+        target: body.target,
+        request: body.request,
+        status: 'started',
+        evidence: {},
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+      operations.set(id, operation);
+      return send({ operation, duplicate: false }, 201);
+    }
+    const operationPath = path.match(new RegExp(`^${workRoot}/operations/([^/]+)$`, 'u'));
+    if (operationPath && request.method === 'GET') {
+      const operation = operations.get(decodeURIComponent(operationPath[1]));
+      return operation ? send({ operation }) : send({ error: 'not found' }, 404);
+    }
+    if (operationPath && request.method === 'PATCH') {
+      const operation = operations.get(decodeURIComponent(operationPath[1]));
+      if (!operation) return send({ error: 'not found' }, 404);
+      Object.assign(operation, { status: body.status, evidence: body.evidence, updatedAt: Date.now() });
+      return send({ operation, duplicate: false });
+    }
+    return send({ error: `unexpected ${request.method} ${path}` }, 404);
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+
+  const priorToken = process.env.WORK_TOOL_TEST_TOKEN;
+  process.env.WORK_TOOL_TEST_TOKEN = 'private-test-token';
+  const providerResponses = [
+    {
+      outcome: 'uncertain', operationRef: 'github-cli-unknown-1',
+      result: {
+        content: [{ type: 'text', text: JSON.stringify({ state: 'UNKNOWN_RESULT', operation_ref: 'github-cli-unknown-1' }) }],
+        structuredContent: { state: 'UNKNOWN_RESULT', operation_ref: 'github-cli-unknown-1' },
+        isError: false,
+      },
+    },
+    { outcome: 'verified', result: expectedIndependentReadResult },
+    {
+      outcome: 'verified',
+      result: { content: [{ type: 'text', text: JSON.stringify({ state: 'CLEANED_UP' }) }], isError: false },
+    },
+    {
+      outcome: 'uncertain', operationRef: 'github-cli-unknown-2',
+      result: {
+        content: [{ type: 'text', text: JSON.stringify({ state: 'UNKNOWN_RESULT', operation_ref: 'github-cli-unknown-2' }) }],
+        structuredContent: { state: 'UNKNOWN_RESULT', operation_ref: 'github-cli-unknown-2' },
+        isError: false,
+      },
+    },
+  ];
+  const authorizationClient = {
+    mintInputs: [],
+    providerInputs: [],
+    async mintGrant(input) {
+      this.mintInputs.push(input);
+      return {
+        connectorGrantBin: 'AQ==', grantRef: `github-grant-${this.mintInputs.length}`, audience: 'exchange',
+        organizationId: 'github-test-org', issuedAt: Math.floor(Date.now() / 1_000),
+        expiresAt: Math.floor(Date.now() / 1_000) + 15, request: input,
+      };
+    },
+    async callProviderOperation(input) {
+      this.providerInputs.push(input);
+      const next = providerResponses.shift();
+      if (!next) throw new Error('Unexpected provider call');
+      return { ...next, requestId: input.requestId };
+    },
+  };
+
+  const ctx = new Context();
+  await ctx.plugin(SystemPrompt);
+  await ctx.plugin(ToolRuntime);
+  try {
+    const bridge = registerWorkTools(ctx, {
+      baseUrl: `http://127.0.0.1:${server.address().port}`,
+      workspaceId: 'github-workspace',
+      tokenEnv: 'WORK_TOOL_TEST_TOKEN',
+      taskIdForSession: value => value === githubSession ? githubTask : undefined,
+    });
+    const disposeProviders = await registerToolProviders(ctx, {
+      bridge,
+      taskIdForSession: value => value === githubSession ? githubTask : undefined,
+      connectorAuthorization: {
+        client: authorizationClient,
+        workspaceId: 'github-workspace',
+        bindings: new Map([[githubBindingId, {
+          bindingId: githubBindingId,
+          connectionRef: githubConnectionRef,
+          providerId: 'github',
+          profileRef: githubProfileRef,
+          tools: [
+            { toolId: 'github_vendor_cli', operationId: 'github.vendor.cli.execute', resourceProjection: 'profile', mutating: true },
+            { toolId: 'github.branches.list', operationId: 'github.branches.list', resourceProjection: 'github_repository', mutating: false },
+          ],
+        }]]),
+      },
+    });
+    try {
+      const cliName = toolName(ctx, 'Run GitHub CLI', githubBindingId);
+      const listName = toolName(ctx, 'List GitHub branches', githubBindingId);
+      assert.ok(cliName);
+      assert.ok(listName);
+      const call = (name, args, id) => ctx.tools.execute({
+        name,
+        callId: ToolCallId(id),
+        arguments: args,
+        signal: new AbortController().signal,
+        agent: { id: 'navigator-agent', session: { id: githubSession } },
+      });
+
+      const firstWrite = await call(cliName, {
+        argv: ['api', 'repos/example/repo/git/refs', '-X', 'POST', '-f', 'ref=refs/heads/test-branch', '-f', 'sha=0123456789abcdef'],
+      }, 'github-write-1');
+      assert.equal(firstWrite.isError, true);
+      assert.match(firstWrite.error.message, /github-cli-unknown-1/u);
+      const firstReceiptId = operations.keys().next().value;
+      assert.ok(firstWrite.error.message.includes(`Work operation ID: ${firstReceiptId}`));
+      assert.equal(operations.get(firstReceiptId).status, 'uncertain');
+
+      const blockedBeforeReadback = await call(cliName, {
+        argv: ['api', 'repos/example/repo/git/refs/heads/test-branch', '-X', 'DELETE'],
+      }, 'github-write-blocked-1');
+      assert.equal(blockedBeforeReadback.isError, true);
+      assert.match(blockedBeforeReadback.error.message, /Work operation ID/u);
+      assert.equal(authorizationClient.mintInputs.length, 1);
+      assert.equal(authorizationClient.providerInputs.length, 1);
+
+      operations.get(firstReceiptId).evidence.privateNote = 'synthetic-sensitive-field';
+      const writeReceiptRead = await call('work_operation_read', { operationId: firstReceiptId }, 'read-work-write-receipt');
+      assert.equal(writeReceiptRead.isError, false);
+      assert.equal(writeReceiptRead.value.id, firstReceiptId);
+      assert.equal(Object.hasOwn(writeReceiptRead.value, 'request'), false);
+      assert.equal(Object.hasOwn(writeReceiptRead.value.evidence, 'privateNote'), false);
+
+      const independentRead = await call(listName, {
+        repository_id: '42', repository: 'example/repo',
+      }, 'github-independent-read');
+      assert.equal(independentRead.isError, false);
+      const readReceiptId = independentRead.value.structuredContent.workOperationId;
+      assert.equal(typeof readReceiptId, 'string');
+      const readReceiptRead = await call('work_operation_read', { operationId: readReceiptId }, 'read-work-readback-receipt');
+      const readReceipt = readReceiptRead.value;
+      assert.equal(readReceipt.status, 'verified');
+      assert.equal(readReceipt.evidence.effect, 'read');
+      assert.equal(readReceipt.evidence.resultSha256, sha256(canonicalJson(expectedIndependentReadResult)));
+
+      const unprovenVerify = await call('work_operation_verify', {
+        operationId: firstReceiptId,
+        status: 'verified',
+        evidence: { independentRead: { operationId: 'invented-readback', confirmed: true, observation: 'Invented.' } },
+      }, 'verify-without-read-receipt');
+      assert.equal(unprovenVerify.isError, true);
+      assert.equal(operations.get(firstReceiptId).status, 'uncertain');
+
+      operations.set('foreign-readback-receipt', {
+        id: 'foreign-readback-receipt',
+        taskId: 'another-teams-task',
+        operationType: 'tool.provider.v1:github.repository.list',
+        target: `connector-readback:${operations.get(firstReceiptId).evidence.targetDigestSha256}`,
+        request: {},
+        status: 'verified',
+        evidence: {
+          outcome: 'verified', effect: 'read', providerId: 'github', profileRef: githubProfileRef,
+          operationId: 'github.repository.list',
+          targetDigestSha256: operations.get(firstReceiptId).evidence.targetDigestSha256,
+          resultSha256: 'a'.repeat(64),
+        },
+        createdAt: Date.now(), updatedAt: Date.now(),
+      });
+      const crossTaskVerify = await call('work_operation_verify', {
+        operationId: firstReceiptId,
+        status: 'verified',
+        evidence: {
+          independentRead: {
+            operationId: 'foreign-readback-receipt',
+            confirmed: true,
+            observation: 'This receipt belongs to another task and must not authorize reconciliation.',
+          },
+        },
+      }, 'verify-with-foreign-task-readback');
+      assert.equal(crossTaskVerify.isError, true);
+      assert.equal(operations.get(firstReceiptId).status, 'uncertain');
+
+      const verified = await call('work_operation_verify', {
+        operationId: firstReceiptId,
+        status: 'verified',
+        evidence: {
+          independentRead: {
+            operationId: readReceiptId,
+            confirmed: true,
+            observation: 'The exact repository branch listing confirms the newly created test branch exists.',
+            resultSha256: 'f'.repeat(64),
+          },
+        },
+      }, 'verify-from-real-read-receipt');
+      assert.equal(verified.isError, false);
+      assert.equal(operations.get(firstReceiptId).status, 'verified');
+      assert.equal(operations.get(firstReceiptId).evidence.independentRead.resultSha256, readReceipt.evidence.resultSha256);
+
+      const cleanup = await call(cliName, {
+        argv: ['api', 'repos/example/repo/git/refs/heads/test-branch', '-X', 'DELETE'],
+      }, 'github-cleanup');
+      assert.equal(cleanup.isError, false);
+      assert.equal(authorizationClient.providerInputs.length, 3);
+      assert.equal(authorizationClient.providerInputs[2].arguments.argv.at(-1), 'DELETE');
+
+      const secondUnknownWrite = await call(cliName, {
+        argv: ['api', 'repos/example/repo/git/refs/heads/another-branch', '-X', 'DELETE'],
+      }, 'github-write-2');
+      assert.equal(secondUnknownWrite.isError, true);
+      assert.match(secondUnknownWrite.error.message, /Work operation ID/u);
+      const countBeforeFinalAttempt = authorizationClient.providerInputs.length;
+      const stillBlocked = await call(cliName, {
+        argv: ['api', 'repos/example/repo/git/refs/heads/another-branch', '-X', 'DELETE'],
+      }, 'github-write-blocked-2');
+      assert.equal(stillBlocked.isError, true);
+      assert.equal(authorizationClient.providerInputs.length, countBeforeFinalAttempt);
+      assert.equal(providerResponses.length, 0);
+      assert.equal(authorizationClient.mintInputs.length, 4);
+      assert.equal(approvalCalls, 0);
+    } finally {
+      disposeProviders();
+      await ctx.fiber.dispose();
+    }
+  } finally {
+    if (priorToken === undefined) delete process.env.WORK_TOOL_TEST_TOKEN;
+    else process.env.WORK_TOOL_TEST_TOKEN = priorToken;
+    await new Promise(resolve => server.close(resolve));
   }
 });

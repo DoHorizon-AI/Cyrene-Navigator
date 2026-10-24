@@ -36,6 +36,8 @@ _STARTUP_TIMEOUT_SECONDS = 30.0
 _STOP_TIMEOUT_SECONDS = 8.0
 _PROBE_TIMEOUT_SECONDS = 0.5
 _MAX_TASK_CONCURRENCY = 32
+_MAX_CONNECTOR_TOOL_CATALOG_BYTES = 32 * 1024 * 1024
+_MAX_CONNECTOR_TOOL_CATALOG_ITEMS = 128
 
 
 class _WindowsByteLock(Protocol):
@@ -717,6 +719,7 @@ def _executor_integration_environment(
             "NAVIGATOR_EXCHANGE_HMAC_KEY_FILE",
             "NAVIGATOR_EXCHANGE_HMAC_KEY_ID",
             "CYRENE_CONNECTOR_BINDINGS_FILE",
+            "CYRENE_CONNECTOR_TOOL_CATALOG_FILE",
         )
         for name in required_names:
             if name not in environment or not environment[name].strip():
@@ -790,6 +793,9 @@ def _executor_integration_environment(
         ):
             raise ValueError("CYRENE_CONNECTOR_BINDINGS_FILE must contain version 1 bindings")
         result["CYRENE_CONNECTOR_BINDINGS_FILE"] = str(binding_path)
+        result["CYRENE_CONNECTOR_TOOL_CATALOG_FILE"] = _validated_connector_tool_catalog_file(
+            environment["CYRENE_CONNECTOR_TOOL_CATALOG_FILE"]
+        )
         result["TEAMS_ENABLED"] = teams_enabled
         audience = environment.get("CYRENE_AUTHORITY_EXCHANGE_WORKLOAD_AUDIENCE", "exchange")
         if not audience.strip() or len(audience) > 256 or any(ord(ch) < 32 for ch in audience):
@@ -814,6 +820,48 @@ def _executor_integration_environment(
         else:
             _collect_cloud_environment_references(document, result, environment)
     return result
+
+
+def _validated_connector_tool_catalog_file(value: str) -> str:
+    """Validate a bounded versioned Exchange catalog envelope and return its resolved path.
+
+    中文:校验有大小限制的 Exchange catalog 外层版本与 items 列表，并返回实际解析路径。
+    """
+
+    if not value or value.strip() != value or any(ord(character) < 32 for character in value):
+        raise ValueError("CYRENE_CONNECTOR_TOOL_CATALOG_FILE is invalid")
+    try:
+        path = Path(value).expanduser().resolve()
+        metadata = path.stat()
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError(
+            "CYRENE_CONNECTOR_TOOL_CATALOG_FILE could not be read as bounded JSON"
+        ) from None
+    if (
+        not path.is_file()
+        or metadata.st_size < 1
+        or metadata.st_size > _MAX_CONNECTOR_TOOL_CATALOG_BYTES
+    ):
+        raise ValueError("CYRENE_CONNECTOR_TOOL_CATALOG_FILE must be a bounded regular file")
+    try:
+        with path.open("rb") as stream:
+            payload = stream.read(_MAX_CONNECTOR_TOOL_CATALOG_BYTES + 1)
+        if len(payload) > _MAX_CONNECTOR_TOOL_CATALOG_BYTES:
+            raise ValueError("CYRENE_CONNECTOR_TOOL_CATALOG_FILE must be a bounded regular file")
+        catalog = json.loads(payload.decode("utf-8"))
+    except (OSError, RecursionError, UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError(
+            "CYRENE_CONNECTOR_TOOL_CATALOG_FILE could not be read as bounded JSON"
+        ) from None
+    if (
+        not isinstance(catalog, dict)
+        or type(catalog.get("schemaVersion")) is not int
+        or catalog.get("schemaVersion") != 1
+        or not isinstance(catalog.get("items"), list)
+        or not 1 <= len(catalog["items"]) <= _MAX_CONNECTOR_TOOL_CATALOG_ITEMS
+    ):
+        raise ValueError("CYRENE_CONNECTOR_TOOL_CATALOG_FILE must contain version 1 catalog items")
+    return str(path)
 
 
 def _validate_uuid_environment(value: str, name: str) -> None:

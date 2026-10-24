@@ -118,6 +118,116 @@ async function execute(ctx, name, args, callId, withAgent = true) {
   });
 }
 
+test('host catalog snapshot fixture registers only matching launcher-authorized connector tools', async () => {
+  const githubBindingId = 'exchange-github-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const connectionRef = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const profileRef = 'github-profile-snapshot-test';
+  const snapshot = {
+    schemaVersion: 1,
+    items: [{
+      bindingId: githubBindingId,
+      capabilityId: 'tool.provider.v1',
+      providerId: 'github',
+      connectionRef,
+      profileRef,
+      tools: [
+        {
+          id: 'github_vendor_cli',
+          name: 'Run GitHub CLI Command',
+          description: 'Run one profile-bound argv vector.',
+          readOnly: false,
+          inputSchema: {
+            type: 'object',
+            properties: { argv: { type: 'array', minItems: 1, maxItems: 128, items: { type: 'string', maxLength: 4096 } } },
+            required: ['argv'],
+            additionalProperties: false,
+          },
+        },
+        {
+          id: 'github.repository.list',
+          name: 'List GitHub Repositories',
+          description: 'List repositories for this profile.',
+          readOnly: true,
+          inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+        },
+      ],
+    }],
+  };
+  const trustedBinding = {
+    bindingId: githubBindingId,
+    connectionRef,
+    providerId: 'github',
+    profileRef,
+    tools: [{
+      toolId: 'github_vendor_cli',
+      operationId: 'github.vendor.cli.execute',
+      resourceProjection: 'profile',
+      mutating: true,
+    }],
+  };
+  const bridge = {
+    async request() { throw new Error('Snapshot registration must not discover tools from Work'); },
+    async requestApproval() { throw new Error('Catalog registration must not call tools'); },
+    async mutate() { throw new Error('Catalog registration must not call tools'); },
+  };
+  const ctx = new Context();
+  await ctx.plugin(SystemPrompt);
+  await ctx.plugin(ToolRuntime);
+  try {
+    const dispose = await registerToolProviders(ctx, {
+      bridge,
+      taskIdForSession: () => undefined,
+      connectorAuthorization: {
+        client: {},
+        workspaceId: 'workspace-snapshot-test',
+        bindings: new Map([[githubBindingId, trustedBinding]]),
+      },
+      connectorToolCatalogSnapshot: snapshot,
+    });
+    try {
+      const schemas = ctx.tools.schemas();
+      assert.equal(schemas.length, 1);
+      assert.match(schemas[0].description, /Run GitHub CLI Command/u);
+      assert.deepEqual(schemas[0].parameters.required, ['argv']);
+      assert.equal(schemas.some(schema => schema.description.includes('List GitHub Repositories')), false);
+    } finally {
+      dispose();
+    }
+
+    await assert.rejects(registerToolProviders(ctx, {
+      bridge,
+      taskIdForSession: () => undefined,
+      connectorAuthorization: {
+        client: {},
+        workspaceId: 'workspace-snapshot-test',
+        bindings: new Map([[githubBindingId, trustedBinding]]),
+      },
+      connectorToolCatalogSnapshot: {
+        ...snapshot,
+        items: [{ ...snapshot.items[0], connectionRef: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' }],
+      },
+    }), /launcher-owned connector binding/u);
+    await assert.rejects(registerToolProviders(ctx, {
+      bridge,
+      taskIdForSession: () => undefined,
+      connectorAuthorization: {
+        client: {},
+        workspaceId: 'workspace-snapshot-test',
+        bindings: new Map([[githubBindingId, trustedBinding]]),
+      },
+      connectorToolCatalogSnapshot: {
+        ...snapshot,
+        items: [{
+          ...snapshot.items[0],
+          tools: [{ ...snapshot.items[0].tools[0], operationId: 'caller-controlled.operation' }],
+        }],
+      },
+    }), /missing or unsupported fields/u);
+  } finally {
+    await ctx.fiber.dispose();
+  }
+});
+
 test('registers canonical read tools and routes calls through the configured binding', async () => {
   const fixture = createBridgeFixture();
   const { ctx, dispose } = await createToolContext(fixture);

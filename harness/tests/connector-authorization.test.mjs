@@ -33,7 +33,7 @@ function grantFor(input) {
     requestId: input.requestId,
     workspaceId: 'workspace-1',
     principalIssuer: `https://login.microsoftonline.com/${route.tenantId}/v2.0`,
-    principalSubject: 'd83aeb27-ff11-46d7-b0f7-af8da8d5b8ec',
+    principalSubject: '11111111-1111-4111-8111-111111111111',
     connectionRef,
     providerId: 'msteams',
     profileRef,

@@ -144,11 +144,14 @@ def test_workflow_flag_accepts_only_explicit_boolean_values() -> None:
 
 
 def test_teams_owner_projection_file_is_forwarded_without_static_actor_env(tmp_path: Path) -> None:
-    """Forward the scoped owner projection and keep it outside unrelated child processes."""
+    """Forward scoped owner/catalog files without static actors or unrelated child values."""
 
     workspace_id = "11111111-1111-4111-8111-111111111111"
     tenant_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-    actor_id = "d83aeb27-ff11-46d7-b0f7-af8da8d5b8ec"
+    actor_id = "11111111-1111-4111-8111-111111111111"
+    binding_id = "exchange-github-11111111-1111-4111-8111-111111111111"
+    connection_ref = "11111111-1111-4111-8111-111111111111"
+    profile_ref = "github-profile-1"
     actor_file = tmp_path / "teams-actor-subjects.json"
     actor_file.write_text(
         json.dumps(
@@ -164,19 +167,20 @@ def test_teams_owner_projection_file_is_forwarded_without_static_actor_env(tmp_p
     key_file = tmp_path / "exchange-hmac.key"
     key_file.write_bytes(b"x" * 32)
     binding_file = tmp_path / "connector-bindings.json"
+    catalog_file = tmp_path / "connector-tool-catalog.json"
     binding_file.write_text(
         json.dumps(
             {
                 "schemaVersion": 1,
                 "bindings": [
                     {
-                        "bindingId": "exchange-github-11111111-1111-4111-8111-111111111111",
-                        "connectionRef": "11111111-1111-4111-8111-111111111111",
+                        "bindingId": binding_id,
+                        "connectionRef": connection_ref,
                         "providerId": "github",
-                        "profileRef": "github-profile-1",
+                        "profileRef": profile_ref,
                         "tools": [
                             {
-                                "toolId": "github_repository_list",
+                                "toolId": "github.repository.list",
                                 "operationId": "github.repository.list",
                                 "resourceProjection": "profile",
                                 "mutating": False,
@@ -188,26 +192,72 @@ def test_teams_owner_projection_file_is_forwarded_without_static_actor_env(tmp_p
         ),
         encoding="utf-8",
     )
+    catalog_file.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "items": [
+                    {
+                        "bindingId": binding_id,
+                        "capabilityId": "tool.provider.v1",
+                        "providerId": "github",
+                        "connectionRef": connection_ref,
+                        "profileRef": profile_ref,
+                        "tools": [
+                            {
+                                "id": "github.repository.list",
+                                "name": "List GitHub Repositories",
+                                "description": "List repositories from this configured profile.",
+                                "readOnly": True,
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {},
+                                    "additionalProperties": False,
+                                },
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    environment = {
+        "TEAMS_ENABLED": "true",
+        "TEAMS_NAVIGATOR_HMAC_KEY": "teams-ingress-test-key-0123456789abcdef",
+        "TEAMS_TENANT_ID": tenant_id,
+        "TEAMS_ALLOWED_TEAM_IDS": "team-1",
+        "TEAMS_BOT_APP_ID": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        "TEAMS_TASK_ACTOR_SUBJECTS_FILE": str(actor_file),
+        "TEAMS_EXCHANGE_CONNECTION_REF": "22222222-2222-4222-8222-222222222222",
+        "TEAMS_EXCHANGE_PROFILE_REF": "teams-profile-1",
+        "CYRENE_EXCHANGE_CONNECTOR_INTERNAL_URL": "https://exchange.example.test",
+        "NAVIGATOR_EXCHANGE_HMAC_KEY_FILE": str(key_file),
+        "NAVIGATOR_EXCHANGE_HMAC_KEY_ID": "navigator-prod-v1",
+        "CYRENE_CONNECTOR_BINDINGS_FILE": str(binding_file),
+        "CYRENE_CONNECTOR_TOOL_CATALOG_FILE": str(catalog_file),
+    }
     forwarded = serve_local._executor_integration_environment(
-        {
-            "TEAMS_ENABLED": "true",
-            "TEAMS_NAVIGATOR_HMAC_KEY": "teams-ingress-test-key-0123456789abcdef",
-            "TEAMS_TENANT_ID": tenant_id,
-            "TEAMS_ALLOWED_TEAM_IDS": "team-1",
-            "TEAMS_BOT_APP_ID": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-            "TEAMS_TASK_ACTOR_SUBJECTS_FILE": str(actor_file),
-            "TEAMS_EXCHANGE_CONNECTION_REF": "22222222-2222-4222-8222-222222222222",
-            "TEAMS_EXCHANGE_PROFILE_REF": "teams-profile-1",
-            "CYRENE_EXCHANGE_CONNECTOR_INTERNAL_URL": "https://exchange.example.test",
-            "NAVIGATOR_EXCHANGE_HMAC_KEY_FILE": str(key_file),
-            "NAVIGATOR_EXCHANGE_HMAC_KEY_ID": "navigator-prod-v1",
-            "CYRENE_CONNECTOR_BINDINGS_FILE": str(binding_file),
-        },
-        workspace_id=workspace_id,
+        environment, workspace_id=workspace_id
     )
 
     assert forwarded["TEAMS_TASK_ACTOR_SUBJECTS_FILE"] == str(actor_file.resolve())
     assert "TEAMS_TASK_ACTOR_SUBJECTS" not in forwarded
+    assert forwarded["CYRENE_CONNECTOR_TOOL_CATALOG_FILE"] == str(catalog_file.resolve())
+
+    without_catalog = environment.copy()
+    without_catalog.pop("CYRENE_CONNECTOR_TOOL_CATALOG_FILE")
+    with pytest.raises(ValueError, match="CYRENE_CONNECTOR_TOOL_CATALOG_FILE is required"):
+        serve_local._executor_integration_environment(without_catalog, workspace_id=workspace_id)
+
+    catalog_file.write_text('{"schemaVersion": 2, "items": []}', encoding="utf-8")
+    with pytest.raises(ValueError, match="version 1 catalog items"):
+        serve_local._executor_integration_environment(environment, workspace_id=workspace_id)
+
+    with catalog_file.open("wb") as catalog_stream:
+        catalog_stream.truncate(32 * 1024 * 1024 + 1)
+    with pytest.raises(ValueError, match="bounded regular file"):
+        serve_local._executor_integration_environment(environment, workspace_id=workspace_id)
 
 
 def test_teams_owner_projection_rejects_mismatched_workspace_or_issuer(tmp_path: Path) -> None:
@@ -222,7 +272,7 @@ def test_teams_owner_projection_rejects_mismatched_workspace_or_issuer(tmp_path:
                 "schemaVersion": 1,
                 "workspaceId": "another-workspace",
                 "issuer": f"https://login.microsoftonline.com/{tenant_id}/v2.0",
-                "subjects": ["d83aeb27-ff11-46d7-b0f7-af8da8d5b8ec"],
+                "subjects": ["11111111-1111-4111-8111-111111111111"],
             }
         ),
         encoding="utf-8",
@@ -242,6 +292,7 @@ def test_teams_owner_projection_rejects_mismatched_workspace_or_issuer(tmp_path:
                 "NAVIGATOR_EXCHANGE_HMAC_KEY_FILE": str(tmp_path / "missing.key"),
                 "NAVIGATOR_EXCHANGE_HMAC_KEY_ID": "navigator-prod-v1",
                 "CYRENE_CONNECTOR_BINDINGS_FILE": str(tmp_path / "missing-bindings.json"),
+                "CYRENE_CONNECTOR_TOOL_CATALOG_FILE": str(tmp_path / "connector-tool-catalog.json"),
             },
             workspace_id=workspace_id,
         )
