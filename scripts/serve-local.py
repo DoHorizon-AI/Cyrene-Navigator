@@ -22,6 +22,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,7 @@ _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
 _STARTUP_TIMEOUT_SECONDS = 30.0
 _STOP_TIMEOUT_SECONDS = 8.0
 _PROBE_TIMEOUT_SECONDS = 0.5
+_MAX_TASK_CONCURRENCY = 32
 
 
 class _WindowsByteLock(Protocol):
@@ -653,6 +655,13 @@ def _executor_integration_environment(
             raise ValueError("CYRENE_WORKFLOWS_ENABLED must be 'true' or 'false'")
         result["CYRENE_WORKFLOWS_ENABLED"] = workflows_enabled
 
+    concurrency = environment.get("CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS", "1")
+    if not re.fullmatch(r"[0-9]{1,2}", concurrency):
+        raise ValueError("CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS must be an integer")
+    if not 1 <= int(concurrency) <= _MAX_TASK_CONCURRENCY:
+        raise ValueError("CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS must be between 1 and 32")
+    result["CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS"] = concurrency
+
     integration_url = environment.get("CYRENE_EXCHANGE_INTEGRATION_URL")
     if integration_url is not None:
         if not integration_url.strip():
@@ -679,6 +688,102 @@ def _executor_integration_environment(
                 raise ValueError("CYRENE_EXCHANGE_INTEGRATION_USER_TOKEN cannot be empty")
             result["CYRENE_EXCHANGE_INTEGRATION_USER_TOKEN"] = user_token
 
+    teams_enabled = environment.get("TEAMS_ENABLED")
+    if teams_enabled is not None and teams_enabled not in {"true", "false"}:
+        raise ValueError("TEAMS_ENABLED must be 'true' or 'false'")
+    if teams_enabled == "true":
+        if not _WORKSPACE_RE.fullmatch(workspace_id):
+            raise ValueError("Teams requires a configured Navigator Workspace")
+        required_names = (
+            "TEAMS_NAVIGATOR_HMAC_KEY",
+            "TEAMS_TENANT_ID",
+            "TEAMS_ALLOWED_TEAM_IDS",
+            "TEAMS_BOT_APP_ID",
+            "TEAMS_EXCHANGE_CONNECTION_REF",
+            "TEAMS_EXCHANGE_PROFILE_REF",
+            "CYRENE_EXCHANGE_CONNECTOR_INTERNAL_URL",
+            "NAVIGATOR_EXCHANGE_HMAC_KEY_FILE",
+            "NAVIGATOR_EXCHANGE_HMAC_KEY_ID",
+            "CYRENE_CONNECTOR_BINDINGS_FILE",
+        )
+        for name in required_names:
+            if name not in environment or not environment[name].strip():
+                raise ValueError(f"{name} is required when Teams is enabled")
+            result[name] = environment[name]
+        if len(environment["TEAMS_NAVIGATOR_HMAC_KEY"].encode("utf-8")) < 32:
+            raise ValueError("TEAMS_NAVIGATOR_HMAC_KEY must contain at least 32 bytes")
+        _validate_uuid_environment(environment["TEAMS_TENANT_ID"], "TEAMS_TENANT_ID")
+        _validate_uuid_environment(environment["TEAMS_BOT_APP_ID"], "TEAMS_BOT_APP_ID")
+        _validate_uuid_environment(
+            environment["TEAMS_EXCHANGE_CONNECTION_REF"], "TEAMS_EXCHANGE_CONNECTION_REF"
+        )
+        allowed_teams = _split_unique_values(
+            environment["TEAMS_ALLOWED_TEAM_IDS"], "TEAMS_ALLOWED_TEAM_IDS"
+        )
+        actor_file = environment.get("TEAMS_TASK_ACTOR_SUBJECTS_FILE")
+        if actor_file is not None:
+            actor_path = Path(actor_file).expanduser().resolve()
+            try:
+                actor_document = json.loads(actor_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                raise ValueError(
+                    "TEAMS_TASK_ACTOR_SUBJECTS_FILE is unavailable or invalid"
+                ) from None
+            if (
+                not isinstance(actor_document, dict)
+                or set(actor_document) != {"schemaVersion", "workspaceId", "issuer", "subjects"}
+                or actor_document.get("schemaVersion") != 1
+                or actor_document.get("workspaceId") != workspace_id
+                or actor_document.get("issuer")
+                != f"https://login.microsoftonline.com/{environment['TEAMS_TENANT_ID'].lower()}/v2.0"
+                or not isinstance(actor_document.get("subjects"), list)
+                or len(actor_document["subjects"]) > 256
+            ):
+                raise ValueError("TEAMS_TASK_ACTOR_SUBJECTS_FILE has invalid scope or schema")
+            if not all(isinstance(actor, str) for actor in actor_document["subjects"]):
+                raise ValueError("TEAMS_TASK_ACTOR_SUBJECTS_FILE subjects must be UUID text")
+            for actor in actor_document["subjects"]:
+                _validate_uuid_environment(actor, "TEAMS_TASK_ACTOR_SUBJECTS_FILE")
+            if len(set(actor_document["subjects"])) != len(actor_document["subjects"]):
+                raise ValueError("TEAMS_TASK_ACTOR_SUBJECTS_FILE contains duplicate subjects")
+            result["TEAMS_TASK_ACTOR_SUBJECTS_FILE"] = str(actor_path)
+        else:
+            if "TEAMS_TASK_ACTOR_SUBJECTS" not in environment:
+                raise ValueError(
+                    "TEAMS_TASK_ACTOR_SUBJECTS or TEAMS_TASK_ACTOR_SUBJECTS_FILE is required"
+                )
+            actors = _split_unique_values(
+                environment["TEAMS_TASK_ACTOR_SUBJECTS"], "TEAMS_TASK_ACTOR_SUBJECTS"
+            )
+            for actor in actors:
+                _validate_uuid_environment(actor, "TEAMS_TASK_ACTOR_SUBJECTS")
+            result["TEAMS_TASK_ACTOR_SUBJECTS"] = environment["TEAMS_TASK_ACTOR_SUBJECTS"]
+        if not allowed_teams:
+            raise ValueError("TEAMS_ALLOWED_TEAM_IDS must contain at least one team id")
+        if not environment["CYRENE_EXCHANGE_CONNECTOR_INTERNAL_URL"].startswith("https://"):
+            raise ValueError("CYRENE_EXCHANGE_CONNECTOR_INTERNAL_URL must use HTTPS")
+        key_file = Path(environment["NAVIGATOR_EXCHANGE_HMAC_KEY_FILE"]).expanduser().resolve()
+        if not key_file.is_file():
+            raise ValueError("Navigator Exchange HMAC secret file is unavailable")
+        binding_path = Path(environment["CYRENE_CONNECTOR_BINDINGS_FILE"]).expanduser().resolve()
+        try:
+            binding_map = json.loads(binding_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            raise ValueError("CYRENE_CONNECTOR_BINDINGS_FILE could not be read as JSON") from None
+        if (
+            not isinstance(binding_map, dict)
+            or binding_map.get("schemaVersion") != 1
+            or not isinstance(binding_map.get("bindings"), list)
+            or not binding_map["bindings"]
+        ):
+            raise ValueError("CYRENE_CONNECTOR_BINDINGS_FILE must contain version 1 bindings")
+        result["CYRENE_CONNECTOR_BINDINGS_FILE"] = str(binding_path)
+        result["TEAMS_ENABLED"] = teams_enabled
+        audience = environment.get("CYRENE_AUTHORITY_EXCHANGE_WORKLOAD_AUDIENCE", "exchange")
+        if not audience.strip() or len(audience) > 256 or any(ord(ch) < 32 for ch in audience):
+            raise ValueError("CYRENE_AUTHORITY_EXCHANGE_WORKLOAD_AUDIENCE is invalid")
+        result["CYRENE_AUTHORITY_EXCHANGE_WORKLOAD_AUDIENCE"] = audience
+
     config_names = ("CYRENE_SUBAGENT_CONFIG", "CYRENE_CLOUD_PROFILE_CONFIG")
     for config_name in config_names:
         configured_path = environment.get(config_name)
@@ -697,6 +802,25 @@ def _executor_integration_environment(
         else:
             _collect_cloud_environment_references(document, result, environment)
     return result
+
+
+def _validate_uuid_environment(value: str, name: str) -> None:
+    """Validate one canonical Entra/Exchange UUID without echoing its value."""
+
+    try:
+        if str(uuid.UUID(value)) != value.lower():
+            raise ValueError
+    except (ValueError, AttributeError):
+        raise ValueError(f"{name} must be a UUID") from None
+
+
+def _split_unique_values(value: str, name: str) -> list[str]:
+    """Parse a comma-separated allowlist with no empty or duplicate values."""
+
+    values = [part.strip() for part in value.split(",")]
+    if not values or any(not part for part in values) or len(set(values)) != len(values):
+        raise ValueError(f"{name} must contain unique non-empty values")
+    return values
 
 
 def _add_environment_reference(

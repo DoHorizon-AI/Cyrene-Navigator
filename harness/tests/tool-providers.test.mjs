@@ -29,7 +29,7 @@ const tools = {
       name: 'Search contacts',
       description: 'Search the configured WeCom directory.',
       inputSchema: {
-        type: 'object', properties: { query: { type: 'string' } }, required: ['query'], additionalProperties: false,
+        type: 'object', properties: { query: { type: 'string', pattern: '^[A-Za-z]+$' } }, required: ['query'], additionalProperties: false,
       },
       readOnly: true,
     },
@@ -38,7 +38,9 @@ const tools = {
       name: 'Send message',
       description: 'Send a message to one approved conversation.',
       inputSchema: {
-        type: 'object', properties: { conversationId: { type: 'string' }, text: { type: 'string' } },
+        type: 'object', properties: {
+          conversationId: { type: 'string' }, text: { type: 'string', minLength: 1, maxLength: 64 },
+        },
         required: ['conversationId', 'text'], additionalProperties: false,
       },
       readOnly: false,
@@ -124,6 +126,7 @@ test('registers canonical read tools and routes calls through the configured bin
     const schema = schemas.find(item => item.description.startsWith(`Search contacts (configured provider ${bindingId})`));
     assert.ok(schema);
     assert.equal(schema.parameters.properties.query.type, 'string');
+    assert.equal(schema.parameters.properties.query.pattern, undefined);
     const name = schema.name;
     const result = await execute(ctx, name, { query: 'Ada' }, 'read-call-1', false);
 
@@ -135,6 +138,11 @@ test('registers canonical read tools and routes calls through the configured bin
     assert.equal(fixture.callCount(), 1);
     assert.equal(fixture.events.some(event => event.type === 'approval' || event.path === '/operations'), false);
     assert.ok(fixture.events.some(event => event.path === `/tool-providers/${bindingId}/tools/${readToolId}/call`));
+
+    const rejected = await execute(ctx, name, { query: 'Ada/Lovelace' }, 'pattern-invalid-call', false);
+    assert.equal(rejected.isError, true);
+    assert.match(rejected.error.message, /violates its configured bounds/u);
+    assert.equal(fixture.callCount(), 1);
   } finally {
     dispose();
     await ctx.fiber.dispose();
@@ -185,6 +193,26 @@ test('approval rejection prevents operation receipt creation and provider call',
 
     assert.equal(result.isError, true);
     assert.equal(fixture.events.some(event => event.type === 'mutate' || event.path?.includes('/operations/')), false);
+    assert.equal(fixture.callCount(), 0);
+  } finally {
+    dispose();
+    await ctx.fiber.dispose();
+  }
+});
+
+test('projected string bounds remain enforced before approval and provider calls', async () => {
+  const fixture = createBridgeFixture();
+  const { ctx, dispose } = await createToolContext(fixture);
+  try {
+    const schema = schemaFor(ctx, writeToolId);
+    assert.ok(schema);
+    assert.equal(schema.parameters.properties.text.minLength, undefined);
+    const result = await execute(
+      ctx, schema.name, { conversationId: 'team-chat-9', text: '' }, 'empty-message',
+    );
+    assert.equal(result.isError, true);
+    assert.match(result.error.message, /configured bounds/u);
+    assert.equal(fixture.events.some(event => event.type === 'approval'), false);
     assert.equal(fixture.callCount(), 0);
   } finally {
     dispose();

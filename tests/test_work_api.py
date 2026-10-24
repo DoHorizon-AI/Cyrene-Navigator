@@ -550,6 +550,440 @@ def test_terminal_task_enqueues_wecom_reply_atomically(tmp_path: Path) -> None:
         assert notification["taskId"] == "reply-1"
 
 
+def test_terminal_teams_reply_uses_root_thread_route_and_unknown_delivery_is_not_replayed(
+    tmp_path: Path,
+) -> None:
+    """Persist Teams routing and prevent unknown Bot-send replay.
+
+    中文：持久化 Teams 回帖，并阻止未知投递结果被重放。
+    """
+
+    db_path = tmp_path / "teams-task-reply.sqlite3"
+    base = BASE.format(workspace="w1")
+    route = {
+        "tenantId": "tenant-1",
+        "teamId": "team-1",
+        "channelId": "channel-1",
+        "conversationId": "conversation-1",
+        "rootThreadId": "1698765432100",
+    }
+    with _client(db_path) as client:
+        created = client.post(
+            base + "/tasks",
+            json={
+                "id": "teams-task-1",
+                "sessionId": "teams-session-1",
+                "prompt": "Inspect the repository status.",
+                "metadata": {
+                    "notification": {
+                        "type": "teams.message",
+                        "connectorId": "teams-v1",
+                        "recipient": "teams:thread-digest",
+                        "payload": route,
+                    }
+                },
+            },
+            headers=_headers(),
+        )
+        assert created.status_code == 201, created.text
+        assert client.post(base + "/tasks/teams-task-1/claim", headers=_headers()).json()["claimed"]
+        completed = client.patch(
+            base + "/tasks/teams-task-1",
+            json={"status": "completed", "output": "Repository is clean."},
+            headers=_headers(),
+        )
+        assert completed.status_code == 200, completed.text
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE work_notifications SET available_at=0")
+        claimed = client.post(
+            base + "/notifications/claim",
+            json={
+                "workerId": "navigator-teams-dispatcher",
+                "limit": 10,
+                "leaseSeconds": 60,
+                "type": "teams.message",
+                "connectorId": "teams-v1",
+            },
+            headers=_headers(),
+        )
+        assert claimed.status_code == 200, claimed.text
+        lease = claimed.json()["items"][0]
+        notice_id = lease["notification"]["id"]
+        assert lease["notification"]["payload"] == {
+            **route,
+            "text": "Repository is clean.",
+            "taskId": "teams-task-1",
+            "status": "completed",
+        }
+        assert (
+            client.post(
+                base + f"/notifications/{notice_id}/start",
+                json={"leaseToken": lease["leaseToken"]},
+                headers=_headers(),
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                base + f"/notifications/{notice_id}/finish",
+                json={
+                    "leaseToken": lease["leaseToken"],
+                    "outcome": "uncertain",
+                    "result": {"code": "timeout"},
+                },
+                headers=_headers(),
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                base + "/notifications/claim",
+                json={
+                    "workerId": "navigator-teams-dispatcher",
+                    "limit": 10,
+                    "leaseSeconds": 60,
+                    "type": "teams.message",
+                    "connectorId": "teams-v1",
+                },
+                headers=_headers(),
+            ).json()["items"]
+            == []
+        )
+
+
+def test_outbox_rate_limit_retries_only_with_bounded_retry_after(tmp_path: Path) -> None:
+    """Known rate limits get bounded delayed retries; unknown sends remain terminal."""
+
+    db_path = tmp_path / "outbox-rate-limit.sqlite3"
+    base = BASE.format(workspace="w1")
+    body = {
+        "deduplicationKey": "teams-rate-limit-1",
+        "type": "teams.message",
+        "connectorId": "teams-v1",
+        "recipient": "teams:route-hash",
+        "payload": {"text": "reply"},
+    }
+    claim_body = {
+        "workerId": "navigator-teams-dispatcher",
+        "limit": 1,
+        "leaseSeconds": 60,
+        "type": "teams.message",
+        "connectorId": "teams-v1",
+    }
+    with _client(db_path) as client:
+        created = client.post(base + "/notifications", json=body, headers=_headers())
+        assert created.status_code == 201
+        notice_id = created.json()["notification"]["id"]
+        for retry_number in range(1, 4):
+            lease = client.post(
+                base + "/notifications/claim", json=claim_body, headers=_headers()
+            ).json()["items"][0]
+            token = lease["leaseToken"]
+            assert (
+                client.post(
+                    base + f"/notifications/{notice_id}/start",
+                    json={"leaseToken": token},
+                    headers=_headers(),
+                ).status_code
+                == 200
+            )
+            finish = client.post(
+                base + f"/notifications/{notice_id}/finish",
+                json={
+                    "leaseToken": token,
+                    "outcome": "retry",
+                    "retryAfterSeconds": 30,
+                    "result": {"code": "rate_limited"},
+                },
+                headers=_headers(),
+            )
+            assert finish.status_code == 200, finish.text
+            assert finish.json()["status"] == "queued"
+            assert finish.json()["result"]["retryCount"] == retry_number
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "UPDATE work_notifications SET available_at=0 WHERE notification_id=?",
+                    (notice_id,),
+                )
+
+        final_lease = client.post(
+            base + "/notifications/claim", json=claim_body, headers=_headers()
+        ).json()["items"][0]
+        token = final_lease["leaseToken"]
+        assert (
+            client.post(
+                base + f"/notifications/{notice_id}/start",
+                json={"leaseToken": token},
+                headers=_headers(),
+            ).status_code
+            == 200
+        )
+        limit = client.post(
+            base + f"/notifications/{notice_id}/finish",
+            json={
+                "leaseToken": token,
+                "outcome": "retry",
+                "retryAfterSeconds": 30,
+                "result": {"code": "rate_limited"},
+            },
+            headers=_headers(),
+        )
+        assert limit.status_code == 409
+        assert limit.json()["code"] == "WORK_NOTIFICATION_RETRY_LIMIT"
+
+
+def test_connector_event_admission_deduplicates_task_across_reopen_and_rejects_changed_replay(
+    tmp_path: Path,
+) -> None:
+    """Persist a Teams activity and task atomically across restart. | Teams 活动任务原子持久。"""
+
+    db_path = tmp_path / "teams-ingress.sqlite3"
+    base = BASE.format(workspace="w1")
+    event = {
+        "messageId": "teams:activity-hash",
+        "type": "message.received",
+        "accountId": "bot-app-1",
+        "conversationId": "conversation-1",
+        "senderId": "aad-object-1",
+        "payload": {
+            "provider": "teams",
+            "tenantId": "tenant-1",
+            "teamId": "team-1",
+            "channelId": "channel-1",
+            "rootThreadId": "1698765432100",
+            "text": "Inspect the repository status.",
+        },
+        "task": {
+            "id": "teams-task-hash",
+            "sessionId": "teams-session-hash",
+            "prompt": "Inspect the repository status.",
+            "metadata": {"teamsCaller": {"issuer": "issuer-1", "subject": "aad-object-1"}},
+        },
+    }
+    with _client(db_path) as client:
+        first = client.post(base + "/connectors/teams-v1/events", json=event, headers=_headers())
+        assert first.status_code == 200, first.text
+        receipt = first.json()
+        assert receipt["duplicate"] is False
+        assert receipt["task"]["id"] == "teams-task-hash"
+        replay = client.post(base + "/connectors/teams-v1/events", json=event, headers=_headers())
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["duplicate"] is True
+        assert replay.json()["task"]["id"] == receipt["task"]["id"]
+
+    with _client(db_path) as reopened:
+        replay = reopened.post(base + "/connectors/teams-v1/events", json=event, headers=_headers())
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["duplicate"] is True
+        assert (
+            reopened.get(base + "/tasks/teams-task-hash", headers=_headers()).json()["metadata"]
+            == event["task"]["metadata"]
+        )
+        changed = {**event, "payload": {**event["payload"], "text": "Changed replay"}}
+        conflict = reopened.post(
+            base + "/connectors/teams-v1/events", json=changed, headers=_headers()
+        )
+        assert conflict.status_code == 409
+
+
+def test_teams_thread_mapping_keeps_member_messages_as_context_without_admitting_tasks(
+    tmp_path: Path,
+) -> None:
+    """Participant context is durable, while only the owner admission creates a Session task.
+
+    其他参与者的文本只作为后续上下文保存；只有维护者接纳消息才建立 DSH Session 任务。
+    """
+
+    db_path = tmp_path / "teams-thread-context.sqlite3"
+    base = BASE.format(workspace="w1")
+    tenant_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    owner_id = "d83aeb27-ff11-46d7-b0f7-af8da8d5b8ec"
+    member_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    thread = {
+        "threadId": "a" * 64,
+        "tenantId": tenant_id,
+        "teamId": "team-1",
+        "channelId": "channel-1",
+        "conversationId": "conversation-1",
+        "rootThreadId": "1698765432100",
+        "serviceUrl": "https://smba.trafficmanager.net/emea/",
+    }
+    member_event = {
+        "messageId": "member-message-1",
+        "type": "message.received",
+        "accountId": "bot-app-1",
+        "conversationId": "conversation-1",
+        "senderId": member_id,
+        "payload": {
+            "messageId": "member-message-1",
+            "text": "The deployment failed after the last update.",
+        },
+        "teamsThreadMessage": {
+            **thread,
+            "messageId": "member-message-1",
+            "actorIssuer": f"https://login.microsoftonline.com/{tenant_id}/v2.0",
+            "actorSubject": member_id,
+            "text": "The deployment failed after the last update.",
+        },
+    }
+    with _client(db_path) as client:
+        member_receipt = client.post(
+            base + "/connectors/teams-v1/events", json=member_event, headers=_headers()
+        )
+        assert member_receipt.status_code == 200, member_receipt.text
+        assert member_receipt.json()["task"] is None
+        context_before_owner = client.get(
+            base + f"/connectors/teams-v1/threads/{thread['threadId']}", headers=_headers()
+        )
+        assert context_before_owner.status_code == 200
+        assert context_before_owner.json()["sessionId"] is None
+        assert context_before_owner.json()["serviceUrl"] == thread["serviceUrl"]
+        assert [item["actorSubject"] for item in context_before_owner.json()["messages"]] == [
+            member_id
+        ]
+
+        untrusted_service = {
+            **member_event,
+            "messageId": "member-message-untrusted-service",
+            "payload": {
+                "messageId": "member-message-untrusted-service",
+                "text": "This URL must not be stored.",
+            },
+            "teamsThreadMessage": {
+                **member_event["teamsThreadMessage"],
+                "messageId": "member-message-untrusted-service",
+                "serviceUrl": "https://127.0.0.1/teams/",
+                "text": "This URL must not be stored.",
+            },
+        }
+        rejected_service = client.post(
+            base + "/connectors/teams-v1/events",
+            json=untrusted_service,
+            headers=_headers(),
+        )
+        assert rejected_service.status_code == 422
+
+        owner_event = {
+            "messageId": "owner-message-1",
+            "type": "message.received",
+            "accountId": "bot-app-1",
+            "conversationId": "conversation-1",
+            "senderId": owner_id,
+            "payload": {
+                "messageId": "owner-message-1",
+                "text": "Please inspect the deployment status.",
+            },
+            "teamsThreadMessage": {
+                **thread,
+                "messageId": "owner-message-1",
+                "actorIssuer": f"https://login.microsoftonline.com/{tenant_id}/v2.0",
+                "actorSubject": owner_id,
+                "text": "Please inspect the deployment status.",
+                "sessionId": "teams-session-1",
+            },
+            "task": {
+                "id": "teams-owner-task-1",
+                "sessionId": "teams-session-1",
+                "prompt": "Please inspect the deployment status.",
+                "metadata": {
+                    "teamsCaller": {
+                        "issuer": f"https://login.microsoftonline.com/{tenant_id}/v2.0",
+                        "subject": owner_id,
+                    }
+                },
+            },
+        }
+        admitted = client.post(
+            base + "/connectors/teams-v1/events", json=owner_event, headers=_headers()
+        )
+        assert admitted.status_code == 200, admitted.text
+        assert admitted.json()["task"]["sessionId"] == "teams-session-1"
+        context = client.get(
+            base + f"/connectors/teams-v1/threads/{thread['threadId']}", headers=_headers()
+        )
+        assert context.status_code == 200
+        record = context.json()
+        assert record["sessionId"] == "teams-session-1"
+        assert [item["actorSubject"] for item in record["messages"]] == [member_id, owner_id]
+        excluded = client.get(
+            base
+            + f"/connectors/teams-v1/threads/{thread['threadId']}"
+            + "?exclude_message_id=owner-message-1",
+            headers=_headers(),
+        )
+        assert [item["messageId"] for item in excluded.json()["messages"]] == ["member-message-1"]
+
+        mismatched_session = {
+            **owner_event,
+            "messageId": "owner-message-2",
+            "payload": {
+                "messageId": "owner-message-2",
+                "text": "Please inspect the deployment status.",
+            },
+            "task": {
+                **owner_event["task"],
+                "id": "teams-owner-task-2",
+                "sessionId": "another-session",
+            },
+            "teamsThreadMessage": {
+                **owner_event["teamsThreadMessage"],
+                "messageId": "owner-message-2",
+                "sessionId": "another-session",
+            },
+        }
+        rejected = client.post(
+            base + "/connectors/teams-v1/events", json=mismatched_session, headers=_headers()
+        )
+        assert rejected.status_code == 409
+        assert client.get(base + "/tasks/teams-owner-task-2", headers=_headers()).status_code == 404
+
+
+def test_teams_service_url_columns_migrate_additively(tmp_path: Path) -> None:
+    """Existing thread mappings survive the serviceUrl column migration."""
+
+    db_path = tmp_path / "teams-service-url-migration.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE work_connector_threads (
+              organization_id TEXT NOT NULL, workspace_id TEXT NOT NULL, connector_id TEXT NOT NULL,
+              thread_id TEXT NOT NULL, tenant_id TEXT NOT NULL, team_id TEXT NOT NULL,
+              channel_id TEXT NOT NULL, conversation_id TEXT NOT NULL, root_thread_id TEXT NOT NULL,
+              session_id TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+              PRIMARY KEY(organization_id,workspace_id,connector_id,thread_id));
+            CREATE TABLE work_connector_thread_messages (
+              organization_id TEXT NOT NULL, workspace_id TEXT NOT NULL, connector_id TEXT NOT NULL,
+              thread_id TEXT NOT NULL, message_id TEXT NOT NULL, tenant_id TEXT NOT NULL,
+              team_id TEXT NOT NULL, channel_id TEXT NOT NULL, conversation_id TEXT NOT NULL,
+              root_thread_id TEXT NOT NULL, actor_issuer TEXT NOT NULL, actor_subject TEXT NOT NULL,
+              message_text TEXT NOT NULL, created_at INTEGER NOT NULL,
+              PRIMARY KEY(organization_id,workspace_id,connector_id,thread_id,message_id));
+            INSERT INTO work_connector_threads VALUES (
+              'org-a','w1','teams-v1','thread-1','tenant-1','team-1','channel-1',
+              'conversation-1','123456789','teams-session-1',1,1);
+            INSERT INTO work_connector_thread_messages VALUES (
+              'org-a','w1','teams-v1','thread-1','123456789','tenant-1','team-1','channel-1',
+              'conversation-1','123456789','issuer','actor','context',1);
+            """
+        )
+
+    with _client(db_path), sqlite3.connect(db_path) as conn:
+        thread_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(work_connector_threads)")
+        }
+        message_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(work_connector_thread_messages)")
+        }
+        assert "service_url" in thread_columns
+        assert "service_url" in message_columns
+        assert conn.execute(
+            "SELECT thread_id,service_url FROM work_connector_threads"
+        ).fetchone() == ("thread-1", "")
+        assert conn.execute(
+            "SELECT message_id,service_url FROM work_connector_thread_messages"
+        ).fetchone() == ("123456789", "")
+
+
 def test_failed_task_result_notification_keeps_partial_output_and_deduplicates(
     tmp_path: Path,
 ) -> None:
@@ -789,6 +1223,86 @@ def test_rejected_task_cannot_begin_operations_or_enqueue_notifications(tmp_path
         assert notification.status_code == 409
         assert operation.status_code == 409
         assert client.get(base + "/notifications", headers=_headers()).json()["items"] == []
+
+
+def test_unresolved_operation_query_supports_exact_target_reconciliation(tmp_path: Path) -> None:
+    """Expose minimal pending receipts for target fences and operation-ref reconciliation."""
+
+    base = BASE.format(workspace="w1")
+    with _client(tmp_path / "operation-reconciliation.sqlite3") as client:
+        created = client.post(
+            base + "/tasks", json=_task_body("operation-task"), headers=_headers()
+        )
+        assert created.status_code == 201
+        claimed = client.post(base + "/tasks/operation-task/claim", headers=_headers())
+        assert claimed.json()["claimed"]
+        receipt = client.post(
+            base + "/operations",
+            json={
+                "idempotencyKey": "cloud-stop-1",
+                "operationType": "tool.provider.v1:cloud.resource.stop",
+                "taskId": "operation-task",
+                "target": "connector-target:sha256:exact-vm",
+                "request": {"providerId": "azure", "arguments": {"resource_id": "vm-1"}},
+            },
+            headers=_headers(),
+        )
+        assert receipt.status_code == 201, receipt.text
+        operation_id = receipt.json()["operation"]["id"]
+        pending = client.patch(
+            base + f"/operations/{operation_id}",
+            json={
+                "status": "uncertain",
+                "evidence": {
+                    "providerId": "azure",
+                    "profileRef": "azure-profile-1",
+                    "operationRef": "operation-remote-1",
+                    "outcome": "pending",
+                },
+            },
+            headers=_headers(),
+        )
+        assert pending.status_code == 200, pending.text
+
+        exact = client.get(
+            base + "/operations/unresolved?target=connector-target%3Asha256%3Aexact-vm",
+            headers=_headers(),
+        )
+        assert exact.status_code == 200, exact.text
+        assert len(exact.json()["items"]) == 1
+        summary = exact.json()["items"][0]
+        assert summary["id"] == operation_id
+        assert summary["evidence"]["operationRef"] == "operation-remote-1"
+        assert "request" not in summary
+
+        duplicate_target = client.post(
+            base + "/operations",
+            json={
+                "idempotencyKey": "cloud-restart-while-stop-pending",
+                "operationType": "tool.provider.v1:cloud.resource.restart",
+                "taskId": "operation-task",
+                "target": "connector-target:sha256:exact-vm",
+                "request": {"providerId": "azure", "arguments": {"resource_id": "vm-1"}},
+            },
+            headers=_headers(),
+        )
+        assert duplicate_target.status_code == 409
+        assert duplicate_target.json()["code"] == "WORK_OPERATION_TARGET_UNRESOLVED"
+
+        verified = client.patch(
+            base + f"/operations/{operation_id}",
+            json={
+                "status": "verified",
+                "evidence": {
+                    **summary["evidence"],
+                    "reconciledByOperationRef": "operation-remote-1",
+                    "reconciliationState": "SUCCEEDED",
+                },
+            },
+            headers=_headers(),
+        )
+        assert verified.status_code == 200, verified.text
+        assert client.get(base + "/operations/unresolved", headers=_headers()).json()["items"] == []
 
 
 def test_human_input_pauses_resumes_once_and_survives_scope_checks(tmp_path: Path) -> None:

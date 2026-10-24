@@ -165,6 +165,11 @@ jobs:
             harness/tests/native.integration.test.mjs \
             harness/tests/executor.integration.test.mjs \
             harness/tests/exchange-authorization.test.mjs \
+            harness/tests/connector-authorization.test.mjs \
+            harness/tests/connector-provider-outcomes.test.mjs \
+            harness/tests/teams-bridge.integration.test.mjs \
+            harness/tests/connector-exchange-contract.test.mjs \
+            harness/tests/codebuddy-adapter.test.mjs \
             harness/tests/subagents.test.mjs \
             harness/tests/subagent-wire.test.mjs \
             harness/tests/antigravity-boundary.test.mjs \

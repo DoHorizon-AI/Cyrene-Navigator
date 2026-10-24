@@ -4,10 +4,10 @@
 // │ 模块职责：通过 REST/SSE 执行经过认证且持久化的任务。                    │
 // └─────────────────────────────────────────────────────────────────────┘
 
-import { timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import type { IncomingMessage, ServerResponse, Server } from 'node:http';
-import { randomUUID } from 'node:crypto';
 import type { Context } from '@deepseek-ai/cordis';
 import { brandString } from '@deepseek-ai/dsh-brand';
 import type { Agent, AgentOptions, ModelSelectionRef } from '@deepseek-ai/dsh-agent';
@@ -19,6 +19,15 @@ import type { DynamicPluginManager } from './plugin-manager.js';
 import { WorkStateHttpError } from './work-state-client.js';
 import type { ExecutionStatus, TaskRecord, WorkStateStore } from './work-state-client.js';
 import type { ExchangeAuthorizationWaitReceipt } from './integrations/exchange-authorization.js';
+import {
+  ExchangeConnectorAuthorizationClient,
+  ExchangeConnectorRequestError,
+  canonicalJson,
+  sha256,
+  teamsThreadResourceRef,
+  validateTeamsServiceUrl,
+} from './connector-authorization.ts';
+import type { ConnectorGrantRequest, TeamsMessageRoute } from './connector-authorization.ts';
 
 export type TaskStatus = ExecutionStatus;
 
@@ -83,10 +92,12 @@ export interface ExecutorConfig {
   readonly host?: string;
   readonly defaultCwd?: string;
   readonly defaultTimeoutMs?: number;
+  readonly maxConcurrentTasks?: number;
   readonly workState: WorkStateStore;
   readonly workspaceId: string;
   readonly authTokenEnv?: string;
   readonly allowedOrigins?: readonly string[];
+  readonly teams?: TeamsExecutorConfig;
   readonly revalidateExchangeAuthorization?: (
     sessionId: string,
     connectionId: string,
@@ -101,6 +112,20 @@ export interface ExecutorConfig {
     sessionId: string,
     operationId: string,
   ) => Promise<string>;
+}
+
+/** Verified transport policy and Exchange route for the built-in Teams bridge. */
+export interface TeamsExecutorConfig {
+  readonly connectorId: string;
+  readonly tenantId: string;
+  readonly allowedTeamIds: readonly string[];
+  readonly botAppId: string;
+  readonly taskActorSubjects: readonly string[];
+  readonly taskActorSubjectsFile?: string;
+  readonly ingressSecretEnv: string;
+  readonly exchangeConnectionRef: string;
+  readonly exchangeProfileRef: string;
+  readonly exchangeAuthorization: ExchangeConnectorAuthorizationClient;
 }
 
 class ExecutorRequestError extends Error {
@@ -130,6 +155,70 @@ const EXCHANGE_MUTATING_TOOLS = new Set([
   'exchange_reauthorization_start',
 ]);
 
+interface TaskWaiter {
+  readonly signal: AbortSignal;
+  readonly resolve: () => void;
+  readonly reject: (error: unknown) => void;
+  readonly onAbort: () => void;
+}
+
+/** Bound CPU and memory pressure while keeping durable queued rows available for recovery. */
+class TaskConcurrencyLimiter {
+  private active = 0;
+  private readonly waiting: TaskWaiter[] = [];
+
+  constructor(private readonly maximum: number) {
+    if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 32) {
+      throw new TypeError('maxConcurrentTasks must be between 1 and 32');
+    }
+  }
+
+  async run<T>(signal: AbortSignal, action: () => Promise<T>): Promise<T> {
+    await this.acquire(signal);
+    try {
+      return await action();
+    } finally {
+      this.release();
+    }
+  }
+
+  private acquire(signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
+    if (this.active < this.maximum) {
+      this.active += 1;
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve, reject) => {
+      const waiter: TaskWaiter = {
+        signal,
+        resolve,
+        reject,
+        onAbort: () => {
+          const index = this.waiting.indexOf(waiter);
+          if (index >= 0) this.waiting.splice(index, 1);
+          reject(signal.reason instanceof Error ? signal.reason : new DOMException('The task was aborted', 'AbortError'));
+        },
+      };
+      signal.addEventListener('abort', waiter.onAbort, { once: true });
+      this.waiting.push(waiter);
+    });
+  }
+
+  private release(): void {
+    while (this.waiting.length > 0) {
+      const waiter = this.waiting.shift()!;
+      waiter.signal.removeEventListener('abort', waiter.onAbort);
+      if (waiter.signal.aborted) {
+        waiter.reject(waiter.signal.reason);
+        continue;
+      }
+      waiter.resolve();
+      return;
+    }
+    this.active = Math.max(0, this.active - 1);
+  }
+}
+
 /** Run an autonomous agent against durable Work Task state and an authenticated REST/SSE boundary.  中文：基于持久 Work Task 执行 Agent，并提供认证 REST/SSE 边界。 */
 export class NavigatorExecutor {
   /** Only active process-local handles live here; durable records stay in WorkStateStore.  中文：此 Map 只保存活动运行句柄；持久记录由 WorkStateStore 管理。 */
@@ -137,9 +226,12 @@ export class NavigatorExecutor {
   private readonly agentTaskMap = new Map<Agent, string>();
   private readonly sessionTaskMap = new Map<Session, string>();
   private readonly sessionTails = new Map<string, Promise<void>>();
+  private readonly taskLimiter: TaskConcurrencyLimiter;
   private readonly defaultTimeoutMs: number;
   private httpServer?: Server;
   private drainTimer?: ReturnType<typeof setInterval>;
+  private teamsNotificationDrainTimer?: ReturnType<typeof setInterval>;
+  private teamsNotificationDrain?: Promise<void>;
   private disposeStreamListener?: () => void;
   private disposeErrorListener?: () => void;
   private disposeSessionListener?: () => void;
@@ -150,6 +242,7 @@ export class NavigatorExecutor {
     private readonly config: ExecutorConfig,
   ) {
     this.defaultTimeoutMs = config.defaultTimeoutMs ?? 300_000;
+    this.taskLimiter = new TaskConcurrencyLimiter(config.maxConcurrentTasks ?? 1);
     this.setupStreamListeners();
     this.ready = this.recoverInterruptedTasks();
   }
@@ -436,6 +529,16 @@ export class NavigatorExecutor {
   }
 
   private async runTask(task: InternalTaskState, params: ExecuteTaskParams): Promise<TaskOutcome> {
+    try {
+      return await this.taskLimiter.run(task.abortController.signal, () => this.runTaskWithSlot(task, params));
+    } catch (error: unknown) {
+      if (!task.abortController.signal.aborted) throw error;
+      const latest = await this.config.workState.getTask(task.id).catch(() => undefined);
+      return outcome(latest ?? task.record, safeErrorMessage(error), 'aborted');
+    }
+  }
+
+  private async runTaskWithSlot(task: InternalTaskState, params: ExecuteTaskParams): Promise<TaskOutcome> {
     const timeoutMs = params.timeoutMs ?? this.defaultTimeoutMs;
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new TypeError('timeoutMs must be a positive number');
     const timeoutId = setTimeout(() => task.abortController.abort(new Error(`Task timed out after ${timeoutMs}ms`)), timeoutMs);
@@ -972,6 +1075,17 @@ export class NavigatorExecutor {
       void this.drainQueuedTasks().catch(() => undefined);
     }, 1_000);
     this.drainTimer.unref?.();
+    if (this.config.teams) {
+      this.teamsNotificationDrainTimer = setInterval(() => {
+        void this.drainTeamsNotifications().catch(error => {
+          this.ctx.logger.warn(`Teams notification dispatch failed (${safeErrorMessage(error)})`);
+        });
+      }, 1_000);
+      this.teamsNotificationDrainTimer.unref?.();
+      void this.drainTeamsNotifications().catch(error => {
+        this.ctx.logger.warn(`Teams notification dispatch failed (${safeErrorMessage(error)})`);
+      });
+    }
     const address = server.address();
     const resolvedPort = typeof address === 'object' && address ? address.port : port;
     const url = `http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${resolvedPort}`;
@@ -980,10 +1094,290 @@ export class NavigatorExecutor {
       close: async () => {
         if (this.drainTimer) clearInterval(this.drainTimer);
         this.drainTimer = undefined;
+        if (this.teamsNotificationDrainTimer) clearInterval(this.teamsNotificationDrainTimer);
+        this.teamsNotificationDrainTimer = undefined;
         await new Promise<void>(resolve => server.close(() => resolve()));
         this.httpServer = undefined;
       },
     };
+  }
+
+  /** Verify the adapter HMAC, persist the event/task/thread, then allow the caller to ACK. */
+  private async acceptTeamsEvent(req: IncomingMessage): Promise<{
+    readonly duplicate: boolean;
+    readonly taskId?: string;
+    readonly receipt: Record<string, unknown>;
+  }> {
+    const config = this.config.teams;
+    if (!config || !this.config.workState.registerConnectorEvent
+      || !this.config.workState.getConnectorThread || !this.config.workState.claimNotifications
+      || !this.config.workState.startNotification || !this.config.workState.finishNotification) {
+      throw new ExecutorRequestError(503, 'TEAMS_BRIDGE_NOT_CONFIGURED', 'Teams delivery is not configured.');
+    }
+    const secret = process.env[config.ingressSecretEnv];
+    if (!secret || Buffer.byteLength(secret, 'utf8') < 32) {
+      throw new ExecutorRequestError(503, 'TEAMS_BRIDGE_NOT_CONFIGURED', 'Teams delivery is not configured.');
+    }
+    const sourceKeyId = req.headers['x-cyrene-source-key-id'];
+    const timestamp = req.headers['x-cyrene-source-timestamp'];
+    const signature = req.headers['x-cyrene-source-signature'];
+    if (sourceKeyId !== 'teams-v1' || typeof timestamp !== 'string' || !/^\d{1,12}$/u.test(timestamp)
+      || typeof signature !== 'string' || !/^v1=[0-9a-f]{64}$/u.test(signature)) {
+      throw new ExecutorRequestError(401, 'CONNECTOR_SOURCE_UNAUTHENTICATED', 'Teams event authentication failed.');
+    }
+    const timestampSeconds = Number(timestamp);
+    const nowSeconds = Math.floor(Date.now() / 1_000);
+    if (!Number.isSafeInteger(timestampSeconds) || Math.abs(nowSeconds - timestampSeconds) > 300) {
+      throw new ExecutorRequestError(401, 'CONNECTOR_SOURCE_UNAUTHENTICATED', 'Teams event authentication failed.');
+    }
+    const rawBody = await this.readRawBody(req, 1_048_576);
+    const expected = createHmac('sha256', secret).update(`${timestamp}.`, 'utf8').update(rawBody).digest();
+    const presented = Buffer.from(signature.slice(3), 'hex');
+    if (presented.byteLength !== expected.byteLength || !timingSafeEqual(presented, expected)) {
+      throw new ExecutorRequestError(401, 'CONNECTOR_SOURCE_UNAUTHENTICATED', 'Teams event authentication failed.');
+    }
+    const body = parseTeamsJsonObject(rawBody.toString('utf8'), 'Teams event body');
+    if (!isExactObjectKeys(body, ['event_type', 'payload', 'trust']) || body.event_type !== 'inbound_message') {
+      throw new ExecutorRequestError(400, 'TEAMS_EVENT_INVALID', 'Teams event is invalid.');
+    }
+    const normalized = normalizeTeamsActivity(body.payload, body.trust, config);
+    const threadId = sha256(canonicalJson({
+      tenantId: normalized.route.tenantId,
+      teamId: normalized.route.teamId,
+      channelId: normalized.route.channelId,
+      rootThreadId: normalized.route.rootThreadId,
+    }));
+    const eventId = `teams-${sha256(canonicalJson({
+      tenantId: normalized.route.tenantId,
+      teamId: normalized.route.teamId,
+      channelId: normalized.route.channelId,
+      messageId: normalized.messageId,
+    }))}`;
+
+    let priorThread: Awaited<ReturnType<WorkStateStore['getConnectorThread']>> | undefined;
+    try {
+      priorThread = await this.config.workState.getConnectorThread(
+        config.connectorId, threadId, 20, normalized.messageId,
+      );
+      assertTeamsThreadRoute(priorThread, normalized.route, threadId);
+    } catch (error: unknown) {
+      if (!(error instanceof WorkStateHttpError) || error.status !== 404) throw error;
+    }
+    const activeSessionId = priorThread?.sessionId;
+    const taskActorSubjects = await resolveTeamsTaskActorSubjects(
+      config, this.config.workspaceId, normalized.actorIssuer,
+    );
+    const isTaskActor = taskActorSubjects.includes(normalized.actorSubject);
+    const createTask = isTaskActor && (activeSessionId !== undefined || normalized.mentionsBot);
+    const sessionId = activeSessionId ?? (createTask ? `teams-${threadId}` : undefined);
+    const teamsThreadMessage = {
+      threadId,
+      messageId: normalized.messageId,
+      serviceUrl: normalized.route.serviceUrl,
+      tenantId: normalized.route.tenantId,
+      teamId: normalized.route.teamId,
+      channelId: normalized.route.channelId,
+      conversationId: normalized.route.conversationId,
+      rootThreadId: normalized.route.rootThreadId,
+      actorIssuer: normalized.actorIssuer,
+      actorSubject: normalized.actorSubject,
+      text: normalized.text,
+      ...(sessionId === undefined ? {} : { sessionId }),
+    };
+    const task = createTask
+      ? {
+        id: eventId,
+        sessionId: sessionId!,
+        prompt: buildTeamsTaskPrompt(priorThread?.messages ?? [], normalized.text, normalized.actorSubject),
+        title: 'Teams request',
+        metadata: {
+          teamsCaller: {
+            issuer: normalized.actorIssuer,
+            subject: normalized.actorSubject,
+            tenantId: normalized.route.tenantId,
+            actorAadObjectId: normalized.actorSubject,
+          },
+          teamsThread: {
+            threadId,
+            tenantId: normalized.route.tenantId,
+            teamId: normalized.route.teamId,
+            channelId: normalized.route.channelId,
+            conversationId: normalized.route.conversationId,
+            rootThreadId: normalized.route.rootThreadId,
+          },
+          notification: {
+            type: 'teams.message',
+            connectorId: config.connectorId,
+            recipient: `teams:${threadId}`,
+            payload: normalized.route,
+          },
+        },
+      }
+      : undefined;
+    const receipt = await this.config.workState.registerConnectorEvent({
+      connectorId: config.connectorId,
+      messageId: eventId,
+      type: 'message.received',
+      accountId: config.botAppId,
+      conversationId: normalized.route.conversationId,
+      senderId: normalized.actorSubject,
+      payload: {
+        provider: 'teams',
+        tenantId: normalized.route.tenantId,
+        teamId: normalized.route.teamId,
+        channelId: normalized.route.channelId,
+        conversationId: normalized.route.conversationId,
+        rootThreadId: normalized.route.rootThreadId,
+        messageId: normalized.messageId,
+        senderId: normalized.actorSubject,
+        text: normalized.text,
+      },
+      teamsThreadMessage,
+      ...(task === undefined ? {} : { task }),
+    });
+    return {
+      duplicate: receipt.duplicate,
+      ...(receipt.task === undefined ? {} : { taskId: receipt.task.id }),
+      receipt: {
+        accepted: true,
+        duplicate: receipt.duplicate,
+        eventId: receipt.eventId,
+        ...(receipt.task === undefined ? {} : { taskId: receipt.task.id, status: receipt.task.status }),
+      },
+    };
+  }
+
+  /** Deliver durable Teams notifications once; uncertain provider outcomes stay terminal. */
+  private async drainTeamsNotifications(): Promise<void> {
+    if (this.teamsNotificationDrain) return this.teamsNotificationDrain;
+    const config = this.config.teams;
+    if (!config) return;
+    this.teamsNotificationDrain = (async () => {
+      const leases = await this.config.workState.claimNotifications({
+        workerId: `navigator-teams-${process.pid}`,
+        limit: 10,
+        leaseSeconds: 60,
+        type: 'teams.message',
+        connectorId: config.connectorId,
+      });
+      for (const lease of leases) await this.deliverTeamsNotification(lease, config);
+    })().finally(() => { this.teamsNotificationDrain = undefined; });
+    return this.teamsNotificationDrain;
+  }
+
+  private async deliverTeamsNotification(
+    lease: Awaited<ReturnType<WorkStateStore['claimNotifications']>>[number],
+    config: TeamsExecutorConfig,
+  ): Promise<void> {
+    const notification = lease.notification;
+    let started = false;
+    let providerCallStarted = false;
+    try {
+      await this.config.workState.startNotification(notification.id, lease.leaseToken);
+      started = true;
+      const retryCountValue = notification.result.retryCount ?? 0;
+      if (typeof retryCountValue !== 'number' || !Number.isSafeInteger(retryCountValue)
+        || retryCountValue < 0 || retryCountValue > 3) {
+        throw new TypeError('Teams notification retry counter is invalid');
+      }
+      const requestId = `${notification.id}:attempt:${retryCountValue + 1}`;
+      if (requestId.length > 200) throw new TypeError('Teams notification request identifier is too long');
+      if (notification.taskId === undefined) throw new TypeError('Teams notification has no source task');
+      const task = await this.config.workState.getTask(notification.taskId);
+      if (!task) throw new TypeError('Teams notification source task is unavailable');
+      const metadata = task.metadata ?? {};
+      const caller = readTeamsCaller(metadata.teamsCaller);
+      const currentTaskActors = await resolveTeamsTaskActorSubjects(
+        config, this.config.workspaceId, caller.issuer,
+      );
+      if (!currentTaskActors.includes(caller.subject)) throw new TypeError('Teams notification actor is no longer authorized');
+      const route = readTeamsNotificationRoute(notification.payload);
+      if (route.tenantId !== caller.tenantId) throw new TypeError('Teams notification tenant does not match its task actor');
+      const text = boundedText(notification.payload.text, 'Teams notification text', 20_000);
+      const conversation = {
+        tenantId: route.tenantId,
+        teamId: route.teamId,
+        channelId: route.channelId,
+        conversationId: route.conversationId,
+        rootThreadId: route.rootThreadId,
+        serviceUrl: route.serviceUrl,
+      };
+      const argumentsValue: ConnectorGrantRequest['arguments'] = { conversation, text };
+      const grantRequest: ConnectorGrantRequest = {
+        requestId,
+        workspaceId: this.config.workspaceId,
+        principalIssuer: caller.issuer,
+        principalSubject: caller.subject,
+        connectionRef: config.exchangeConnectionRef,
+        providerId: 'msteams',
+        profileRef: config.exchangeProfileRef,
+        operationId: 'msteams.message.reply',
+        resourceRef: teamsThreadResourceRef(conversation),
+        argumentsDigestSha256: sha256(canonicalJson(argumentsValue)),
+        arguments: argumentsValue,
+      };
+      const grant = await config.exchangeAuthorization.mintGrant(grantRequest, AbortSignal.timeout(10_000));
+      const message = { requestId, conversation, text };
+      providerCallStarted = true;
+      const result = await config.exchangeAuthorization.sendTeamsMessage(
+        message, grant, config.exchangeConnectionRef, config.exchangeProfileRef, AbortSignal.timeout(15_000),
+      );
+      if (result.outcome === 'rate_limited' && result.retryAfterSeconds !== undefined) {
+        await this.finishTeamsRateLimit(notification.id, lease.leaseToken, result.retryAfterSeconds, {
+          reasonCode: result.reasonCode ?? 'rate_limited',
+        });
+        return;
+      }
+      const outcome = result.outcome === 'accepted'
+        ? 'delivered'
+        : result.outcome === 'uncertain' ? 'uncertain' : 'failed';
+      await this.config.workState.finishNotification(notification.id, lease.leaseToken, outcome, {
+        reasonCode: result.reasonCode ?? null,
+        vendorMessageId: result.vendorMessageId ?? null,
+      });
+    } catch (error: unknown) {
+      if (!started) return;
+      if (providerCallStarted && error instanceof ExchangeConnectorRequestError
+        && error.status === 429 && error.retryAfterSeconds !== undefined) {
+        await this.finishTeamsRateLimit(notification.id, lease.leaseToken, error.retryAfterSeconds, {
+          code: 'EXCHANGE_HTTP_429',
+        }).catch(() => undefined);
+        return;
+      }
+      const unknown = providerCallStarted && isUncertainConnectorOutcome(error);
+      try {
+        await this.config.workState.finishNotification(
+          notification.id,
+          lease.leaseToken,
+          unknown ? 'uncertain' : 'failed',
+          { code: safeErrorCode(error) },
+        );
+      } catch (finishError: unknown) {
+        this.ctx.logger.warn(`Teams notification receipt could not be finalized (${safeErrorMessage(finishError)})`);
+      }
+    }
+  }
+
+  private async finishTeamsRateLimit(
+    notificationId: string,
+    leaseToken: string,
+    retryAfterSeconds: number,
+    result: Readonly<Record<string, unknown>>,
+  ): Promise<void> {
+    try {
+      await this.config.workState.finishNotification(
+        notificationId,
+        leaseToken,
+        'retry',
+        result,
+        Math.min(Math.max(Math.ceil(retryAfterSeconds), 1), 300),
+      );
+    } catch (error: unknown) {
+      if (!(error instanceof WorkStateHttpError) || error.code !== 'WORK_NOTIFICATION_RETRY_LIMIT') throw error;
+      await this.config.workState.finishNotification(notificationId, leaseToken, 'failed', {
+        code: 'TEAMS_RATE_LIMIT_RETRY_LIMIT',
+      });
+    }
   }
 
   /** Route every task operation through fixed workspace state after bearer authentication.  中文：认证后将任务操作全部路由至固定 Workspace 状态。 */
@@ -1002,6 +1396,49 @@ export class NavigatorExecutor {
         status: 'ok', service: 'cyrene-navigator-executor', version: '0.2.0-rc.2',
         timestamp: Date.now(),
       });
+      return;
+    }
+    if (method === 'POST' && url.pathname === '/internal/v1/connectors/teams/events') {
+      try {
+        await this.ready;
+        const admission = await this.acceptTeamsEvent(req);
+        this.sendJson(res, admission.duplicate ? 200 : 202, admission.receipt);
+        if (admission.taskId) {
+          setImmediate(() => {
+            void this.dispatchTask(admission.taskId!).catch(error => {
+              this.ctx.logger.warn(`Teams task dispatch failed (${safeErrorMessage(error)})`);
+            });
+          });
+        }
+      } catch (error: unknown) {
+        if (error instanceof ExecutorRequestError) {
+          if (error.code === 'CONNECTOR_SOURCE_UNAUTHENTICATED') {
+            this.sendJson(res, error.status, {
+              code: error.code,
+              error: 'Teams event authentication failed',
+              terminal: false,
+              sourceAuthenticated: false,
+            });
+          } else if (['TEAMS_TENANT_NOT_ALLOWED', 'TEAMS_TEAM_NOT_ALLOWED'].includes(error.code)) {
+            this.sendJson(res, error.status, {
+              code: error.code,
+              error: error.message,
+              terminal: true,
+              sourceAuthenticated: true,
+            });
+          } else {
+            this.sendJson(res, error.status, { code: error.code, error: error.message });
+          }
+        } else if (error instanceof WorkStateHttpError) {
+          const status = error.status >= 500 ? 503 : error.status;
+          this.sendJson(res, status, {
+            code: error.code,
+            error: 'Teams event admission could not be persisted',
+          });
+        } else {
+          this.sendJson(res, 503, { code: 'TEAMS_INGRESS_UNAVAILABLE', error: 'Teams event admission is unavailable' });
+        }
+      }
       return;
     }
     if (!this.isAuthorized(req)) {
@@ -1253,6 +1690,36 @@ export class NavigatorExecutor {
     });
   }
 
+  private readRawBody(req: IncomingMessage, maximumBytes: number): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      let total = 0;
+      let settled = false;
+      req.on('data', (chunk: Buffer | string) => {
+        if (settled) return;
+        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        total += bytes.byteLength;
+        if (total > maximumBytes) {
+          settled = true;
+          reject(new ExecutorRequestError(413, 'TEAMS_EVENT_TOO_LARGE', 'Teams event exceeds the request limit.'));
+          req.destroy();
+          return;
+        }
+        chunks.push(bytes);
+      });
+      req.on('end', () => {
+        if (settled) return;
+        settled = true;
+        resolve(Buffer.concat(chunks, total));
+      });
+      req.on('error', error => {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      });
+    });
+  }
+
   private async patch(task: InternalTaskState, patch: Partial<Omit<TaskRecord, 'id' | 'workspaceId' | 'sequence'>>): Promise<void> {
     const next = task.patchChain.then(async () => {
       if (task.patchFailure) throw task.patchFailure;
@@ -1305,6 +1772,8 @@ export class NavigatorExecutor {
     this.disposeSessionListener?.();
     if (this.drainTimer) clearInterval(this.drainTimer);
     this.drainTimer = undefined;
+    if (this.teamsNotificationDrainTimer) clearInterval(this.teamsNotificationDrainTimer);
+    this.teamsNotificationDrainTimer = undefined;
     const live = [...this.tasks.values()];
     for (const task of live) {
       if (!TERMINAL_STATUSES.has(task.record.status)) {
@@ -1393,6 +1862,243 @@ function parseJsonObject(value: string): Record<string, unknown> {
     // The caller treats an unreadable receipt as unresolved and requires manual review.
   }
   return {};
+}
+
+interface NormalizedTeamsActivity {
+  readonly messageId: string;
+  readonly actorSubject: string;
+  readonly actorIssuer: string;
+  readonly route: TeamsMessageRoute;
+  readonly text: string;
+  readonly mentionsBot: boolean;
+}
+
+function normalizeTeamsActivity(
+  payloadValue: unknown,
+  trustValue: unknown,
+  config: TeamsExecutorConfig,
+): NormalizedTeamsActivity {
+  const payload = objectValue(payloadValue, 'Teams canonical payload');
+  const trust = objectValue(trustValue, 'Teams trust envelope');
+  const trustKeys = [
+    'version', 'provider', 'tenant_id', 'actor_aad_object_id', 'team_id', 'channel_id',
+    'root_thread_id', 'message_id', 'bot_app_id', 'service_url',
+  ];
+  if (!isExactObjectKeys(trust, trustKeys) || trust.version !== 1 || trust.provider !== 'teams') {
+    throw new ExecutorRequestError(400, 'TEAMS_TRUST_ENVELOPE_INVALID', 'Teams event trust context is invalid.');
+  }
+  const tenantId = uuidText(trust.tenant_id, 'tenant id');
+  const actorSubject = uuidText(trust.actor_aad_object_id, 'actor id');
+  const botAppId = uuidText(trust.bot_app_id, 'bot app id');
+  if (tenantId !== config.tenantId.toLowerCase() || botAppId !== config.botAppId.toLowerCase()) {
+    throw new ExecutorRequestError(403, 'TEAMS_TENANT_NOT_ALLOWED', 'Teams tenant is not configured.');
+  }
+  const teamId = boundedText(trust.team_id, 'team id', 512);
+  if (!config.allowedTeamIds.includes(teamId)) {
+    throw new ExecutorRequestError(403, 'TEAMS_TEAM_NOT_ALLOWED', 'Teams team is not configured.');
+  }
+  const channelId = boundedText(trust.channel_id, 'channel id', 512);
+  const rootThreadId = validateTeamsRootThreadId(trust.root_thread_id);
+  const messageId = boundedText(trust.message_id, 'message id', 512);
+  const serviceUrl = validateTeamsServiceUrl(trust.service_url, tenantId);
+  const canonicalMessageId = boundedText(payload.message_id, 'canonical message id', 512);
+  const senderId = uuidText(payload.sender_id, 'canonical sender id');
+  if (canonicalMessageId !== messageId || senderId !== actorSubject || senderId === botAppId) {
+    throw new ExecutorRequestError(403, 'TEAMS_SENDER_MISMATCH', 'Teams sender context does not match.');
+  }
+  const conversation = objectValue(payload.conversation, 'Teams conversation');
+  if (conversation.vendor !== 'msteams' || conversation.kind !== 'channel'
+    || uuidText(conversation.account_id, 'canonical bot account id') !== botAppId) {
+    throw new ExecutorRequestError(400, 'TEAMS_CONVERSATION_INVALID', 'Teams conversation context is invalid.');
+  }
+  const conversationId = boundedText(conversation.conversation_id, 'conversation id', 512);
+  const extension = objectValue(payload.vendor_extension, 'Teams vendor extension');
+  if (extension.vendor !== 'msteams' || !Array.isArray(extension.facts)) {
+    throw new ExecutorRequestError(400, 'TEAMS_VENDOR_EXTENSION_INVALID', 'Teams route facts are invalid.');
+  }
+  const facts = new Map<string, string>();
+  for (const item of extension.facts) {
+    const fact = objectValue(item, 'Teams route fact');
+    if (typeof fact.name === 'string' && typeof fact.value === 'string') facts.set(fact.name, fact.value);
+  }
+  if (facts.get('tenant_id')?.toLowerCase() !== tenantId
+    || facts.get('team_id') !== teamId || facts.get('channel_id') !== channelId) {
+    throw new ExecutorRequestError(403, 'TEAMS_ROUTE_MISMATCH', 'Teams route context does not match.');
+  }
+  if (!Array.isArray(payload.content) || payload.content.length > 500) {
+    throw new ExecutorRequestError(400, 'TEAMS_CONTENT_INVALID', 'Teams message content is invalid.');
+  }
+
+  const textParts: string[] = [];
+  let mentionsBot = false;
+  for (const blockValue of payload.content) {
+    const block = objectValue(blockValue, 'Teams message content block');
+    if (block.mention !== undefined) {
+      const mention = objectValue(block.mention, 'Teams mention');
+      const target = typeof mention.target_id === 'string' ? mention.target_id.toLowerCase() : '';
+      if (target === botAppId) mentionsBot = true;
+      else if (target) textParts.push(`@${target}`);
+    }
+    if (block.text !== undefined) {
+      const textBlock = objectValue(block.text, 'Teams text block');
+      if (typeof textBlock.text === 'string' && textBlock.text.trim()) textParts.push(textBlock.text.trim());
+    }
+    if (block.image !== undefined) textParts.push('[Image attachment is present in Teams; its contents were not transferred.]');
+    if (block.file !== undefined) textParts.push('[File attachment is present in Teams; its contents were not transferred.]');
+  }
+  const text = boundedText(textParts.join('\n').trim(), 'Teams message text', 20_000);
+  const actorIssuer = `https://login.microsoftonline.com/${tenantId}/v2.0`;
+  return {
+    messageId,
+    actorSubject,
+    actorIssuer,
+    route: { tenantId, teamId, channelId, conversationId, rootThreadId, serviceUrl },
+    text,
+    mentionsBot,
+  };
+}
+
+function buildTeamsTaskPrompt(
+  messages: readonly { readonly actorSubject: string; readonly text: string }[],
+  currentText: string,
+  actorSubject: string,
+): string {
+  const contextLines: string[] = [];
+  let total = 0;
+  const actorMessages = messages.filter(item => item.actorSubject === actorSubject);
+  for (const item of [...actorMessages].slice(-20).reverse()) {
+    const line = `[Teams context from actor ${item.actorSubject}]\n${item.text}`;
+    if (total + line.length > 60_000) break;
+    contextLines.unshift(line);
+    total += line.length;
+  }
+  if (contextLines.length === 0) return currentText;
+  return [
+    'Earlier messages from the same authorized Teams actor are context. Messages from other actors are never included in an operation prompt.',
+    ...contextLines,
+    `Current request from authorized Teams actor ${actorSubject}:\n${currentText}`,
+  ].join('\n\n');
+}
+
+function assertTeamsThreadRoute(
+  value: { readonly threadId: string; readonly tenantId: string; readonly teamId: string; readonly channelId: string; readonly conversationId: string; readonly rootThreadId: string },
+  route: TeamsMessageRoute,
+  threadId: string,
+): void {
+  if (value.threadId !== threadId || value.tenantId !== route.tenantId || value.teamId !== route.teamId
+    || value.channelId !== route.channelId || value.conversationId !== route.conversationId
+    || value.rootThreadId !== route.rootThreadId) {
+    throw new ExecutorRequestError(409, 'TEAMS_THREAD_ROUTE_CONFLICT', 'Teams thread route does not match its persisted mapping.');
+  }
+}
+
+interface TeamsCaller {
+  readonly issuer: string;
+  readonly subject: string;
+  readonly tenantId: string;
+}
+
+async function resolveTeamsTaskActorSubjects(
+  config: TeamsExecutorConfig,
+  workspaceId: string,
+  issuer: string,
+): Promise<readonly string[]> {
+  if (!config.taskActorSubjectsFile) return config.taskActorSubjects;
+  const raw = await readFile(config.taskActorSubjectsFile);
+  if (raw.byteLength > 64_000) throw new TypeError('Teams task actor authorization file exceeds its size limit');
+  const value: unknown = JSON.parse(raw.toString('utf8'));
+  const row = objectValue(value, 'Teams task actor authorization file');
+  if (!isExactObjectKeys(row, ['schemaVersion', 'workspaceId', 'issuer', 'subjects'])
+    || row.schemaVersion !== 1 || row.workspaceId !== workspaceId || row.issuer !== issuer
+    || !Array.isArray(row.subjects) || row.subjects.length > 256) {
+    throw new TypeError('Teams task actor authorization file has invalid scope or schema');
+  }
+  const subjects = row.subjects.map((subject, index) =>
+    uuidText(subject, `Teams task actor authorization subject ${index}`));
+  if (new Set(subjects).size !== subjects.length) {
+    throw new TypeError('Teams task actor authorization file contains duplicate subjects');
+  }
+  return subjects;
+}
+
+function readTeamsCaller(value: unknown): TeamsCaller {
+  const row = objectValue(value, 'Teams task caller');
+  const tenantId = uuidText(row.tenantId, 'Teams task tenant id');
+  const subject = uuidText(row.subject, 'Teams task actor id');
+  const issuer = boundedText(row.issuer, 'Teams task actor issuer', 512);
+  if (issuer !== `https://login.microsoftonline.com/${tenantId}/v2.0`
+    || (row.actorAadObjectId !== undefined && uuidText(row.actorAadObjectId, 'Teams actor object id') !== subject)) {
+    throw new TypeError('Teams task caller identity is invalid');
+  }
+  return { issuer, subject, tenantId };
+}
+
+function readTeamsNotificationRoute(value: Record<string, unknown>): TeamsMessageRoute {
+  const tenantId = uuidText(value.tenantId, 'Teams notification tenant id');
+  return {
+    tenantId,
+    teamId: boundedText(value.teamId, 'Teams notification team id', 512),
+    channelId: boundedText(value.channelId, 'Teams notification channel id', 512),
+    conversationId: boundedText(value.conversationId, 'Teams notification conversation id', 512),
+    rootThreadId: validateTeamsRootThreadId(value.rootThreadId),
+    serviceUrl: validateTeamsServiceUrl(value.serviceUrl, tenantId),
+  };
+}
+
+function validateTeamsRootThreadId(value: unknown): string {
+  const rootThreadId = boundedText(value, 'Teams root thread id', 512);
+  if (!/^\d+$/u.test(rootThreadId) || BigInt(rootThreadId) === 0n) {
+    throw new ExecutorRequestError(400, 'TEAMS_ROOT_THREAD_INVALID', 'Teams root thread ID must be a positive numeric activity ID.');
+  }
+  return rootThreadId;
+}
+
+function isUncertainConnectorOutcome(error: unknown): boolean {
+  if (error instanceof ExchangeConnectorRequestError) return error.outcomeUnknown;
+  if (error instanceof WorkStateHttpError) return error.status >= 500;
+  return true;
+}
+
+function safeErrorCode(error: unknown): string {
+  if (error instanceof ExchangeConnectorRequestError && error.status !== undefined) return `EXCHANGE_HTTP_${error.status}`;
+  if (error instanceof WorkStateHttpError) return error.code.slice(0, 128);
+  return 'TEAMS_DELIVERY_FAILED';
+}
+
+function objectValue(value: unknown, label: string): Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new ExecutorRequestError(400, 'TEAMS_EVENT_INVALID', `${label} must be an object.`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function parseTeamsJsonObject(value: string, label: string): Record<string, unknown> {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return objectValue(parsed, label);
+  } catch (error: unknown) {
+    if (error instanceof ExecutorRequestError) throw error;
+    throw new ExecutorRequestError(400, 'TEAMS_EVENT_INVALID', `${label} is invalid JSON.`);
+  }
+}
+
+function isExactObjectKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  return Object.keys(value).length === expected.length && expected.every(key => Object.hasOwn(value, key));
+}
+
+function boundedText(value: unknown, label: string, maximum: number): string {
+  if (typeof value !== 'string' || value.length === 0 || value.length > maximum
+    || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new ExecutorRequestError(400, 'TEAMS_EVENT_INVALID', `${label} is invalid.`);
+  }
+  return value;
+}
+
+function uuidText(value: unknown, label: string): string {
+  if (typeof value !== 'string' || !/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/u.test(value)) {
+    throw new ExecutorRequestError(400, 'TEAMS_EVENT_INVALID', `${label} is invalid.`);
+  }
+  return value.toLowerCase();
 }
 
 function resultIsConfirmedAuthWait(value: string): boolean {

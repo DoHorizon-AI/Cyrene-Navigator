@@ -143,6 +143,7 @@ Reusing a message id with different event content returns `409`.
 | `POST /approvals/{approvalId}/resolve` | `{ "decision":"approved", "messageId":"decision-1" }` | `{ "approval":{...}, "task":{...}, "duplicate":false }` |
 | `POST /operations` | `{ "idempotencyKey":"publish-1", "operationType":"publish", "taskId":"task-123", "target":"draft/7", "request":{} }` | `{ "operation":{"status":"started",...}, "duplicate":false }` |
 | `GET /operations/{operationId}` | — | `{ "operation":{...} }` |
+| `GET /operations/unresolved?target=<hash>&limit=100` | Read minimal `started`/`uncertain` receipts for an exact target; original provider arguments are not returned. |
 | `PATCH /operations/{operationId}` | `{ "status":"verified", "evidence":{"remoteId":"r-7"} }` | `{ "operation":{...}, "duplicate":false }` |
 
 When a model-callable operation includes `taskId`, the server requires that task
@@ -206,7 +207,7 @@ inventories retain the previous snapshot and never mark omitted facts missing.
 | `GET /notifications?status=uncertain&limit=100` | Inspect outbox state, including unknown delivery. |
 | `POST /notifications/claim` | Lease with `{ "workerId":"wecom-1", "limit":10, "leaseSeconds":60, "type":"wecom.message", "connectorId":"binding-1", "recipient":"bot:7/group/room-1" }`. Type/connector/recipient filters apply before leasing. |
 | `POST /notifications/{notificationId}/start` | `{ "leaseToken":"..." }` immediately before attempting the remote send. |
-| `POST /notifications/{notificationId}/finish` | `{ "leaseToken":"...", "outcome":"delivered", "result":{} }`; outcome is `delivered`, `failed`, or `uncertain`. |
+| `POST /notifications/{notificationId}/finish` | `{ "leaseToken":"...", "outcome":"delivered", "result":{} }`; outcome is `delivered`, `failed`, `uncertain`, or bounded `retry` with `retryAfterSeconds`. |
 | `POST /attachments` | Upload `{ "name":"report.pdf", "mediaType":"application/pdf", "contentBase64":"..." }`; returns a content digest. |
 | `GET /attachments/{sha256}` | Download only if the digest is registered in the authorized Workspace. |
 
@@ -254,6 +255,7 @@ Only a configured adapter sends it; the store has no external-send callback.
 | `POST /connectors/{connectorId}/status` | Update typed local connection status. |
 | `POST /connectors/{connectorId}/events` | Idempotently record an inbound event and, optionally, a nested `task` in the same transaction. |
 | `GET /connectors/{connectorId}/events?after=0` | Read connector event history. |
+| `GET /connectors/{connectorId}/threads/{threadId}?exclude_message_id=...` | Read the exact Teams route (including its private validated Bot Framework `serviceUrl`) and latest context, excluding the original current activity ID; an unmapped thread returns `sessionId:null`. |
 | `GET /connectors/{bindingId}/health` | Probe the launcher-configured QQ bridge; no bridge returns `503 QQ_HOST_NOT_CONFIGURED`. |
 | `POST /connectors/{bindingId}/login/qr` | Request a QR from that trusted bridge; request body is empty. |
 | `POST /connectors/{bindingId}/login/poll` | Poll `{ "loginId":"..." }`; account and host are taken from trusted launcher configuration. |
@@ -263,17 +265,21 @@ Only a configured adapter sends it; the store has no external-send callback.
 | `GET /workflows` / `PUT /workflows/{workflowId}` | Read or replace versioned workflow memory, including optional UTC/IANA cron metadata. |
 | `POST /schedule-events` / `GET /schedule-events` | Append/read safe workflow execution history. DSH owns all timer scheduling. |
 
-Connector intake uses `{ "messageId":"msg-1", "type":"message.received", "accountId":"acct-1", "conversationId":"room-1", "senderId":"user-1", "payload":{}, "task":{"id":"stable-task-id","sessionId":"session-1","prompt":"...","metadata":{}} }`.
+Connector intake uses `{ "messageId":"msg-1", "type":"message.received", "accountId":"acct-1", "conversationId":"room-1", "senderId":"user-1", "payload":{}, "teamsThreadMessage":{"threadId":"<sha256>","messageId":"original-activity-id","serviceUrl":"https://smba.trafficmanager.net/emea/","tenantId":"...","teamId":"...","channelId":"...","conversationId":"...","rootThreadId":"...","actorIssuer":"...","actorSubject":"...","text":"...","sessionId":"session-1"}, "task":{"id":"stable-task-id","sessionId":"session-1","prompt":"...","metadata":{}} }`.
 The response is `{ "eventId":"<uuid>", "duplicate":false, "receivedAt":1791050400000, "task":<TaskRecord> }`.
 The `(organization, workspace, connector, messageId)` key deduplicates retries;
 the event and nested task admission are atomic. A duplicate with changed content
 returns `409`.
 
+Teams activity text and stable route identifiers are committed with the event. A verified participant message can be stored without a task; a later authorized request may establish the DSH Session mapping in the same transaction as its task. The mapping key is a host-derived SHA-256 over tenant, team, channel, and root-thread IDs. Context lookup is Workspace-scoped, returns no display names, and accepts an `exclude_message_id` query so retries reproduce the original task prompt.
+
+Teams terminal replies use the existing notification outbox with `type="teams.message"`, a configured connector binding, and route payload `{ "tenantId":"...", "teamId":"...", "channelId":"...", "conversationId":"...", "rootThreadId":"...", "serviceUrl":"https://smba.trafficmanager.net/emea/" }`. Navigator validates and keeps the service URL private; it never enters the task prompt. The Navigator runtime is the only outbox dispatcher: it claims and starts the durable lease, mints a short-lived exact Exchange connector grant from the task's persisted caller identity and final text, invokes Exchange, and records `delivered`, `failed`, or `uncertain`. Only an explicit HTTP 429 with a matching `rate_limited` response and bounded `Retry-After` may return to `queued`; each delivery attempt gets a new provider request ID. An uncertain Bot Framework send is never automatically replayed.
+
 QQ bridge health/login calls use only the launcher-installed bridge keyed by
 organization, Workspace, and binding. Browser inputs cannot select a host or account. QR payloads
 are returned directly and are not stored in public memory.
 
-连接器接纳请求可包含一个嵌套任务；事件与任务在同一事务写入。键
-`(organization, workspace, connector, messageId)` 用于重试去重；相同 id 内容改变会返回
-`409`。QQ 健康状态与登录只调用启动器按 Workspace 和 binding 安装的桥接器，浏览器不能
+连接器接纳请求可包含一个嵌套任务；事件与任务在同一事务写入。Teams 可额外提交经验证的参与者消息；普通参与者消息只保存为后续上下文，不建立任务。精确查询会排除当前活动，确保重试生成相同任务。
+键 `(organization, workspace, connector, messageId)` 用于重试去重；相同 id 内容改变会返回 `409`。Teams 任务的 prompt 与会话由首次持久接纳确定，重试返回原任务，不重新构造。
+Teams 完成结果进入持久 outbox，由 Navigator 用任务中保存的调用者身份向 Exchange 申请短期精确 grant 后发送；发送结果未知时进入 `uncertain` 并禁止自动重放。QQ 健康状态与登录只调用启动器按 Workspace 和 binding 安装的桥接器，浏览器不能
 指定 host 或 account。QR 内容直接返回且不写入公共记忆。

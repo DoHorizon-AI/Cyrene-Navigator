@@ -34,6 +34,83 @@ export interface TaskRecord {
   readonly sequence?: number;
   readonly continuationOfTaskId?: string | null;
   readonly continuationMode?: 'read_only' | null;
+  readonly metadata?: Readonly<Record<string, unknown>>;
+}
+
+/** One canonical inbound connector event with optional atomic task admission. */
+export interface ConnectorEventInput {
+  readonly connectorId: string;
+  readonly messageId: string;
+  readonly type: string;
+  readonly occurredAt?: number;
+  readonly accountId?: string;
+  readonly conversationId?: string;
+  readonly senderId?: string;
+  readonly payload: Readonly<Record<string, unknown>>;
+  readonly teamsThreadMessage?: {
+    readonly threadId: string;
+    readonly messageId: string;
+    readonly serviceUrl: string;
+    readonly tenantId: string;
+    readonly teamId: string;
+    readonly channelId: string;
+    readonly conversationId: string;
+    readonly rootThreadId: string;
+    readonly actorIssuer: string;
+    readonly actorSubject: string;
+    readonly text: string;
+    readonly sessionId?: string;
+  };
+  readonly task?: {
+    readonly id: string;
+    readonly sessionId: string;
+    readonly prompt: string;
+    readonly title?: string;
+    readonly metadata?: Readonly<Record<string, unknown>>;
+  };
+}
+
+/** Durable connector acknowledgement; replay returns the original task row. */
+export interface ConnectorEventReceipt {
+  readonly eventId: string;
+  readonly duplicate: boolean;
+  readonly receivedAt: number;
+  readonly task?: TaskRecord;
+}
+
+/** Stable thread route plus its bound DSH session and recent participant context. */
+export interface ConnectorThreadRecord {
+  readonly threadId: string;
+  readonly tenantId: string;
+  readonly teamId: string;
+  readonly channelId: string;
+  readonly conversationId: string;
+  readonly rootThreadId: string;
+  readonly serviceUrl: string;
+  readonly sessionId?: string;
+  readonly messages: readonly {
+    readonly messageId: string;
+    readonly actorIssuer: string;
+    readonly actorSubject: string;
+    readonly text: string;
+    readonly createdAt: number;
+  }[];
+}
+
+/** One immutable outbox payload claimed by a single adapter worker. */
+export interface NotificationLease {
+  readonly notification: {
+    readonly id: string;
+    readonly deduplicationKey: string;
+    readonly type: string;
+    readonly payload: Readonly<Record<string, unknown>>;
+    readonly taskId?: string;
+    readonly connectorId?: string;
+    readonly recipient?: string;
+    readonly status: 'queued' | 'leased' | 'started' | 'uncertain' | 'delivered' | 'failed';
+    readonly result: Readonly<Record<string, unknown>>;
+  };
+  readonly leaseToken: string;
 }
 
 /** One ordered durable event attached to a task.  中文：与任务关联的一条有序持久化事件。 */
@@ -54,9 +131,19 @@ export interface TaskEventPage {
   readonly nextSeq: number;
 }
 
+/** Minimal started/uncertain connector receipts used to block replay and reconcile status. */
+export interface UnresolvedOperationSummary {
+  readonly id: string;
+  readonly operationType: string;
+  readonly taskId?: string | null;
+  readonly target?: string | null;
+  readonly status: 'started' | 'uncertain';
+  readonly evidence: Readonly<Record<string, unknown>>;
+}
+
 /** Narrow storage contract shared by the HTTP service and explicit test store.  中文：HTTP 服务和显式测试存储共用的最小存储契约。 */
 export interface WorkStateStore {
-  createTask(input: { id?: string; sessionId: string; prompt: string }): Promise<TaskRecord>;
+  createTask(input: { id?: string; sessionId: string; prompt: string; metadata?: Readonly<Record<string, unknown>> }): Promise<TaskRecord>;
   createContinuationTask(
     sourceTaskId: string,
     input: { prompt: string; idempotencyKey: string },
@@ -68,6 +155,18 @@ export interface WorkStateStore {
   patchTask(taskId: string, patch: Partial<Omit<TaskRecord, 'id' | 'workspaceId' | 'sequence'>>): Promise<TaskRecord>;
   appendEvent(taskId: string, event: Record<string, unknown>): Promise<DurableTaskEvent>;
   getEvents(taskId: string, after?: number): Promise<TaskEventPage>;
+  listUnresolvedOperations(options?: { target?: string; limit?: number }): Promise<readonly UnresolvedOperationSummary[]>;
+  registerConnectorEvent(input: ConnectorEventInput): Promise<ConnectorEventReceipt>;
+  getConnectorThread(connectorId: string, threadId: string, messageLimit?: number, excludeMessageId?: string): Promise<ConnectorThreadRecord>;
+  claimNotifications(input: { workerId: string; limit: number; leaseSeconds: number; type: string; connectorId: string }): Promise<readonly NotificationLease[]>;
+  startNotification(notificationId: string, leaseToken: string): Promise<void>;
+  finishNotification(
+    notificationId: string,
+    leaseToken: string,
+    outcome: 'delivered' | 'failed' | 'uncertain' | 'retry',
+    result?: Readonly<Record<string, unknown>>,
+    retryAfterSeconds?: number,
+  ): Promise<void>;
 }
 
 export interface WorkStateConnection {
@@ -129,6 +228,7 @@ function decodeTask(value: unknown): TaskRecord {
     : row.continuationMode === null ? null
       : row.continuationMode === 'read_only' ? 'read_only'
         : (() => { throw new TypeError('Invalid Work Task continuationMode'); })();
+  const metadata = row.metadata === undefined ? undefined : object(row.metadata, 'Work Task metadata');
   return {
     ...task,
     ...(startedAt === undefined ? {} : { startedAt }),
@@ -138,6 +238,7 @@ function decodeTask(value: unknown): TaskRecord {
     ...(sequence === undefined ? {} : { sequence }),
     ...(continuationOfTaskId === undefined ? {} : { continuationOfTaskId }),
     ...(continuationMode === undefined ? {} : { continuationMode }),
+    ...(metadata === undefined ? {} : { metadata }),
   };
 }
 
@@ -158,9 +259,31 @@ function decodeEventPage(value: unknown): TaskEventPage {
   return { events, nextSeq: timeField(row.nextSeq, 'nextSeq')! };
 }
 
+function decodeUnresolvedOperation(value: unknown): UnresolvedOperationSummary {
+  const row = object(value, 'Work unresolved operation');
+  if (row.status !== 'started' && row.status !== 'uncertain') {
+    throw new TypeError('Invalid Work unresolved operation status');
+  }
+  const taskId = row.taskId === undefined || row.taskId === null
+    ? row.taskId as null | undefined
+    : stringField(row.taskId, 'operation taskId');
+  const target = row.target === undefined || row.target === null
+    ? row.target as null | undefined
+    : stringField(row.target, 'operation target');
+  return {
+    id: stringField(row.id, 'operation id'),
+    operationType: stringField(row.operationType, 'operation type'),
+    ...(taskId === undefined ? {} : { taskId }),
+    ...(target === undefined ? {} : { target }),
+    status: row.status,
+    evidence: object(row.evidence, 'operation evidence'),
+  };
+}
+
 /** Authenticated client for one configured workspace; callers cannot select another tenant.  中文：绑定单个配置 Workspace 的认证客户端；调用方无法选择其他租户。 */
 export class WorkStateClient implements WorkStateStore {
   readonly tasksUrl: string;
+  readonly workUrl: string;
 
   constructor(private readonly connection: WorkStateConnection) {
     const base = new URL(connection.baseUrl);
@@ -169,11 +292,12 @@ export class WorkStateClient implements WorkStateStore {
       throw new Error('Remote work-state persistence requires HTTPS; HTTP is limited to loopback');
     }
     if (!connection.workspaceId.trim()) throw new Error('A configured workspace is required');
-    this.tasksUrl = `${base.href.replace(/\/$/, '')}/api/v1/workspaces/${encodeURIComponent(connection.workspaceId)}/work/tasks`;
+    this.workUrl = `${base.href.replace(/\/$/, '')}/api/v1/workspaces/${encodeURIComponent(connection.workspaceId)}/work`;
+    this.tasksUrl = `${this.workUrl}/tasks`;
   }
 
   /** Create one durable task. The server binds organization and workspace from the bearer principal.  中文：创建持久任务；服务端从 bearer principal 绑定组织和 Workspace。 */
-  async createTask(input: { id?: string; sessionId: string; prompt: string }): Promise<TaskRecord> {
+  async createTask(input: { id?: string; sessionId: string; prompt: string; metadata?: Readonly<Record<string, unknown>> }): Promise<TaskRecord> {
     return decodeTask(await this.request('', 'POST', input));
   }
 
@@ -273,8 +397,151 @@ export class WorkStateClient implements WorkStateStore {
     return decodeEventPage(await this.request(`/${encodeURIComponent(taskId)}/events?${query}`, 'GET'));
   }
 
+  /** Read scoped unresolved operation receipts without exposing their original arguments. */
+  async listUnresolvedOperations(
+    options: { target?: string; limit?: number } = {},
+  ): Promise<readonly UnresolvedOperationSummary[]> {
+    const query = new URLSearchParams({ limit: String(Math.min(Math.max(options.limit ?? 100, 1), 500)) });
+    if (options.target !== undefined) query.set('target', boundedString(options.target, 'operation target', 2_000));
+    const row = object(await this.request(`/operations/unresolved?${query}`, 'GET'), 'Work unresolved operations');
+    if (!Array.isArray(row.items)) throw new TypeError('Invalid Work unresolved operations');
+    return row.items.map(decodeUnresolvedOperation);
+  }
+
+  /** Deduplicate an inbound event and persist its task admission atomically. */
+  async registerConnectorEvent(input: ConnectorEventInput): Promise<ConnectorEventReceipt> {
+    const row = object(await this.requestAt(
+      `${this.workUrl}/connectors/${encodeURIComponent(safeIdentifier(input.connectorId, 'connectorId'))}/events`,
+      'POST',
+      {
+        messageId: boundedString(input.messageId, 'messageId', 512),
+        type: boundedString(input.type, 'type', 256),
+        ...(input.occurredAt === undefined ? {} : { occurredAt: input.occurredAt }),
+        ...(input.accountId === undefined ? {} : { accountId: input.accountId }),
+        ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
+        ...(input.senderId === undefined ? {} : { senderId: input.senderId }),
+        payload: input.payload,
+        ...(input.teamsThreadMessage === undefined ? {} : { teamsThreadMessage: input.teamsThreadMessage }),
+        ...(input.task === undefined ? {} : { task: input.task }),
+      },
+    ), 'Work connector event receipt');
+    if (typeof row.eventId !== 'string' || typeof row.duplicate !== 'boolean'
+      || typeof row.receivedAt !== 'number' || !Number.isSafeInteger(row.receivedAt)) {
+      throw new TypeError('Invalid Work connector event receipt');
+    }
+    return {
+      eventId: row.eventId,
+      duplicate: row.duplicate,
+      receivedAt: row.receivedAt,
+      ...(row.task === undefined || row.task === null ? {} : { task: decodeTask(row.task) }),
+    };
+  }
+
+  /** Read the exact durable Teams thread mapping and bounded participant context. */
+  async getConnectorThread(
+    connectorId: string,
+    threadId: string,
+    messageLimit = 20,
+    excludeMessageId?: string,
+  ): Promise<ConnectorThreadRecord> {
+    const query = new URLSearchParams({ message_limit: String(Math.min(Math.max(messageLimit, 1), 100)) });
+    if (excludeMessageId !== undefined) query.set('exclude_message_id', boundedString(excludeMessageId, 'excludeMessageId', 512));
+    const row = object(await this.requestAt(
+      `${this.workUrl}/connectors/${encodeURIComponent(safeIdentifier(connectorId, 'connectorId'))}/threads/${encodeURIComponent(boundedString(threadId, 'threadId', 128))}?${query}`,
+      'GET',
+    ), 'Work connector thread');
+    if (!Array.isArray(row.messages)) throw new TypeError('Invalid Work connector thread messages');
+    const messages = row.messages.map(item => {
+      const message = object(item, 'Work connector thread message');
+      return {
+        messageId: boundedString(message.messageId, 'thread message id', 512),
+        actorIssuer: boundedString(message.actorIssuer, 'thread actor issuer', 512),
+        actorSubject: boundedString(message.actorSubject, 'thread actor subject', 256),
+        text: boundedString(message.text, 'thread message text', 20_000),
+        createdAt: timeField(message.createdAt, 'thread message createdAt')!,
+      };
+    });
+    const serviceUrl = row.serviceUrl ?? '';
+    if (typeof serviceUrl !== 'string' || serviceUrl.length > 512) {
+      throw new TypeError('Invalid Work connector thread serviceUrl');
+    }
+    return {
+      threadId: boundedString(row.threadId, 'threadId', 128),
+      tenantId: boundedString(row.tenantId, 'tenantId', 128),
+      teamId: boundedString(row.teamId, 'teamId', 512),
+      channelId: boundedString(row.channelId, 'channelId', 512),
+      conversationId: boundedString(row.conversationId, 'conversationId', 512),
+      rootThreadId: boundedString(row.rootThreadId, 'rootThreadId', 512),
+      serviceUrl,
+      ...(typeof row.sessionId === 'string' ? { sessionId: boundedString(row.sessionId, 'sessionId', 512) } : {}),
+      messages,
+    };
+  }
+
+  /** Lease one connector's durable messages; expired started sends are never replayed. */
+  async claimNotifications(input: {
+    workerId: string; limit: number; leaseSeconds: number; type: string; connectorId: string;
+  }): Promise<readonly NotificationLease[]> {
+    const row = object(await this.requestAt(`${this.workUrl}/notifications/claim`, 'POST', input), 'Work notification claim');
+    if (!Array.isArray(row.items)) throw new TypeError('Invalid Work notification claim response');
+    return row.items.map(item => {
+      const lease = object(item, 'Work notification lease');
+      const notice = object(lease.notification, 'Work notification');
+      const payload = object(notice.payload, 'Work notification payload');
+      const status = notice.status;
+      if (!['queued', 'leased', 'started', 'uncertain', 'delivered', 'failed'].includes(String(status))) {
+        throw new TypeError('Invalid Work notification state');
+      }
+      if (notice.type !== input.type || notice.connectorId !== input.connectorId) {
+        throw new TypeError('Work returned a notification outside the requested connector scope');
+      }
+      return {
+        notification: {
+          id: boundedString(notice.id, 'notification id', 512),
+          deduplicationKey: boundedString(notice.deduplicationKey, 'deduplication key', 512),
+          type: String(notice.type), payload,
+          ...(typeof notice.taskId === 'string' ? { taskId: notice.taskId } : {}),
+          ...(typeof notice.connectorId === 'string' ? { connectorId: notice.connectorId } : {}),
+          ...(typeof notice.recipient === 'string' ? { recipient: notice.recipient } : {}),
+          status: status as NotificationLease['notification']['status'],
+          result: notice.result === undefined ? {} : object(notice.result, 'Work notification result'),
+        },
+        leaseToken: boundedString(lease.leaseToken, 'notification lease token', 512),
+      };
+    });
+  }
+
+  async startNotification(notificationId: string, leaseToken: string): Promise<void> {
+    await this.requestAt(`${this.workUrl}/notifications/${encodeURIComponent(notificationId)}/start`, 'POST', { leaseToken });
+  }
+
+  async finishNotification(
+    notificationId: string,
+    leaseToken: string,
+    outcome: 'delivered' | 'failed' | 'uncertain' | 'retry',
+    result: Readonly<Record<string, unknown>> = {},
+    retryAfterSeconds?: number,
+  ): Promise<void> {
+    await this.requestAt(`${this.workUrl}/notifications/${encodeURIComponent(notificationId)}/finish`, 'POST', {
+      leaseToken,
+      outcome,
+      ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }),
+      result,
+    });
+  }
+
   private async request(
     path: string,
+    method: string,
+    body?: unknown,
+    timeoutMs?: number,
+    extraHeaders: Readonly<Record<string, string>> = {},
+  ): Promise<unknown> {
+    return this.requestAt(this.tasksUrl + path, method, body, timeoutMs, extraHeaders);
+  }
+
+  private async requestAt(
+    url: string,
     method: string,
     body?: unknown,
     timeoutMs?: number,
@@ -284,7 +551,7 @@ export class WorkStateClient implements WorkStateStore {
     const token = process.env[tokenEnv];
     if (!token) throw new Error(`Missing persistence credential in ${tokenEnv}`);
     const requestTimeoutMs = timeoutMs ?? this.connection.requestTimeoutMs ?? 10_000;
-    const response = await fetch(this.tasksUrl + path, {
+    const response = await fetch(url, {
       method,
       headers: {
         Authorization: `Bearer ${token}`,
@@ -317,6 +584,21 @@ function errorCode(value: unknown): string {
   }
 }
 
+function safeIdentifier(value: unknown, label: string): string {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/u.test(value)) {
+    throw new TypeError(`Invalid ${label}`);
+  }
+  return value;
+}
+
+function boundedString(value: unknown, label: string, maximum: number): string {
+  if (typeof value !== 'string' || value.length === 0 || value.length > maximum
+    || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new TypeError(`Invalid ${label}`);
+  }
+  return value;
+}
+
 /** Sanitized HTTP failure with no response body or credential details.  中文：不携带响应正文或凭据细节的安全 HTTP 错误。 */
 export class WorkStateHttpError extends Error {
   constructor(readonly status: number, readonly code: string) {
@@ -329,14 +611,19 @@ export class WorkStateHttpError extends Error {
 export class InMemoryWorkStateStore implements WorkStateStore {
   private readonly records = new Map<string, TaskRecord>();
   private readonly events = new Map<string, DurableTaskEvent[]>();
+  private readonly connectorEvents = new Map<string, { digest: string; receipt: ConnectorEventReceipt }>();
+  private readonly connectorThreads = new Map<string, ConnectorThreadRecord>();
+  private readonly connectorThreadRoutes = new Map<string, Omit<ConnectorThreadRecord, 'sessionId' | 'messages'>>();
+  private readonly connectorThreadMessages = new Map<string, ConnectorThreadRecord['messages'][number][]>();
 
-  async createTask(input: { id?: string; sessionId: string; prompt: string }): Promise<TaskRecord> {
+  async createTask(input: { id?: string; sessionId: string; prompt: string; metadata?: Readonly<Record<string, unknown>> }): Promise<TaskRecord> {
     const id = input.id ?? `task-${randomUUID()}`;
     if (this.records.has(id)) throw new WorkStateHttpError(409, 'TASK_ALREADY_EXISTS');
     const now = Date.now();
     const row: TaskRecord = {
       id, sessionId: input.sessionId, prompt: input.prompt, status: 'queued',
       createdAt: now, output: '', reasoning: '', durationMs: 0,
+      ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
     };
     this.records.set(id, row);
     this.events.set(id, []);
@@ -447,6 +734,109 @@ export class InMemoryWorkStateStore implements WorkStateStore {
     const events = this.events.get(taskId)!.filter(row => row.seq > after);
     return { events, nextSeq: this.events.get(taskId)!.length + 1 };
   }
+
+  async listUnresolvedOperations(): Promise<readonly UnresolvedOperationSummary[]> { return []; }
+
+  async registerConnectorEvent(input: ConnectorEventInput): Promise<ConnectorEventReceipt> {
+    const key = `${input.connectorId}\0${input.messageId}`;
+    const teamsThreadMessage = input.teamsThreadMessage;
+    if (teamsThreadMessage !== undefined && input.payload.messageId !== teamsThreadMessage.messageId) {
+      throw new TypeError('Teams thread message ID does not match its canonical event payload');
+    }
+    const digestInput = teamsThreadMessage === undefined ? input : {
+      ...input,
+      teamsThreadMessage: Object.fromEntries(Object.entries(teamsThreadMessage).filter(([field]) => field !== 'sessionId')),
+    };
+    const digest = createHash('sha256').update(JSON.stringify(digestInput)).digest('hex');
+    const prior = this.connectorEvents.get(key);
+    if (prior) {
+      if (prior.digest !== digest) throw new WorkStateHttpError(409, 'CONNECTOR_EVENT_ID_CONFLICT');
+      return { ...prior.receipt, duplicate: true };
+    }
+    if (teamsThreadMessage) {
+      const threadKey = `${input.connectorId}\0${teamsThreadMessage.threadId}`;
+      const route = this.connectorThreadRoutes.get(threadKey);
+      if (route && (route.tenantId !== teamsThreadMessage.tenantId || route.teamId !== teamsThreadMessage.teamId
+        || route.channelId !== teamsThreadMessage.channelId || route.conversationId !== teamsThreadMessage.conversationId
+        || route.rootThreadId !== teamsThreadMessage.rootThreadId)) {
+        throw new WorkStateHttpError(409, 'CONNECTOR_THREAD_CONFLICT');
+      }
+    }
+    if (teamsThreadMessage?.sessionId) {
+      const threadKey = `${input.connectorId}\0${teamsThreadMessage.threadId}`;
+      const mapped = this.connectorThreads.get(threadKey);
+      if (mapped && (mapped.sessionId !== teamsThreadMessage.sessionId
+        || mapped.tenantId !== teamsThreadMessage.tenantId || mapped.teamId !== teamsThreadMessage.teamId
+        || mapped.channelId !== teamsThreadMessage.channelId || mapped.conversationId !== teamsThreadMessage.conversationId
+        || mapped.rootThreadId !== teamsThreadMessage.rootThreadId)) {
+        throw new WorkStateHttpError(409, 'CONNECTOR_THREAD_CONFLICT');
+      }
+    }
+    const task = input.task ? await this.createTask(input.task) : undefined;
+    if (teamsThreadMessage) {
+      const threadKey = `${input.connectorId}\0${teamsThreadMessage.threadId}`;
+      this.connectorThreadRoutes.set(threadKey, {
+        threadId: teamsThreadMessage.threadId,
+        tenantId: teamsThreadMessage.tenantId,
+        teamId: teamsThreadMessage.teamId,
+        channelId: teamsThreadMessage.channelId,
+        conversationId: teamsThreadMessage.conversationId,
+        rootThreadId: teamsThreadMessage.rootThreadId,
+        serviceUrl: teamsThreadMessage.serviceUrl,
+      });
+      if (teamsThreadMessage.sessionId) {
+        this.connectorThreads.set(threadKey, {
+          threadId: teamsThreadMessage.threadId,
+          tenantId: teamsThreadMessage.tenantId,
+          teamId: teamsThreadMessage.teamId,
+          channelId: teamsThreadMessage.channelId,
+          conversationId: teamsThreadMessage.conversationId,
+          rootThreadId: teamsThreadMessage.rootThreadId,
+          serviceUrl: teamsThreadMessage.serviceUrl,
+          sessionId: teamsThreadMessage.sessionId,
+          messages: [],
+        });
+      }
+      const messages = this.connectorThreadMessages.get(threadKey) ?? [];
+      messages.push({
+        messageId: teamsThreadMessage.messageId,
+        actorIssuer: teamsThreadMessage.actorIssuer,
+        actorSubject: teamsThreadMessage.actorSubject,
+        text: teamsThreadMessage.text,
+        createdAt: Date.now(),
+      });
+      this.connectorThreadMessages.set(threadKey, messages);
+    }
+    const receipt: ConnectorEventReceipt = {
+      eventId: randomUUID(), duplicate: false, receivedAt: Date.now(),
+      ...(task === undefined ? {} : { task }),
+    };
+    this.connectorEvents.set(key, { digest, receipt });
+    return receipt;
+  }
+
+  async getConnectorThread(
+    connectorId: string,
+    threadId: string,
+    messageLimit = 20,
+    excludeMessageId?: string,
+  ): Promise<ConnectorThreadRecord> {
+    const key = `${connectorId}\0${threadId}`;
+    const route = this.connectorThreadRoutes.get(key);
+    if (!route) throw new WorkStateHttpError(404, 'WORK_CONNECTOR_THREAD_NOT_FOUND');
+    const record = this.connectorThreads.get(key);
+    return {
+      ...route,
+      ...(record === undefined ? {} : { sessionId: record.sessionId }),
+      messages: (this.connectorThreadMessages.get(key) ?? [])
+        .filter(message => message.messageId !== excludeMessageId)
+        .slice(-messageLimit),
+    };
+  }
+
+  async claimNotifications(): Promise<readonly NotificationLease[]> { return []; }
+  async startNotification(): Promise<void> { throw new WorkStateHttpError(404, 'NOTIFICATION_NOT_FOUND'); }
+  async finishNotification(): Promise<void> { throw new WorkStateHttpError(404, 'NOTIFICATION_NOT_FOUND'); }
 }
 
 const TERMINAL_STATUSES = new Set<ExecutionStatus>(['completed', 'failed', 'aborted']);

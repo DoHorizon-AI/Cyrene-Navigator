@@ -121,6 +121,77 @@ launcher 会将此 Bearer 绑定到精确配置的 DSH Session 与 Workspace。t
 本地 CLI 尚未实现 Client 的 session-bound Control bridge，因此此集成选项仍要求外部提供当前用户
 Bearer。CLI 不会把它写入 Navigator 数据库。
 
+## Teams ingress and connector grants / Teams 入站与连接器授权
+
+Teams is disabled unless `TEAMS_ENABLED=true`. The executor accepts only the
+Teams adapter's timestamped HMAC callback, checks the configured tenant and
+team allowlist, and persists the activity before returning success. Configure
+`TEAMS_NAVIGATOR_HMAC_KEY` through the secret manager (at least 32 bytes),
+`TEAMS_TENANT_ID`, `TEAMS_ALLOWED_TEAM_IDS`, `TEAMS_BOT_APP_ID`, and
+`TEAMS_TASK_ACTOR_SUBJECTS_FILE`. The private JSON file uses
+`{"schemaVersion":1,"workspaceId":"...","issuer":"https://login.microsoftonline.com/<tenant-uuid>/v2.0","subjects":["<aad-object-uuid>"]}`.
+Navigator reloads it for each admission and before each Teams reply; a scope
+mismatch or unreadable file fails closed. The owner provisioning command updates
+this projection after Directory authorization. `TEAMS_TASK_ACTOR_SUBJECTS` remains
+available for static deployments that do not configure the file. The first task
+actor is Derek's immutable Entra object ID; additional actor IDs can be added by
+the owner command. Member
+messages in an admitted thread are stored as context but never start tasks or
+enter another actor's operation prompt. The SDK-verified per-activity service
+URL is validated against exact Bot Framework HTTPS hosts and regional paths,
+then kept only in the private thread/outbox route and exact connector grant.
+
+The outbox dispatcher uses `CYRENE_EXCHANGE_CONNECTOR_INTERNAL_URL`,
+`NAVIGATOR_EXCHANGE_HMAC_KEY_FILE`, `NAVIGATOR_EXCHANGE_HMAC_KEY_ID`, and the
+host-bound `TEAMS_EXCHANGE_CONNECTION_REF` / `TEAMS_EXCHANGE_PROFILE_REF`. It
+mints a short-lived grant for each exact provider call and each final Teams
+reply. Grants stay in memory. Unknown delivery results become `uncertain` and
+are not resent automatically. `CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS` defaults
+to `1`; the launcher accepts values from 1 to 32.
+
+`CYRENE_CONNECTOR_BINDINGS_FILE` is a read-only launcher-owned JSON file. Its
+`schemaVersion: 1` binding rows map a Tool Provider `bindingId` to an Exchange
+connection UUID, provider ID, fixed profile reference, and a list of fixed
+`toolId → operationId` mappings with `resourceProjection` and `mutating` fields.
+Navigator validates every operation and mutability flag against its closed
+table before it registers these mappings. It rejects unknown operations or a
+projection/mutability mismatch at startup. With connector authorization enabled,
+Navigator exposes only catalog tools named by the trusted binding map. String,
+numeric, and collection bounds unsupported by DSH are removed from its display
+schema and enforced by Navigator before approval or dispatch; any other
+unsupported schema keyword rejects registration. The model cannot change the binding,
+profile, operation ID, or caller identity. Cloud, GitHub, and Hugging Face CLI
+operations bind to the fixed profile scope, are classified as writes, and sign
+the complete `argv` in the exact argument digest. Prefer typed API tools when
+they provide the requested query result.
+GitHub and Hugging Face provider tools expose only their canonical operation
+arguments to the model; Navigator keeps their profile outside the payload and
+binds it in the grant. Their CLI tools expose only `argv`, and Exchange uses an
+empty Account Center lease target for those CLI calls.
+
+Teams 默认关闭。设置 `TEAMS_ENABLED=true` 后，executor 只接受带时间戳 HMAC 的 Teams adapter
+回调，核对配置的 tenant/team allowlist，并在持久接纳事件后才返回成功。通过 secret manager 配置
+`TEAMS_NAVIGATOR_HMAC_KEY`（至少 32 字节）、`TEAMS_TENANT_ID`、`TEAMS_ALLOWED_TEAM_IDS`、
+`TEAMS_BOT_APP_ID` 和 `TEAMS_TASK_ACTOR_SUBJECTS_FILE`。私有 JSON 使用
+`{"schemaVersion":1,"workspaceId":"...","issuer":"https://login.microsoftonline.com/<tenant-uuid>/v2.0","subjects":["<aad-object-uuid>"]}`；Navigator 在每次接纳事件和发送 Teams 回帖前重新读取，范围不匹配或文件不可读时关闭授权。维护者命令在 Directory 授权成功后更新此投影。未配置文件时仍兼容静态 `TEAMS_TASK_ACTOR_SUBJECTS`。首位任务执行者是 Derek 不变的 Entra object ID；
+后续维护者可用宿主管理命令添加。已接纳线程里的其他成员消息会保存为讨论上下文，不会启动任务，
+也不会进入另一位维护者的操作提示。
+
+outbox dispatcher 使用 `CYRENE_EXCHANGE_CONNECTOR_INTERNAL_URL`、
+`NAVIGATOR_EXCHANGE_HMAC_KEY_FILE`、`NAVIGATOR_EXCHANGE_HMAC_KEY_ID` 和宿主绑定的
+`TEAMS_EXCHANGE_CONNECTION_REF` / `TEAMS_EXCHANGE_PROFILE_REF`。每次精确 provider 调用和最终 Teams
+回帖都会申请短期 grant，grant 仅驻留内存。投递结果未知时记录为 `uncertain`，不自动重发。
+`CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS` 默认 `1`，launcher 接受 `1` 到 `32`。
+
+`CYRENE_CONNECTOR_BINDINGS_FILE` 是 launcher 只读管理的 JSON 文件。`schemaVersion: 1` 的 binding
+行把 Tool Provider `bindingId` 映射到 Exchange connection UUID、provider ID、固定 profile reference，
+以及固定的 `toolId → operationId` 列表和 `resourceProjection`、`mutating` 字段。Navigator 会用闭合表
+校验每项 operation 和 mutability；未知操作或投影/权限标记不匹配会阻止启动。模型无法更改 binding、
+profile、operation ID 或调用者身份。CLI 操作绑定固定 profile，并在 exact argument digest 中签入完整
+`argv`。
+GitHub 和 Hugging Face provider tools 只向模型暴露各自的标准 operation 参数；Navigator 不把 profile 写进参数，
+而是在 grant 中单独绑定。两类 CLI 只暴露 `argv`，Exchange 对它们使用空的 Account Center lease target。
+
 The process prints one JSON line with the Web Host, persistence, and executor
 URLs after all three listeners pass readiness probes. Child logs are discarded
 by the supervisor. The one-time pairing code is written to

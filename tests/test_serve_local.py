@@ -143,6 +143,110 @@ def test_workflow_flag_accepts_only_explicit_boolean_values() -> None:
         )
 
 
+def test_teams_owner_projection_file_is_forwarded_without_static_actor_env(tmp_path: Path) -> None:
+    """Forward the scoped owner projection and keep it outside unrelated child processes."""
+
+    workspace_id = "11111111-1111-4111-8111-111111111111"
+    tenant_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    actor_id = "d83aeb27-ff11-46d7-b0f7-af8da8d5b8ec"
+    actor_file = tmp_path / "teams-actor-subjects.json"
+    actor_file.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "workspaceId": workspace_id,
+                "issuer": f"https://login.microsoftonline.com/{tenant_id}/v2.0",
+                "subjects": [actor_id],
+            }
+        ),
+        encoding="utf-8",
+    )
+    key_file = tmp_path / "exchange-hmac.key"
+    key_file.write_bytes(b"x" * 32)
+    binding_file = tmp_path / "connector-bindings.json"
+    binding_file.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "bindings": [
+                    {
+                        "bindingId": "exchange-github-11111111-1111-4111-8111-111111111111",
+                        "connectionRef": "11111111-1111-4111-8111-111111111111",
+                        "providerId": "github",
+                        "profileRef": "github-profile-1",
+                        "tools": [
+                            {
+                                "toolId": "github_repository_list",
+                                "operationId": "github.repository.list",
+                                "resourceProjection": "profile",
+                                "mutating": False,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    forwarded = serve_local._executor_integration_environment(
+        {
+            "TEAMS_ENABLED": "true",
+            "TEAMS_NAVIGATOR_HMAC_KEY": "teams-ingress-test-key-0123456789abcdef",
+            "TEAMS_TENANT_ID": tenant_id,
+            "TEAMS_ALLOWED_TEAM_IDS": "team-1",
+            "TEAMS_BOT_APP_ID": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            "TEAMS_TASK_ACTOR_SUBJECTS_FILE": str(actor_file),
+            "TEAMS_EXCHANGE_CONNECTION_REF": "22222222-2222-4222-8222-222222222222",
+            "TEAMS_EXCHANGE_PROFILE_REF": "teams-profile-1",
+            "CYRENE_EXCHANGE_CONNECTOR_INTERNAL_URL": "https://exchange.example.test",
+            "NAVIGATOR_EXCHANGE_HMAC_KEY_FILE": str(key_file),
+            "NAVIGATOR_EXCHANGE_HMAC_KEY_ID": "navigator-prod-v1",
+            "CYRENE_CONNECTOR_BINDINGS_FILE": str(binding_file),
+        },
+        workspace_id=workspace_id,
+    )
+
+    assert forwarded["TEAMS_TASK_ACTOR_SUBJECTS_FILE"] == str(actor_file.resolve())
+    assert "TEAMS_TASK_ACTOR_SUBJECTS" not in forwarded
+
+
+def test_teams_owner_projection_rejects_mismatched_workspace_or_issuer(tmp_path: Path) -> None:
+    """Refuse a maintainer file scoped to a different Workspace or tenant issuer."""
+
+    workspace_id = "11111111-1111-4111-8111-111111111111"
+    tenant_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    actor_file = tmp_path / "teams-actor-subjects.json"
+    actor_file.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "workspaceId": "another-workspace",
+                "issuer": f"https://login.microsoftonline.com/{tenant_id}/v2.0",
+                "subjects": ["d83aeb27-ff11-46d7-b0f7-af8da8d5b8ec"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="invalid scope or schema"):
+        serve_local._executor_integration_environment(
+            {
+                "TEAMS_ENABLED": "true",
+                "TEAMS_NAVIGATOR_HMAC_KEY": "teams-ingress-test-key-0123456789abcdef",
+                "TEAMS_TENANT_ID": tenant_id,
+                "TEAMS_ALLOWED_TEAM_IDS": "team-1",
+                "TEAMS_BOT_APP_ID": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                "TEAMS_TASK_ACTOR_SUBJECTS_FILE": str(actor_file),
+                "TEAMS_EXCHANGE_CONNECTION_REF": "22222222-2222-4222-8222-222222222222",
+                "TEAMS_EXCHANGE_PROFILE_REF": "teams-profile-1",
+                "CYRENE_EXCHANGE_CONNECTOR_INTERNAL_URL": "https://exchange.example.test",
+                "NAVIGATOR_EXCHANGE_HMAC_KEY_FILE": str(tmp_path / "missing.key"),
+                "NAVIGATOR_EXCHANGE_HMAC_KEY_ID": "navigator-prod-v1",
+                "CYRENE_CONNECTOR_BINDINGS_FILE": str(tmp_path / "missing-bindings.json"),
+            },
+            workspace_id=workspace_id,
+        )
+
+
 def test_exchange_cli_bearer_requires_a_trusted_single_session_binding() -> None:
     """The local supervisor rejects a process Bearer with no explicit DSH session."""
 

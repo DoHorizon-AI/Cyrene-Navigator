@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import secrets
 import sqlite3
 import time
@@ -17,7 +18,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from cyrene_navigator.persistence.errors import PersistenceError
 
@@ -1120,6 +1121,21 @@ class WorkStore:
                         "idempotencyKey names another operation.",
                     )
                 return self._operation_view(prior), True
+            if (
+                operation_type.startswith("tool.provider.v1:")
+                and target is not None
+                and target.startswith("connector-target:")
+            ):
+                unresolved = conn.execute(
+                    """SELECT 1 FROM work_operations WHERE organization_id=? AND workspace_id=?
+                       AND target=? AND status IN ('started','uncertain') LIMIT 1""",
+                    (org, workspace, target),
+                ).fetchone()
+                if unresolved is not None:
+                    raise _conflict(
+                        "WORK_OPERATION_TARGET_UNRESOLVED",
+                        "An operation on this exact provider target still needs reconciliation.",
+                    )
             operation_id = uuid4().hex
             conn.execute(
                 """INSERT INTO work_operations(
@@ -1226,6 +1242,59 @@ class WorkStore:
                     "The operation does not exist in this Workspace.",
                 )
             return self._operation_view(row)
+
+    def list_unresolved_operations(
+        self,
+        organization_id: str | None,
+        workspace_id: str,
+        *,
+        target: str | None = None,
+        operation_type: str | None = None,
+        limit: int = 100,
+    ) -> list[JsonObject]:
+        """List minimal started/uncertain receipts for exact-target reconciliation.
+
+        中文：只返回目标/操作精确匹配的未解决回执，不泄露完整参数正文。
+        """
+
+        org, workspace = _scope(organization_id, workspace_id)
+        target_value = _optional_text(target, "target", 2_000)
+        operation_value = _optional_text(operation_type, "operationType", 128)
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise _invalid("WORK_OPERATION_INVALID_PAGE", "limit must be between 1 and 500")
+        filters = [
+            "organization_id=?",
+            "workspace_id=?",
+            "status IN ('started','uncertain')",
+        ]
+        params: list[Any] = [org, workspace]
+        if target_value is not None:
+            filters.append("target=?")
+            params.append(target_value)
+        if operation_value is not None:
+            filters.append("operation_type=?")
+            params.append(operation_value)
+        params.append(limit)
+        with self._read() as conn:
+            rows = conn.execute(
+                "SELECT * FROM work_operations WHERE "
+                + " AND ".join(filters)
+                + " ORDER BY created_at,operation_id LIMIT ?",
+                params,
+            ).fetchall()
+            return [
+                {
+                    "id": str(row["operation_id"]),
+                    "operationType": str(row["operation_type"]),
+                    "taskId": row["task_id"],
+                    "target": row["target"],
+                    "status": str(row["status"]),
+                    "evidence": _stored_object(row["evidence_json"], "operation evidence"),
+                    "createdAt": int(row["created_at"]),
+                    "updatedAt": int(row["updated_at"]),
+                }
+                for row in rows
+            ]
 
     def upsert_memory_fact(
         self, organization_id: str | None, workspace_id: str, body: Mapping[str, Any]
@@ -2056,14 +2125,33 @@ class WorkStore:
         lease_token: str,
         outcome: str,
         result: Mapping[str, Any],
+        retry_after_seconds: int | None = None,
     ) -> JsonObject:
         """Persist a delivery result; uncertain outcomes are terminal until reviewed. |
         记录投递结果。"""
 
-        if outcome not in {"delivered", "failed", "uncertain"}:
+        if outcome not in {"delivered", "failed", "uncertain", "retry"}:
             raise _invalid("WORK_NOTIFICATION_INVALID_OUTCOME", "outcome is not valid")
+        if outcome == "retry" and (
+            type(retry_after_seconds) is not int or not 1 <= retry_after_seconds <= 300
+        ):
+            raise _invalid(
+                "WORK_NOTIFICATION_INVALID_RETRY",
+                "A retry outcome requires retryAfterSeconds between 1 and 300.",
+            )
+        if outcome != "retry" and retry_after_seconds is not None:
+            raise _invalid(
+                "WORK_NOTIFICATION_INVALID_RETRY",
+                "retryAfterSeconds is supported only for the retry outcome.",
+            )
         return self._notification_transition(
-            organization_id, workspace_id, notification_id, lease_token, outcome, result
+            organization_id,
+            workspace_id,
+            notification_id,
+            lease_token,
+            outcome,
+            result,
+            retry_after_seconds=retry_after_seconds,
         )
 
     def get_attachment(
@@ -2227,6 +2315,12 @@ class WorkStore:
         conversation_id = _optional_text(body.get("conversationId"), "conversationId", 512)
         sender_id = _optional_text(body.get("senderId"), "senderId", 512)
         payload = _json_object(body.get("payload", {}), "payload")
+        teams_message = _teams_thread_message(body.get("teamsThreadMessage"))
+        if teams_message is not None and payload.get("messageId") != teams_message["messageId"]:
+            raise _invalid(
+                "WORK_CONNECTOR_INVALID_TEAMS_THREAD",
+                "teamsThreadMessage.messageId must match the canonical event payload.",
+            )
         if event_type.endswith("login.qr") or any(
             key in payload for key in ("qrPayload", "qr_payload")
         ):
@@ -2247,6 +2341,11 @@ class WorkStore:
                 "description": task_body.get("description"),
                 "metadata": task_body.get("metadata", {}),
             }
+        teams_digest_message = (
+            {key: item for key, item in teams_message.items() if key != "sessionId"}
+            if teams_message is not None
+            else None
+        )
         event_body = {
             "type": event_type,
             "occurredAt": supplied_occurred_at,
@@ -2254,7 +2353,8 @@ class WorkStore:
             "conversationId": conversation_id,
             "senderId": sender_id,
             "payload": payload,
-            "task": task_digest_body,
+            "task": None if teams_message is not None else task_digest_body,
+            "teamsThreadMessage": teams_digest_message,
         }
         event_digest = _digest(event_body)
         now = _unix_ms()
@@ -2287,6 +2387,19 @@ class WorkStore:
                     conn, org, workspace, task_digest_body, now, actor_id
                 )
                 task_id = str(task_view["id"])
+            if teams_message is not None:
+                if (
+                    task_view is not None
+                    and teams_message.get("sessionId") is not None
+                    and str(task_view["sessionId"]) != str(teams_message["sessionId"])
+                ):
+                    raise _conflict(
+                        "WORK_CONNECTOR_THREAD_SESSION_MISMATCH",
+                        "The Teams task and thread mapping must use the same Session.",
+                    )
+                self._store_teams_thread_message(
+                    conn, org, workspace, connector_id, teams_message, now
+                )
             event_id = uuid4().hex
             sequence_row = conn.execute(
                 """SELECT COALESCE(MAX(seq),0) AS seq FROM work_connector_events
@@ -2350,6 +2463,194 @@ class WorkStore:
                 "duplicate": False,
                 "receivedAt": now,
             }, task_view
+
+    def get_connector_thread(
+        self,
+        organization_id: str | None,
+        workspace_id: str,
+        connector_id: str,
+        thread_id: str,
+        *,
+        message_limit: int = 20,
+        exclude_message_id: str | None = None,
+    ) -> JsonObject:
+        """Read the exact Teams thread mapping and bounded participant context.
+
+        Args:
+            organization_id: Authenticated organization scope.
+            workspace_id: Authenticated Workspace scope.
+            connector_id: Configured connector binding.
+            thread_id: Stable host-derived digest of tenant/team/channel/root thread IDs.
+            message_limit: Maximum context messages, newest messages win.
+        Returns:
+            The mapped DSH Session and recent participant text in chronological order.
+        Raises:
+            PersistenceError: If no mapped thread exists or the page is invalid.
+
+        中文：按精确线程摘要查询持久 Session 映射和最近讨论内容。
+        """
+
+        org, workspace = _scope(organization_id, workspace_id)
+        connector_id = _identifier(connector_id, "connector id")
+        thread_id = _identifier(thread_id, "thread id")
+        excluded = _optional_text(exclude_message_id, "excludeMessageId", 512)
+        if type(message_limit) is not int or not 1 <= message_limit <= 100:
+            raise _invalid("WORK_CONNECTOR_INVALID_THREAD_PAGE", "messageLimit must be 1 to 100")
+        with self._read() as conn:
+            row = conn.execute(
+                """SELECT * FROM work_connector_threads WHERE organization_id=? AND workspace_id=?
+                   AND connector_id=? AND thread_id=?""",
+                (org, workspace, connector_id, thread_id),
+            ).fetchone()
+            route_row = row
+            if route_row is None:
+                route_row = conn.execute(
+                    """SELECT tenant_id,team_id,channel_id,conversation_id,root_thread_id,
+                       service_url
+                       FROM work_connector_thread_messages WHERE organization_id=? AND
+                       workspace_id=? AND connector_id=? AND thread_id=?
+                       ORDER BY created_at DESC,message_id DESC LIMIT 1""",
+                    (org, workspace, connector_id, thread_id),
+                ).fetchone()
+            if route_row is None:
+                raise _not_found(
+                    "WORK_CONNECTOR_THREAD_NOT_FOUND", "The Teams thread has no accepted messages."
+                )
+            exclusion = "" if excluded is None else "AND message_id<>?"
+            message_params: tuple[Any, ...] = (org, workspace, connector_id, thread_id)
+            if excluded is not None:
+                message_params += (excluded,)
+            message_params += (message_limit,)
+            message_rows = conn.execute(
+                f"""SELECT * FROM work_connector_thread_messages WHERE organization_id=? AND
+                   workspace_id=? AND connector_id=? AND thread_id=? {exclusion}
+                   ORDER BY created_at DESC,message_id DESC LIMIT ?""",
+                message_params,
+            ).fetchall()
+            return {
+                "threadId": thread_id,
+                "tenantId": str(route_row["tenant_id"]),
+                "teamId": str(route_row["team_id"]),
+                "channelId": str(route_row["channel_id"]),
+                "conversationId": str(route_row["conversation_id"]),
+                "rootThreadId": str(route_row["root_thread_id"]),
+                "serviceUrl": str(route_row["service_url"] or ""),
+                "sessionId": str(row["session_id"]) if row is not None else None,
+                "messages": [
+                    {
+                        "messageId": str(item["message_id"]),
+                        "actorIssuer": str(item["actor_issuer"]),
+                        "actorSubject": str(item["actor_subject"]),
+                        "text": str(item["message_text"]),
+                        "createdAt": int(item["created_at"]),
+                    }
+                    for item in reversed(message_rows)
+                ],
+            }
+
+    def _store_teams_thread_message(
+        self,
+        conn: sqlite3.Connection,
+        org: str,
+        workspace: str,
+        connector_id: str,
+        message: Mapping[str, Any],
+        now: int,
+    ) -> None:
+        """Persist verified Teams context and atomically establish owner thread mappings."""
+
+        thread_id = str(message["threadId"])
+        message_id = str(message["messageId"])
+        route_fields = (
+            "tenantId",
+            "teamId",
+            "channelId",
+            "conversationId",
+            "rootThreadId",
+        )
+        route = {field: str(message[field]) for field in route_fields}
+        service_url = str(message.get("serviceUrl", ""))
+        session_id = message.get("sessionId")
+        if session_id is not None:
+            session_id = str(session_id)
+            existing = conn.execute(
+                """SELECT * FROM work_connector_threads WHERE organization_id=? AND workspace_id=?
+                   AND connector_id=? AND thread_id=?""",
+                (org, workspace, connector_id, thread_id),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    any(
+                        str(existing[column]) != route[field]
+                        for field, column in zip(
+                            route_fields,
+                            (
+                                "tenant_id",
+                                "team_id",
+                                "channel_id",
+                                "conversation_id",
+                                "root_thread_id",
+                            ),
+                            strict=True,
+                        )
+                    )
+                    or str(existing["session_id"]) != session_id
+                ):
+                    raise _conflict(
+                        "WORK_CONNECTOR_THREAD_CONFLICT",
+                        "The Teams thread key is already mapped to another session or route.",
+                    )
+                conn.execute(
+                    """UPDATE work_connector_threads SET service_url=?,updated_at=?
+                       WHERE organization_id=?
+                       AND workspace_id=? AND connector_id=? AND thread_id=?""",
+                    (service_url, now, org, workspace, connector_id, thread_id),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO work_connector_threads(organization_id,workspace_id,
+                       connector_id,thread_id,tenant_id,team_id,channel_id,conversation_id,
+                       root_thread_id,service_url,session_id,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        org,
+                        workspace,
+                        connector_id,
+                        thread_id,
+                        route["tenantId"],
+                        route["teamId"],
+                        route["channelId"],
+                        route["conversationId"],
+                        route["rootThreadId"],
+                        service_url,
+                        session_id,
+                        now,
+                        now,
+                    ),
+                )
+        conn.execute(
+            """INSERT OR IGNORE INTO work_connector_thread_messages(
+               organization_id,workspace_id,connector_id,thread_id,message_id,tenant_id,team_id,
+               channel_id,conversation_id,root_thread_id,service_url,actor_issuer,actor_subject,
+               message_text,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                org,
+                workspace,
+                connector_id,
+                thread_id,
+                message_id,
+                route["tenantId"],
+                route["teamId"],
+                route["channelId"],
+                route["conversationId"],
+                route["rootThreadId"],
+                service_url,
+                str(message["actorIssuer"]),
+                str(message["actorSubject"]),
+                str(message["text"]),
+                now,
+            ),
+        )
 
     def list_connector_events(
         self,
@@ -2535,6 +2836,8 @@ class WorkStore:
         lease_token: str,
         target_status: str,
         result: Mapping[str, Any],
+        *,
+        retry_after_seconds: int | None = None,
     ) -> JsonObject:
         """Apply a token-fenced delivery transition. | 按租约令牌更新投递状态。"""
 
@@ -2584,20 +2887,50 @@ class WorkStore:
                         "WORK_NOTIFICATION_DELIVERY_STATE_INVALID",
                         "Only the current started lease can record a delivery result.",
                     )
-                conn.execute(
-                    """UPDATE work_notifications SET
-                    status=?,result_json=?,updated_at=?,worker_id=NULL,
-                       lease_expires_at=NULL WHERE organization_id=? AND workspace_id=? AND
-                       notification_id=?""",
-                    (
-                        target_status,
-                        _json_text(normalized_result),
-                        now,
-                        org,
-                        workspace,
-                        notification_id,
-                    ),
-                )
+                if target_status == "retry":
+                    retry_count = old_result.get("retryCount", 0)
+                    if type(retry_count) is not int or retry_count < 0:
+                        raise PersistenceError(
+                            "WORK_STORAGE_CORRUPT",
+                            500,
+                            "Stored notification retry count is invalid.",
+                        )
+                    if retry_count >= 3:
+                        raise _conflict(
+                            "WORK_NOTIFICATION_RETRY_LIMIT",
+                            "The bounded notification retry limit has been reached.",
+                        )
+                    assert retry_after_seconds is not None
+                    stored_result = {**normalized_result, "retryCount": retry_count + 1}
+                    conn.execute(
+                        """UPDATE work_notifications SET status='queued',available_at=?,
+                           result_json=?,updated_at=?,worker_id=NULL,lease_token_hash=NULL,
+                           lease_expires_at=NULL WHERE organization_id=? AND workspace_id=? AND
+                           notification_id=?""",
+                        (
+                            now + retry_after_seconds * 1_000,
+                            _json_text(stored_result),
+                            now,
+                            org,
+                            workspace,
+                            notification_id,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """UPDATE work_notifications SET
+                        status=?,result_json=?,updated_at=?,worker_id=NULL,
+                           lease_expires_at=NULL WHERE organization_id=? AND workspace_id=? AND
+                           notification_id=?""",
+                        (
+                            target_status,
+                            _json_text(normalized_result),
+                            now,
+                            org,
+                            workspace,
+                            notification_id,
+                        ),
+                    )
             updated = conn.execute(
                 (
                     "SELECT * FROM work_notifications WHERE organization_id=? AND "
@@ -2623,6 +2956,17 @@ class WorkStore:
                 "work_notifications": {"connector_id": "TEXT", "task_id": "TEXT"},
                 "work_operations": {"task_id": "TEXT"},
                 "work_connector_states": {"configured": "INTEGER NOT NULL DEFAULT 0"},
+                "work_connector_threads": {
+                    "service_url": "TEXT NOT NULL DEFAULT ''",
+                },
+                "work_connector_thread_messages": {
+                    "tenant_id": "TEXT NOT NULL DEFAULT ''",
+                    "team_id": "TEXT NOT NULL DEFAULT ''",
+                    "channel_id": "TEXT NOT NULL DEFAULT ''",
+                    "conversation_id": "TEXT NOT NULL DEFAULT ''",
+                    "root_thread_id": "TEXT NOT NULL DEFAULT ''",
+                    "service_url": "TEXT NOT NULL DEFAULT ''",
+                },
             }
             for table, additions in migrations.items():
                 columns = {
@@ -3264,6 +3608,23 @@ CREATE TABLE IF NOT EXISTS work_connector_events (
  event_digest TEXT NOT NULL, task_id TEXT, expires_at INTEGER,
  PRIMARY KEY(organization_id,workspace_id,connector_id,seq),
  UNIQUE(organization_id,workspace_id,connector_id,message_id));
+CREATE TABLE IF NOT EXISTS work_connector_threads (
+ organization_id TEXT NOT NULL, workspace_id TEXT NOT NULL, connector_id TEXT NOT NULL,
+ thread_id TEXT NOT NULL, tenant_id TEXT NOT NULL, team_id TEXT NOT NULL,
+ channel_id TEXT NOT NULL, conversation_id TEXT NOT NULL, root_thread_id TEXT NOT NULL,
+ service_url TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL, created_at INTEGER NOT NULL,
+ updated_at INTEGER NOT NULL,
+ PRIMARY KEY(organization_id,workspace_id,connector_id,thread_id));
+CREATE TABLE IF NOT EXISTS work_connector_thread_messages (
+ organization_id TEXT NOT NULL, workspace_id TEXT NOT NULL, connector_id TEXT NOT NULL,
+ thread_id TEXT NOT NULL, message_id TEXT NOT NULL, tenant_id TEXT NOT NULL,
+ team_id TEXT NOT NULL, channel_id TEXT NOT NULL, conversation_id TEXT NOT NULL,
+ root_thread_id TEXT NOT NULL, service_url TEXT NOT NULL DEFAULT '',
+ actor_issuer TEXT NOT NULL, actor_subject TEXT NOT NULL,
+ message_text TEXT NOT NULL, created_at INTEGER NOT NULL,
+ PRIMARY KEY(organization_id,workspace_id,connector_id,thread_id,message_id));
+CREATE INDEX IF NOT EXISTS work_connector_thread_messages_context
+ ON work_connector_thread_messages(organization_id,workspace_id,connector_id,thread_id,created_at);
 CREATE TABLE IF NOT EXISTS work_workflows (
  organization_id TEXT NOT NULL, workspace_id TEXT NOT NULL, workflow_id TEXT NOT NULL,
  version INTEGER NOT NULL, workflow_json TEXT NOT NULL, updated_at INTEGER NOT NULL,
@@ -3293,6 +3654,135 @@ def _identifier(value: object, field: str) -> str:
     if any(ord(character) < 32 or ord(character) == 127 for character in value):
         raise _invalid("WORK_INVALID_IDENTIFIER", f"{field} contains control characters")
     return value
+
+
+def _teams_thread_message(value: object) -> JsonObject | None:
+    """Validate trusted Teams identity and route fields before storing context.
+
+    中文：只接受由 Navigator 适配器验证后传入的 tenant/OID 和稳定线程标识。
+    """
+
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise _invalid(
+            "WORK_CONNECTOR_INVALID_TEAMS_THREAD", "teamsThreadMessage must be an object"
+        )
+    required = {
+        "threadId",
+        "messageId",
+        "tenantId",
+        "teamId",
+        "channelId",
+        "conversationId",
+        "rootThreadId",
+        "actorIssuer",
+        "actorSubject",
+        "text",
+    }
+    allowed = required | {"sessionId", "serviceUrl"}
+    if not required.issubset(value) or set(value) - allowed:
+        raise _invalid(
+            "WORK_CONNECTOR_INVALID_TEAMS_THREAD", "teamsThreadMessage fields are invalid"
+        )
+    thread_id = _identifier(value.get("threadId"), "teamsThreadMessage.threadId")
+    tenant_id = _identifier(value.get("tenantId"), "teamsThreadMessage.tenantId").lower()
+    expected_issuer = f"https://login.microsoftonline.com/{tenant_id}/v2.0"
+    issuer = _bounded_text(value.get("actorIssuer"), "teamsThreadMessage.actorIssuer", 512)
+    subject = _identifier(value.get("actorSubject"), "teamsThreadMessage.actorSubject").lower()
+    uuid_pattern = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    if not re.fullmatch(uuid_pattern, tenant_id) or not re.fullmatch(uuid_pattern, subject):
+        raise _invalid(
+            "WORK_CONNECTOR_INVALID_TEAMS_THREAD",
+            "tenantId and actorSubject must be canonical lowercase UUIDs.",
+        )
+    if issuer != expected_issuer:
+        raise _invalid(
+            "WORK_CONNECTOR_INVALID_TEAMS_THREAD",
+            "actorIssuer must match the verified tenant v2 issuer.",
+        )
+    service_url_value = value.get("serviceUrl", "")
+    normalized: JsonObject = {
+        "threadId": thread_id,
+        "messageId": _identifier(value.get("messageId"), "teamsThreadMessage.messageId"),
+        "serviceUrl": _teams_service_url(service_url_value, tenant_id),
+        "tenantId": tenant_id,
+        "teamId": _identifier(value.get("teamId"), "teamsThreadMessage.teamId"),
+        "channelId": _identifier(value.get("channelId"), "teamsThreadMessage.channelId"),
+        "conversationId": _identifier(
+            value.get("conversationId"), "teamsThreadMessage.conversationId"
+        ),
+        "rootThreadId": _identifier(value.get("rootThreadId"), "teamsThreadMessage.rootThreadId"),
+        "actorIssuer": issuer,
+        "actorSubject": subject,
+        "text": _bounded_text(value.get("text"), "teamsThreadMessage.text", 20_000),
+    }
+    if "sessionId" in value:
+        normalized["sessionId"] = _identifier(
+            value.get("sessionId"), "teamsThreadMessage.sessionId"
+        )
+    return normalized
+
+
+def _teams_service_url(value: object, tenant_id: str) -> str:
+    """Require a verified Bot Framework HTTPS host and exact allowed regional path.
+
+    中文：只允许 Bot Framework 官方 HTTPS 主机及精确地域路径。
+    """
+
+    if value == "":
+        return ""
+    if not re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        tenant_id,
+    ):
+        raise _invalid("WORK_CONNECTOR_INVALID_TEAMS_THREAD", "serviceUrl tenant scope is invalid")
+    if (
+        not isinstance(value, str)
+        or len(value) > 512
+        or value.strip() != value
+        or re.search(r"[\s\x00-\x1f\x7f%\\]", value)
+    ):
+        raise _invalid("WORK_CONNECTOR_INVALID_TEAMS_THREAD", "serviceUrl is invalid")
+    match = re.fullmatch(r"https://([^/?#]+)(/[^?#]*)", value)
+    if match is None:
+        raise _invalid("WORK_CONNECTOR_INVALID_TEAMS_THREAD", "serviceUrl is invalid")
+    authority, path = match.groups()
+    host = authority.lower().removesuffix(":443")
+    if host not in {"smba.trafficmanager.net", "smba.infra.teams.microsoft.com"}:
+        raise _invalid("WORK_CONNECTOR_INVALID_TEAMS_THREAD", "serviceUrl host is not allowed")
+    channel_path = path in {"/teams", "/teams/"}
+    if host == "smba.infra.teams.microsoft.com":
+        if not channel_path:
+            raise _invalid("WORK_CONNECTOR_INVALID_TEAMS_THREAD", "serviceUrl path is not allowed")
+        return value
+    if channel_path:
+        return value
+    segments = path.split("/")[1:]
+    if segments and segments[-1] == "":
+        segments.pop()
+    if any(
+        re.fullmatch(r"[A-Za-z0-9-]{1,128}", segment) is None or segment in {".", ".."}
+        for segment in segments
+    ):
+        raise _invalid("WORK_CONNECTOR_INVALID_TEAMS_THREAD", "serviceUrl path is invalid")
+    regions = {"amer", "in", "emea", "apac"}
+    if len(segments) == 1 and segments[0] in regions:
+        return value
+    if (
+        len(segments) == 2
+        and segments[0] in regions
+        and _teams_service_tenant_matches(segments[1], tenant_id)
+    ):
+        return value
+    raise _invalid("WORK_CONNECTOR_INVALID_TEAMS_THREAD", "serviceUrl path is not allowed")
+
+
+def _teams_service_tenant_matches(path_segment: str, tenant_id: str) -> bool:
+    try:
+        return str(UUID(path_segment)) == tenant_id
+    except ValueError:
+        return False
 
 
 def _bounded_text(value: object, field: str, maximum: int, *, allow_empty: bool = False) -> str:
@@ -3466,20 +3956,37 @@ def _task_notification_descriptor(metadata: Mapping[str, Any]) -> JsonObject | N
             "metadata.notification must contain type, connectorId, recipient, and payload.",
         )
     notification_type = _bounded_text(value.get("type"), "notification.type", 128)
-    if notification_type != "wecom.message":
-        raise _invalid(
-            "WORK_TASK_INVALID_NOTIFICATION",
-            "Task result notifications currently support only wecom.message.",
-        )
     connector_id = _identifier(value.get("connectorId"), "notification.connectorId")
     recipient = _bounded_text(value.get("recipient"), "notification.recipient", 2_000)
     payload = _json_object(value.get("payload"), "notification.payload")
-    expected_fields = {"accountId", "conversationId", "chatType", "senderId"}
-    if set(payload) != expected_fields:
+    if notification_type == "wecom.message":
+        expected_fields = {"accountId", "conversationId", "chatType", "senderId"}
+        route_error = "The WeCom route needs accountId, conversationId, chatType, and senderId."
+    elif notification_type == "teams.message":
+        expected_fields = {
+            "tenantId",
+            "teamId",
+            "channelId",
+            "conversationId",
+            "rootThreadId",
+        }
+        if set(payload) == expected_fields | {"serviceUrl"}:
+            service_url = _teams_service_url(
+                payload.get("serviceUrl"), str(payload.get("tenantId", "")).lower()
+            )
+            expected_fields = expected_fields | {"serviceUrl"}
+            payload = {**payload, "serviceUrl": service_url}
+        route_error = (
+            "The Teams route needs tenantId, teamId, channelId, conversationId, rootThreadId, "
+            "and an optional validated serviceUrl."
+        )
+    else:
         raise _invalid(
             "WORK_TASK_INVALID_NOTIFICATION",
-            "The WeCom route needs accountId, conversationId, chatType, and senderId.",
+            "Task result notifications require a supported connector message type.",
         )
+    if set(payload) != expected_fields:
+        raise _invalid("WORK_TASK_INVALID_NOTIFICATION", route_error)
     route = {
         field: _bounded_text(payload[field], f"notification.payload.{field}", 512)
         for field in sorted(expected_fields)

@@ -21,11 +21,18 @@ import AgentLoop from '@deepseek-ai/dsh-agent-loop';
 import CyreneSessionPersistence from './persistence.js';
 import { DynamicPluginManager, apply as applyPluginManager } from './plugin-manager.js';
 import { NavigatorExecutor, apply as applyExecutor } from './executor.js';
+import type { TeamsExecutorConfig } from './executor.js';
 import { ExchangeLlmAdapter } from './exchange-adapter.js';
+import { CodeBuddyLlmAdapter } from './codebuddy-adapter.js';
+import { ExchangeConnectorAuthorizationClient } from './connector-authorization.js';
 import { InMemoryWorkStateStore, WorkStateClient } from './work-state-client.js';
 import type { WorkStateStore } from './work-state-client.js';
 import { registerWorkTools } from './work-tools.js';
 import { registerToolProviders } from './tool-providers.js';
+import type {
+  ConnectorBindingAuthorization,
+  ConnectorResourceProjection,
+} from './tool-providers.js';
 import type { WorkAssistantBridge } from './work-tools.js';
 import { registerSubagents } from './subagents/index.js';
 import type { SubagentAdapterConfig, SubagentAdapterEvent } from './subagents/types.js';
@@ -62,6 +69,7 @@ export interface CreateExecutorAppOptions {
     readonly generation: number;
   }>;
   readonly readExchangeOperationState?: (sessionId: string, operationId: string) => Promise<string>;
+  readonly modelSource?: 'exchange' | 'codebuddy';
   readonly model?: string;
   readonly pluginsDir?: string;
   readonly watchPlugins?: boolean;
@@ -76,6 +84,8 @@ export interface CreateExecutorAppOptions {
   readonly dshHome?: string;
   readonly cloudConnectionConfigPath?: string;
   readonly subagentConfigPath?: string;
+  readonly teams?: TeamsExecutorConfig;
+  readonly connectorBindingsPath?: string;
 }
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -90,6 +100,15 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
 
   const persistenceUrl = options.persistenceUrl ?? process.env.CYRENE_PERSISTENCE_URL;
   const workspaceId = options.workspaceId ?? process.env.CYRENE_WORKSPACE_ID;
+  const teams = options.teams ?? createTeamsExecutorConfig(workspaceId);
+  const maxConcurrentTasks = parseTaskConcurrency(process.env.CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS);
+  const connectorBindingsPath = options.connectorBindingsPath ?? process.env.CYRENE_CONNECTOR_BINDINGS_FILE;
+  const connectorBindings = connectorBindingsPath === undefined
+    ? new Map<string, ConnectorBindingAuthorization>()
+    : validateConnectorBindingMap(JSON.parse(await readFile(resolve(connectorBindingsPath), 'utf8')) as unknown);
+  if (teams !== undefined && production && connectorBindings.size === 0) {
+    throw new Error('CYRENE_CONNECTOR_BINDINGS_FILE is required when Teams connector execution is enabled');
+  }
   const exchangeIntegrationUrl = options.exchangeIntegrationUrl ?? process.env.CYRENE_EXCHANGE_INTEGRATION_URL;
   const exchangeIntegrationWorkspaceId = options.exchangeIntegrationWorkspaceId
     ?? process.env.CYRENE_EXCHANGE_INTEGRATION_WORKSPACE_ID ?? workspaceId;
@@ -163,9 +182,15 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
 
   // LLM Model Adapter setup
   const exchangeUrl = options.exchangeUrl ?? process.env.CYRENE_EXCHANGE_URL;
-  const modelId = options.model ?? process.env.CYRENE_HARNESS_MODEL ?? (testMode ? 'test-model' : undefined);
+  const configuredModelSource = options.modelSource ?? process.env.CYRENE_HARNESS_MODEL_SOURCE ?? 'exchange';
+  if (configuredModelSource !== 'exchange' && configuredModelSource !== 'codebuddy') {
+    throw new Error('CYRENE_HARNESS_MODEL_SOURCE must be exchange or codebuddy');
+  }
+  const modelId = options.model
+    ?? process.env.CYRENE_HARNESS_MODEL
+    ?? (configuredModelSource === 'codebuddy' ? 'glm-5.3-flash' : testMode ? 'test-model' : undefined);
 
-  if (exchangeUrl) {
+  if (configuredModelSource === 'exchange' && exchangeUrl) {
     const exchangeToken = process.env.CYRENE_EXCHANGE_TOKEN;
     if (!exchangeToken) throw new Error('CYRENE_EXCHANGE_TOKEN is required when Exchange is configured');
     if (!modelId) throw new Error('CYRENE_HARNESS_MODEL is required when Exchange is configured');
@@ -182,6 +207,11 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
     ctx.llm.registerAdapter([custom.provider], custom.adapter);
     ctx.provide('agentDefaultModel', {
       currentSelection: () => ({ provider: custom.provider, model: modelId! }),
+    });
+  } else if (configuredModelSource === 'codebuddy') {
+    ctx.llm.registerAdapter(['codebuddy'], new CodeBuddyLlmAdapter());
+    ctx.provide('agentDefaultModel', {
+      currentSelection: () => ({ provider: 'codebuddy', model: modelId! }),
     });
   } else if (testMode && options.enableTestEchoAdapter === true) {
     // Explicit test-only deterministic adapter; it is never the production default.
@@ -203,7 +233,7 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
       currentSelection: () => ({ provider: 'cloud-default', model: modelId }),
     });
   } else if (!testMode) {
-    throw new Error('CYRENE_EXCHANGE_URL and CYRENE_HARNESS_MODEL are required outside explicit testMode');
+    throw new Error('CYRENE_EXCHANGE_URL and CYRENE_HARNESS_MODEL are required when CYRENE_HARNESS_MODEL_SOURCE=exchange');
   }
 
   const pluginsDir = options.pluginsDir ?? process.env.NAVIGATOR_PLUGINS_DIR ?? join(repository, 'plugins');
@@ -234,6 +264,8 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
     workspaceId: workspaceId ?? 'test-workspace',
     workState,
     authTokenEnv: publicTokenEnv,
+    maxConcurrentTasks,
+    ...(teams === undefined ? {} : { teams }),
     allowedOrigins: options.allowedOrigins,
     ...(revalidateExchangeAuthorization === undefined ? {} : { revalidateExchangeAuthorization }),
     ...(readExchangeOperationState === undefined ? {} : { readExchangeOperationState }),
@@ -255,6 +287,13 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
     await registerToolProviders(ctx, {
       bridge: workAssistantBridge,
       taskIdForSession: sessionId => executor.activeTaskId(sessionId),
+      ...(teams === undefined ? {} : {
+        connectorAuthorization: {
+          client: teams.exchangeAuthorization,
+          workspaceId: workspaceId!,
+          bindings: connectorBindings,
+        },
+      }),
     });
   }
 
@@ -332,6 +371,218 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
   }
 
   return { ctx, executor, pluginManager, pluginsDir };
+}
+
+function createTeamsExecutorConfig(workspaceId: string | undefined): TeamsExecutorConfig | undefined {
+  const enabled = process.env.TEAMS_ENABLED;
+  if (enabled === undefined || enabled === 'false') return undefined;
+  if (enabled !== 'true') throw new TypeError('TEAMS_ENABLED must be true or false');
+  if (!workspaceId) throw new Error('CYRENE_WORKSPACE_ID is required when Teams is enabled');
+  const ingressSecret = process.env.TEAMS_NAVIGATOR_HMAC_KEY;
+  if (!ingressSecret || Buffer.byteLength(ingressSecret, 'utf8') < 32) {
+    throw new Error('TEAMS_NAVIGATOR_HMAC_KEY is unavailable');
+  }
+  const tenantId = requiredUuidEnvironment('TEAMS_TENANT_ID');
+  const botAppId = requiredUuidEnvironment('TEAMS_BOT_APP_ID');
+  const allowedTeamIds = requiredCsvEnvironment('TEAMS_ALLOWED_TEAM_IDS');
+  const taskActorSubjectsFile = process.env.TEAMS_TASK_ACTOR_SUBJECTS_FILE === undefined
+    ? undefined
+    : resolve(configText(process.env.TEAMS_TASK_ACTOR_SUBJECTS_FILE, 'TEAMS_TASK_ACTOR_SUBJECTS_FILE', 2_000));
+  if (taskActorSubjectsFile !== undefined && !existsSync(taskActorSubjectsFile)) {
+    throw new Error('TEAMS_TASK_ACTOR_SUBJECTS_FILE is unavailable');
+  }
+  const configuredSubjects = taskActorSubjectsFile === undefined
+    ? requiredCsvEnvironment('TEAMS_TASK_ACTOR_SUBJECTS')
+    : [];
+  const taskActorSubjects = configuredSubjects.map(value => {
+    if (!/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/u.test(value)) {
+      throw new TypeError('TEAMS_TASK_ACTOR_SUBJECTS must contain AAD object UUIDs');
+    }
+    return value.toLowerCase();
+  });
+  const baseUrl = requiredEnvironment('CYRENE_EXCHANGE_CONNECTOR_INTERNAL_URL');
+  const hmacKeyFile = requiredEnvironment('NAVIGATOR_EXCHANGE_HMAC_KEY_FILE');
+  if (!existsSync(hmacKeyFile)) throw new Error('Navigator Exchange HMAC key file is unavailable');
+  const hmacKeyId = requiredEnvironment('NAVIGATOR_EXCHANGE_HMAC_KEY_ID');
+  const audience = process.env.CYRENE_AUTHORITY_EXCHANGE_WORKLOAD_AUDIENCE ?? 'exchange';
+  const exchangeConnectionRef = requiredUuidEnvironment('TEAMS_EXCHANGE_CONNECTION_REF');
+  const exchangeProfileRef = requiredEnvironment('TEAMS_EXCHANGE_PROFILE_REF');
+  return {
+    connectorId: 'teams-v1',
+    tenantId,
+    allowedTeamIds,
+    botAppId,
+    taskActorSubjects,
+    ...(taskActorSubjectsFile === undefined ? {} : { taskActorSubjectsFile }),
+    ingressSecretEnv: 'TEAMS_NAVIGATOR_HMAC_KEY',
+    exchangeConnectionRef,
+    exchangeProfileRef,
+    exchangeAuthorization: new ExchangeConnectorAuthorizationClient({ baseUrl, hmacKeyFile, hmacKeyId, audience }),
+  };
+}
+
+function parseTaskConcurrency(value: string | undefined): number {
+  if (value === undefined || value === '') return 1;
+  if (!/^\d{1,2}$/u.test(value)) throw new TypeError('CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS must be an integer');
+  const maximum = Number(value);
+  if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 32) {
+    throw new TypeError('CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS must be between 1 and 32');
+  }
+  return maximum;
+}
+
+export function validateConnectorBindingMap(value: unknown): Map<string, ConnectorBindingAuthorization> {
+  const root = asObject(value, 'connector binding map');
+  assertKeys(root, ['schemaVersion', 'bindings'], 'connector binding map');
+  if (root.schemaVersion !== 1 || !Array.isArray(root.bindings)) {
+    throw new TypeError('connector binding map must use schemaVersion 1 and a bindings array');
+  }
+  const projections = new Set<ConnectorResourceProjection>([
+    'empty', 'profile', 'github_repository', 'github_pull_request', 'github_ci', 'github_commit', 'github_issue',
+    'huggingface_repository', 'cloud_target', 'cloud_operation',
+  ]);
+  const result = new Map<string, ConnectorBindingAuthorization>();
+  const connectionRefs = new Set<string>();
+  for (const [index, value] of root.bindings.entries()) {
+    const row = asObject(value, `connector binding ${index}`);
+    assertKeys(row, ['bindingId', 'connectionRef', 'providerId', 'profileRef', 'tools'], `connector binding ${index}`);
+    const bindingId = configText(row.bindingId, 'bindingId', 200);
+    const connectionRef = configText(row.connectionRef, 'connectionRef', 64);
+    if (!/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/u.test(connectionRef)) {
+      throw new TypeError(`connector binding ${index} connectionRef must be an Exchange UUID`);
+    }
+    const providerId = configText(row.providerId, 'providerId', 64);
+    if (!['github', 'huggingface', 'azure', 'gcp', 'runpod'].includes(providerId)) {
+      throw new TypeError(`connector binding ${index} providerId is not supported`);
+    }
+    const profileRef = configText(row.profileRef, 'profileRef', 512);
+    if (!Array.isArray(row.tools) || row.tools.length === 0) {
+      throw new TypeError(`connector binding ${index} must declare tools`);
+    }
+    if (result.has(bindingId) || connectionRefs.has(connectionRef.toLowerCase())) {
+      throw new TypeError('connector binding IDs and Exchange connection refs must be unique');
+    }
+    const toolIds = new Set<string>();
+    const tools = row.tools.map((toolValue, toolIndex) => {
+      const tool = asObject(toolValue, `connector binding ${index} tool ${toolIndex}`);
+      assertKeys(tool, ['toolId', 'operationId', 'resourceProjection', 'mutating'], `connector binding ${index} tool ${toolIndex}`);
+      const toolId = configText(tool.toolId, 'toolId', 200);
+      const operationId = configText(tool.operationId, 'operationId', 256);
+      if (!projections.has(tool.resourceProjection as ConnectorResourceProjection)) {
+        throw new TypeError(`connector binding ${index} tool ${toolIndex} has an invalid resourceProjection`);
+      }
+      if (typeof tool.mutating !== 'boolean' || toolIds.has(toolId)) {
+        throw new TypeError(`connector binding ${index} tool ${toolIndex} must have a unique toolId and mutating flag`);
+      }
+      const canonical = connectorOperationPolicy(providerId, operationId);
+      if (toolId !== canonical.toolId) {
+        throw new TypeError(`connector binding ${index} tool ${toolIndex} does not match the canonical tool mapping`);
+      }
+      if (tool.mutating !== canonical.mutating || tool.resourceProjection !== canonical.resourceProjection) {
+        throw new TypeError(`connector binding ${index} tool ${toolIndex} does not match the canonical operation policy`);
+      }
+      toolIds.add(toolId);
+      return {
+        toolId,
+        operationId,
+        resourceProjection: tool.resourceProjection as ConnectorResourceProjection,
+        mutating: tool.mutating,
+      };
+    });
+    result.set(bindingId, { bindingId, connectionRef: connectionRef.toLowerCase(), providerId, profileRef, tools });
+    connectionRefs.add(connectionRef.toLowerCase());
+  }
+  return result;
+}
+
+function connectorOperationPolicy(
+  providerId: string,
+  operationId: string,
+): {
+  readonly toolId: string;
+  readonly mutating: boolean;
+  readonly resourceProjection: ConnectorResourceProjection;
+} {
+  const policies: Readonly<Record<string, {
+    readonly toolId: string;
+    readonly mutating: boolean;
+    readonly resourceProjection: ConnectorResourceProjection;
+  }>> = {
+    'github.repository.list': { toolId: 'github.repository.list', mutating: false, resourceProjection: 'profile' },
+    'github.repository.get': { toolId: 'github.repository.get', mutating: false, resourceProjection: 'github_repository' },
+    'github.branches.list': { toolId: 'github.branches.list', mutating: false, resourceProjection: 'github_repository' },
+    'github.pull_requests.list': { toolId: 'github.pull_requests.list', mutating: false, resourceProjection: 'github_repository' },
+    'github.pull_request.get': { toolId: 'github.pull_request.get', mutating: false, resourceProjection: 'github_pull_request' },
+    'github.actions.runs.list': { toolId: 'github.actions.runs.list', mutating: false, resourceProjection: 'github_repository' },
+    'github.ci.status': { toolId: 'github.ci.status', mutating: false, resourceProjection: 'github_commit' },
+    'github.issue.get': { toolId: 'github.issue.get', mutating: false, resourceProjection: 'github_issue' },
+    'github.issue.comment.create': { toolId: 'github.issue.comment.create', mutating: true, resourceProjection: 'github_issue' },
+    'github.issue.state.update': { toolId: 'github.issue.state.update', mutating: true, resourceProjection: 'github_issue' },
+    'github.vendor.cli.execute': { toolId: 'github_vendor_cli', mutating: true, resourceProjection: 'profile' },
+    'huggingface.models.list': { toolId: 'huggingface.models.list', mutating: false, resourceProjection: 'profile' },
+    'huggingface.datasets.list': { toolId: 'huggingface.datasets.list', mutating: false, resourceProjection: 'profile' },
+    'huggingface.spaces.list': { toolId: 'huggingface.spaces.list', mutating: false, resourceProjection: 'profile' },
+    'huggingface.repo.get': { toolId: 'huggingface.repo.get', mutating: false, resourceProjection: 'huggingface_repository' },
+    'huggingface.file.download': { toolId: 'huggingface.file.download', mutating: false, resourceProjection: 'huggingface_repository' },
+    'huggingface.file.upload': { toolId: 'huggingface.file.upload', mutating: true, resourceProjection: 'huggingface_repository' },
+    'huggingface.vendor.cli.execute': { toolId: 'hf_vendor_cli', mutating: true, resourceProjection: 'profile' },
+    'cloud.provider.health.read': { toolId: 'cloud_provider_health', mutating: false, resourceProjection: 'profile' },
+    'cloud.resources.list': { toolId: 'cloud_resources_list', mutating: false, resourceProjection: 'cloud_target' },
+    'cloud.resource.get': { toolId: 'cloud_resource_get', mutating: false, resourceProjection: 'cloud_target' },
+    'cloud.resource.create': { toolId: 'cloud_resource_create', mutating: true, resourceProjection: 'cloud_target' },
+    'cloud.resource.deploy': { toolId: 'cloud_resource_deploy', mutating: true, resourceProjection: 'cloud_target' },
+    'cloud.resource.start': { toolId: 'cloud_resource_start', mutating: true, resourceProjection: 'cloud_target' },
+    'cloud.resource.stop': { toolId: 'cloud_resource_stop', mutating: true, resourceProjection: 'cloud_target' },
+    'cloud.resource.restart': { toolId: 'cloud_resource_restart', mutating: true, resourceProjection: 'cloud_target' },
+    'cloud.resource.update': { toolId: 'cloud_resource_update', mutating: true, resourceProjection: 'cloud_target' },
+    'cloud.resource.delete': { toolId: 'cloud_resource_delete', mutating: true, resourceProjection: 'cloud_target' },
+    'cloud.operation.status.read': { toolId: 'cloud_operation_status', mutating: false, resourceProjection: 'cloud_operation' },
+    'cloud.operation.logs.read': { toolId: 'cloud_operation_logs', mutating: false, resourceProjection: 'cloud_operation' },
+    'cloud.operation.cancel': { toolId: 'cloud_operation_cancel', mutating: true, resourceProjection: 'cloud_operation' },
+    'cloud.vendor.cli.execute': { toolId: 'cloud_vendor_cli', mutating: true, resourceProjection: 'profile' },
+  };
+  const policy = policies[operationId];
+  if (!policy) throw new TypeError(`Connector operation ${operationId} is not in the canonical operation table`);
+  const providerAllowed = providerId === 'github'
+    ? operationId.startsWith('github.')
+    : providerId === 'huggingface'
+      ? operationId.startsWith('huggingface.')
+      : ['azure', 'gcp', 'runpod'].includes(providerId) && operationId.startsWith('cloud.');
+  if (!providerAllowed || (operationId === 'cloud.resource.restart' && providerId !== 'runpod')) {
+    throw new TypeError(`Connector operation ${operationId} is not valid for provider ${providerId}`);
+  }
+  return policy;
+}
+
+function requiredEnvironment(name: string): string {
+  const value = process.env[name];
+  if (!value || value.trim() !== value || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new Error(`${name} is required`);
+  }
+  return value;
+}
+
+function requiredUuidEnvironment(name: string): string {
+  const value = requiredEnvironment(name);
+  if (!/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/u.test(value)) {
+    throw new TypeError(`${name} must be a UUID`);
+  }
+  return value.toLowerCase();
+}
+
+function requiredCsvEnvironment(name: string): string[] {
+  const values = requiredEnvironment(name).split(',').map(value => value.trim());
+  if (values.length === 0 || values.some(value => value.length === 0 || /[\u0000-\u001f\u007f]/u.test(value))
+    || new Set(values).size !== values.length) {
+    throw new TypeError(`${name} must contain unique non-empty values`);
+  }
+  return values;
+}
+
+function configText(value: unknown, label: string, maximum: number): string {
+  if (typeof value !== 'string' || value.length === 0 || value.trim() !== value || value.length > maximum
+    || /[\u0000-\u001f\u007f]/u.test(value)) throw new TypeError(`Invalid connector ${label}`);
+  return value;
 }
 
 /** Parse the host-only CLI deployment file without accepting inline secret values. | 解析仅由宿主管理且不含内联凭据的部署文件。 */
