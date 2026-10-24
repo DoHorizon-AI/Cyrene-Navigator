@@ -488,6 +488,9 @@ def _base_child_environment(repository: Path) -> dict[str, str]:
 
     allowed = ("PATH", "HOME", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "LANG", "LC_ALL")
     environment = {name: os.environ[name] for name in allowed if name in os.environ}
+    for name in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        if name in os.environ:
+            environment[name] = os.environ[name]
     old_pythonpath = os.environ.get("PYTHONPATH")
     values = [str(repository / "src")]
     if old_pythonpath:
@@ -594,6 +597,12 @@ def _persistence_child_environment(
     environment = _base_child_environment(repository)
     environment["CYRENE_SESSION_TOKEN"] = session_token
     environment[principal_token_env] = session_token
+    for name in (
+        "CYRENE_PERSISTENCE_TLS_CERT_FILE",
+        "CYRENE_PERSISTENCE_TLS_KEY_FILE",
+    ):
+        if name in os.environ:
+            environment[name] = os.environ[name]
     for name in env_references.difference({principal_token_env, "CYRENE_SESSION_TOKEN"}):
         if name in os.environ:
             environment[name] = os.environ[name]
@@ -616,6 +625,9 @@ def _executor_child_environment(
 
     allowed = ("PATH", "HOME", "SYSTEMROOT", "WINDIR", "TEMP", "TMP")
     environment = {name: os.environ[name] for name in allowed if name in os.environ}
+    for name in ("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        if name in os.environ:
+            environment[name] = os.environ[name]
     provider_names = (
         "CYRENE_EXCHANGE_URL",
         "CYRENE_EXCHANGE_TOKEN",
@@ -968,15 +980,24 @@ def _read_startup(child: ChildService, timeout: float) -> dict[str, Any]:
 
 
 def _persistence_url(startup: dict[str, Any]) -> str:
-    """Derive a loopback URL from the persistence launcher's bound listener."""
+    """Derive an HTTP(S) loopback URL from the bound persistence listener."""
 
     if startup.get("service") != "cyrene-persistence":
         raise RuntimeError("persistence service returned an unexpected startup identity")
     host = startup.get("host")
     port = startup.get("port")
-    if not isinstance(host, str) or not isinstance(port, int) or not 0 < port < 65536:
+    scheme = startup.get("scheme", "http")
+    if (
+        not isinstance(host, str)
+        or host not in {"127.0.0.1", "localhost", "::1"}
+        or isinstance(port, bool)
+        or not isinstance(port, int)
+        or not 0 < port < 65536
+        or not isinstance(scheme, str)
+        or scheme not in {"http", "https"}
+    ):
         raise RuntimeError("persistence service returned an invalid listener address")
-    return f"http://127.0.0.1:{port}"
+    return f"{scheme}://127.0.0.1:{port}"
 
 
 def _executor_url(startup: dict[str, Any]) -> str:

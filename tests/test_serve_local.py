@@ -332,3 +332,81 @@ def test_wecom_environment_references_reach_only_persistence(
         workspace_id="fixture-workspace",
     )
     assert "ROUND1_BOT_SECRET" not in web
+
+
+def test_tls_file_references_and_trust_roots_reach_only_required_children(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pass TLS files only to persistence and CA trust only to HTTP clients."""
+
+    monkeypatch.setenv("CYRENE_PERSISTENCE_TLS_CERT_FILE", "/run/secrets/persistence-cert")
+    monkeypatch.setenv("CYRENE_PERSISTENCE_TLS_KEY_FILE", "/run/secrets/persistence-key")
+    monkeypatch.setenv("SSL_CERT_FILE", "/run/config/system-plus-internal-ca.pem")
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", "/run/config/system-plus-internal-ca.pem")
+    monkeypatch.setenv("NODE_EXTRA_CA_CERTS", "/run/secrets/internal-service-root-ca")
+    monkeypatch.setenv("UNRELATED_TLS_SECRET", "must-not-cross-process-boundary")
+
+    persistence = serve_local._persistence_child_environment(
+        tmp_path, "session-token", "CYRENE_SESSION_TOKEN", set()
+    )
+    web = serve_local._web_child_environment(
+        repository=tmp_path,
+        session_token="session-token",
+        executor_token="executor-token",
+        workspace_id="workspace-1",
+    )
+    executor = serve_local._executor_child_environment(
+        repository=tmp_path,
+        persistence_url="https://127.0.0.1:3001",
+        workspace_id="workspace-1",
+        session_token="session-token",
+        executor_token="executor-token",
+        dsh_home=tmp_path / "dsh",
+        plugins_dir=tmp_path / "plugins",
+        node="node",
+    )
+
+    assert persistence["CYRENE_PERSISTENCE_TLS_CERT_FILE"] == "/run/secrets/persistence-cert"
+    assert persistence["CYRENE_PERSISTENCE_TLS_KEY_FILE"] == "/run/secrets/persistence-key"
+    assert persistence["SSL_CERT_FILE"] == "/run/config/system-plus-internal-ca.pem"
+    assert web["SSL_CERT_FILE"] == "/run/config/system-plus-internal-ca.pem"
+    assert web["REQUESTS_CA_BUNDLE"] == "/run/config/system-plus-internal-ca.pem"
+    assert "CYRENE_PERSISTENCE_TLS_KEY_FILE" not in web
+    assert executor["NODE_EXTRA_CA_CERTS"] == "/run/secrets/internal-service-root-ca"
+    assert executor["SSL_CERT_FILE"] == "/run/config/system-plus-internal-ca.pem"
+    for environment in (persistence, web, executor):
+        assert "UNRELATED_TLS_SECRET" not in environment
+
+
+def test_persistence_url_preserves_https_and_rejects_unknown_schemes() -> None:
+    """Keep the listener's secure scheme and reject untrusted startup values."""
+
+    assert (
+        serve_local._persistence_url(
+            {
+                "service": "cyrene-persistence",
+                "host": "127.0.0.1",
+                "port": 8080,
+                "scheme": "https",
+            }
+        )
+        == "https://127.0.0.1:8080"
+    )
+    with pytest.raises(RuntimeError, match="invalid listener address"):
+        serve_local._persistence_url(
+            {
+                "service": "cyrene-persistence",
+                "host": "127.0.0.1",
+                "port": 8080,
+                "scheme": "file",
+            }
+        )
+    with pytest.raises(RuntimeError, match="invalid listener address"):
+        serve_local._persistence_url(
+            {
+                "service": "cyrene-persistence",
+                "host": [],
+                "port": True,
+                "scheme": [],
+            }
+        )

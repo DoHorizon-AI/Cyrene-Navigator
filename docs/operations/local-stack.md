@@ -19,6 +19,34 @@ is always generated internally.
 Only the Web Host accepts a configurable bind address. The default is
 `127.0.0.1`; bind to a remote interface only when explicitly required.
 
+## Persistence HTTPS / 持久化 HTTPS
+
+The persistence launcher serves HTTPS when both
+`CYRENE_PERSISTENCE_TLS_CERT_FILE` and `CYRENE_PERSISTENCE_TLS_KEY_FILE` name
+absolute readable certificate and private-key files. Set both or leave both
+unset; partial, unreadable, malformed, or mismatched pairs fail startup before
+the listener is advertised. The local supervisor preserves the reported
+`http` or `https` scheme when building backend URLs and passes the key pair only
+to the persistence child.
+
+Configure `SSL_CERT_FILE` as a PEM bundle containing the system roots and the
+private internal root for Python HTTPX clients. Set `NODE_EXTRA_CA_CERTS` to the
+internal root for the Node executor. Do not replace the public CA bundle with a
+private-root-only file when the same process also connects to public services.
+For the cloud Compose stack, the persistence URL is
+`https://navigator-persistence:8080` and the certificate must cover that DNS
+name.
+
+当 `CYRENE_PERSISTENCE_TLS_CERT_FILE` 和 `CYRENE_PERSISTENCE_TLS_KEY_FILE` 同时指向绝对路径、可读的
+证书与私钥文件时，persistence launcher 会启用 HTTPS。必须同时设置两个变量，或都不设置；只设置一个、文件
+不可读、格式错误或证书与私钥不匹配时，会在公布监听地址前拒绝启动。local supervisor 会保留启动回执中的
+`http` 或 `https` scheme，并且只向 persistence 子进程传递证书与私钥路径。
+
+将 `SSL_CERT_FILE` 设置为 PEM 信任 bundle，其中同时包含系统根证书和私有内部根证书，供 Python HTTPX
+客户端使用。为 Node executor 设置指向内部根证书的 `NODE_EXTRA_CA_CERTS`。若同一进程还会访问公共服务，
+不要用仅含私有根证书的文件替换公共 CA bundle。云端 Compose persistence URL 为
+`https://navigator-persistence:8080`，服务器证书必须覆盖此 DNS 名称。
+
 ## First-party Exchange API proxy / First-party Exchange API 代理
 
 `scripts/serve-web.py` can opt one registered Exchange proxy into request-scoped
