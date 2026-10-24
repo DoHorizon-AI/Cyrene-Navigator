@@ -1946,7 +1946,11 @@ function normalizeTeamsActivity(
     if (block.image !== undefined) textParts.push('[Image attachment is present in Teams; its contents were not transferred.]');
     if (block.file !== undefined) textParts.push('[File attachment is present in Teams; its contents were not transferred.]');
   }
-  const text = boundedText(textParts.join('\n').trim(), 'Teams message text', 20_000);
+  const text = boundedTeamsMessageText(
+    textParts.join('\n').trim(),
+    'Teams message text',
+    20_000,
+  );
   const actorIssuer = `https://login.microsoftonline.com/${tenantId}/v2.0`;
   return {
     messageId,
@@ -2089,6 +2093,15 @@ function isExactObjectKeys(value: Record<string, unknown>, expected: readonly st
 function boundedText(value: unknown, label: string, maximum: number): string {
   if (typeof value !== 'string' || value.length === 0 || value.length > maximum
     || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new ExecutorRequestError(400, 'TEAMS_EVENT_INVALID', `${label} is invalid.`);
+  }
+  return value;
+}
+
+function boundedTeamsMessageText(value: unknown, label: string, maximum: number): string {
+  // Match the store's NUL/length guards while allowing LF, CRLF, and TAB in message text.
+  if (typeof value !== 'string' || value.length === 0 || value.length > maximum
+    || value.includes('\u0000')) {
     throw new ExecutorRequestError(400, 'TEAMS_EVENT_INVALID', `${label} is invalid.`);
   }
   return value;
