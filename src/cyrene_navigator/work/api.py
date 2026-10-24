@@ -54,6 +54,7 @@ from cyrene_navigator.work.models import (
     NotificationStart,
     OperationCreate,
     OperationReceipt,
+    OperationSummaryList,
     OperationVerify,
     SourceInventoryPage,
     SourceInventoryReceipt,
@@ -68,6 +69,7 @@ from cyrene_navigator.work.models import (
     TaskList,
     TaskPatch,
     TaskRecord,
+    TeamsThreadRecord,
     WorkflowList,
     WorkflowRecord,
     WorkflowScheduleEvent,
@@ -442,6 +444,25 @@ def mount_work_routes(
             response.status_code = 200
         return {"operation": operation, "duplicate": duplicate}
 
+    @app.get(base + "/operations/unresolved", response_model=OperationSummaryList)
+    def list_unresolved_operations(
+        workspace_id: str,
+        request: Request,
+        target: str | None = Query(default=None, max_length=2_000),
+        operation_type: str | None = Query(default=None, max_length=128),
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict[str, Any]:
+        principal = principal_for(request, workspace_id)
+        return {
+            "items": store.list_unresolved_operations(
+                principal.organization_id,
+                workspace_id,
+                target=target,
+                operation_type=operation_type,
+                limit=limit,
+            )
+        }
+
     @app.get(base + "/operations/{operation_id}", response_model=OperationReceipt)
     def get_operation(workspace_id: str, operation_id: str, request: Request) -> dict[str, Any]:
         principal = principal_for(request, workspace_id)
@@ -628,6 +649,7 @@ def mount_work_routes(
             body.lease_token,
             body.outcome,
             body.result,
+            retry_after_seconds=body.retry_after_seconds,
         )
 
     @app.post(base + "/attachments", response_model=AttachmentRecord, status_code=201)
@@ -706,6 +728,33 @@ def mount_work_routes(
             principal.organization_id, workspace_id, connector_id, after, limit
         )
         return {"events": events, "nextSeq": next_seq}
+
+    @app.get(
+        base + "/connectors/{connector_id}/threads/{thread_id}",
+        response_model=TeamsThreadRecord,
+    )
+    def get_connector_thread(
+        workspace_id: str,
+        connector_id: str,
+        thread_id: str,
+        request: Request,
+        message_limit: int = Query(default=20, ge=1, le=100),
+        exclude_message_id: str | None = Query(default=None, max_length=512),
+    ) -> dict[str, Any]:
+        """Read one durable Teams thread mapping and recent context messages.
+
+        中文：只返回本 Workspace 的稳定 Teams 线程映射及最近讨论文本。
+        """
+
+        principal = principal_for(request, workspace_id)
+        return store.get_connector_thread(
+            principal.organization_id,
+            workspace_id,
+            connector_id,
+            thread_id,
+            message_limit=message_limit,
+            exclude_message_id=exclude_message_id,
+        )
 
     @app.get(base + "/workflows", response_model=WorkflowList)
     def list_workflows(workspace_id: str, request: Request) -> dict[str, Any]:

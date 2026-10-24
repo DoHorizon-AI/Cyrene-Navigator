@@ -266,6 +266,25 @@ class OperationRecord(WorkModel):
     updated_at: int
 
 
+class OperationSummary(WorkModel):
+    """Minimal unresolved provider receipt for status reconciliation. | 未解决操作摘要。"""
+
+    id: str
+    operation_type: str
+    task_id: str | None = None
+    target: str | None = None
+    status: Literal["started", "uncertain"]
+    evidence: dict[str, Any]
+    created_at: int
+    updated_at: int
+
+
+class OperationSummaryList(WorkModel):
+    """Workspace-scoped unresolved operation receipts. | 工作区未解决操作摘要。"""
+
+    items: list[OperationSummary]
+
+
 class OperationReceipt(WorkModel):
     """Creation or transition acknowledgement. | 创建与状态转换回执。"""
 
@@ -393,7 +412,8 @@ class NotificationFinish(WorkModel):
     """Record known delivery, known failure, or unknown delivery. | 记录投递结果。"""
 
     lease_token: str = Field(min_length=1, max_length=512)
-    outcome: Literal["delivered", "failed", "uncertain"]
+    outcome: Literal["delivered", "failed", "uncertain", "retry"]
+    retry_after_seconds: int | None = Field(default=None, ge=1, le=300)
     result: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -479,6 +499,26 @@ class ConnectorStatusUpdate(WorkModel):
     detail: str | None = Field(default=None, max_length=2_000)
 
 
+class TeamsThreadMessageCreate(WorkModel):
+    """Persist one verified Teams participant message and optional thread mapping.
+
+    中文：保存经验证的 Teams 参与者消息；只有受信维护者接纳任务时才创建线程映射。
+    """
+
+    thread_id: str = Field(min_length=1, max_length=128)
+    message_id: str = Field(min_length=1, max_length=512)
+    service_url: str = Field(default="", max_length=512)
+    tenant_id: str = Field(min_length=1, max_length=128)
+    team_id: str = Field(min_length=1, max_length=512)
+    channel_id: str = Field(min_length=1, max_length=512)
+    conversation_id: str = Field(min_length=1, max_length=512)
+    root_thread_id: str = Field(min_length=1, max_length=512)
+    actor_issuer: str = Field(min_length=1, max_length=512)
+    actor_subject: str = Field(min_length=1, max_length=256)
+    text: str = Field(min_length=1, max_length=20_000)
+    session_id: str | None = Field(default=None, min_length=1, max_length=512)
+
+
 class ConnectorEventCreate(WorkModel):
     """Register one connector event and optional atomic task admission. | 连接事件。"""
 
@@ -490,6 +530,31 @@ class ConnectorEventCreate(WorkModel):
     sender_id: str | None = Field(default=None, max_length=512)
     payload: dict[str, Any] = Field(default_factory=dict)
     task: TaskCreate | None = None
+    teams_thread_message: TeamsThreadMessageCreate | None = None
+
+
+class TeamsThreadMessage(WorkModel):
+    """Durable message text used as context for a later owner request. | 线程上下文消息。"""
+
+    message_id: str
+    actor_issuer: str
+    actor_subject: str
+    text: str
+    created_at: int
+
+
+class TeamsThreadRecord(WorkModel):
+    """Stable Teams thread to DSH Session mapping and recent context. | Teams 线程映射。"""
+
+    thread_id: str
+    tenant_id: str
+    team_id: str
+    channel_id: str
+    conversation_id: str
+    root_thread_id: str
+    service_url: str = ""
+    session_id: str | None = None
+    messages: list[TeamsThreadMessage]
 
 
 class ConnectorEventReceipt(WorkModel):

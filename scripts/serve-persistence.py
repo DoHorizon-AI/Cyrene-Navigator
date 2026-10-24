@@ -13,6 +13,9 @@ import importlib
 import json
 import os
 import socket
+import ssl
+import stat
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -24,6 +27,9 @@ from cyrene_navigator import Product
 from cyrene_navigator import create_app as create_product_api_app
 from cyrene_navigator.persistence import PersistencePrincipal, create_persistence_app
 from cyrene_navigator.work.api import ConnectorBridge
+
+PERSISTENCE_TLS_CERT_FILE_ENV = "CYRENE_PERSISTENCE_TLS_CERT_FILE"
+PERSISTENCE_TLS_KEY_FILE_ENV = "CYRENE_PERSISTENCE_TLS_KEY_FILE"
 
 
 class PrincipalConfig(BaseModel):
@@ -111,6 +117,7 @@ def main() -> None:
         help="fail startup unless all Product origins and scoped Bearers are configured",
     )
     args = parser.parse_args()
+    tls_files = _persistence_tls_files(os.environ)
     try:
         config_text = args.principal_config.read_text(encoding="utf-8")
         config = ServiceConfig.model_validate_json(config_text)
@@ -180,10 +187,67 @@ def main() -> None:
         listener.bind((args.host, args.port))
         listener.listen(128)
         port = listener.getsockname()[1]
-        address = {"service": "cyrene-persistence", "host": args.host, "port": port}
+        address = {
+            "service": "cyrene-persistence",
+            "host": args.host,
+            "port": port,
+            "scheme": "https" if tls_files is not None else "http",
+        }
         print(json.dumps(address), flush=True)
-        server = uvicorn.Server(uvicorn.Config(app, log_level="warning", access_log=False))
+        certificate = str(tls_files[0]) if tls_files is not None else None
+        private_key = str(tls_files[1]) if tls_files is not None else None
+        server = uvicorn.Server(
+            uvicorn.Config(
+                app,
+                log_level="warning",
+                access_log=False,
+                ssl_certfile=certificate,
+                ssl_keyfile=private_key,
+            )
+        )
         server.run(sockets=[listener])
+
+
+def _persistence_tls_files(environment: Mapping[str, str]) -> tuple[Path, Path] | None:
+    """Validate an optional TLS key pair before binding or advertising the service.
+
+    中文:绑定服务前验证可选 TLS 证书和私钥；未配置时保留显式部署的 HTTP 行为。
+    """
+
+    certificate_value = environment.get(PERSISTENCE_TLS_CERT_FILE_ENV)
+    private_key_value = environment.get(PERSISTENCE_TLS_KEY_FILE_ENV)
+    if (certificate_value is None) != (private_key_value is None):
+        raise ValueError(
+            "Navigator persistence TLS certificate and key must be configured together"
+        )
+    if certificate_value is None or private_key_value is None:
+        return None
+    if not certificate_value or not private_key_value:
+        raise ValueError("Navigator persistence TLS certificate and key paths must be non-empty")
+
+    certificate = Path(certificate_value)
+    private_key = Path(private_key_value)
+    if not certificate.is_absolute() or not private_key.is_absolute():
+        raise ValueError("Navigator persistence TLS certificate and key paths must be absolute")
+    try:
+        certificate = certificate.resolve(strict=True)
+        private_key = private_key.resolve(strict=True)
+        certificate_stat = certificate.stat()
+        private_key_stat = private_key.stat()
+        if (
+            not stat.S_ISREG(certificate_stat.st_mode)
+            or not stat.S_ISREG(private_key_stat.st_mode)
+            or certificate == private_key
+        ):
+            raise ValueError
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.load_cert_chain(certfile=str(certificate), keyfile=str(private_key))
+    except (OSError, ssl.SSLError, ValueError):
+        raise ValueError(
+            "Navigator persistence TLS certificate and key files are invalid or unreadable"
+        ) from None
+    return certificate, private_key
 
 
 def _load_work_connectors(

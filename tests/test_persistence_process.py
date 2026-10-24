@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -20,16 +21,29 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 
 BASE = "/api/v1/harness/workspaces/w1/sessions"
 TOKEN = "process-alice-token"
 
 
-def _start_service(db_path: Path, config_path: Path) -> tuple[subprocess.Popen[str], str]:
+def _start_service(
+    db_path: Path,
+    config_path: Path,
+    *,
+    tls_cert_file: Path | None = None,
+    tls_key_file: Path | None = None,
+) -> tuple[subprocess.Popen[str], str]:
     """Start the configured service and return its advertised loopback URL. | 启动真实服务。"""
 
     repository = Path(__file__).parents[1]
     environment = os.environ.copy()
+    environment.pop("CYRENE_PERSISTENCE_TLS_CERT_FILE", None)
+    environment.pop("CYRENE_PERSISTENCE_TLS_KEY_FILE", None)
+    if tls_cert_file is not None:
+        environment["CYRENE_PERSISTENCE_TLS_CERT_FILE"] = str(tls_cert_file)
+    if tls_key_file is not None:
+        environment["CYRENE_PERSISTENCE_TLS_KEY_FILE"] = str(tls_key_file)
     environment["PERSISTENCE_TEST_TOKEN"] = TOKEN
     environment["PYTHONPATH"] = os.pathsep.join(
         [str(repository / "src"), environment.get("PYTHONPATH", "")]
@@ -76,7 +90,8 @@ def _start_service(db_path: Path, config_path: Path) -> tuple[subprocess.Popen[s
         raise AssertionError(f"persistence service exited before startup: {stderr}")
     try:
         advertised = json.loads(banner)
-        base_url = f"http://{advertised['host']}:{advertised['port']}"
+        scheme = advertised.get("scheme", "http")
+        base_url = f"{scheme}://{advertised['host']}:{advertised['port']}"
         _wait_until_ready(process, base_url)
     except BaseException:
         _stop_service(process)
@@ -198,3 +213,167 @@ def test_real_http_process_restart_recovers_committed_events(tmp_path: Path) -> 
             assert appended_after_restart.json() == {"nextSeq": 2}
     finally:
         _stop_service(second_process)
+
+
+def test_real_tls_process_accepts_httpx_and_node_clients(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Serve real HTTPS and verify both configured HTTPX and Node CA trust paths."""
+
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        pytest.skip("OpenSSL is required to generate an ephemeral TLS test certificate")
+    certificate, private_key = _generate_tls_pair(tmp_path, openssl, "navigator")
+    monkeypatch.setenv("SSL_CERT_FILE", str(certificate))
+
+    config_path = tmp_path / "tls-principals.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "principals": [
+                    {
+                        "token_env": "PERSISTENCE_TEST_TOKEN",
+                        "actor_id": "alice",
+                        "workspace_ids": ["w1"],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    process, base_url = _start_service(
+        tmp_path / "tls-process.db",
+        config_path,
+        tls_cert_file=certificate,
+        tls_key_file=private_key,
+    )
+    assert base_url.startswith("https://")
+    try:
+        with httpx.Client(
+            base_url=base_url,
+            headers={"Authorization": f"Bearer {TOKEN}"},
+            timeout=5,
+        ) as client:
+            created = client.post(
+                BASE,
+                json={
+                    "header": {
+                        "version": 2,
+                        "id": "tls-session",
+                        "createdAt": 1_783_000_000_000,
+                        "isSeeded": False,
+                    },
+                    "inheritedEventCount": 0,
+                    "clientId": "tls-client",
+                },
+            )
+            assert created.status_code == 200, created.text
+
+        node = shutil.which("node")
+        if node is not None:
+            node_environment = os.environ.copy()
+            node_environment["NODE_EXTRA_CA_CERTS"] = str(certificate)
+            node_environment["NAVIGATOR_TEST_TLS_URL"] = f"{base_url}/readyz"
+            result = subprocess.run(
+                [
+                    node,
+                    "--input-type=module",
+                    "--eval",
+                    "const response = await fetch(process.env.NAVIGATOR_TEST_TLS_URL); "
+                    "if (!response.ok) process.exitCode = 1;",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+                env=node_environment,
+            )
+            assert result.returncode == 0, result.stderr
+    finally:
+        _stop_service(process)
+
+
+def test_persistence_tls_configuration_fails_closed_for_partial_or_invalid_pairs(
+    tmp_path: Path,
+) -> None:
+    """Reject partial TLS configuration and paths before publishing a listener."""
+
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        pytest.skip("OpenSSL is required to generate an ephemeral TLS test certificate")
+    certificate, private_key = _generate_tls_pair(tmp_path, openssl, "invalid-pair")
+    _other_certificate, other_private_key = _generate_tls_pair(tmp_path, openssl, "mismatched-pair")
+    config_path = tmp_path / "invalid-tls-principals.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "principals": [
+                    {
+                        "token_env": "PERSISTENCE_TEST_TOKEN",
+                        "actor_id": "alice",
+                        "workspace_ids": ["w1"],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AssertionError, match="must be configured together"):
+        _start_service(
+            tmp_path / "partial-tls.db",
+            config_path,
+            tls_cert_file=certificate,
+        )
+    with pytest.raises(AssertionError, match="invalid or unreadable"):
+        _start_service(
+            tmp_path / "invalid-tls.db",
+            config_path,
+            tls_cert_file=tmp_path / "missing-cert.pem",
+            tls_key_file=private_key,
+        )
+    with pytest.raises(AssertionError, match="invalid or unreadable"):
+        _start_service(
+            tmp_path / "mismatched-tls.db",
+            config_path,
+            tls_cert_file=certificate,
+            tls_key_file=other_private_key,
+        )
+
+
+def _generate_tls_pair(directory: Path, openssl: str, prefix: str) -> tuple[Path, Path]:
+    """Generate a short-lived test CA/server certificate for the loopback listener."""
+
+    certificate = directory / f"{prefix}-cert.pem"
+    private_key = directory / f"{prefix}-key.pem"
+    subprocess.run(
+        [
+            openssl,
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            str(private_key),
+            "-out",
+            str(certificate),
+            "-days",
+            "1",
+            "-subj",
+            "/CN=127.0.0.1",
+            "-addext",
+            "subjectAltName=IP:127.0.0.1",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-addext",
+            "keyUsage=critical,digitalSignature,keyCertSign,keyEncipherment",
+            "-addext",
+            "extendedKeyUsage=serverAuth",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=True,
+    )
+    return certificate, private_key

@@ -14,6 +14,8 @@ Loop 或可写消息历史。
 | --- | --- |
 | `persistence.ts` | Remote Cyrene `SessionPersistence` and ordered live writer / 远程 Cyrene 会话持久化与有序 writer |
 | `persistence-wire.ts` | Authenticated HTTP, handle decoding, and upstream event validation / 认证 HTTP、handle 解码和上游事件校验 |
+| `codebuddy-adapter.ts` | Restricted CodeBuddy structured-output provider; DSH remains the sole tool executor / 受限 CodeBuddy 结构化输出 provider；DSH 保持唯一工具执行者 |
+| `exchange-adapter.ts` | OpenAI-compatible streaming adapter for Exchange / Exchange 的 OpenAI 兼容流式 adapter |
 | `native-ipc.ts` | Supervised inherited-stdio request, cancellation, and protocol framing / 受监管 inherited-stdio 请求、取消和协议封装 |
 | `native.ts` | Cordis Tool registration over the Rust host / 通过 Rust host 注册 Cordis Tool |
 | `import-codex.ts` | Codex read-only archive and explicit AgentLoop Continue / Codex 只读 archive 与显式 AgentLoop Continue |
@@ -80,6 +82,23 @@ Suggested reading and verification order:
 The Rust protocol and executable authority are documented in `../../native/`.
 The parent `harness/README.md` and `upstream.lock.json` define the Bundle and
 exact upstream pin.
+
+`CYRENE_HARNESS_MODEL_SOURCE` selects `exchange` or `codebuddy` and defaults to
+`exchange` for existing deployments. The CodeBuddy provider defaults to
+`glm-5.3-flash` when `CYRENE_HARNESS_MODEL` is unset; `deepseek-v4.1-flash` is
+also advertised. Each model step runs a stateless CodeBuddy CLI process with
+only structured output enabled. DSH tool calls and results are serialized into
+the next prompt, while DSH's existing AgentLoop remains the only tool executor.
+The adapter rejects output without a successful terminal result and locally
+validates requested tool names and arguments against the active DSH catalog.
+
+`CYRENE_HARNESS_MODEL_SOURCE` 用于选择 `exchange` 或 `codebuddy`，未设置时默认
+`exchange`，以兼容既有部署。CodeBuddy provider 在未设置
+`CYRENE_HARNESS_MODEL` 时默认使用 `glm-5.3-flash`，同时公布
+`deepseek-v4.1-flash`。每个模型步骤都会启动一个无状态 CodeBuddy CLI 进程，且只开放
+结构化输出。DSH 工具调用及结果会序列化进下一轮 prompt；DSH 现有 AgentLoop 仍是唯一
+工具执行者。适配器要求 CodeBuddy 返回成功的终态结果，并根据当前 DSH 工具目录在本地
+校验工具名和参数。
 
 Rust 协议和可执行文件 authority 见 `../../native/`；父目录的 `harness/README.md`
 与 `upstream.lock.json` 定义 Bundle 和精确上游 pin。

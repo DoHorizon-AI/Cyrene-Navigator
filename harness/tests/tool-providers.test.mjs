@@ -29,7 +29,7 @@ const tools = {
       name: 'Search contacts',
       description: 'Search the configured WeCom directory.',
       inputSchema: {
-        type: 'object', properties: { query: { type: 'string' } }, required: ['query'], additionalProperties: false,
+        type: 'object', properties: { query: { type: 'string', pattern: '^[A-Za-z]+$' } }, required: ['query'], additionalProperties: false,
       },
       readOnly: true,
     },
@@ -38,7 +38,9 @@ const tools = {
       name: 'Send message',
       description: 'Send a message to one approved conversation.',
       inputSchema: {
-        type: 'object', properties: { conversationId: { type: 'string' }, text: { type: 'string' } },
+        type: 'object', properties: {
+          conversationId: { type: 'string' }, text: { type: 'string', minLength: 1, maxLength: 64 },
+        },
         required: ['conversationId', 'text'], additionalProperties: false,
       },
       readOnly: false,
@@ -116,6 +118,116 @@ async function execute(ctx, name, args, callId, withAgent = true) {
   });
 }
 
+test('host catalog snapshot fixture registers only matching launcher-authorized connector tools', async () => {
+  const githubBindingId = 'exchange-github-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const connectionRef = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const profileRef = 'github-profile-snapshot-test';
+  const snapshot = {
+    schemaVersion: 1,
+    items: [{
+      bindingId: githubBindingId,
+      capabilityId: 'tool.provider.v1',
+      providerId: 'github',
+      connectionRef,
+      profileRef,
+      tools: [
+        {
+          id: 'github_vendor_cli',
+          name: 'Run GitHub CLI Command',
+          description: 'Run one profile-bound argv vector.',
+          readOnly: false,
+          inputSchema: {
+            type: 'object',
+            properties: { argv: { type: 'array', minItems: 1, maxItems: 128, items: { type: 'string', maxLength: 4096 } } },
+            required: ['argv'],
+            additionalProperties: false,
+          },
+        },
+        {
+          id: 'github.repository.list',
+          name: 'List GitHub Repositories',
+          description: 'List repositories for this profile.',
+          readOnly: true,
+          inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+        },
+      ],
+    }],
+  };
+  const trustedBinding = {
+    bindingId: githubBindingId,
+    connectionRef,
+    providerId: 'github',
+    profileRef,
+    tools: [{
+      toolId: 'github_vendor_cli',
+      operationId: 'github.vendor.cli.execute',
+      resourceProjection: 'profile',
+      mutating: true,
+    }],
+  };
+  const bridge = {
+    async request() { throw new Error('Snapshot registration must not discover tools from Work'); },
+    async requestApproval() { throw new Error('Catalog registration must not call tools'); },
+    async mutate() { throw new Error('Catalog registration must not call tools'); },
+  };
+  const ctx = new Context();
+  await ctx.plugin(SystemPrompt);
+  await ctx.plugin(ToolRuntime);
+  try {
+    const dispose = await registerToolProviders(ctx, {
+      bridge,
+      taskIdForSession: () => undefined,
+      connectorAuthorization: {
+        client: {},
+        workspaceId: 'workspace-snapshot-test',
+        bindings: new Map([[githubBindingId, trustedBinding]]),
+      },
+      connectorToolCatalogSnapshot: snapshot,
+    });
+    try {
+      const schemas = ctx.tools.schemas();
+      assert.equal(schemas.length, 1);
+      assert.match(schemas[0].description, /Run GitHub CLI Command/u);
+      assert.deepEqual(schemas[0].parameters.required, ['argv']);
+      assert.equal(schemas.some(schema => schema.description.includes('List GitHub Repositories')), false);
+    } finally {
+      dispose();
+    }
+
+    await assert.rejects(registerToolProviders(ctx, {
+      bridge,
+      taskIdForSession: () => undefined,
+      connectorAuthorization: {
+        client: {},
+        workspaceId: 'workspace-snapshot-test',
+        bindings: new Map([[githubBindingId, trustedBinding]]),
+      },
+      connectorToolCatalogSnapshot: {
+        ...snapshot,
+        items: [{ ...snapshot.items[0], connectionRef: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' }],
+      },
+    }), /launcher-owned connector binding/u);
+    await assert.rejects(registerToolProviders(ctx, {
+      bridge,
+      taskIdForSession: () => undefined,
+      connectorAuthorization: {
+        client: {},
+        workspaceId: 'workspace-snapshot-test',
+        bindings: new Map([[githubBindingId, trustedBinding]]),
+      },
+      connectorToolCatalogSnapshot: {
+        ...snapshot,
+        items: [{
+          ...snapshot.items[0],
+          tools: [{ ...snapshot.items[0].tools[0], operationId: 'caller-controlled.operation' }],
+        }],
+      },
+    }), /missing or unsupported fields/u);
+  } finally {
+    await ctx.fiber.dispose();
+  }
+});
+
 test('registers canonical read tools and routes calls through the configured binding', async () => {
   const fixture = createBridgeFixture();
   const { ctx, dispose } = await createToolContext(fixture);
@@ -124,6 +236,7 @@ test('registers canonical read tools and routes calls through the configured bin
     const schema = schemas.find(item => item.description.startsWith(`Search contacts (configured provider ${bindingId})`));
     assert.ok(schema);
     assert.equal(schema.parameters.properties.query.type, 'string');
+    assert.equal(schema.parameters.properties.query.pattern, undefined);
     const name = schema.name;
     const result = await execute(ctx, name, { query: 'Ada' }, 'read-call-1', false);
 
@@ -135,6 +248,11 @@ test('registers canonical read tools and routes calls through the configured bin
     assert.equal(fixture.callCount(), 1);
     assert.equal(fixture.events.some(event => event.type === 'approval' || event.path === '/operations'), false);
     assert.ok(fixture.events.some(event => event.path === `/tool-providers/${bindingId}/tools/${readToolId}/call`));
+
+    const rejected = await execute(ctx, name, { query: 'Ada/Lovelace' }, 'pattern-invalid-call', false);
+    assert.equal(rejected.isError, true);
+    assert.match(rejected.error.message, /violates its configured bounds/u);
+    assert.equal(fixture.callCount(), 1);
   } finally {
     dispose();
     await ctx.fiber.dispose();
@@ -185,6 +303,26 @@ test('approval rejection prevents operation receipt creation and provider call',
 
     assert.equal(result.isError, true);
     assert.equal(fixture.events.some(event => event.type === 'mutate' || event.path?.includes('/operations/')), false);
+    assert.equal(fixture.callCount(), 0);
+  } finally {
+    dispose();
+    await ctx.fiber.dispose();
+  }
+});
+
+test('projected string bounds remain enforced before approval and provider calls', async () => {
+  const fixture = createBridgeFixture();
+  const { ctx, dispose } = await createToolContext(fixture);
+  try {
+    const schema = schemaFor(ctx, writeToolId);
+    assert.ok(schema);
+    assert.equal(schema.parameters.properties.text.minLength, undefined);
+    const result = await execute(
+      ctx, schema.name, { conversationId: 'team-chat-9', text: '' }, 'empty-message',
+    );
+    assert.equal(result.isError, true);
+    assert.match(result.error.message, /configured bounds/u);
+    assert.equal(fixture.events.some(event => event.type === 'approval'), false);
     assert.equal(fixture.callCount(), 0);
   } finally {
     dispose();

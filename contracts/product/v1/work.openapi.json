@@ -331,6 +331,16 @@
               }
             ]
           },
+          "teamsThreadMessage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TeamsThreadMessageCreate"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "type": {
             "maxLength": 256,
             "minLength": 1,
@@ -1133,7 +1143,8 @@
             "enum": [
               "delivered",
               "failed",
-              "uncertain"
+              "uncertain",
+              "retry"
             ],
             "title": "Outcome",
             "type": "string"
@@ -1142,6 +1153,19 @@
             "additionalProperties": true,
             "title": "Result",
             "type": "object"
+          },
+          "retryAfterSeconds": {
+            "anyOf": [
+              {
+                "maximum": 300.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retryafterseconds"
           }
         },
         "required": [
@@ -1499,6 +1523,91 @@
           "updatedAt"
         ],
         "title": "OperationRecord",
+        "type": "object"
+      },
+      "OperationSummary": {
+        "additionalProperties": false,
+        "description": "Minimal unresolved provider receipt for status reconciliation. | \u672a\u89e3\u51b3\u64cd\u4f5c\u6458\u8981\u3002",
+        "properties": {
+          "createdAt": {
+            "title": "Createdat",
+            "type": "integer"
+          },
+          "evidence": {
+            "additionalProperties": true,
+            "title": "Evidence",
+            "type": "object"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "operationType": {
+            "title": "Operationtype",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "started",
+              "uncertain"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "target": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target"
+          },
+          "taskId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Taskid"
+          },
+          "updatedAt": {
+            "title": "Updatedat",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "operationType",
+          "status",
+          "evidence",
+          "createdAt",
+          "updatedAt"
+        ],
+        "title": "OperationSummary",
+        "type": "object"
+      },
+      "OperationSummaryList": {
+        "additionalProperties": false,
+        "description": "Workspace-scoped unresolved operation receipts. | \u5de5\u4f5c\u533a\u672a\u89e3\u51b3\u64cd\u4f5c\u6458\u8981\u3002",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/OperationSummary"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "OperationSummaryList",
         "type": "object"
       },
       "OperationVerify": {
@@ -2283,6 +2392,204 @@
           "metadata"
         ],
         "title": "TaskRecord",
+        "type": "object"
+      },
+      "TeamsThreadMessage": {
+        "additionalProperties": false,
+        "description": "Durable message text used as context for a later owner request. | \u7ebf\u7a0b\u4e0a\u4e0b\u6587\u6d88\u606f\u3002",
+        "properties": {
+          "actorIssuer": {
+            "title": "Actorissuer",
+            "type": "string"
+          },
+          "actorSubject": {
+            "title": "Actorsubject",
+            "type": "string"
+          },
+          "createdAt": {
+            "title": "Createdat",
+            "type": "integer"
+          },
+          "messageId": {
+            "title": "Messageid",
+            "type": "string"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "messageId",
+          "actorIssuer",
+          "actorSubject",
+          "text",
+          "createdAt"
+        ],
+        "title": "TeamsThreadMessage",
+        "type": "object"
+      },
+      "TeamsThreadMessageCreate": {
+        "additionalProperties": false,
+        "description": "Persist one verified Teams participant message and optional thread mapping.\n\n\u4e2d\u6587\uff1a\u4fdd\u5b58\u7ecf\u9a8c\u8bc1\u7684 Teams \u53c2\u4e0e\u8005\u6d88\u606f\uff1b\u53ea\u6709\u53d7\u4fe1\u7ef4\u62a4\u8005\u63a5\u7eb3\u4efb\u52a1\u65f6\u624d\u521b\u5efa\u7ebf\u7a0b\u6620\u5c04\u3002",
+        "properties": {
+          "actorIssuer": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Actorissuer",
+            "type": "string"
+          },
+          "actorSubject": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Actorsubject",
+            "type": "string"
+          },
+          "channelId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Channelid",
+            "type": "string"
+          },
+          "conversationId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Conversationid",
+            "type": "string"
+          },
+          "messageId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Messageid",
+            "type": "string"
+          },
+          "rootThreadId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Rootthreadid",
+            "type": "string"
+          },
+          "serviceUrl": {
+            "default": "",
+            "maxLength": 512,
+            "title": "Serviceurl",
+            "type": "string"
+          },
+          "sessionId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sessionid"
+          },
+          "teamId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Teamid",
+            "type": "string"
+          },
+          "tenantId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Tenantid",
+            "type": "string"
+          },
+          "text": {
+            "maxLength": 20000,
+            "minLength": 1,
+            "title": "Text",
+            "type": "string"
+          },
+          "threadId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Threadid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "threadId",
+          "messageId",
+          "tenantId",
+          "teamId",
+          "channelId",
+          "conversationId",
+          "rootThreadId",
+          "actorIssuer",
+          "actorSubject",
+          "text"
+        ],
+        "title": "TeamsThreadMessageCreate",
+        "type": "object"
+      },
+      "TeamsThreadRecord": {
+        "additionalProperties": false,
+        "description": "Stable Teams thread to DSH Session mapping and recent context. | Teams \u7ebf\u7a0b\u6620\u5c04\u3002",
+        "properties": {
+          "channelId": {
+            "title": "Channelid",
+            "type": "string"
+          },
+          "conversationId": {
+            "title": "Conversationid",
+            "type": "string"
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/TeamsThreadMessage"
+            },
+            "title": "Messages",
+            "type": "array"
+          },
+          "rootThreadId": {
+            "title": "Rootthreadid",
+            "type": "string"
+          },
+          "serviceUrl": {
+            "default": "",
+            "title": "Serviceurl",
+            "type": "string"
+          },
+          "sessionId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sessionid"
+          },
+          "teamId": {
+            "title": "Teamid",
+            "type": "string"
+          },
+          "tenantId": {
+            "title": "Tenantid",
+            "type": "string"
+          },
+          "threadId": {
+            "title": "Threadid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "threadId",
+          "tenantId",
+          "teamId",
+          "channelId",
+          "conversationId",
+          "rootThreadId",
+          "messages"
+        ],
+        "title": "TeamsThreadRecord",
         "type": "object"
       },
       "ToolCallBody": {
@@ -3368,6 +3675,93 @@
         "summary": "Update Connector Status"
       }
     },
+    "/api/v1/workspaces/{workspace_id}/work/connectors/{connector_id}/threads/{thread_id}": {
+      "get": {
+        "description": "Read one durable Teams thread mapping and recent context messages.\n\n\u4e2d\u6587\uff1a\u53ea\u8fd4\u56de\u672c Workspace \u7684\u7a33\u5b9a Teams \u7ebf\u7a0b\u6620\u5c04\u53ca\u6700\u8fd1\u8ba8\u8bba\u6587\u672c\u3002",
+        "operationId": "get_connector_thread_api_v1_workspaces__workspace_id__work_connectors__connector_id__threads__thread_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "title": "Connector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "message_limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Message Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "exclude_message_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Exclude Message Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TeamsThreadRecord"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Connector Thread"
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/work/inputs": {
       "get": {
         "operationId": "list_input_requests_api_v1_workspaces__workspace_id__work_inputs_get",
@@ -4024,6 +4418,91 @@
           }
         },
         "summary": "Create Operation"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/operations/unresolved": {
+      "get": {
+        "operationId": "list_unresolved_operations_api_v1_workspaces__workspace_id__work_operations_unresolved_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "target",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 2000,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Target"
+            }
+          },
+          {
+            "in": "query",
+            "name": "operation_type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Operation Type"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationSummaryList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Unresolved Operations"
       }
     },
     "/api/v1/workspaces/{workspace_id}/work/operations/{operation_id}": {

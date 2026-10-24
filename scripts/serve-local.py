@@ -22,6 +22,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,9 @@ _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
 _STARTUP_TIMEOUT_SECONDS = 30.0
 _STOP_TIMEOUT_SECONDS = 8.0
 _PROBE_TIMEOUT_SECONDS = 0.5
+_MAX_TASK_CONCURRENCY = 32
+_MAX_CONNECTOR_TOOL_CATALOG_BYTES = 32 * 1024 * 1024
+_MAX_CONNECTOR_TOOL_CATALOG_ITEMS = 128
 
 
 class _WindowsByteLock(Protocol):
@@ -486,6 +490,9 @@ def _base_child_environment(repository: Path) -> dict[str, str]:
 
     allowed = ("PATH", "HOME", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "LANG", "LC_ALL")
     environment = {name: os.environ[name] for name in allowed if name in os.environ}
+    for name in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        if name in os.environ:
+            environment[name] = os.environ[name]
     old_pythonpath = os.environ.get("PYTHONPATH")
     values = [str(repository / "src")]
     if old_pythonpath:
@@ -592,6 +599,12 @@ def _persistence_child_environment(
     environment = _base_child_environment(repository)
     environment["CYRENE_SESSION_TOKEN"] = session_token
     environment[principal_token_env] = session_token
+    for name in (
+        "CYRENE_PERSISTENCE_TLS_CERT_FILE",
+        "CYRENE_PERSISTENCE_TLS_KEY_FILE",
+    ):
+        if name in os.environ:
+            environment[name] = os.environ[name]
     for name in env_references.difference({principal_token_env, "CYRENE_SESSION_TOKEN"}):
         if name in os.environ:
             environment[name] = os.environ[name]
@@ -614,6 +627,9 @@ def _executor_child_environment(
 
     allowed = ("PATH", "HOME", "SYSTEMROOT", "WINDIR", "TEMP", "TMP")
     environment = {name: os.environ[name] for name in allowed if name in os.environ}
+    for name in ("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        if name in os.environ:
+            environment[name] = os.environ[name]
     provider_names = (
         "CYRENE_EXCHANGE_URL",
         "CYRENE_EXCHANGE_TOKEN",
@@ -653,6 +669,13 @@ def _executor_integration_environment(
             raise ValueError("CYRENE_WORKFLOWS_ENABLED must be 'true' or 'false'")
         result["CYRENE_WORKFLOWS_ENABLED"] = workflows_enabled
 
+    concurrency = environment.get("CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS", "1")
+    if not re.fullmatch(r"[0-9]{1,2}", concurrency):
+        raise ValueError("CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS must be an integer")
+    if not 1 <= int(concurrency) <= _MAX_TASK_CONCURRENCY:
+        raise ValueError("CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS must be between 1 and 32")
+    result["CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS"] = concurrency
+
     integration_url = environment.get("CYRENE_EXCHANGE_INTEGRATION_URL")
     if integration_url is not None:
         if not integration_url.strip():
@@ -679,6 +702,106 @@ def _executor_integration_environment(
                 raise ValueError("CYRENE_EXCHANGE_INTEGRATION_USER_TOKEN cannot be empty")
             result["CYRENE_EXCHANGE_INTEGRATION_USER_TOKEN"] = user_token
 
+    teams_enabled = environment.get("TEAMS_ENABLED")
+    if teams_enabled is not None and teams_enabled not in {"true", "false"}:
+        raise ValueError("TEAMS_ENABLED must be 'true' or 'false'")
+    if teams_enabled == "true":
+        if not _WORKSPACE_RE.fullmatch(workspace_id):
+            raise ValueError("Teams requires a configured Navigator Workspace")
+        required_names = (
+            "TEAMS_NAVIGATOR_HMAC_KEY",
+            "TEAMS_TENANT_ID",
+            "TEAMS_ALLOWED_TEAM_IDS",
+            "TEAMS_BOT_APP_ID",
+            "TEAMS_EXCHANGE_CONNECTION_REF",
+            "TEAMS_EXCHANGE_PROFILE_REF",
+            "CYRENE_EXCHANGE_CONNECTOR_INTERNAL_URL",
+            "NAVIGATOR_EXCHANGE_HMAC_KEY_FILE",
+            "NAVIGATOR_EXCHANGE_HMAC_KEY_ID",
+            "CYRENE_CONNECTOR_BINDINGS_FILE",
+            "CYRENE_CONNECTOR_TOOL_CATALOG_FILE",
+        )
+        for name in required_names:
+            if name not in environment or not environment[name].strip():
+                raise ValueError(f"{name} is required when Teams is enabled")
+            result[name] = environment[name]
+        if len(environment["TEAMS_NAVIGATOR_HMAC_KEY"].encode("utf-8")) < 32:
+            raise ValueError("TEAMS_NAVIGATOR_HMAC_KEY must contain at least 32 bytes")
+        _validate_uuid_environment(environment["TEAMS_TENANT_ID"], "TEAMS_TENANT_ID")
+        _validate_uuid_environment(environment["TEAMS_BOT_APP_ID"], "TEAMS_BOT_APP_ID")
+        _validate_uuid_environment(
+            environment["TEAMS_EXCHANGE_CONNECTION_REF"], "TEAMS_EXCHANGE_CONNECTION_REF"
+        )
+        allowed_teams = _split_unique_values(
+            environment["TEAMS_ALLOWED_TEAM_IDS"], "TEAMS_ALLOWED_TEAM_IDS"
+        )
+        actor_file = environment.get("TEAMS_TASK_ACTOR_SUBJECTS_FILE")
+        if actor_file is not None:
+            actor_path = Path(actor_file).expanduser().resolve()
+            try:
+                actor_document = json.loads(actor_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                raise ValueError(
+                    "TEAMS_TASK_ACTOR_SUBJECTS_FILE is unavailable or invalid"
+                ) from None
+            if (
+                not isinstance(actor_document, dict)
+                or set(actor_document) != {"schemaVersion", "workspaceId", "issuer", "subjects"}
+                or actor_document.get("schemaVersion") != 1
+                or actor_document.get("workspaceId") != workspace_id
+                or actor_document.get("issuer")
+                != f"https://login.microsoftonline.com/{environment['TEAMS_TENANT_ID'].lower()}/v2.0"
+                or not isinstance(actor_document.get("subjects"), list)
+                or len(actor_document["subjects"]) > 256
+            ):
+                raise ValueError("TEAMS_TASK_ACTOR_SUBJECTS_FILE has invalid scope or schema")
+            if not all(isinstance(actor, str) for actor in actor_document["subjects"]):
+                raise ValueError("TEAMS_TASK_ACTOR_SUBJECTS_FILE subjects must be UUID text")
+            for actor in actor_document["subjects"]:
+                _validate_uuid_environment(actor, "TEAMS_TASK_ACTOR_SUBJECTS_FILE")
+            if len(set(actor_document["subjects"])) != len(actor_document["subjects"]):
+                raise ValueError("TEAMS_TASK_ACTOR_SUBJECTS_FILE contains duplicate subjects")
+            result["TEAMS_TASK_ACTOR_SUBJECTS_FILE"] = str(actor_path)
+        else:
+            if "TEAMS_TASK_ACTOR_SUBJECTS" not in environment:
+                raise ValueError(
+                    "TEAMS_TASK_ACTOR_SUBJECTS or TEAMS_TASK_ACTOR_SUBJECTS_FILE is required"
+                )
+            actors = _split_unique_values(
+                environment["TEAMS_TASK_ACTOR_SUBJECTS"], "TEAMS_TASK_ACTOR_SUBJECTS"
+            )
+            for actor in actors:
+                _validate_uuid_environment(actor, "TEAMS_TASK_ACTOR_SUBJECTS")
+            result["TEAMS_TASK_ACTOR_SUBJECTS"] = environment["TEAMS_TASK_ACTOR_SUBJECTS"]
+        if not allowed_teams:
+            raise ValueError("TEAMS_ALLOWED_TEAM_IDS must contain at least one team id")
+        if not environment["CYRENE_EXCHANGE_CONNECTOR_INTERNAL_URL"].startswith("https://"):
+            raise ValueError("CYRENE_EXCHANGE_CONNECTOR_INTERNAL_URL must use HTTPS")
+        key_file = Path(environment["NAVIGATOR_EXCHANGE_HMAC_KEY_FILE"]).expanduser().resolve()
+        if not key_file.is_file():
+            raise ValueError("Navigator Exchange HMAC secret file is unavailable")
+        binding_path = Path(environment["CYRENE_CONNECTOR_BINDINGS_FILE"]).expanduser().resolve()
+        try:
+            binding_map = json.loads(binding_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            raise ValueError("CYRENE_CONNECTOR_BINDINGS_FILE could not be read as JSON") from None
+        if (
+            not isinstance(binding_map, dict)
+            or binding_map.get("schemaVersion") != 1
+            or not isinstance(binding_map.get("bindings"), list)
+            or not binding_map["bindings"]
+        ):
+            raise ValueError("CYRENE_CONNECTOR_BINDINGS_FILE must contain version 1 bindings")
+        result["CYRENE_CONNECTOR_BINDINGS_FILE"] = str(binding_path)
+        result["CYRENE_CONNECTOR_TOOL_CATALOG_FILE"] = _validated_connector_tool_catalog_file(
+            environment["CYRENE_CONNECTOR_TOOL_CATALOG_FILE"]
+        )
+        result["TEAMS_ENABLED"] = teams_enabled
+        audience = environment.get("CYRENE_AUTHORITY_EXCHANGE_WORKLOAD_AUDIENCE", "exchange")
+        if not audience.strip() or len(audience) > 256 or any(ord(ch) < 32 for ch in audience):
+            raise ValueError("CYRENE_AUTHORITY_EXCHANGE_WORKLOAD_AUDIENCE is invalid")
+        result["CYRENE_AUTHORITY_EXCHANGE_WORKLOAD_AUDIENCE"] = audience
+
     config_names = ("CYRENE_SUBAGENT_CONFIG", "CYRENE_CLOUD_PROFILE_CONFIG")
     for config_name in config_names:
         configured_path = environment.get(config_name)
@@ -697,6 +820,67 @@ def _executor_integration_environment(
         else:
             _collect_cloud_environment_references(document, result, environment)
     return result
+
+
+def _validated_connector_tool_catalog_file(value: str) -> str:
+    """Validate a bounded versioned Exchange catalog envelope and return its resolved path.
+
+    中文:校验有大小限制的 Exchange catalog 外层版本与 items 列表，并返回实际解析路径。
+    """
+
+    if not value or value.strip() != value or any(ord(character) < 32 for character in value):
+        raise ValueError("CYRENE_CONNECTOR_TOOL_CATALOG_FILE is invalid")
+    try:
+        path = Path(value).expanduser().resolve()
+        metadata = path.stat()
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError(
+            "CYRENE_CONNECTOR_TOOL_CATALOG_FILE could not be read as bounded JSON"
+        ) from None
+    if (
+        not path.is_file()
+        or metadata.st_size < 1
+        or metadata.st_size > _MAX_CONNECTOR_TOOL_CATALOG_BYTES
+    ):
+        raise ValueError("CYRENE_CONNECTOR_TOOL_CATALOG_FILE must be a bounded regular file")
+    try:
+        with path.open("rb") as stream:
+            payload = stream.read(_MAX_CONNECTOR_TOOL_CATALOG_BYTES + 1)
+        if len(payload) > _MAX_CONNECTOR_TOOL_CATALOG_BYTES:
+            raise ValueError("CYRENE_CONNECTOR_TOOL_CATALOG_FILE must be a bounded regular file")
+        catalog = json.loads(payload.decode("utf-8"))
+    except (OSError, RecursionError, UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError(
+            "CYRENE_CONNECTOR_TOOL_CATALOG_FILE could not be read as bounded JSON"
+        ) from None
+    if (
+        not isinstance(catalog, dict)
+        or type(catalog.get("schemaVersion")) is not int
+        or catalog.get("schemaVersion") != 1
+        or not isinstance(catalog.get("items"), list)
+        or not 1 <= len(catalog["items"]) <= _MAX_CONNECTOR_TOOL_CATALOG_ITEMS
+    ):
+        raise ValueError("CYRENE_CONNECTOR_TOOL_CATALOG_FILE must contain version 1 catalog items")
+    return str(path)
+
+
+def _validate_uuid_environment(value: str, name: str) -> None:
+    """Validate one canonical Entra/Exchange UUID without echoing its value."""
+
+    try:
+        if str(uuid.UUID(value)) != value.lower():
+            raise ValueError
+    except (ValueError, AttributeError):
+        raise ValueError(f"{name} must be a UUID") from None
+
+
+def _split_unique_values(value: str, name: str) -> list[str]:
+    """Parse a comma-separated allowlist with no empty or duplicate values."""
+
+    values = [part.strip() for part in value.split(",")]
+    if not values or any(not part for part in values) or len(set(values)) != len(values):
+        raise ValueError(f"{name} must contain unique non-empty values")
+    return values
 
 
 def _add_environment_reference(
@@ -844,15 +1028,24 @@ def _read_startup(child: ChildService, timeout: float) -> dict[str, Any]:
 
 
 def _persistence_url(startup: dict[str, Any]) -> str:
-    """Derive a loopback URL from the persistence launcher's bound listener."""
+    """Derive an HTTP(S) loopback URL from the bound persistence listener."""
 
     if startup.get("service") != "cyrene-persistence":
         raise RuntimeError("persistence service returned an unexpected startup identity")
     host = startup.get("host")
     port = startup.get("port")
-    if not isinstance(host, str) or not isinstance(port, int) or not 0 < port < 65536:
+    scheme = startup.get("scheme", "http")
+    if (
+        not isinstance(host, str)
+        or host not in {"127.0.0.1", "localhost", "::1"}
+        or isinstance(port, bool)
+        or not isinstance(port, int)
+        or not 0 < port < 65536
+        or not isinstance(scheme, str)
+        or scheme not in {"http", "https"}
+    ):
         raise RuntimeError("persistence service returned an invalid listener address")
-    return f"http://127.0.0.1:{port}"
+    return f"{scheme}://127.0.0.1:{port}"
 
 
 def _executor_url(startup: dict[str, Any]) -> str:
