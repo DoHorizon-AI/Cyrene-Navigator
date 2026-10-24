@@ -409,6 +409,79 @@ test('WorkStateClient: requests use the configured workspace bearer and decode n
   }
 });
 
+test('WorkStateClient reads consecutive persisted Teams messages with line breaks', async () => {
+  const tenantId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const ownerId = '11111111-1111-4111-8111-111111111111';
+  const serviceUrl = 'https://smba.trafficmanager.net/emea/';
+  const tokenEnv = 'TEAMS_WORK_STATE_TEST_TOKEN';
+  const previousToken = process.env[tokenEnv];
+  process.env[tokenEnv] = 'work-state-test-token';
+  const q1 = 'Question one, line one.\nQuestion one, line two\twith a tab.\r\nQuestion one, line three.';
+  const q2 = 'Question two, first line.\nQuestion two, second line.';
+  let messages = [
+    {
+      messageId: 'teams-q1',
+      actorIssuer: `https://login.microsoftonline.com/${tenantId}/v2.0`,
+      actorSubject: ownerId,
+      text: q1,
+      createdAt: 10,
+    },
+    {
+      messageId: 'teams-q2',
+      actorIssuer: `https://login.microsoftonline.com/${tenantId}/v2.0`,
+      actorSubject: ownerId,
+      text: q2,
+      createdAt: 20,
+    },
+  ];
+  let authorizationHeader;
+  const server = createServer((req, res) => {
+    if (req.method === 'GET'
+      && req.url?.startsWith('/api/v1/workspaces/acme/work/connectors/teams-v1/threads/thread-1?')) {
+      authorizationHeader = req.headers.authorization;
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
+        threadId: 'thread-1',
+        tenantId,
+        teamId: 'team-1',
+        channelId: 'channel-1',
+        conversationId: '19:channel-conversation',
+        rootThreadId: '1698765432100',
+        serviceUrl,
+        sessionId: 'teams-thread-1',
+        messages,
+      }));
+      return;
+    }
+    res.writeHead(404).end(JSON.stringify({ code: 'WORK_CONNECTOR_THREAD_NOT_FOUND' }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  try {
+    const client = new WorkStateClient({
+      baseUrl: `http://127.0.0.1:${port}`,
+      workspaceId: 'acme',
+      tokenEnv,
+    });
+    const thread = await client.getConnectorThread('teams-v1', 'thread-1', 20);
+    assert.deepEqual(thread.messages.map(message => message.text), [q1, q2]);
+    assert.equal(thread.sessionId, 'teams-thread-1');
+    assert.equal(authorizationHeader, 'Bearer work-state-test-token');
+
+    messages = [{ ...messages[0], text: 'Before\u0000After' }];
+    await assert.rejects(client.getConnectorThread('teams-v1', 'thread-1', 20), /Invalid thread message text/u);
+
+    messages = [{ ...messages[0], text: 'x'.repeat(20_001) }];
+    await assert.rejects(client.getConnectorThread('teams-v1', 'thread-1', 20), /Invalid thread message text/u);
+
+    messages = [{ ...messages[0], messageId: 'bad\nmessage-id' }];
+    await assert.rejects(client.getConnectorThread('teams-v1', 'thread-1', 20), /Invalid thread message id/u);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+    if (previousToken === undefined) delete process.env[tokenEnv];
+    else process.env[tokenEnv] = previousToken;
+  }
+});
+
 test('continuation verifies Work ownership before using a stored session with Exchange', async () => {
   const store = new InMemoryWorkStateStore();
   const source = await createPausedAuthorizationTask(store, 'foreign-source', 'foreign-session');

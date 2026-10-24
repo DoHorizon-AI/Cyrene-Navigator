@@ -75,6 +75,17 @@ Windows 也必须执行同一顺序并使用批准的 Node runtime；编译前�
 `Remove-Item harness/dist -Recurse -Force`，再通过该 Node executable 调用 `tsc`
 和 `build-harness-client.mjs`。最终的 `harness/dist/client.js` 是生成的 DSH Loader
 产物，不是源码入口，也不能用来证明已测试安装后的桌面应用。
+
+## Teams message admission / Teams 消息接入
+
+The Teams bridge preserves LF, CRLF and TAB in message text, including line
+breaks inserted between separate content parts. It rejects NUL characters and
+text longer than 20,000 JavaScript string code units. Identifier validation
+remains stricter and continues to reject control characters.
+
+Teams bridge 会保留消息正文中的 LF、CRLF 与 TAB，也会保留不同内容片段之间的换行；
+正文包含 NUL 或超过 20,000 个 JavaScript UTF-16 code unit 时拒绝。标识符校验仍更严格，
+继续拒绝控制字符。
 ---
 <!-- Chinese Translation / 中文翻译 -->
 

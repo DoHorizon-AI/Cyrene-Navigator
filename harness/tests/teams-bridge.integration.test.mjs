@@ -37,7 +37,13 @@ class FixtureAdapter extends LlmAdapter {
   }
 }
 
-function teamsActivity({ messageId, senderId, text, mention = false }) {
+function teamsActivity({
+  messageId,
+  senderId,
+  text,
+  mention = false,
+  additionalContentParts = [],
+}) {
   return {
     event_type: 'inbound_message',
     payload: {
@@ -49,6 +55,7 @@ function teamsActivity({ messageId, senderId, text, mention = false }) {
       sender_id: senderId,
       content: [
         ...(mention ? [{ mention: { target: 'user', target_id: BOT_APP_ID, display_name: 'Cyrene' } }] : []),
+        ...additionalContentParts,
         { text: { text } },
       ],
       vendor_extension: {
@@ -207,6 +214,130 @@ test('signed Teams intake stores member context but only the mapped owner trigge
     await app.ctx.fiber.dispose();
     if (previousSecret === undefined) delete process.env.TEAMS_TEST_HMAC_KEY;
     else process.env.TEAMS_TEST_HMAC_KEY = previousSecret;
+  }
+});
+
+test('Teams message text preserves LF, CRLF, TAB and content-part boundaries', async () => {
+  const store = new InMemoryWorkStateStore();
+  const exchangeAuthorization = new ExchangeConnectorAuthorizationClient({
+    baseUrl: 'http://127.0.0.1:1',
+    hmacKeyFile: '/does-not-exist-in-this-test',
+    hmacKeyId: 'teams-test',
+    audience: 'exchange',
+  });
+  const app = await createExecutorApp({
+    testMode: true,
+    authTokenEnv: 'TEAMS_EXECUTOR_TOKEN',
+    customLlmAdapter: { provider: 'teams-fixture', adapter: new FixtureAdapter() },
+    model: 'fixture-v1',
+    workStateStore: store,
+    teams: {
+      connectorId: 'teams-v1', tenantId: TENANT_ID,
+      allowedTeamIds: ['team-1'], botAppId: BOT_APP_ID,
+      taskActorSubjects: [OWNER_ID], ingressSecretEnv: 'TEAMS_TEST_HMAC_KEY',
+      exchangeConnectionRef: '11111111-1111-4111-8111-111111111111',
+      exchangeProfileRef: 'teams-profile-1', exchangeAuthorization,
+    },
+  });
+  const server = await app.executor.startServer(0, '127.0.0.1');
+  try {
+    const ownerRoot = await postActivity(server.url, teamsActivity({
+      messageId: 'owner-multiline-root', senderId: OWNER_ID, text: 'Start the thread.', mention: true,
+    }));
+    assert.equal(ownerRoot.status, 202, await ownerRoot.text());
+    const rootTasks = await eventually(() => store.listTasks(), page => page.items.length === 1);
+    const rootTask = await store.getTask(rootTasks.items[0].id);
+    assert.ok(rootTask);
+
+    const multilineLines = [
+      `${'A'.repeat(68)}\t`,
+      'B'.repeat(70),
+      'C'.repeat(70),
+      'D'.repeat(70),
+      'E'.repeat(70),
+      'F'.repeat(42),
+    ];
+    const multilineText = `${multilineLines.slice(0, 5).join('\n')}\r\n${multilineLines[5]}`;
+    assert.equal(multilineText.length, 397);
+    const additionalText = 'Additional content block';
+    const expectedText = `${additionalText}\n${multilineText}`;
+    const multilineReply = await postActivity(server.url, teamsActivity({
+      messageId: 'owner-multiline-followup',
+      senderId: OWNER_ID,
+      text: multilineText,
+      additionalContentParts: [{ text: { text: additionalText } }],
+    }));
+    assert.equal(multilineReply.status, 202, await multilineReply.text());
+
+    const tasks = await eventually(() => store.listTasks(), page => page.items.length === 2);
+    const followupTask = await store.getTask(tasks.items.find(row => row.id !== rootTask.id).id);
+    assert.ok(followupTask);
+    assert.equal(followupTask.sessionId, rootTask.sessionId);
+    assert.ok(followupTask.prompt.includes(expectedText));
+    const thread = await store.getConnectorThread(
+      'teams-v1', rootTask.sessionId.slice('teams-'.length), 20,
+    );
+    assert.equal(
+      thread.messages.find(message => message.messageId === 'owner-multiline-followup')?.text,
+      expectedText,
+    );
+
+    const longMentionedText = [
+      'M'.repeat(70),
+      'N'.repeat(70),
+      'O'.repeat(70),
+      'P'.repeat(70),
+      'Q'.repeat(7),
+    ].join('\n');
+    assert.equal(longMentionedText.length, 291);
+    const longMentioned = await postActivity(server.url, teamsActivity({
+      messageId: 'owner-long-mentioned-followup',
+      senderId: OWNER_ID,
+      text: longMentionedText,
+      mention: true,
+    }));
+    assert.equal(longMentioned.status, 202, await longMentioned.text());
+
+    const tasksAfterLongMention = await eventually(
+      () => store.listTasks(),
+      page => page.items.length === 3,
+    );
+    const longMentionTask = await store.getTask(
+      tasksAfterLongMention.items.find(
+        row => row.id !== rootTask.id && row.id !== followupTask.id,
+      ).id,
+    );
+    assert.ok(longMentionTask);
+    assert.ok(longMentionTask.prompt.includes(longMentionedText));
+    const threadAfterLongMention = await store.getConnectorThread(
+      'teams-v1', rootTask.sessionId.slice('teams-'.length), 20,
+    );
+    assert.equal(
+      threadAfterLongMention.messages.find(message => message.messageId === 'owner-long-mentioned-followup')?.text,
+      longMentionedText,
+    );
+
+    const nulText = await postActivity(server.url, teamsActivity({
+      messageId: 'owner-nul-text', senderId: OWNER_ID, text: 'Before\u0000After',
+    }));
+    assert.equal(nulText.status, 400, await nulText.text());
+
+    const oversizedText = await postActivity(server.url, teamsActivity({
+      messageId: 'owner-oversized-text', senderId: OWNER_ID, text: 'x'.repeat(20_001),
+    }));
+    assert.equal(oversizedText.status, 400, await oversizedText.text());
+
+    const invalidIdentifier = teamsActivity({
+      messageId: 'owner-invalid-identifier', senderId: OWNER_ID, text: 'This is short.',
+    });
+    invalidIdentifier.payload.conversation.conversation_id = '19:channel\nconversation';
+    const rejectedIdentifier = await postActivity(server.url, invalidIdentifier);
+    assert.equal(rejectedIdentifier.status, 400, await rejectedIdentifier.text());
+    assert.equal((await store.listTasks()).items.length, 3);
+  } finally {
+    await app.executor.dispose();
+    await app.pluginManager?.dispose();
+    await app.ctx.fiber.dispose();
   }
 });
 
