@@ -91,7 +91,9 @@ there selects the model adapter. The separate `scripts/serve-local.py` launcher
 is not wired for Antigravity yet. CodeBuddy defaults to
 `glm-5.3-flash` and also advertises `deepseek-v4.1-flash`. Antigravity defaults
 to `gemini-3.8-flash-medium` and advertises only the verified 3.8 Flash low,
-medium, and high model slugs. It requires the service HOME's exact
+medium, and high model slugs. If `CYRENE_HARNESS_MODEL` is set, it must use one
+of those Antigravity slugs; remove a stale model from another provider or set
+the desired Antigravity model explicitly. It requires the service HOME's exact
 `~/.gemini/config/agents/cyrene-dsh-model.md` profile and an operator-installed,
 authenticated `agy` executable on PATH. Each request is one stdin JSON event in
 a temporary empty working directory; the user prompt is never a command-line
@@ -115,7 +117,8 @@ is resumed with the currently configured model selection and its prior history.
 `antigravity`，未设置时仍默认 `exchange`，以兼容既有部署。CodeBuddy provider 在未设置
 `CYRENE_HARNESS_MODEL` 时默认使用 `glm-5.3-flash`，同时公布
 `deepseek-v4.1-flash`。Antigravity 默认使用 `gemini-3.8-flash-medium`，只公布已验证的
-3.8 Flash low、medium、high 模型 slug。它要求服务 HOME 下存在精确的
+3.8 Flash low、medium、high 模型 slug。若设置了 `CYRENE_HARNESS_MODEL`，其值必须属于这三个 slug；
+切换 provider 时应移除旧模型值或显式设置目标 Antigravity 模型。它要求服务 HOME 下存在精确的
 `~/.gemini/config/agents/cyrene-dsh-model.md` profile，并且 `agy` 已由 operator 安装和授权。
 每次请求通过 stdin 发送单条 JSON event，工作目录是新建的空临时目录；用户 prompt 不会进入命令行参数。
 适配器在启动和每次请求前校验固定 profile，要求 Antigravity 回报匹配的 model、agent 和 strict
