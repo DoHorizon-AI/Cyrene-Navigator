@@ -99,6 +99,7 @@ jobs:
             harness/tests/exchange-authorization.test.mjs \
             harness/tests/subagents.test.mjs \
             harness/tests/subagent-wire.test.mjs \
+            harness/tests/antigravity-adapter.test.mjs \
             harness/tests/antigravity-boundary.test.mjs \
             harness/tests/antigravity-profile.test.mjs \
             harness/tests/tool-providers.test.mjs \

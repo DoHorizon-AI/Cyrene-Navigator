@@ -22,6 +22,12 @@ CLI flags, serialized DSH history, canonical tool-call chunks, active-schema
 validation, terminal-result handling, timeout, and cancellation. It does not
 make a credentialed model request or claim real-model inference.
 
+`antigravity-adapter.test.mjs` uses a local fake CLI to verify the exact
+operator-provisioned model-only profile, strict permission mode, finish-only
+steps, split UTF-8 stream decoding, bounded process execution, and DSH catalog
+validation. It does not use Antigravity credentials or claim live model
+inference; the ARM64 live adapter probe is tracked separately.
+
 `teams-bridge.integration.test.mjs` signs canonical adapter callbacks and
 verifies durable thread admission, owner-only task dispatch, context isolation,
 retry deduplication, rejection of invalid HMACs, and the trusted Teams system
@@ -56,6 +62,8 @@ and interactive GUI evidence.
 `native.integration.test.mjs` 在只调用 Navigator 自有方法的前提下，保留子进程取消、回收、协议版本、输出边界和凭据隔离矩阵。Windows 会编译等价的 Rust fixture，以在真实进程边界验证相同的 supervisor 行为。
 
 `codebuddy-adapter.test.mjs` 使用本地 fake executable 验证受限 CLI 参数、DSH 历史序列化、标准 tool-call block、当前 schema 校验、终态结果处理、超时和取消。它不会发出带凭据的模型请求，也不代表真实模型推理。
+
+`antigravity-adapter.test.mjs` 使用本地 fake CLI 验证 operator 配置的精确纯模型 profile、strict permission mode、仅允许 `finish` 的步骤、分块 UTF-8 解码、有界进程执行和 DSH catalog 校验。它不使用 Antigravity 凭据，也不代表真实模型推理；ARM64 实时 adapter probe 单独记录。
 
 `teams-bridge.integration.test.mjs` 为标准化适配器回调签名，并验证持久线程接纳、仅维护者触发任务、上下文隔离、重试去重、无效 HMAC 拒绝，以及 Teams system prompt 要求完整授权请求直接执行且不额外审批；测试不连接 Teams。
 
