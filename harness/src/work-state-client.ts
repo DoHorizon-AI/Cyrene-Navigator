@@ -457,7 +457,7 @@ export class WorkStateClient implements WorkStateStore {
         messageId: boundedString(message.messageId, 'thread message id', 512),
         actorIssuer: boundedString(message.actorIssuer, 'thread actor issuer', 512),
         actorSubject: boundedString(message.actorSubject, 'thread actor subject', 256),
-        text: boundedString(message.text, 'thread message text', 20_000),
+        text: boundedThreadMessageText(message.text, 'thread message text', 20_000),
         createdAt: timeField(message.createdAt, 'thread message createdAt')!,
       };
     });
@@ -594,6 +594,15 @@ function safeIdentifier(value: unknown, label: string): string {
 function boundedString(value: unknown, label: string, maximum: number): string {
   if (typeof value !== 'string' || value.length === 0 || value.length > maximum
     || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new TypeError(`Invalid ${label}`);
+  }
+  return value;
+}
+
+/** Validate stored message bodies using the Work store's NUL/length rule. | 按 Work store 的 NUL/长度规则校验正文。 */
+function boundedThreadMessageText(value: unknown, label: string, maximum: number): string {
+  if (typeof value !== 'string' || value.length === 0 || value.length > maximum
+    || value.includes('\u0000')) {
     throw new TypeError(`Invalid ${label}`);
   }
   return value;
