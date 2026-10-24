@@ -31,7 +31,11 @@ fixtures and do not count as real model inference. Client UI integration tests
 are owned by the Native Client (`Cyrene-Client`).
 
 `CYRENE_HARNESS_MODEL_SOURCE` defaults to `exchange` for compatibility and may
-select `codebuddy`. The CodeBuddy adapter defaults to `glm-5.3-flash`, with
+select `codebuddy` or `antigravity`. Antigravity defaults to
+`gemini-3.8-flash-medium` and requires the pinned model-only agent profile in
+the service HOME. The production Docker executor selects it through
+`node scripts/serve-executor.mjs`; the separate Python local-stack launcher is
+not wired for Antigravity yet. The CodeBuddy adapter defaults to `glm-5.3-flash`, with
 `deepseek-v4.1-flash` as an available model choice. Focused adapter tests use a
 local fake CLI and establish process flags, DSH history serialization, schema
 validation, terminal-result checks, timeout, and cancellation; they do not
@@ -69,7 +73,7 @@ Profile 测试使用真实固定版本 Harness CLI、Bundle、Rust host 和本�
 
 原生 supervisor 矩阵保留取消、回收、协议版本、有界输出和凭据隔离检查。受控故障 fixture 只验证传输；Codex 导入仍通过真实 Navigator Rust host。
 
-`CYRENE_HARNESS_MODEL_SOURCE` 为兼容旧部署默认 `exchange`，也可选择 `codebuddy`。CodeBuddy adapter 默认模型为 `glm-5.3-flash`，并提供 `deepseek-v4.1-flash`。重点 adapter 测试用本地 fake CLI 验证进程参数、DSH 历史序列化、schema 校验、终态检查、超时和取消；这些测试不代表进行了带凭据的真实模型调用。
+`CYRENE_HARNESS_MODEL_SOURCE` 为兼容旧部署默认 `exchange`，也可选择 `codebuddy` 或 `antigravity`。Antigravity 默认使用 `gemini-3.8-flash-medium`，要求服务 HOME 中存在固定的纯模型 agent profile。生产 Docker executor 通过 `node scripts/serve-executor.mjs` 选择该 adapter；独立的 Python local-stack launcher 目前尚未接入。CodeBuddy adapter 默认模型为 `glm-5.3-flash`，并提供 `deepseek-v4.1-flash`。重点 adapter 测试用本地 fake CLI 验证进程参数、DSH 历史序列化、schema 校验、终态检查、超时和取消；这些测试不代表进行了带凭据的真实模型调用。
 
 生成的 Profile 清单是 lockfile 组合快照。Profile patch 或上游 pin 变化时必须重新生成，不能把它作为运行成功证据。
 

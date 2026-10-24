@@ -15,6 +15,7 @@ Loop 或可写消息历史。
 | `persistence.ts` | Remote Cyrene `SessionPersistence` and ordered live writer / 远程 Cyrene 会话持久化与有序 writer |
 | `persistence-wire.ts` | Authenticated HTTP, handle decoding, and upstream event validation / 认证 HTTP、handle 解码和上游事件校验 |
 | `codebuddy-adapter.ts` | Restricted CodeBuddy structured-output provider; DSH remains the sole tool executor / 受限 CodeBuddy 结构化输出 provider；DSH 保持唯一工具执行者 |
+| `antigravity-adapter.ts` | Pinned Antigravity model-only structured-output provider; native tools are rejected and DSH remains the sole executor / 固定 Antigravity 纯模型结构化输出 provider；拒绝原生工具并保持 DSH 唯一执行权 |
 | `exchange-adapter.ts` | OpenAI-compatible streaming adapter for Exchange / Exchange 的 OpenAI 兼容流式 adapter |
 | `native-ipc.ts` | Supervised inherited-stdio request, cancellation, and protocol framing / 受监管 inherited-stdio 请求、取消和协议封装 |
 | `native.ts` | Cordis Tool registration over the Rust host / 通过 Rust host 注册 Cordis Tool |
@@ -83,22 +84,52 @@ The Rust protocol and executable authority are documented in `../../native/`.
 The parent `harness/README.md` and `upstream.lock.json` define the Bundle and
 exact upstream pin.
 
-`CYRENE_HARNESS_MODEL_SOURCE` selects `exchange` or `codebuddy` and defaults to
-`exchange` for existing deployments. The CodeBuddy provider defaults to
-`glm-5.3-flash` when `CYRENE_HARNESS_MODEL` is unset; `deepseek-v4.1-flash` is
-also advertised. Each model step runs a stateless CodeBuddy CLI process with
-only structured output enabled. DSH tool calls and results are serialized into
-the next prompt, while DSH's existing AgentLoop remains the only tool executor.
-The adapter rejects output without a successful terminal result and locally
-validates requested tool names and arguments against the active DSH catalog.
+`CYRENE_HARNESS_MODEL_SOURCE` selects `exchange`, `codebuddy`, or `antigravity`
+and defaults to `exchange` for existing deployments. The production Docker
+executor enters through `node scripts/serve-executor.mjs`; setting the source
+there selects the model adapter. The separate `scripts/serve-local.py` launcher
+is not wired for Antigravity yet. CodeBuddy defaults to
+`glm-5.3-flash` and also advertises `deepseek-v4.1-flash`. Antigravity defaults
+to `gemini-3.8-flash-medium` and advertises only the verified 3.8 Flash low,
+medium, and high model slugs. It requires the service HOME's exact
+`~/.gemini/config/agents/cyrene-dsh-model.md` profile and an operator-installed,
+authenticated `agy` executable on PATH. Each request is one stdin JSON event in
+a temporary empty working directory; the user prompt is never a command-line
+argument. The adapter validates the pinned profile before startup and each
+request, requires Antigravity to report the selected model and agent with strict
+permission mode, and accepts only one `finish` tool step plus a successful
+schema-constrained terminal result. Its `init.tools` registry list is not used
+as the effective allowlist. The CLI receives only the HOME, PATH, temporary
+directory, locale settings, and optional CA paths; Cyrene, Exchange, and provider
+credentials are not forwarded. Only DSH catalog tool requests are returned to the existing
+AgentLoop, which remains the sole business-tool executor. CodeBuddy remains
+registered in Antigravity mode so already-live CodeBuddy Agents can finish.
 
-`CYRENE_HARNESS_MODEL_SOURCE` 用于选择 `exchange` 或 `codebuddy`，未设置时默认
-`exchange`，以兼容既有部署。CodeBuddy provider 在未设置
+The adapter rejects missing, changed, or unsuccessful terminal results and
+locally validates requested tool names and arguments against the active DSH
+catalog. Existing in-memory Agent sessions keep their captured model; new
+sessions use the configured source. After a service restart, a persisted session
+is resumed with the currently configured model selection and its prior history.
+
+`CYRENE_HARNESS_MODEL_SOURCE` 用于选择 `exchange`、`codebuddy` 或
+`antigravity`，未设置时仍默认 `exchange`，以兼容既有部署。CodeBuddy provider 在未设置
 `CYRENE_HARNESS_MODEL` 时默认使用 `glm-5.3-flash`，同时公布
-`deepseek-v4.1-flash`。每个模型步骤都会启动一个无状态 CodeBuddy CLI 进程，且只开放
-结构化输出。DSH 工具调用及结果会序列化进下一轮 prompt；DSH 现有 AgentLoop 仍是唯一
-工具执行者。适配器要求 CodeBuddy 返回成功的终态结果，并根据当前 DSH 工具目录在本地
-校验工具名和参数。
+`deepseek-v4.1-flash`。Antigravity 默认使用 `gemini-3.8-flash-medium`，只公布已验证的
+3.8 Flash low、medium、high 模型 slug。它要求服务 HOME 下存在精确的
+`~/.gemini/config/agents/cyrene-dsh-model.md` profile，并且 `agy` 已由 operator 安装和授权。
+每次请求通过 stdin 发送单条 JSON event，工作目录是新建的空临时目录；用户 prompt 不会进入命令行参数。
+适配器在启动和每次请求前校验固定 profile，要求 Antigravity 回报匹配的 model、agent 和 strict
+permission mode，且只接受一个 `finish` tool step 和成功的 schema 结构化终态。`init.tools` 中的工具
+注册表清单不代表当前 agent 的有效 allowlist。CLI 子进程只继承 HOME、PATH、临时目录、locale 设置和
+可选 CA 路径；不会接收 Cyrene、Exchange 或 Provider 凭据。生产 Docker executor 通过
+`node scripts/serve-executor.mjs` 读取该模型 source；独立的 `scripts/serve-local.py` 当前尚未接入
+Antigravity。模型只能返回 DSH catalog 中的工具请求，业务工具仍由
+现有 DSH AgentLoop 唯一执行。Antigravity 模式也会保留 CodeBuddy adapter，以便已运行的 CodeBuddy
+Agent 完成当前 Session。
+
+适配器拒绝缺失、变更或失败的终态，并根据当前 DSH 工具目录在本地校验工具名和参数。已经驻留内存的
+Agent Session 保持原模型；新 Session 使用当前配置。服务重启后，持久化 Session 会在恢复原历史的同时
+使用当前配置的模型选择。
 
 Rust 协议和可执行文件 authority 见 `../../native/`；父目录的 `harness/README.md`
 与 `upstream.lock.json` 定义 Bundle 和精确上游 pin。

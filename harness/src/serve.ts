@@ -24,6 +24,7 @@ import { NavigatorExecutor, apply as applyExecutor } from './executor.js';
 import type { TeamsExecutorConfig } from './executor.js';
 import { ExchangeLlmAdapter } from './exchange-adapter.js';
 import { CodeBuddyLlmAdapter } from './codebuddy-adapter.js';
+import { AntigravityLlmAdapter, DEFAULT_ANTIGRAVITY_MODEL } from './antigravity-adapter.js';
 import { ExchangeConnectorAuthorizationClient } from './connector-authorization.js';
 import { InMemoryWorkStateStore, WorkStateClient } from './work-state-client.js';
 import type { WorkStateStore } from './work-state-client.js';
@@ -69,7 +70,7 @@ export interface CreateExecutorAppOptions {
     readonly generation: number;
   }>;
   readonly readExchangeOperationState?: (sessionId: string, operationId: string) => Promise<string>;
-  readonly modelSource?: 'exchange' | 'codebuddy';
+  readonly modelSource?: 'exchange' | 'codebuddy' | 'antigravity';
   readonly model?: string;
   readonly pluginsDir?: string;
   readonly watchPlugins?: boolean;
@@ -242,12 +243,18 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
   // LLM Model Adapter setup
   const exchangeUrl = options.exchangeUrl ?? process.env.CYRENE_EXCHANGE_URL;
   const configuredModelSource = options.modelSource ?? process.env.CYRENE_HARNESS_MODEL_SOURCE ?? 'exchange';
-  if (configuredModelSource !== 'exchange' && configuredModelSource !== 'codebuddy') {
-    throw new Error('CYRENE_HARNESS_MODEL_SOURCE must be exchange or codebuddy');
+  if (configuredModelSource !== 'exchange'
+    && configuredModelSource !== 'codebuddy'
+    && configuredModelSource !== 'antigravity') {
+    throw new Error('CYRENE_HARNESS_MODEL_SOURCE must be exchange, codebuddy or antigravity');
   }
   const modelId = options.model
     ?? process.env.CYRENE_HARNESS_MODEL
-    ?? (configuredModelSource === 'codebuddy' ? 'glm-5.3-flash' : testMode ? 'test-model' : undefined);
+    ?? (configuredModelSource === 'codebuddy'
+      ? 'glm-5.3-flash'
+      : configuredModelSource === 'antigravity'
+        ? DEFAULT_ANTIGRAVITY_MODEL
+        : testMode ? 'test-model' : undefined);
 
   if (configuredModelSource === 'exchange' && exchangeUrl) {
     const exchangeToken = process.env.CYRENE_EXCHANGE_TOKEN;
@@ -271,6 +278,16 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
     ctx.llm.registerAdapter(['codebuddy'], new CodeBuddyLlmAdapter());
     ctx.provide('agentDefaultModel', {
       currentSelection: () => ({ provider: 'codebuddy', model: modelId! }),
+    });
+  } else if (configuredModelSource === 'antigravity') {
+    const antigravityAdapter = new AntigravityLlmAdapter();
+    await antigravityAdapter.validateHostProfile();
+    await antigravityAdapter.resolveModel('antigravity', modelId!);
+    ctx.llm.registerAdapter(['antigravity'], antigravityAdapter);
+    // Existing in-memory CodeBuddy Agents retain their original provider selection.
+    ctx.llm.registerAdapter(['codebuddy'], new CodeBuddyLlmAdapter());
+    ctx.provide('agentDefaultModel', {
+      currentSelection: () => ({ provider: 'antigravity', model: modelId! }),
     });
   } else if (testMode && options.enableTestEchoAdapter === true) {
     // Explicit test-only deterministic adapter; it is never the production default.
