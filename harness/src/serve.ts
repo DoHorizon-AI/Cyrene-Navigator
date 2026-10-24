@@ -85,6 +85,8 @@ export interface CreateExecutorAppOptions {
   readonly cloudConnectionConfigPath?: string;
   readonly subagentConfigPath?: string;
   readonly teams?: TeamsExecutorConfig;
+  /** Restrict a Teams deployment to authenticated text conversations with no model tools. | 仅允许通过身份校验的纯文字对话，不向模型开放工具。 */
+  readonly teamsChatOnly?: boolean;
   readonly connectorBindingsPath?: string;
   readonly connectorToolCatalogPath?: string;
 }
@@ -96,6 +98,7 @@ const MAX_CONNECTOR_TOOL_CATALOG_BYTES = 32 * 1024 * 1024;
 export async function createExecutorApp(options: CreateExecutorAppOptions = {}) {
   const testMode = options.testMode === true;
   const production = process.env.NODE_ENV === 'production';
+  const teamsChatOnly = resolveTeamsChatOnly(options.teamsChatOnly);
   if (production && testMode) throw new Error('Executor test mode is disabled in production');
   if (options.customLlmAdapter && !testMode) throw new Error('Custom LLM adapters require explicit testMode');
   if (options.enableTestEchoAdapter && !testMode) throw new Error('The echo adapter is test-only');
@@ -108,17 +111,41 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
   const connectorBindings = connectorBindingsPath === undefined
     ? new Map<string, ConnectorBindingAuthorization>()
     : validateConnectorBindingMap(JSON.parse(await readFile(resolve(connectorBindingsPath), 'utf8')) as unknown);
-  if (teams !== undefined && production && connectorBindings.size === 0) {
+  if (teamsChatOnly && teams === undefined) {
+    throw new Error('TEAMS_CHAT_ONLY requires Teams to be enabled');
+  }
+  if (teamsChatOnly && connectorBindings.size > 0) {
+    throw new Error('TEAMS_CHAT_ONLY requires an empty connector binding map');
+  }
+  if (!teamsChatOnly && teams !== undefined && production && connectorBindings.size === 0) {
     throw new Error('CYRENE_CONNECTOR_BINDINGS_FILE is required when Teams connector execution is enabled');
   }
   const connectorToolCatalogPath = options.connectorToolCatalogPath ?? process.env.CYRENE_CONNECTOR_TOOL_CATALOG_FILE;
-  if (teams !== undefined && production && connectorToolCatalogPath === undefined) {
+  if (!teamsChatOnly && teams !== undefined && production && connectorToolCatalogPath === undefined) {
     throw new Error('CYRENE_CONNECTOR_TOOL_CATALOG_FILE is required when Teams connector execution is enabled');
   }
   const connectorToolCatalogSnapshot = connectorToolCatalogPath === undefined
     ? undefined
     : await readHostConnectorToolCatalog(resolve(connectorToolCatalogPath));
   const exchangeIntegrationUrl = options.exchangeIntegrationUrl ?? process.env.CYRENE_EXCHANGE_INTEGRATION_URL;
+  const cloudConfigPath = options.cloudConnectionConfigPath ?? process.env.CYRENE_CLOUD_PROFILE_CONFIG;
+  const subagentConfigPath = options.subagentConfigPath ?? process.env.CYRENE_SUBAGENT_CONFIG;
+  const configuredPluginsDir = options.pluginsDir ?? process.env.NAVIGATOR_PLUGINS_DIR;
+  if (teamsChatOnly) {
+    if (connectorToolCatalogSnapshot !== undefined) assertEmptyConnectorToolCatalog(connectorToolCatalogSnapshot);
+    if (exchangeIntegrationUrl) throw new Error('TEAMS_CHAT_ONLY disallows Exchange business tools');
+    if (cloudConfigPath) throw new Error('TEAMS_CHAT_ONLY disallows cloud connection tools');
+    if (subagentConfigPath) throw new Error('TEAMS_CHAT_ONLY disallows subagent tools');
+    if (configuredPluginsDir) throw new Error('TEAMS_CHAT_ONLY disallows configured dynamic plugins');
+    if (options.enableWorkflows === true || process.env.CYRENE_WORKFLOWS_ENABLED === 'true') {
+      throw new Error('TEAMS_CHAT_ONLY disallows workflow tools');
+    }
+    if (process.env.CYRENE_WORKFLOWS_ENABLED !== undefined
+      && process.env.CYRENE_WORKFLOWS_ENABLED !== 'false'
+      && process.env.CYRENE_WORKFLOWS_ENABLED !== 'true') {
+      throw new TypeError('CYRENE_WORKFLOWS_ENABLED must be true or false');
+    }
+  }
   const exchangeIntegrationWorkspaceId = options.exchangeIntegrationWorkspaceId
     ?? process.env.CYRENE_EXCHANGE_INTEGRATION_WORKSPACE_ID ?? workspaceId;
   if (exchangeIntegrationUrl && !exchangeIntegrationWorkspaceId) {
@@ -136,7 +163,7 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
     })
     : undefined;
   const dshHome = options.dshHome ?? process.env.DSH_HOME;
-  const workflowsEnabled = options.enableWorkflows ?? (
+  const workflowsEnabled = teamsChatOnly ? false : options.enableWorkflows ?? (
     process.env.CYRENE_WORKFLOWS_ENABLED === 'true'
     || (!testMode && Boolean(dshHome) && process.env.CYRENE_WORKFLOWS_ENABLED !== 'false')
   );
@@ -168,7 +195,17 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
   await ctx.plugin(SessionStore);
   await ctx.plugin(SessionProjectionRegistry);
   await ctx.plugin(SystemPrompt);
-  if (teams !== undefined) {
+  if (teamsChatOnly) {
+    ctx.systemPrompt.section({
+      name: 'navigator:teams-chat-only-capability',
+      order: ctx.systemPrompt.getSectionOrder('TEAM_POLICY'),
+      text: [
+        'This deployment supports text conversation only. No external search, query, or action tools are available.',
+        'Do not claim to have checked GitHub, Hugging Face, cloud resources, or other external systems, and do not claim to have completed an operation.',
+        'If asked to perform an external check or action, explain that connector tools are not enabled in this chat deployment.',
+      ].join('\n'),
+    });
+  } else if (teams !== undefined) {
     ctx.systemPrompt.section({
       name: 'navigator:teams-connector-execution-policy',
       order: ctx.systemPrompt.getSectionOrder('TEAM_POLICY'),
@@ -258,15 +295,15 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
     throw new Error('CYRENE_EXCHANGE_URL and CYRENE_HARNESS_MODEL are required when CYRENE_HARNESS_MODEL_SOURCE=exchange');
   }
 
-  const pluginsDir = options.pluginsDir ?? process.env.NAVIGATOR_PLUGINS_DIR ?? join(repository, 'plugins');
-  if (!existsSync(pluginsDir)) {
+  const pluginsDir = configuredPluginsDir ?? join(repository, 'plugins');
+  if (!teamsChatOnly && !existsSync(pluginsDir)) {
     mkdirSync(pluginsDir, { recursive: true });
   }
 
   // Dynamic Plugin Hot-Reload supervisor
   applyPluginManager(ctx, {
-    pluginsDir,
-    watch: options.watchPlugins ?? true,
+    ...(teamsChatOnly ? {} : { pluginsDir }),
+    watch: teamsChatOnly ? false : options.watchPlugins ?? true,
   });
 
   const revalidateExchangeAuthorization = options.revalidateExchangeAuthorization
@@ -298,7 +335,7 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
   const pluginManager = ctx.get('pluginManager');
 
   let workAssistantBridge: WorkAssistantBridge | undefined;
-  if (persistenceUrl && workspaceId) {
+  if (!teamsChatOnly && persistenceUrl && workspaceId) {
     workAssistantBridge = registerWorkTools(ctx, {
       baseUrl: persistenceUrl,
       workspaceId,
@@ -365,15 +402,13 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
     });
   }
 
-  const cloudConfigPath = options.cloudConnectionConfigPath ?? process.env.CYRENE_CLOUD_PROFILE_CONFIG;
-  if (cloudConfigPath) {
+  if (!teamsChatOnly && cloudConfigPath) {
     const source = await readFile(resolve(cloudConfigPath), 'utf8');
     const cloudConfig = validateCloudConnectionConfig(JSON.parse(source) as unknown);
     await registerCloudConnections(ctx, cloudConfig);
   }
 
-  const subagentConfigPath = options.subagentConfigPath ?? process.env.CYRENE_SUBAGENT_CONFIG;
-  if (subagentConfigPath) {
+  if (!teamsChatOnly && subagentConfigPath) {
     const source = await readFile(resolve(subagentConfigPath), 'utf8');
     const subagentConfig = parseHostSubagentConfig(JSON.parse(source) as unknown);
     if (subagentConfig.deployments.length > 0) {
@@ -391,6 +426,10 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
       schedulerSessionId: 'navigator-workflow-scheduler-v1',
       executeTask: params => executor.executeTask(params),
     });
+  }
+
+  if (teamsChatOnly && ctx.tools.schemas().length !== 0) {
+    throw new Error('TEAMS_CHAT_ONLY startup registered model tools');
   }
 
   return { ctx, executor, pluginManager, pluginsDir };
@@ -452,6 +491,28 @@ function parseTaskConcurrency(value: string | undefined): number {
     throw new TypeError('CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS must be between 1 and 32');
   }
   return maximum;
+}
+
+/** Resolve the explicit text-only deployment switch and reject ambiguous environment values. */
+function resolveTeamsChatOnly(option: boolean | undefined): boolean {
+  const environmentValues = [process.env.CYRENE_TEAMS_CHAT_ONLY, process.env.TEAMS_CHAT_ONLY]
+    .filter((value): value is string => value !== undefined);
+  if (environmentValues.some(value => value !== 'true' && value !== 'false')) {
+    throw new TypeError('CYRENE_TEAMS_CHAT_ONLY and TEAMS_CHAT_ONLY must be true or false');
+  }
+  if (new Set(environmentValues).size > 1) {
+    throw new TypeError('CYRENE_TEAMS_CHAT_ONLY and TEAMS_CHAT_ONLY must agree');
+  }
+  return option ?? environmentValues[0] === 'true';
+}
+
+/** Reject a private connector catalog that would expose any model-callable provider tool. */
+function assertEmptyConnectorToolCatalog(value: unknown): void {
+  const root = asObject(value, 'private connector tool catalog');
+  assertKeys(root, ['schemaVersion', 'items'], 'private connector tool catalog');
+  if (root.schemaVersion !== 1 || !Array.isArray(root.items) || root.items.length !== 0) {
+    throw new Error('TEAMS_CHAT_ONLY requires an empty connector tool catalog');
+  }
 }
 
 export function validateConnectorBindingMap(value: unknown): Map<string, ConnectorBindingAuthorization> {
