@@ -9,7 +9,7 @@ import { test } from 'node:test';
 import { Context } from '@deepseek-ai/cordis';
 import { ToolCallId } from '@deepseek-ai/dsh-llm';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
-import ToolRuntime from '@deepseek-ai/dsh-tools';
+import ToolRuntime, { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools';
 import { registerToolProviders } from '../dist/tool-providers.js';
 
 const bindingId = 'wecom-primary';
@@ -297,9 +297,35 @@ test('projects uniqueItems to the host and rejects duplicate values before provi
             },
             uniqueItems: true,
           },
+          uniqueItems: { type: 'string' },
+          pattern: { type: 'string' },
+          variants: {
+            type: 'array',
+            items: {
+              oneOf: [
+                {
+                  type: 'object',
+                  properties: {
+                    uniqueItems: {
+                      type: 'array',
+                      items: { type: 'string' },
+                      uniqueItems: false,
+                    },
+                  },
+                  required: ['uniqueItems'],
+                  additionalProperties: false,
+                },
+                {
+                  type: 'object',
+                  properties: { pattern: { type: 'string' } },
+                  required: ['pattern'],
+                  additionalProperties: false,
+                },
+              ],
+            },
+          },
         },
-        required: ['labels', 'selectors'],
-        additionalProperties: false,
+        required: ['labels', 'selectors', 'uniqueItems', 'pattern', 'variants'],
       },
       readOnly: true,
     }],
@@ -314,11 +340,29 @@ test('projects uniqueItems to the host and rejects duplicate values before provi
     assert.equal(schema.parameters.properties.labels.minItems, undefined);
     assert.equal(schema.parameters.properties.labels.maxItems, undefined);
     assert.equal(schema.parameters.properties.selectors.uniqueItems, undefined);
+    assert.equal(schema.parameters.properties.uniqueItems.type, 'string');
+    assert.equal(schema.parameters.properties.pattern.type, 'string');
+    assert.equal(schema.parameters.properties.variants.items.oneOf[0].properties.uniqueItems.type, 'array');
+    assert.equal(schema.parameters.properties.variants.items.oneOf[0].properties.uniqueItems.uniqueItems, undefined);
+    assert.equal(schema.parameters.properties.variants.items.oneOf[1].properties.pattern.type, 'string');
 
     const baseArguments = {
       labels: ['bug', 'feature'],
       selectors: [{ name: 'primary', filter: { active: true, labels: ['bug', 'feature'] } }],
+      uniqueItems: 'preserved property name',
+      pattern: 'preserved property name',
+      variants: [{ uniqueItems: ['repeat', 'repeat'] }],
     };
+    assert.deepEqual(validateJsonSchemaValue(schema.parameters, baseArguments), []);
+    const invalidPropertyNamedUniqueItems = validateJsonSchemaValue(schema.parameters, {
+      ...baseArguments,
+      uniqueItems: 42,
+      pattern: 42,
+    });
+    assert.notDeepEqual(invalidPropertyNamedUniqueItems, []);
+    assert.match(invalidPropertyNamedUniqueItems.join(' '), /uniqueItems.*string/u);
+    assert.match(invalidPropertyNamedUniqueItems.join(' '), /pattern.*string/u);
+
     const duplicateLabels = await execute(
       ctx,
       schema.name,

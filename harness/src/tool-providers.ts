@@ -1325,7 +1325,7 @@ function collectProviderConstraints(schema: JsonValue): ProviderInputConstraint[
       if (node.type !== 'array' || typeof node.uniqueItems !== 'boolean') {
         throw new TypeError('Provider uniqueItems requires an array schema and boolean value');
       }
-      constraint.uniqueItems = node.uniqueItems;
+      if (node.uniqueItems) constraint.uniqueItems = true;
     }
     if (['minProperties', 'maxProperties'].some(key => Object.hasOwn(node, key))) {
       if (node.type !== 'object') throw new TypeError('Provider property bounds require an object schema');
@@ -1381,25 +1381,50 @@ function schemaHasProjectedConstraints(value: JsonValue): boolean {
   while (pending.length > 0 && visited < 20_000) {
     const current = pending.pop()!;
     visited += 1;
-    if (Array.isArray(current)) pending.push(...current);
-    else if (current !== null && typeof current === 'object') {
-      if (Object.keys(current).some(key => PROJECTED_PROVIDER_CONSTRAINTS.has(key))) return true;
-      pending.push(...Object.values(current));
+    if (current === null || Array.isArray(current) || typeof current !== 'object') continue;
+    const node = current as Record<string, JsonValue>;
+    if (hasProjectedProviderConstraint(node)) return true;
+    const properties = node.properties;
+    if (properties !== null && typeof properties === 'object' && !Array.isArray(properties)) {
+      pending.push(...Object.values(properties));
     }
+    if (node.items !== undefined) pending.push(node.items);
+    if (Array.isArray(node.oneOf)) pending.push(...node.oneOf);
   }
   return pending.length > 0;
 }
 
 function projectProviderSchemaForDsh(schema: JsonValue, depth = 0): JsonValue {
   if (depth > 64) throw new TypeError('Provider schema nesting exceeds its configured limit');
-  if (Array.isArray(schema)) return schema.map(value => projectProviderSchemaForDsh(value, depth + 1));
-  if (schema === null || typeof schema !== 'object') return schema;
+  if (schema === null || typeof schema !== 'object' || Array.isArray(schema)) return schema;
+  const node = schema as Record<string, JsonValue>;
   const projected: Record<string, JsonValue> = {};
-  for (const [key, value] of Object.entries(schema)) {
+  for (const [key, value] of Object.entries(node)) {
     if (PROJECTED_PROVIDER_CONSTRAINTS.has(key)) continue;
-    projected[key] = projectProviderSchemaForDsh(value, depth + 1);
+    if (key === 'properties' && value !== null && typeof value === 'object' && !Array.isArray(value)) {
+      projected[key] = Object.fromEntries(
+        Object.entries(value).map(([propertyName, propertySchema]) => [
+          propertyName,
+          projectProviderSchemaForDsh(propertySchema, depth + 1),
+        ]),
+      );
+    } else if (key === 'items') {
+      projected[key] = projectProviderSchemaForDsh(value, depth + 1);
+    } else if (key === 'oneOf' && Array.isArray(value)) {
+      projected[key] = value.map(branch => projectProviderSchemaForDsh(branch, depth + 1));
+    } else {
+      projected[key] = value;
+    }
   }
   return projected;
+}
+
+/** Match projected keywords only on schema nodes, never on user property names or JSON values. */
+function hasProjectedProviderConstraint(node: Record<string, JsonValue>): boolean {
+  for (const key of PROJECTED_PROVIDER_CONSTRAINTS) {
+    if (Object.hasOwn(node, key) && (key !== 'uniqueItems' || node.uniqueItems === true)) return true;
+  }
+  return false;
 }
 
 function validateProviderConstraints(
