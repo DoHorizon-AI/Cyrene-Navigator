@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { ToolCallId } from '@deepseek-ai/dsh-llm';
@@ -25,7 +25,7 @@ async function fixture(output, options = {}) {
   const body = options.script ?? `
 import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
 const input = readFileSync(0, 'utf8');
-writeFileSync(${JSON.stringify(record)}, JSON.stringify({ args: process.argv.slice(2), input, cwd: process.cwd(), cwdEntries: readdirSync(process.cwd()) }));
+writeFileSync(${JSON.stringify(record)}, JSON.stringify({ args: process.argv.slice(2), input, cwd: process.cwd(), cwdEntries: readdirSync(process.cwd()), home: process.env.HOME, userProfile: process.env.USERPROFILE ?? null, leakedCyreneSecret: process.env.CYRENE_TEST_SECRET ?? null }));
 ${options.stdout === undefined ? output === undefined ? '' : `process.stdout.write(${JSON.stringify(JSON.stringify(output))});` : `process.stdout.write(${JSON.stringify(options.stdout)});`}
 ${options.exitCode ? `process.exitCode = ${options.exitCode};` : ''}
 ${options.hang ? 'setInterval(() => undefined, 1000);' : ''}
@@ -120,6 +120,23 @@ test('CodeBuddy runs as a restricted structured-output planner and preserves DSH
   assert.equal(schema.additionalProperties, false);
 });
 
+test('CodeBuddy receives the provider profile but not Cyrene connector environment variables', async t => {
+  const priorSecret = process.env.CYRENE_TEST_SECRET;
+  process.env.CYRENE_TEST_SECRET = 'fixture-only-secret';
+  t.after(() => {
+    if (priorSecret === undefined) delete process.env.CYRENE_TEST_SECRET;
+    else process.env.CYRENE_TEST_SECRET = priorSecret;
+  });
+  const instance = await fixture(terminal({ kind: 'final', text: 'Ready.', tool_name: '', args: {} }));
+  t.after(instance.cleanup);
+
+  await collect(instance.adapter, modelRequest());
+  const request = JSON.parse(await readFile(instance.record, 'utf8'));
+  assert.equal(request.home, homedir());
+  assert.equal(request.leakedCyreneSecret, null);
+  if (process.platform === 'win32') assert.equal(request.userProfile, homedir());
+});
+
 test('CodeBuddy tool calls become canonical DSH tool-call blocks after local schema validation', async t => {
   const instance = await fixture(terminal({ kind: 'tool_call', text: '', tool_name: 'echo', args: { text: 'hello' } }));
   t.after(instance.cleanup);
@@ -199,7 +216,7 @@ test('CodeBuddy rejects schemas it cannot enforce instead of issuing a tool requ
   await assert.rejects(collect(instance.adapter, modelRequest({ tools: [unsupported] })), /DSH runtime cannot enforce/u);
 });
 
-test('serve selects CodeBuddy only when configured and retains Exchange as the default source', async t => {
+test('serve defaults to Antigravity and selects CodeBuddy or Exchange when explicitly configured', async t => {
   const root = await mkdtemp(join(tmpdir(), 'navigator-codebuddy-source-'));
   const originalModel = process.env.CYRENE_HARNESS_MODEL;
   const originalExchangeToken = process.env.CYRENE_EXCHANGE_TOKEN;
@@ -229,8 +246,22 @@ test('serve selects CodeBuddy only when configured and retains Exchange as the d
     model: 'glm-5.3-flash',
   });
 
+  const antigravity = await createExecutorApp({
+    testMode: true,
+    enableWorkflows: false,
+    watchPlugins: false,
+    pluginsDir: join(root, 'antigravity-plugins'),
+    defaultCwd: root,
+  });
+  apps.push(antigravity);
+  assert.deepEqual(antigravity.ctx.get('agentDefaultModel').currentSelection(), {
+    provider: 'antigravity',
+    model: 'gemini-3.8-flash-medium',
+  });
+
   const exchange = await createExecutorApp({
     testMode: true,
+    modelSource: 'exchange',
     exchangeUrl: 'http://127.0.0.1:7777',
     model: 'compatibility-model',
     enableWorkflows: false,

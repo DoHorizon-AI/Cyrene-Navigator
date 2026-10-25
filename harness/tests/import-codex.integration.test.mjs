@@ -399,8 +399,8 @@ test('Codex archive Continue creates a real seeded Agent and never executes arch
     const restartedResponse = await handleCodexContinueRequest(runtime.ctx, continueRequest(), {
       inFlight: new Map(), continueInFlight: new Map(),
     });
-    assert.equal(restartedResponse.status, 200);
     const restarted = await restartedResponse.json();
+    assert.equal(restartedResponse.status, 200, JSON.stringify(restarted));
     assert.equal(restarted.duplicate, true);
     const resumed = runtime.ctx.get('agents').get(targetSessionId);
     assert.ok(resumed, 'a duplicate Continue reopens the target through AgentRegistry.resume');

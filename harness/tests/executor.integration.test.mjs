@@ -542,6 +542,7 @@ test('Exchange adapter: configured Exchange receives authenticated request and s
     testMode: true,
     authTokenEnv: 'CYRENE_EXECUTOR_TOKEN',
     exchangeUrl: `http://127.0.0.1:${port}`,
+    modelSource: 'exchange',
     model: 'exchange-test-model',
   });
   try {

@@ -123,6 +123,9 @@ jobs:
           # 多个文件各自启动 Python/MCP 进程，串行执行避免冷启动资源竞争。
           node --test --test-concurrency=1 `
             harness/tests/executor.integration.test.mjs `
+            harness/tests/execution-priority.test.mjs `
+            harness/tests/responsibility-authority.test.mjs `
+            harness/tests/responsibility-tools.test.mjs `
             harness/tests/exchange-integration.test.mjs `
             harness/tests/exchange-authorization.test.mjs `
             harness/tests/subagents.test.mjs `
@@ -132,6 +135,7 @@ jobs:
             harness/tests/tool-providers.test.mjs `
             harness/tests/work-tools.test.mjs `
             harness/tests/workflows.integration.test.mjs `
+            harness/tests/workflows-v2.test.mjs `
             harness/tests/round1.integration.test.mjs `
             harness/tests/cloud-connections.integration.test.mjs
           if ($LASTEXITCODE -ne 0) { throw 'Windows headless executor and Work fixtures failed.' }

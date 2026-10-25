@@ -164,6 +164,9 @@ jobs:
             harness/tests/profile.integration.test.mjs \
             harness/tests/native.integration.test.mjs \
             harness/tests/executor.integration.test.mjs \
+            harness/tests/execution-priority.test.mjs \
+            harness/tests/responsibility-authority.test.mjs \
+            harness/tests/responsibility-tools.test.mjs \
             harness/tests/exchange-authorization.test.mjs \
             harness/tests/connector-authorization.test.mjs \
             harness/tests/connector-provider-outcomes.test.mjs \
@@ -180,6 +183,7 @@ jobs:
             harness/tests/exchange-integration-contract.tck.test.mjs \
             harness/tests/work-tools.test.mjs \
             harness/tests/workflows.integration.test.mjs \
+            harness/tests/workflows-v2.test.mjs \
             harness/tests/cloud-connections.integration.test.mjs \
             harness/tests/round1.integration.test.mjs
 

@@ -7,12 +7,13 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { LlmAdapter, ToolCallId } from '@deepseek-ai/dsh-llm';
+import { LlmAdapter, LlmError, ToolCallId } from '@deepseek-ai/dsh-llm';
 import type { GenerateOptions, LlmModelInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm';
 import { assertSupportedJsonSchema, validateJsonSchemaValue } from '@deepseek-ai/dsh-tools';
 import type { JsonSchemaNode } from '@deepseek-ai/dsh-tools';
+import { decodeProviderTokenUsage } from './model-policy.js';
 
 interface CodeBuddyAdapterConfig {
   readonly command?: string;
@@ -37,6 +38,31 @@ function safeAbortError(): Error {
 
 function terminalError(message: string): Error {
   return new Error(message);
+}
+
+/** Preserve a stable availability code so Navigator can retry through an explicitly configured route. */
+function providerUnavailable(message: string, code: 'PROVIDER_UNAVAILABLE' | 'PROVIDER_TIMEOUT'): LlmError {
+  return new LlmError(message, code);
+}
+
+/** Keep Cyrene and connector credentials out of the provider-owned CLI process environment. */
+function codeBuddyEnvironment(workingDirectory: string): NodeJS.ProcessEnv {
+  const home = homedir();
+  const environment: NodeJS.ProcessEnv = {
+    HOME: home,
+    PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin',
+    TMPDIR: workingDirectory,
+    TMP: workingDirectory,
+    TEMP: workingDirectory,
+    ...(process.platform === 'win32'
+      ? { USERPROFILE: home, ...(process.env.SystemRoot === undefined ? {} : { SystemRoot: process.env.SystemRoot }) }
+      : {}),
+  };
+  for (const name of ['LANG', 'LC_ALL', 'SSL_CERT_FILE', 'NODE_EXTRA_CA_CERTS'] as const) {
+    const value = process.env[name];
+    if (value !== undefined) environment[name] = value;
+  }
+  return environment;
 }
 
 function assertDshSchemaSupported(schema: unknown): asserts schema is JsonSchemaNode {
@@ -133,7 +159,7 @@ function outputSchema(tools: GenerateOptions['tools']): string {
   });
 }
 
-function parseTerminalResult(stdout: string): unknown {
+function parseTerminalResult(stdout: string): { readonly structuredOutput: unknown; readonly usage?: ReturnType<typeof decodeProviderTokenUsage> } {
   let events: unknown;
   try {
     events = JSON.parse(stdout) as unknown;
@@ -151,7 +177,11 @@ function parseTerminalResult(stdout: string): unknown {
     throw terminalError('CodeBuddy reported a failed model turn');
   }
   if (!Object.hasOwn(terminal, 'structured_output')) throw terminalError('CodeBuddy terminal result omitted structured output');
-  return terminal.structured_output;
+  const usage = decodeProviderTokenUsage(terminal.usage ?? terminal.token_usage);
+  return {
+    structuredOutput: terminal.structured_output,
+    ...(usage === undefined ? {} : { usage }),
+  };
 }
 
 function assertUniqueToolNames(tools: GenerateOptions['tools']): void {
@@ -219,6 +249,7 @@ function runCli(command: string, commandArgs: readonly string[], args: readonly 
     }
     const child = spawn(command, [...commandArgs, ...args], {
       cwd,
+      env: codeBuddyEnvironment(cwd),
       detached: process.platform !== 'win32',
       shell: false,
       stdio: ['pipe', 'pipe', 'ignore'],
@@ -234,10 +265,10 @@ function runCli(command: string, commandArgs: readonly string[], args: readonly 
       stopChild(child);
     };
     const onAbort = () => setFailure(safeAbortError());
-    const timeout = setTimeout(() => setFailure(terminalError(`CodeBuddy request timed out after ${timeoutMs} ms`)), timeoutMs);
+    const timeout = setTimeout(() => setFailure(providerUnavailable(`CodeBuddy request timed out after ${timeoutMs} ms`, 'PROVIDER_TIMEOUT')), timeoutMs);
     signal.addEventListener('abort', onAbort, { once: true });
     if (signal.aborted) onAbort();
-    child.on('error', () => setFailure(terminalError('CodeBuddy CLI could not be started')));
+    child.on('error', () => setFailure(providerUnavailable('CodeBuddy CLI could not be started', 'PROVIDER_UNAVAILABLE')));
     child.stdout.on('data', (chunk: Buffer) => {
       outputBytes += chunk.byteLength;
       if (outputBytes > maxOutputBytes) {
@@ -260,7 +291,7 @@ function runCli(command: string, commandArgs: readonly string[], args: readonly 
         return;
       }
       if (code !== 0) {
-        reject(terminalError(`CodeBuddy CLI failed with exit code ${String(code)}`));
+        reject(providerUnavailable(`CodeBuddy CLI failed with exit code ${String(code)}`, 'PROVIDER_UNAVAILABLE'));
         return;
       }
       resolve(Buffer.concat(output).toString('utf8'));
@@ -337,12 +368,13 @@ export class CodeBuddyLlmAdapter extends LlmAdapter {
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
-    const structured = parseTerminalResult(stdout);
-    const response = parseStructuredOutput(structured, options);
+    const terminal = parseTerminalResult(stdout);
+    const response = parseStructuredOutput(terminal.structuredOutput, options);
     if (response.kind === 'final') {
       yield { type: 'block-start', index: 0, blockType: 'text' };
       yield { type: 'text-delta', index: 0, text: response.text };
       yield { type: 'block-end', index: 0, block: { type: 'text', text: response.text } };
+      if (terminal.usage !== undefined) yield { type: 'usage', usage: terminal.usage };
       yield { type: 'finish', reason: { kind: 'stop' } };
       return;
     }
@@ -355,6 +387,7 @@ export class CodeBuddyLlmAdapter extends LlmAdapter {
       index: 0,
       block: { type: 'tool-call', id, name: response.name, arguments: response.arguments },
     };
+    if (terminal.usage !== undefined) yield { type: 'usage', usage: terminal.usage };
     yield { type: 'finish', reason: { kind: 'tool-calls' } };
   }
 }

@@ -376,6 +376,7 @@ test('round1 simulated connector-to-DSH approval and notification flow uses dura
     persistenceUrl: persistence.address,
     workspaceId: WORKSPACE_ID,
     exchangeUrl,
+    modelSource: 'exchange',
     model: 'round1-fixture-model',
     defaultCwd: directory,
     watchPlugins: false,

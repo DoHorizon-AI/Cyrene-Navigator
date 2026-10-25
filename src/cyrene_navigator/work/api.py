@@ -70,8 +70,9 @@ from cyrene_navigator.work.models import (
     TaskPatch,
     TaskRecord,
     TeamsThreadRecord,
+    WorkflowDefinition,
     WorkflowList,
-    WorkflowRecord,
+    WorkflowNoticeCreate,
     WorkflowScheduleEvent,
     WorkflowScheduleEventList,
     WorkModel,
@@ -757,19 +758,34 @@ def mount_work_routes(
         )
 
     @app.get(base + "/workflows", response_model=WorkflowList)
-    def list_workflows(workspace_id: str, request: Request) -> dict[str, Any]:
+    def list_workflows(
+        workspace_id: str,
+        request: Request,
+        definition_version: int = Query(default=1, ge=1, le=2, alias="definitionVersion"),
+    ) -> dict[str, Any]:
         principal = principal_for(request, workspace_id)
-        return {"items": store.list_workflows(principal.organization_id, workspace_id)}
+        return {
+            "items": store.list_workflows(
+                principal.organization_id, workspace_id, definition_version
+            )
+        }
 
-    @app.put(base + "/workflows/{workflow_id}", response_model=WorkflowRecord)
+    @app.put(base + "/workflows/{workflow_id}", response_model=WorkflowDefinition)
     def put_workflow(
         workspace_id: str,
         workflow_id: str,
-        body: WorkflowRecord,
         request: Request,
+        body: WorkflowDefinition,
+        definition_version: int = Query(default=1, ge=1, le=2, alias="definitionVersion"),
     ) -> dict[str, Any]:
         principal = principal_for(request, workspace_id, write=True)
         value = body.model_dump(by_alias=True, exclude_none=True)
+        if value["version"] != definition_version:
+            raise PersistenceError(
+                "WORK_WORKFLOW_VERSION_MISMATCH",
+                422,
+                "definitionVersion must match the body version.",
+            )
         if value["id"] != workflow_id:
             raise PersistenceError(
                 "WORK_WORKFLOW_ID_MISMATCH",
@@ -777,6 +793,34 @@ def mount_work_routes(
                 "The route workflowId must match body id.",
             )
         return store.put_workflow(principal.organization_id, workspace_id, value)
+
+    @app.post(
+        base + "/workflows/{workflow_id}/notices",
+        response_model=NotificationQueued,
+        status_code=201,
+    )
+    def enqueue_workflow_notice(
+        workspace_id: str,
+        workflow_id: str,
+        body: WorkflowNoticeCreate,
+        request: Request,
+        response: Response,
+    ) -> dict[str, Any]:
+        """Project a terminal responsibility receipt into its stored Teams owner thread.
+
+        中文：从 v2 工作流、运行回执与 owner Teams 任务生成通知；调用方不能指定路由。
+        """
+
+        principal = principal_for(request, workspace_id, write=True)
+        receipt, duplicate = store.enqueue_workflow_notice(
+            principal.organization_id,
+            workspace_id,
+            workflow_id,
+            body.model_dump(by_alias=True, exclude_none=True),
+        )
+        if duplicate:
+            response.status_code = 200
+        return receipt
 
     @app.post(base + "/schedule-events", response_model=WorkflowScheduleEvent)
     def append_schedule_event(
@@ -790,6 +834,11 @@ def mount_work_routes(
             workspace_id,
             body.model_dump(by_alias=True, exclude_none=True),
         )
+
+    @app.get(base + "/schedule-events/{event_id}", response_model=WorkflowScheduleEvent)
+    def get_schedule_event(workspace_id: str, event_id: str, request: Request) -> dict[str, Any]:
+        principal = principal_for(request, workspace_id)
+        return store.get_schedule_event(principal.organization_id, workspace_id, event_id)
 
     @app.get(base + "/schedule-events", response_model=WorkflowScheduleEventList)
     def list_schedule_events(

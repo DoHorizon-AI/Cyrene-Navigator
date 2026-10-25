@@ -17,12 +17,15 @@ export type ExecutionStatus =
   | 'waiting_input'
   | 'awaiting_user_authorization';
 
+export type ExecutionClass = 'foreground' | 'background';
+
 /** Durable executor record; the Work service is the production authority.  中文：持久化执行器记录；生产环境以 Work service 为准。 */
 export interface TaskRecord {
   readonly id: string;
   readonly sessionId: string;
   readonly prompt: string;
   readonly status: ExecutionStatus;
+  readonly executionClass: ExecutionClass;
   readonly createdAt: number;
   readonly startedAt?: number;
   readonly endedAt?: number;
@@ -143,7 +146,13 @@ export interface UnresolvedOperationSummary {
 
 /** Narrow storage contract shared by the HTTP service and explicit test store.  中文：HTTP 服务和显式测试存储共用的最小存储契约。 */
 export interface WorkStateStore {
-  createTask(input: { id?: string; sessionId: string; prompt: string; metadata?: Readonly<Record<string, unknown>> }): Promise<TaskRecord>;
+  createTask(input: {
+    id?: string;
+    sessionId: string;
+    prompt: string;
+    executionClass?: ExecutionClass;
+    metadata?: Readonly<Record<string, unknown>>;
+  }): Promise<TaskRecord>;
   createContinuationTask(
     sourceTaskId: string,
     input: { prompt: string; idempotencyKey: string },
@@ -205,11 +214,16 @@ function decodeTask(value: unknown): TaskRecord {
     'awaiting_user_authorization',
   ];
   if (!statuses.includes(row.status as ExecutionStatus)) throw new TypeError('Invalid Work Task status');
+  const executionClass = row.executionClass === undefined ? 'foreground' : row.executionClass;
+  if (executionClass !== 'foreground' && executionClass !== 'background') {
+    throw new TypeError('Invalid Work Task executionClass');
+  }
   const task: TaskRecord = {
     id: stringField(row.id, 'id'),
     sessionId: stringField(row.sessionId, 'sessionId'),
     prompt: stringField(row.prompt, 'prompt', true),
     status: row.status as ExecutionStatus,
+    executionClass,
     createdAt: timeField(row.createdAt, 'createdAt')!,
     output: stringField(row.output, 'output', true),
     reasoning: stringField(row.reasoning, 'reasoning', true),
@@ -297,7 +311,13 @@ export class WorkStateClient implements WorkStateStore {
   }
 
   /** Create one durable task. The server binds organization and workspace from the bearer principal.  中文：创建持久任务；服务端从 bearer principal 绑定组织和 Workspace。 */
-  async createTask(input: { id?: string; sessionId: string; prompt: string; metadata?: Readonly<Record<string, unknown>> }): Promise<TaskRecord> {
+  async createTask(input: {
+    id?: string;
+    sessionId: string;
+    prompt: string;
+    executionClass?: ExecutionClass;
+    metadata?: Readonly<Record<string, unknown>>;
+  }): Promise<TaskRecord> {
     return decodeTask(await this.request('', 'POST', input));
   }
 
@@ -625,12 +645,19 @@ export class InMemoryWorkStateStore implements WorkStateStore {
   private readonly connectorThreadRoutes = new Map<string, Omit<ConnectorThreadRecord, 'sessionId' | 'messages'>>();
   private readonly connectorThreadMessages = new Map<string, ConnectorThreadRecord['messages'][number][]>();
 
-  async createTask(input: { id?: string; sessionId: string; prompt: string; metadata?: Readonly<Record<string, unknown>> }): Promise<TaskRecord> {
+  async createTask(input: {
+    id?: string;
+    sessionId: string;
+    prompt: string;
+    executionClass?: ExecutionClass;
+    metadata?: Readonly<Record<string, unknown>>;
+  }): Promise<TaskRecord> {
     const id = input.id ?? `task-${randomUUID()}`;
     if (this.records.has(id)) throw new WorkStateHttpError(409, 'TASK_ALREADY_EXISTS');
     const now = Date.now();
     const row: TaskRecord = {
       id, sessionId: input.sessionId, prompt: input.prompt, status: 'queued',
+      executionClass: input.executionClass ?? 'foreground',
       createdAt: now, output: '', reasoning: '', durationMs: 0,
       ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
     };
@@ -665,6 +692,7 @@ export class InMemoryWorkStateStore implements WorkStateStore {
       sessionId: source.sessionId,
       prompt: input.prompt,
       status: 'queued',
+      executionClass: source.executionClass,
       createdAt: now,
       output: '',
       reasoning: '',

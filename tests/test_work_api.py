@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from cyrene_navigator.persistence import PersistencePrincipal, create_persistence_app
-from cyrene_navigator.work.store import _digest, _failed_task_result_notification_text
+from cyrene_navigator.persistence.errors import PersistenceError
+from cyrene_navigator.work.store import WorkStore, _digest, _failed_task_result_notification_text
 
 TOKENS = {
     "writer": PersistencePrincipal(
@@ -651,8 +655,8 @@ def test_terminal_teams_reply_uses_root_thread_route_and_unknown_delivery_is_not
         )
 
 
-def test_outbox_rate_limit_retries_only_with_bounded_retry_after(tmp_path: Path) -> None:
-    """Known rate limits get bounded delayed retries; unknown sends remain terminal."""
+def test_outbox_rate_limit_retries_without_an_attempt_cap(tmp_path: Path) -> None:
+    """Known rate limits retain delayed retries without a fixed attempt ceiling."""
 
     db_path = tmp_path / "outbox-rate-limit.sqlite3"
     base = BASE.format(workspace="w1")
@@ -674,7 +678,7 @@ def test_outbox_rate_limit_retries_only_with_bounded_retry_after(tmp_path: Path)
         created = client.post(base + "/notifications", json=body, headers=_headers())
         assert created.status_code == 201
         notice_id = created.json()["notification"]["id"]
-        for retry_number in range(1, 4):
+        for retry_number in range(1, 7):
             lease = client.post(
                 base + "/notifications/claim", json=claim_body, headers=_headers()
             ).json()["items"][0]
@@ -718,7 +722,7 @@ def test_outbox_rate_limit_retries_only_with_bounded_retry_after(tmp_path: Path)
             ).status_code
             == 200
         )
-        limit = client.post(
+        another_retry = client.post(
             base + f"/notifications/{notice_id}/finish",
             json={
                 "leaseToken": token,
@@ -728,8 +732,9 @@ def test_outbox_rate_limit_retries_only_with_bounded_retry_after(tmp_path: Path)
             },
             headers=_headers(),
         )
-        assert limit.status_code == 409
-        assert limit.json()["code"] == "WORK_NOTIFICATION_RETRY_LIMIT"
+        assert another_retry.status_code == 200
+        assert another_retry.json()["status"] == "queued"
+        assert another_retry.json()["result"]["retryCount"] == 7
 
 
 def test_connector_event_admission_deduplicates_task_across_reopen_and_rejects_changed_replay(
@@ -938,6 +943,272 @@ def test_teams_thread_mapping_keeps_member_messages_as_context_without_admitting
         assert client.get(base + "/tasks/teams-owner-task-2", headers=_headers()).status_code == 404
 
 
+def test_v2_workflow_notice_projects_from_completed_owner_task_without_generic_notification_bypass(
+    tmp_path: Path,
+) -> None:
+    """Only the typed v2 route can reply through a completed owner Teams task."""
+
+    db_path = tmp_path / "workflow-teams-notice.sqlite3"
+    base = BASE.format(workspace="w1")
+    workflow_id = "repo-patrol"
+    trigger_id = "github-poll"
+    owner_task_id = "owner-teams-task"
+    thread_id = "teams-thread-binding-001"
+    tenant_id = "11111111-1111-4111-8111-111111111111"
+    owner_id = "22222222-2222-4222-8222-222222222222"
+    issuer = f"https://login.microsoftonline.com/{tenant_id}/v2.0"
+    service_url = "https://smba.trafficmanager.net/emea/"
+    route = {
+        "tenantId": tenant_id,
+        "teamId": "team-1",
+        "channelId": "channel-1",
+        "conversationId": "conversation-1",
+        "rootThreadId": "1698765432100",
+        "serviceUrl": service_url,
+    }
+    owner_message = "Create a repository patrol responsibility."
+    teams_event = {
+        "messageId": "owner-message-1",
+        "type": "message.received",
+        "accountId": "bot-app-1",
+        "conversationId": route["conversationId"],
+        "senderId": owner_id,
+        "payload": {"messageId": "owner-message-1", "text": owner_message},
+        "teamsThreadMessage": {
+            **route,
+            "threadId": thread_id,
+            "messageId": "owner-message-1",
+            "actorIssuer": issuer,
+            "actorSubject": owner_id,
+            "text": owner_message,
+            "sessionId": "owner-session-1",
+        },
+        "task": {
+            "id": owner_task_id,
+            "sessionId": "owner-session-1",
+            "prompt": owner_message,
+            "metadata": {
+                "teamsCaller": {"issuer": issuer, "subject": owner_id, "tenantId": tenant_id},
+                "teamsThread": {"threadId": thread_id, **route},
+                "notification": {
+                    "type": "teams.message",
+                    "connectorId": "teams-v1",
+                    "recipient": f"teams:{thread_id}",
+                    "payload": route,
+                },
+            },
+        },
+    }
+    scheduled_at = "2026-10-24T12:00:00Z"
+    occurrence_id = (
+        "occ-"
+        + hashlib.sha256(f"{workflow_id}\0{trigger_id}\0{scheduled_at}".encode()).hexdigest()[:40]
+    )
+    event_id = (
+        "workflow-"
+        + hashlib.sha256(
+            f"{workflow_id}\0{trigger_id}\0{scheduled_at}\0succeeded".encode()
+        ).hexdigest()[:48]
+    )
+    workflow = {
+        "id": workflow_id,
+        "version": 2,
+        "title": "Repository patrol",
+        "description": "Observe configured repositories.",
+        "goal": "Find material new repository changes.",
+        "instructions": "Observe only; do not merge or deploy.",
+        "targets": [
+            {
+                "id": "123456",
+                "label": "DoHorizon-AI/Cyrene-Workspace",
+                "kind": "github_repository",
+                "bindingId": "github-binding-1",
+                "uri": "https://github.com/DoHorizon-AI/Cyrene-Workspace",
+            }
+        ],
+        "triggers": [
+            {
+                "id": trigger_id,
+                "kind": "github_incremental_poll",
+                "schedule": {"kind": "cron", "expression": "*/5 * * * *", "timeZone": "UTC"},
+                "targetIds": ["123456"],
+                "initialBaseline": "record_without_notification",
+                "search": {"state": "open", "labels": [], "limit": 50},
+            }
+        ],
+        "actionPolicy": {
+            "allowedActions": [
+                {
+                    "id": "safe-source-ci",
+                    "action": "rerun_source_ci",
+                    "targetIds": ["123456"],
+                    "baseBranches": [],
+                    "branchPrefixes": ["cyrene/assistant/"],
+                    "pathPrefixes": [],
+                    "issueNumbers": [],
+                    "sourceWorkflowIds": ["987654321"],
+                    "permittedOperations": ["github.actions.rerun_failed"],
+                }
+            ],
+            "separateChildTask": True,
+            "productionChanges": "forbidden",
+            "requiresUserAuthorization": ["merge", "release", "production", "new_spend"],
+        },
+        "modelPolicy": {
+            "preferredProvider": "antigravity",
+            "preferredModel": "gemini-3.8-flash-medium",
+            "fallback": "configured_no_additional_spend",
+        },
+        "authorization": {
+            "kind": "teams_thread",
+            "threadBindingId": thread_id,
+            "ownerTaskId": owner_task_id,
+        },
+        "notifications": {
+            "onChange": True,
+            "onFailure": True,
+            "onRecovery": True,
+            "quietWhenUnchanged": True,
+            "quietHours": {"start": "22:00", "end": "08:00", "timeZone": "America/New_York"},
+            "digest": {
+                "enabled": True,
+                "schedule": {
+                    "kind": "cron",
+                    "expression": "0 9 * * *",
+                    "timeZone": "America/New_York",
+                },
+                "maxPerDay": 1,
+            },
+            "destination": {"kind": "responsibility_thread"},
+            "immediateOn": ["blocked_goal", "user_decision", "service_or_auth_outage"],
+        },
+        "enabled": True,
+    }
+    with _client(db_path) as client:
+        admitted = client.post(
+            base + "/connectors/teams-v1/events", json=teams_event, headers=_headers()
+        )
+        assert admitted.status_code == 200, admitted.text
+        assert admitted.json()["task"]["id"] == owner_task_id
+        assert (
+            client.post(base + f"/tasks/{owner_task_id}/claim", headers=_headers()).json()[
+                "claimed"
+            ]
+            is True
+        )
+        completed = client.patch(
+            base + f"/tasks/{owner_task_id}",
+            json={"status": "completed", "output": "Responsibility created."},
+            headers=_headers(),
+        )
+        assert completed.status_code == 200, completed.text
+
+        stored = client.put(
+            base + f"/workflows/{workflow_id}?definitionVersion=2",
+            json=workflow,
+            headers=_headers(),
+        )
+        assert stored.status_code == 200, stored.text
+        assert client.get(base + "/workflows", headers=_headers()).json()["items"] == []
+        assert (
+            len(
+                client.get(base + "/workflows?definitionVersion=2", headers=_headers()).json()[
+                    "items"
+                ]
+            )
+            == 1
+        )
+        canonical_workflow = client.get(
+            base + "/workflows?definitionVersion=2", headers=_headers()
+        ).json()["items"][0]
+        assert canonical_workflow["actionPolicy"]["allowedActions"][0]["sourceWorkflowIds"] == [
+            "987654321"
+        ]
+
+        invalid_rerun = {
+            **workflow,
+            "id": "invalid-source-ci",
+            "actionPolicy": {
+                **workflow["actionPolicy"],
+                "allowedActions": [
+                    {
+                        **workflow["actionPolicy"]["allowedActions"][0],
+                        "sourceWorkflowIds": [],
+                    }
+                ],
+            },
+        }
+        rejected_rerun = client.put(
+            base + "/workflows/invalid-source-ci?definitionVersion=2",
+            json=invalid_rerun,
+            headers=_headers(),
+        )
+        assert rejected_rerun.status_code == 422
+        assert rejected_rerun.json()["code"] == "WORK_WORKFLOW_V2_ACTION_POLICY_INVALID"
+
+        event = {
+            "id": event_id,
+            "workflowId": workflow_id,
+            "triggerId": trigger_id,
+            "scheduledAt": scheduled_at,
+            "createdAt": scheduled_at,
+            "status": "succeeded",
+            "changed": True,
+            "summary": "A new issue update was found.",
+            "baseline": False,
+            "checkpoint": {
+                "kind": "github_issues_search",
+                "watermark": scheduled_at,
+                "windowEnd": scheduled_at,
+                "complete": True,
+                "repositories": [],
+            },
+        }
+        appended = client.post(base + "/schedule-events", json=event, headers=_headers())
+        assert appended.status_code == 200, appended.text
+
+        generic = client.post(
+            base + "/notifications",
+            json={
+                "deduplicationKey": "generic-completed-owner-task",
+                "type": "teams.message",
+                "taskId": owner_task_id,
+                "connectorId": "teams-v1",
+                "recipient": f"teams:{thread_id}",
+                "payload": {**route, "text": "must be denied"},
+            },
+            headers=_headers(),
+        )
+        assert generic.status_code == 409
+        assert generic.json()["code"] == "WORK_TASK_NOT_ACTIVE"
+
+        notice_body = {
+            "occurrenceId": occurrence_id,
+            "triggerId": trigger_id,
+            "scheduledAt": scheduled_at,
+            "kind": "change",
+            "summary": "A new issue update was found.",
+        }
+        notice = client.post(
+            base + f"/workflows/{workflow_id}/notices", json=notice_body, headers=_headers()
+        )
+        assert notice.status_code == 201, notice.text
+        payload = notice.json()["notification"]
+        assert payload["type"] == "teams.message"
+        assert payload["taskId"] == owner_task_id
+        assert payload["connectorId"] == "teams-v1"
+        assert payload["recipient"] == f"teams:{thread_id}"
+        assert payload["payload"]["tenantId"] == tenant_id
+        assert payload["payload"]["text"] == "Repository patrol — A new issue update was found."
+        assert "teamId" not in notice_body and "recipient" not in notice_body
+
+        replay = client.post(
+            base + f"/workflows/{workflow_id}/notices", json=notice_body, headers=_headers()
+        )
+        assert replay.status_code == 200
+        assert replay.json()["duplicate"] is True
+
+
 def test_teams_service_url_columns_migrate_additively(tmp_path: Path) -> None:
     """Existing thread mappings survive the serviceUrl column migration."""
 
@@ -982,6 +1253,51 @@ def test_teams_service_url_columns_migrate_additively(tmp_path: Path) -> None:
         assert conn.execute(
             "SELECT message_id,service_url FROM work_connector_thread_messages"
         ).fetchone() == ("123456789", "")
+
+
+def test_operation_scope_lock_migrates_without_rewriting_existing_receipts(tmp_path: Path) -> None:
+    """Branch-lock storage is additive and leaves earlier provider receipts intact."""
+
+    db_path = tmp_path / "operation-scope-lock-migration.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """CREATE TABLE work_operations (
+              organization_id TEXT NOT NULL, workspace_id TEXT NOT NULL, operation_id TEXT NOT NULL,
+              idempotency_key TEXT NOT NULL, operation_type TEXT NOT NULL,
+              task_id TEXT, target TEXT,
+              request_json TEXT NOT NULL, status TEXT NOT NULL, evidence_json TEXT NOT NULL,
+              request_digest TEXT NOT NULL, created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL,
+              PRIMARY KEY(organization_id,workspace_id,operation_id),
+              UNIQUE(organization_id,workspace_id,idempotency_key))"""
+        )
+        conn.execute(
+            """INSERT INTO work_operations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "org-a",
+                "w1",
+                "legacy-operation",
+                "legacy-key",
+                "tool.provider.v1:github.branch.delete",
+                None,
+                "connector-target:legacy",
+                "{}",
+                "uncertain",
+                '{"outcome":"unknown_after_provider_call"}',
+                "a" * 64,
+                1,
+                1,
+            ),
+        )
+
+    with _client(db_path), sqlite3.connect(db_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(work_operations)")}
+        assert "scope_lock" in columns
+        assert conn.execute(
+            "SELECT operation_id,status,scope_lock FROM work_operations"
+        ).fetchone() == ("legacy-operation", "uncertain", None)
+        indexes = {row[1] for row in conn.execute("PRAGMA index_list(work_operations)")}
+        assert "work_operations_scope_lock" in indexes
 
 
 def test_failed_task_result_notification_keeps_partial_output_and_deduplicates(
@@ -1303,6 +1619,192 @@ def test_unresolved_operation_query_supports_exact_target_reconciliation(tmp_pat
         )
         assert verified.status_code == 200, verified.text
         assert client.get(base + "/operations/unresolved", headers=_headers()).json()["items"] == []
+
+        branch_lock = (
+            "connector-branch:" + hashlib.sha256(b"profile/repo/cyrene/assistant/test").hexdigest()
+        )
+        branch_operation = client.post(
+            base + "/operations",
+            json={
+                "idempotencyKey": "branch-delete-locked",
+                "operationType": "tool.provider.v1:github.branch.delete",
+                "taskId": "operation-task",
+                "target": "connector-target:sha256:branch-delete",
+                "scopeLock": branch_lock,
+                "request": {
+                    "operationId": "github.branch.delete",
+                    "branch": "cyrene/assistant/test",
+                },
+            },
+            headers=_headers(),
+        )
+        assert branch_operation.status_code == 201, branch_operation.text
+        assert branch_operation.json()["operation"]["scopeLock"] == branch_lock
+
+
+def test_branch_scope_lock_serializes_provider_writes_across_tasks_and_restart(
+    tmp_path: Path,
+) -> None:
+    """GitHub writes on one branch serialize atomically until their receipt is verified."""
+
+    db_path = tmp_path / "operation-branch-lock.sqlite3"
+    scope_lock = "connector-branch:" + hashlib.sha256(b"github-profile/repo/develop").hexdigest()
+    store = WorkStore(db_path)
+
+    def start_running_task(task_id: str) -> None:
+        task, duplicate = store.create_task("org-a", "w1", _task_body(task_id), actor_id="owner")
+        assert not duplicate
+        assert task["id"] == task_id
+        claimed, running = store.claim_task("org-a", "w1", task_id)
+        assert claimed and running["status"] == "running"
+
+    def begin(
+        task_id: str,
+        idempotency_key: str,
+        operation_id: str,
+        target: str,
+        branch: str,
+        lock: str | None,
+    ) -> tuple[str, str]:
+        try:
+            operation, duplicate = store.create_operation(
+                "org-a",
+                "w1",
+                {
+                    "idempotencyKey": idempotency_key,
+                    "operationType": f"tool.provider.v1:{operation_id}",
+                    "taskId": task_id,
+                    "target": target,
+                    **({"scopeLock": lock} if lock is not None else {}),
+                    "request": {
+                        "bindingId": "github-binding",
+                        "operationId": operation_id,
+                        "arguments": {"repository": "owner/repo", "branch": branch},
+                    },
+                },
+            )
+            return ("duplicate" if duplicate else "started", str(operation["id"]))
+        except PersistenceError as error:
+            return (str(error.status), error.code)
+
+    for task_id in (
+        "delete-task",
+        "commit-task",
+        "other-branch-task",
+        "readback-task",
+        "retry-task",
+    ):
+        start_running_task(task_id)
+
+    contenders = [
+        (
+            "delete-task",
+            "branch-delete-key",
+            "github.branch.delete",
+            "connector-target:branch-delete",
+            "cyrene/assistant/branch-1",
+        ),
+        (
+            "commit-task",
+            "file-commit-key",
+            "github.file.commit",
+            "connector-target:file-commit",
+            "cyrene/assistant/branch-1",
+        ),
+    ]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(
+                lambda item: begin(*item, scope_lock),
+                contenders,
+            )
+        )
+    winners = [result for result in results if result[0] == "started"]
+    blocked = [result for result in results if result[0] == "409"]
+    assert len(winners) == 1
+    assert len(blocked) == 1
+    assert blocked[0][1] == "WORK_OPERATION_SCOPE_LOCKED"
+    active_operation_id = winners[0][1]
+
+    other_branch_lock = (
+        "connector-branch:"
+        + hashlib.sha256(b"github-profile/repo/cyrene/assistant/branch-2").hexdigest()
+    )
+    other_branch, duplicate = store.create_operation(
+        "org-a",
+        "w1",
+        {
+            "idempotencyKey": "other-branch-key",
+            "operationType": "tool.provider.v1:github.file.commit",
+            "taskId": "other-branch-task",
+            "target": "connector-target:file-commit-branch-2",
+            "scopeLock": other_branch_lock,
+            "request": {"operationId": "github.file.commit", "branch": "cyrene/assistant/branch-2"},
+        },
+    )
+    assert not duplicate
+    assert other_branch["scopeLock"] == other_branch_lock
+
+    readback, duplicate = store.create_operation(
+        "org-a",
+        "w1",
+        {
+            "idempotencyKey": "branch-readback-key",
+            "operationType": "tool.provider.v1:github.branch.get",
+            "taskId": "readback-task",
+            "target": "connector-readback:branch-1",
+            "request": {"operationId": "github.branch.get", "branch": "cyrene/assistant/branch-1"},
+        },
+    )
+    assert not duplicate, "a readback has no branch write lock and must remain available"
+    assert readback["scopeLock"] is None
+
+    store.update_operation(
+        "org-a", "w1", active_operation_id, "uncertain", {"outcome": "unknown_after_provider_call"}
+    )
+    restarted_store = WorkStore(db_path)
+    restarted_task, duplicate = restarted_store.create_task(
+        "org-a", "w1", _task_body("restart-retry-task"), actor_id="owner"
+    )
+    assert not duplicate
+    assert restarted_task["id"] == "restart-retry-task"
+    claimed, _ = restarted_store.claim_task("org-a", "w1", "restart-retry-task")
+    assert claimed
+    with pytest.raises(PersistenceError) as error:
+        restarted_store.create_operation(
+            "org-a",
+            "w1",
+            {
+                "idempotencyKey": "restart-same-branch-key",
+                "operationType": "tool.provider.v1:github.file.commit",
+                "taskId": "restart-retry-task",
+                "target": "connector-target:another-file-on-branch-1",
+                "scopeLock": scope_lock,
+                "request": {
+                    "operationId": "github.file.commit",
+                    "branch": "cyrene/assistant/branch-1",
+                },
+            },
+        )
+    assert error.value.code == "WORK_OPERATION_SCOPE_LOCKED"
+
+    restarted_store.update_operation(
+        "org-a", "w1", active_operation_id, "verified", {"outcome": "verified", "effect": "write"}
+    )
+    retry_operation, duplicate = restarted_store.create_operation(
+        "org-a",
+        "w1",
+        {
+            "idempotencyKey": "verified-branch-retry-key",
+            "operationType": "tool.provider.v1:github.file.commit",
+            "taskId": "restart-retry-task",
+            "target": "connector-target:another-file-on-branch-1",
+            "scopeLock": scope_lock,
+            "request": {"operationId": "github.file.commit", "branch": "cyrene/assistant/branch-1"},
+        },
+    )
+    assert not duplicate, "verified write receipts release branch serialization"
+    assert retry_operation["status"] == "started"
 
 
 def test_human_input_pauses_resumes_once_and_survives_scope_checks(tmp_path: Path) -> None:

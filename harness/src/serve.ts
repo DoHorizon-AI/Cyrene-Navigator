@@ -4,7 +4,7 @@
 // │ 模块职责：在 Harness 作用域内装配并导出 Cloud Executor 运行时。         │
 // └─────────────────────────────────────────────────────────────────────┘
 
-import { existsSync, mkdirSync, statSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, statSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,7 +20,7 @@ import AgentRegistry from '@deepseek-ai/dsh-agent';
 import AgentLoop from '@deepseek-ai/dsh-agent-loop';
 import CyreneSessionPersistence from './persistence.js';
 import { DynamicPluginManager, apply as applyPluginManager } from './plugin-manager.js';
-import { NavigatorExecutor, apply as applyExecutor } from './executor.js';
+import { NavigatorExecutor, apply as applyExecutor, resolveTeamsTaskActorSubjects } from './executor.js';
 import type { TeamsExecutorConfig } from './executor.js';
 import { ExchangeLlmAdapter } from './exchange-adapter.js';
 import { CodeBuddyLlmAdapter } from './codebuddy-adapter.js';
@@ -35,6 +35,24 @@ import type {
   ConnectorResourceProjection,
 } from './tool-providers.js';
 import type { WorkAssistantBridge } from './work-tools.js';
+import {
+  createResponsibilityAuthorizationResolver,
+  verifyActiveTeamsOwnerContext,
+  verifyWorkflowOwnerAccess,
+} from './responsibility-authority.js';
+import type {
+  ActiveTeamsOwnerContext,
+  BackgroundTaskAuthorizationResolver,
+  ResponsibilityAuthorityConfig,
+  ResponsibilityPrincipal,
+} from './responsibility-authority.js';
+import { registerResponsibilityTools } from './responsibility-tools.js';
+import type { ResponsibilityTargetConfig } from './responsibility-tools.js';
+import { projectWorkflowNoticeToTeamsMessage } from './workflow-teams-delivery.js';
+import type { WorkflowV2Write } from './workflows/store.js';
+import type { ModelRoute } from './model-policy.js';
+import { readCodeBuddyFallbackConfig } from './model-policy.js';
+import { PrioritizedModelAdapter, PrioritizedModelGate } from './model-gate.js';
 import { registerSubagents } from './subagents/index.js';
 import type { SubagentAdapterConfig, SubagentAdapterEvent } from './subagents/types.js';
 import { WorkflowsClient } from './workflows/store.js';
@@ -72,10 +90,16 @@ export interface CreateExecutorAppOptions {
   readonly readExchangeOperationState?: (sessionId: string, operationId: string) => Promise<string>;
   readonly modelSource?: 'exchange' | 'codebuddy' | 'antigravity';
   readonly model?: string;
+  /** Test-only route injection for deterministic provider-failover fixtures. */
+  readonly modelFallbacks?: readonly ModelRoute[];
   readonly pluginsDir?: string;
   readonly watchPlugins?: boolean;
   readonly defaultCwd?: string;
+  /** Bounded total active task slots; one is reserved for foreground when at least two are configured. */
+  readonly maxConcurrentTasks?: number;
   readonly customLlmAdapter?: { provider: string; adapter: LlmAdapter };
+  /** Additional fixture providers available only to explicit testMode failover cases. */
+  readonly customTestModelAdapters?: readonly { provider: string; adapter: LlmAdapter }[];
   readonly testMode?: boolean;
   readonly enableTestEchoAdapter?: boolean;
   readonly authTokenEnv?: string;
@@ -90,6 +114,10 @@ export interface CreateExecutorAppOptions {
   readonly teamsChatOnly?: boolean;
   readonly connectorBindingsPath?: string;
   readonly connectorToolCatalogPath?: string;
+  /** Host-owned verifier for persisted background responsibility connector calls. */
+  readonly backgroundTaskAuthority?: BackgroundTaskAuthorizationResolver;
+  /** Host-approved repository/action list for owner responsibility commands. */
+  readonly responsibilityTargets?: readonly ResponsibilityTargetConfig[];
 }
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -102,12 +130,17 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
   const teamsChatOnly = resolveTeamsChatOnly(options.teamsChatOnly);
   if (production && testMode) throw new Error('Executor test mode is disabled in production');
   if (options.customLlmAdapter && !testMode) throw new Error('Custom LLM adapters require explicit testMode');
+  if (options.customTestModelAdapters !== undefined && !testMode) {
+    throw new Error('Custom test model adapters require explicit testMode');
+  }
   if (options.enableTestEchoAdapter && !testMode) throw new Error('The echo adapter is test-only');
 
   const persistenceUrl = options.persistenceUrl ?? process.env.CYRENE_PERSISTENCE_URL;
   const workspaceId = options.workspaceId ?? process.env.CYRENE_WORKSPACE_ID;
   const teams = options.teams ?? createTeamsExecutorConfig(workspaceId);
-  const maxConcurrentTasks = parseTaskConcurrency(process.env.CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS);
+  const maxConcurrentTasks = validateTaskConcurrency(
+    options.maxConcurrentTasks ?? parseTaskConcurrency(process.env.CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS),
+  );
   const connectorBindingsPath = options.connectorBindingsPath ?? process.env.CYRENE_CONNECTOR_BINDINGS_FILE;
   const connectorBindings = connectorBindingsPath === undefined
     ? new Map<string, ConnectorBindingAuthorization>()
@@ -164,10 +197,13 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
     })
     : undefined;
   const dshHome = options.dshHome ?? process.env.DSH_HOME;
-  const workflowsEnabled = teamsChatOnly ? false : options.enableWorkflows ?? (
+  const workflowsRequested = teamsChatOnly ? false : options.enableWorkflows ?? (
     process.env.CYRENE_WORKFLOWS_ENABLED === 'true'
     || (!testMode && Boolean(dshHome) && process.env.CYRENE_WORKFLOWS_ENABLED !== 'false')
   );
+  const workflowRequirementsMet = Boolean(persistenceUrl && workspaceId && dshHome);
+  const workflowsEnabled = workflowsRequested && workflowRequirementsMet;
+  const workflowSetupUnavailable = workflowsRequested && !workflowRequirementsMet;
   const sessionToken = process.env.CYRENE_SESSION_TOKEN;
   const publicTokenEnv = options.authTokenEnv ?? (process.env.CYRENE_EXECUTOR_TOKEN ? 'CYRENE_EXECUTOR_TOKEN' : 'CYRENE_SESSION_TOKEN');
   const publicToken = process.env[publicTokenEnv] ?? sessionToken;
@@ -175,11 +211,6 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
   if (!testMode && !workspaceId) throw new Error('CYRENE_WORKSPACE_ID is required outside explicit testMode');
   if (!testMode && !sessionToken) throw new Error('CYRENE_SESSION_TOKEN is required outside explicit testMode');
   if (!testMode && !publicToken) throw new Error(`${publicTokenEnv} or CYRENE_SESSION_TOKEN is required for executor API authentication`);
-  if (workflowsEnabled && (!persistenceUrl || !workspaceId)) {
-    throw new Error('Durable workflows require CYRENE_PERSISTENCE_URL and CYRENE_WORKSPACE_ID');
-  }
-  if (workflowsEnabled && !dshHome) throw new Error('DSH_HOME is required when durable workflows are enabled');
-
   const workState: WorkStateStore = options.workStateStore
     ?? (persistenceUrl && workspaceId
       ? new WorkStateClient({ baseUrl: persistenceUrl, workspaceId, tokenEnv: 'CYRENE_SESSION_TOKEN', requestTimeoutMs: 10_000 })
@@ -189,6 +220,9 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
   }
 
   const ctx = new Context();
+  if (workflowSetupUnavailable) {
+    ctx.logger.warn('background workflow runtime is unavailable because durable storage or DSH_HOME is not configured; foreground chat remains online');
+  }
 
   // Core Cordis runtime and Agent loop
   await ctx.plugin(LocalSubprocessRuntime);
@@ -242,7 +276,7 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
 
   // LLM Model Adapter setup
   const exchangeUrl = options.exchangeUrl ?? process.env.CYRENE_EXCHANGE_URL;
-  const configuredModelSource = options.modelSource ?? process.env.CYRENE_HARNESS_MODEL_SOURCE ?? 'exchange';
+  const configuredModelSource = options.modelSource ?? process.env.CYRENE_HARNESS_MODEL_SOURCE ?? 'antigravity';
   if (configuredModelSource !== 'exchange'
     && configuredModelSource !== 'codebuddy'
     && configuredModelSource !== 'antigravity') {
@@ -255,37 +289,56 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
       : configuredModelSource === 'antigravity'
         ? DEFAULT_ANTIGRAVITY_MODEL
         : testMode ? 'test-model' : undefined);
+  const codeBuddyFallback = readCodeBuddyFallbackConfig(process.env);
+  if (codeBuddyFallback.enabled && configuredModelSource !== 'antigravity') {
+    throw new TypeError('CodeBuddy fallback is supported only when Antigravity is the primary model source');
+  }
+  if (options.modelFallbacks !== undefined && !testMode) {
+    throw new Error('Explicit model fallback routes are test-only; production fallbacks come from host configuration');
+  }
+  const modelFallbacks = options.modelFallbacks ?? (!options.customLlmAdapter
+    && codeBuddyFallback.enabled && codeBuddyFallback.model !== undefined
+    ? [{ provider: 'codebuddy', model: codeBuddyFallback.model }]
+    : []);
+  const modelGate = new PrioritizedModelGate();
+  const prioritized = (adapter: LlmAdapter): LlmAdapter => new PrioritizedModelAdapter(
+    adapter,
+    modelGate,
+    sessionId => ctx.get('executor')?.executionClassForSession(sessionId) ?? 'foreground',
+  );
 
   if (configuredModelSource === 'exchange' && exchangeUrl) {
     const exchangeToken = process.env.CYRENE_EXCHANGE_TOKEN;
     if (!exchangeToken) throw new Error('CYRENE_EXCHANGE_TOKEN is required when Exchange is configured');
     if (!modelId) throw new Error('CYRENE_HARNESS_MODEL is required when Exchange is configured');
-    ctx.llm.registerAdapter(['cyrene-exchange'], new ExchangeLlmAdapter({
+    ctx.llm.registerAdapter(['cyrene-exchange'], prioritized(new ExchangeLlmAdapter({
       baseUrl: exchangeUrl,
       tokenEnv: 'CYRENE_EXCHANGE_TOKEN',
       requestTimeoutMs: 120_000,
-    }));
+    })));
     ctx.provide('agentDefaultModel', {
       currentSelection: () => ({ provider: 'cyrene-exchange', model: modelId }),
     });
   } else if (options.customLlmAdapter) {
     const custom = options.customLlmAdapter;
-    ctx.llm.registerAdapter([custom.provider], custom.adapter);
+    ctx.llm.registerAdapter([custom.provider], prioritized(custom.adapter));
+    for (const fixture of options.customTestModelAdapters ?? []) {
+      ctx.llm.registerAdapter([fixture.provider], prioritized(fixture.adapter));
+    }
     ctx.provide('agentDefaultModel', {
       currentSelection: () => ({ provider: custom.provider, model: modelId! }),
     });
   } else if (configuredModelSource === 'codebuddy') {
-    ctx.llm.registerAdapter(['codebuddy'], new CodeBuddyLlmAdapter());
+    ctx.llm.registerAdapter(['codebuddy'], prioritized(new CodeBuddyLlmAdapter()));
     ctx.provide('agentDefaultModel', {
       currentSelection: () => ({ provider: 'codebuddy', model: modelId! }),
     });
   } else if (configuredModelSource === 'antigravity') {
     const antigravityAdapter = new AntigravityLlmAdapter();
-    await antigravityAdapter.validateHostProfile();
     await antigravityAdapter.resolveModel('antigravity', modelId!);
-    ctx.llm.registerAdapter(['antigravity'], antigravityAdapter);
+    ctx.llm.registerAdapter(['antigravity'], prioritized(antigravityAdapter));
     // Existing in-memory CodeBuddy Agents retain their original provider selection.
-    ctx.llm.registerAdapter(['codebuddy'], new CodeBuddyLlmAdapter());
+    ctx.llm.registerAdapter(['codebuddy'], prioritized(new CodeBuddyLlmAdapter()));
     ctx.provide('agentDefaultModel', {
       currentSelection: () => ({ provider: 'antigravity', model: modelId! }),
     });
@@ -304,7 +357,7 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
         yield { type: 'finish', reason: { kind: 'stop' } };
       }
     }
-    ctx.llm.registerAdapter(['cloud-default'], new CloudDefaultAdapter());
+    ctx.llm.registerAdapter(['cloud-default'], prioritized(new CloudDefaultAdapter()));
     ctx.provide('agentDefaultModel', {
       currentSelection: () => ({ provider: 'cloud-default', model: modelId }),
     });
@@ -341,6 +394,7 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
     workState,
     authTokenEnv: publicTokenEnv,
     maxConcurrentTasks,
+    modelFallbacks,
     ...(teams === undefined ? {} : { teams }),
     allowedOrigins: options.allowedOrigins,
     ...(revalidateExchangeAuthorization === undefined ? {} : { revalidateExchangeAuthorization }),
@@ -350,6 +404,47 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
   const executor = ctx.get('executor');
   if (!executor) throw new Error('Navigator executor service was not registered');
   const pluginManager = ctx.get('pluginManager');
+  const workflowStore = workflowsEnabled
+    ? new WorkflowsClient({
+      baseUrl: persistenceUrl!, workspaceId: workspaceId!, tokenEnv: 'CYRENE_SESSION_TOKEN', requestTimeoutMs: 10_000,
+    })
+    : undefined;
+  const responsibilityAuthority: ResponsibilityAuthorityConfig | undefined =
+    workflowStore !== undefined && teams !== undefined && workspaceId !== undefined
+      ? {
+        workspaceId,
+        teamsConnectorId: teams.connectorId,
+        allowedTenantId: teams.tenantId,
+        allowedTeamIds: teams.allowedTeamIds,
+        workState,
+        workflows: workflowStore,
+        isDirectoryAuthorized: async (principal, signal) => {
+          signal.throwIfAborted();
+          if (principal.tenantId !== teams.tenantId.toLowerCase()) return false;
+          const subjects = await resolveTeamsTaskActorSubjects(teams, workspaceId, principal.issuer);
+          return subjects.includes(principal.subject.toLowerCase());
+        },
+      }
+      : undefined;
+  const backgroundTaskAuthority = options.backgroundTaskAuthority ?? (
+    responsibilityAuthority === undefined
+      ? undefined
+      : createResponsibilityAuthorizationResolver(responsibilityAuthority)
+  );
+  let responsibilityTargets = options.responsibilityTargets;
+  let responsibilityTargetsUnavailable = false;
+  if (responsibilityTargets === undefined) {
+    const responsibilityTargetsPath = process.env.CYRENE_RESPONSIBILITY_TARGETS_FILE;
+    if (responsibilityTargetsPath !== undefined) {
+      try {
+        responsibilityTargets = await readHostResponsibilityTargets(responsibilityTargetsPath);
+      } catch {
+        responsibilityTargetsUnavailable = true;
+      }
+    } else {
+      responsibilityTargetsUnavailable = true;
+    }
+  }
 
   let workAssistantBridge: WorkAssistantBridge | undefined;
   if (!teamsChatOnly && persistenceUrl && workspaceId) {
@@ -363,6 +458,9 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
     await registerToolProviders(ctx, {
       bridge: workAssistantBridge,
       taskIdForSession: sessionId => executor.activeTaskId(sessionId),
+      ...(backgroundTaskAuthority === undefined
+        ? {}
+        : { backgroundTaskAuthority }),
       ...(teams === undefined ? {} : {
         connectorAuthorization: {
           client: teams.exchangeAuthorization,
@@ -433,16 +531,64 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
     }
   }
 
+  let workflowRuntimeReady = false;
   if (workflowsEnabled) {
-    const workflowStore = new WorkflowsClient({
-      baseUrl: persistenceUrl!, workspaceId: workspaceId!, tokenEnv: 'CYRENE_SESSION_TOKEN', requestTimeoutMs: 10_000,
-    });
-    await registerWorkflowRuntime(ctx, {
-      store: workflowStore,
-      storageRoot: join(resolve(dshHome!), 'storages'),
-      schedulerSessionId: 'navigator-workflow-scheduler-v1',
-      executeTask: params => executor.executeTask(params),
-    });
+    try {
+      if (!workflowStore) throw new Error('durable workflow store is unavailable');
+      await registerWorkflowRuntime(ctx, {
+        store: workflowStore,
+        storageRoot: join(resolve(dshHome!), 'storages'),
+        schedulerSessionId: 'navigator-workflow-scheduler-v1',
+        executeTask: params => executor.executeTask(params),
+        readTaskEvents: (taskId, after) => executor.readTaskEvents(taskId, after),
+        ...(responsibilityAuthority === undefined
+          ? {}
+          : {
+            projectTeamsNotification: notification => projectWorkflowNoticeToTeamsMessage(
+              notification,
+              responsibilityAuthority,
+              AbortSignal.timeout(10_000),
+            ),
+          }),
+      });
+      workflowRuntimeReady = true;
+    } catch {
+      ctx.logger.warn('background workflow runtime is unavailable; foreground chat remains online');
+    }
+  }
+
+  if (workflowRuntimeReady && workflowStore !== undefined && responsibilityAuthority !== undefined
+    && responsibilityTargets !== undefined) {
+    try {
+      const modelPolicy = currentResponsibilityModelPolicy(ctx);
+      if (modelPolicy === undefined) throw new TypeError('No supported host model route is configured for responsibilities');
+      const dispose = registerResponsibilityTools(ctx, {
+        workflows: workflowStore,
+        resolveActiveOwner: async (sessionId, signal) => {
+          const taskId = executor.activeTaskId(sessionId);
+          return taskId === undefined
+            ? undefined
+            : verifyActiveTeamsOwnerContext(responsibilityAuthority, taskId, signal);
+        },
+        authorizeWorkflowOwner: (workflowId, principal, signal) =>
+          verifyWorkflowOwnerAccess(responsibilityAuthority, workflowId, principal, signal),
+        readModelUsage: taskId => executor.readTaskModelUsage(taskId),
+        syncWorkflows: async () => {
+          const runtime = ctx.get('workflowRuntime');
+          if (runtime === undefined) throw new Error('Durable workflow scheduler is unavailable');
+          await runtime.sync();
+        },
+        allowedTargets: responsibilityTargets,
+        modelPolicy,
+      });
+      ctx.effect(() => dispose, 'navigator.responsibilityTools');
+    } catch {
+      ctx.logger.warn('responsibility management tools are unavailable; foreground chat remains online');
+    }
+  } else if (workflowRuntimeReady && workflowsEnabled) {
+    ctx.logger.warn(responsibilityTargetsUnavailable
+      ? 'responsibility management tools are unavailable because the host target configuration is missing or invalid'
+      : 'responsibility management tools are unavailable until Teams owner context and host repository targets are configured');
   }
 
   if (teamsChatOnly && ctx.tools.schemas().length !== 0) {
@@ -501,11 +647,15 @@ function createTeamsExecutorConfig(workspaceId: string | undefined): TeamsExecut
 }
 
 function parseTaskConcurrency(value: string | undefined): number {
-  if (value === undefined || value === '') return 1;
+  if (value === undefined || value === '') return 2;
   if (!/^\d{1,2}$/u.test(value)) throw new TypeError('CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS must be an integer');
-  const maximum = Number(value);
-  if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 32) {
-    throw new TypeError('CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS must be between 1 and 32');
+  return validateTaskConcurrency(Number(value), 'CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS');
+}
+
+/** Validate the bounded foreground/background task budget before creating any runtime resources. */
+function validateTaskConcurrency(maximum: number, label = 'maxConcurrentTasks'): number {
+  if (!Number.isSafeInteger(maximum) || maximum < 2 || maximum > 32) {
+    throw new TypeError(`${label} must be between 2 and 32`);
   }
   return maximum;
 }
@@ -540,6 +690,8 @@ export function validateConnectorBindingMap(value: unknown): Map<string, Connect
   }
   const projections = new Set<ConnectorResourceProjection>([
     'empty', 'profile', 'github_repository', 'github_pull_request', 'github_ci', 'github_commit', 'github_issue',
+    'github_actions_run', 'github_actions_job', 'github_branch', 'github_file', 'github_pull_request_draft',
+    'computer_workspace', 'computer_file', 'computer_directory',
     'huggingface_repository', 'cloud_target', 'cloud_operation',
   ]);
   const result = new Map<string, ConnectorBindingAuthorization>();
@@ -553,7 +705,7 @@ export function validateConnectorBindingMap(value: unknown): Map<string, Connect
       throw new TypeError(`connector binding ${index} connectionRef must be an Exchange UUID`);
     }
     const providerId = configText(row.providerId, 'providerId', 64);
-    if (!['github', 'huggingface', 'azure', 'gcp', 'runpod'].includes(providerId)) {
+    if (!['github', 'huggingface', 'azure', 'gcp', 'runpod', 'computer'].includes(providerId)) {
       throw new TypeError(`connector binding ${index} providerId is not supported`);
     }
     const profileRef = configText(row.profileRef, 'profileRef', 512);
@@ -615,11 +767,34 @@ function connectorOperationPolicy(
     'github.pull_requests.list': { toolId: 'github.pull_requests.list', mutating: false, resourceProjection: 'github_repository' },
     'github.pull_request.get': { toolId: 'github.pull_request.get', mutating: false, resourceProjection: 'github_pull_request' },
     'github.actions.runs.list': { toolId: 'github.actions.runs.list', mutating: false, resourceProjection: 'github_repository' },
+    'github.issues.search': { toolId: 'github.issues.search', mutating: false, resourceProjection: 'github_repository' },
+    'github.actions.jobs.list': { toolId: 'github.actions.jobs.list', mutating: false, resourceProjection: 'github_actions_run' },
+    'github.actions.job.logs.read': { toolId: 'github.actions.job.logs.read', mutating: false, resourceProjection: 'github_actions_job' },
+    'github.actions.rerun_failed': { toolId: 'github.actions.rerun_failed', mutating: true, resourceProjection: 'github_actions_run' },
+    'github.branch.get': { toolId: 'github.branch.get', mutating: false, resourceProjection: 'github_branch' },
+    'github.branch.create': { toolId: 'github.branch.create', mutating: true, resourceProjection: 'github_branch' },
+    'github.branch.delete': { toolId: 'github.branch.delete', mutating: true, resourceProjection: 'github_branch' },
+    'github.file.get': { toolId: 'github.file.get', mutating: false, resourceProjection: 'github_file' },
+    'github.file.commit': { toolId: 'github.file.commit', mutating: true, resourceProjection: 'github_file' },
+    'github.pull_request.draft.find': {
+      toolId: 'github.pull_request.draft.find', mutating: false, resourceProjection: 'github_pull_request_draft',
+    },
+    'github.pull_request.draft.create': {
+      toolId: 'github.pull_request.draft.create', mutating: true, resourceProjection: 'github_pull_request_draft',
+    },
     'github.ci.status': { toolId: 'github.ci.status', mutating: false, resourceProjection: 'github_commit' },
     'github.issue.get': { toolId: 'github.issue.get', mutating: false, resourceProjection: 'github_issue' },
     'github.issue.comment.create': { toolId: 'github.issue.comment.create', mutating: true, resourceProjection: 'github_issue' },
     'github.issue.state.update': { toolId: 'github.issue.state.update', mutating: true, resourceProjection: 'github_issue' },
     'github.vendor.cli.execute': { toolId: 'github_vendor_cli', mutating: true, resourceProjection: 'profile' },
+    'computer.command.execute': {
+      toolId: 'computer.command.execute', mutating: true, resourceProjection: 'computer_workspace',
+    },
+    'computer.file.read': { toolId: 'computer.file.read', mutating: false, resourceProjection: 'computer_file' },
+    'computer.file.write': { toolId: 'computer.file.write', mutating: true, resourceProjection: 'computer_file' },
+    'computer.directory.list': {
+      toolId: 'computer.directory.list', mutating: false, resourceProjection: 'computer_directory',
+    },
     'huggingface.models.list': { toolId: 'huggingface.models.list', mutating: false, resourceProjection: 'profile' },
     'huggingface.datasets.list': { toolId: 'huggingface.datasets.list', mutating: false, resourceProjection: 'profile' },
     'huggingface.spaces.list': { toolId: 'huggingface.spaces.list', mutating: false, resourceProjection: 'profile' },
@@ -648,7 +823,9 @@ function connectorOperationPolicy(
     ? operationId.startsWith('github.')
     : providerId === 'huggingface'
       ? operationId.startsWith('huggingface.')
-      : ['azure', 'gcp', 'runpod'].includes(providerId) && operationId.startsWith('cloud.');
+      : providerId === 'computer'
+        ? operationId.startsWith('computer.')
+        : ['azure', 'gcp', 'runpod'].includes(providerId) && operationId.startsWith('cloud.');
   if (!providerAllowed || (operationId === 'cloud.resource.restart' && providerId !== 'runpod')) {
     throw new TypeError(`Connector operation ${operationId} is not valid for provider ${providerId}`);
   }
@@ -684,6 +861,75 @@ function configText(value: unknown, label: string, maximum: number): string {
   if (typeof value !== 'string' || value.length === 0 || value.trim() !== value || value.length > maximum
     || /[\u0000-\u001f\u007f]/u.test(value)) throw new TypeError(`Invalid connector ${label}`);
   return value;
+}
+
+/** Read the host-authored responsibility allowlist without following symlinks or accepting model-supplied scope. */
+async function readHostResponsibilityTargets(pathValue: string): Promise<readonly ResponsibilityTargetConfig[]> {
+  const path = resolve(configText(pathValue, 'CYRENE_RESPONSIBILITY_TARGETS_FILE', 2_000));
+  const metadata = lstatSync(path);
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size < 2 || metadata.size > 512_000
+    || (metadata.mode & 0o022) !== 0) {
+    throw new TypeError('Responsibility target config must be a bounded regular host file');
+  }
+  const root = asObject(JSON.parse(await readFile(path, 'utf8')) as unknown, 'responsibility target config');
+  assertKeys(root, ['schemaVersion', 'targets'], 'responsibility target config');
+  if (root.schemaVersion !== 1 || !Array.isArray(root.targets) || root.targets.length < 1 || root.targets.length > 100) {
+    throw new TypeError('Responsibility target config must use schemaVersion 1 and a bounded targets array');
+  }
+  return root.targets.map((targetValue, index) => {
+    const target = asObject(targetValue, `responsibility target ${index}`);
+    assertKeys(target, ['id', 'label', 'bindingId', 'uri', 'actionGrants'], `responsibility target ${index}`);
+    if (!Array.isArray(target.actionGrants) || target.actionGrants.length > 100) {
+      throw new TypeError(`responsibility target ${index} actionGrants must be a bounded array`);
+    }
+    const actionGrants = target.actionGrants.map((grantValue, grantIndex) => {
+      const grant = asObject(grantValue, `responsibility target ${index} action grant ${grantIndex}`);
+      assertKeys(grant, [
+        'id', 'action', 'baseBranches', 'branchPrefixes', 'pathPrefixes', 'issueNumbers', 'sourceWorkflowIds',
+        'permittedOperations',
+      ], `responsibility target ${index} action grant ${grantIndex}`);
+      if (!['draft_pull_request', 'rerun_source_ci', 'update_issue_progress'].includes(String(grant.action))) {
+        throw new TypeError(`responsibility target ${index} action grant ${grantIndex} has an unsupported action`);
+      }
+      const strings = (value: unknown, label: string): readonly string[] => {
+        if (!Array.isArray(value) || value.length > 100) throw new TypeError(`${label} must be a bounded string array`);
+        return value.map((item, itemIndex) => configText(item, `${label}[${itemIndex}]`, 512));
+      };
+      if (!Array.isArray(grant.issueNumbers) || grant.issueNumbers.length > 100
+        || grant.issueNumbers.some(item => typeof item !== 'number' || !Number.isSafeInteger(item) || item < 1)) {
+        throw new TypeError(`responsibility target ${index} action grant ${grantIndex} issueNumbers are invalid`);
+      }
+      return {
+        id: configText(grant.id, 'responsibility action grant id', 100),
+        action: grant.action as ResponsibilityTargetConfig['actionGrants'][number]['action'],
+        baseBranches: strings(grant.baseBranches, 'baseBranches'),
+        branchPrefixes: strings(grant.branchPrefixes, 'branchPrefixes'),
+        pathPrefixes: strings(grant.pathPrefixes, 'pathPrefixes'),
+        issueNumbers: grant.issueNumbers as number[],
+        sourceWorkflowIds: strings(grant.sourceWorkflowIds, 'sourceWorkflowIds'),
+        permittedOperations: strings(grant.permittedOperations, 'permittedOperations') as ResponsibilityTargetConfig['actionGrants'][number]['permittedOperations'],
+      };
+    });
+    return {
+      id: configText(target.id, `responsibility target ${index} id`, 32),
+      label: configText(target.label, `responsibility target ${index} label`, 256),
+      bindingId: configText(target.bindingId, `responsibility target ${index} bindingId`, 200),
+      uri: configText(target.uri, `responsibility target ${index} uri`, 512),
+      actionGrants,
+    };
+  });
+}
+
+function currentResponsibilityModelPolicy(ctx: Context): WorkflowV2Write['modelPolicy'] | undefined {
+  const selection = ctx.get('agentDefaultModel')?.currentSelection();
+  if (selection === undefined) return undefined;
+  const preferredProvider = selection.provider === 'cyrene-exchange' ? 'exchange' : selection.provider;
+  if (!['antigravity', 'codebuddy', 'exchange'].includes(preferredProvider)) return undefined;
+  return {
+    preferredProvider: preferredProvider as WorkflowV2Write['modelPolicy']['preferredProvider'],
+    preferredModel: selection.model,
+    fallback: 'configured_no_additional_spend',
+  };
 }
 
 /** Load the private Exchange-exported provider catalog without inline secrets. | 读取私有 Exchange provider catalog。 */

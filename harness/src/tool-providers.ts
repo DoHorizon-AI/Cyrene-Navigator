@@ -18,6 +18,14 @@ import {
   sha256,
 } from './connector-authorization.ts';
 import type { ConnectorGrantRequest } from './connector-authorization.ts';
+import type {
+  BackgroundTaskAuthorizationResolver,
+  ConnectorResourceProjection,
+  ResponsibilityPrincipal,
+  ResponsibilityTaskRecord,
+} from './responsibility-authority.ts';
+
+export type { ConnectorResourceProjection } from './responsibility-authority.ts';
 
 const MAX_PROVIDER_COUNT = 128;
 const MAX_TOOL_COUNT = 512;
@@ -45,21 +53,11 @@ export interface ToolProviderRegistrationOptions {
     readonly workspaceId: string;
     readonly bindings: ReadonlyMap<string, ConnectorBindingAuthorization>;
   };
+  /** Host-only verifier for persisted background responsibility tasks. */
+  readonly backgroundTaskAuthority?: BackgroundTaskAuthorizationResolver;
   /** Private Exchange-exported ListTools snapshot; still intersected with host authorization. */
   readonly connectorToolCatalogSnapshot?: unknown;
 }
-
-export type ConnectorResourceProjection =
-  | 'empty'
-  | 'profile'
-  | 'github_repository'
-  | 'github_pull_request'
-  | 'github_ci'
-  | 'github_commit'
-  | 'github_issue'
-  | 'huggingface_repository'
-  | 'cloud_target'
-  | 'cloud_operation';
 
 export interface ConnectorToolAuthorization {
   readonly toolId: string;
@@ -74,6 +72,24 @@ export interface ConnectorBindingAuthorization {
   readonly providerId: string;
   readonly profileRef: string;
   readonly tools: readonly ConnectorToolAuthorization[];
+}
+
+/** Host-verified mapping from one opaque DSH schema name to its canonical connector operation. */
+export interface ConnectorToolCatalogEntry {
+  readonly name: string;
+  readonly bindingId: string;
+  readonly providerId: string;
+  readonly toolId: string;
+  readonly operationId: string;
+  readonly resourceProjection: ConnectorResourceProjection;
+  readonly mutating: boolean;
+}
+
+const connectorToolCatalogs = new WeakMap<Context, readonly ConnectorToolCatalogEntry[]>();
+
+/** Read the canonical provider/tool map installed for this Context, without parsing opaque tool names. */
+export function getConnectorToolCatalog(ctx: Context): readonly ConnectorToolCatalogEntry[] {
+  return connectorToolCatalogs.get(ctx) ?? [];
 }
 
 interface ProviderBinding {
@@ -168,6 +184,7 @@ export async function registerToolProviders(
 
   const registrations: Array<() => void> = [];
   const names = new Set<string>();
+  const catalogEntries: ConnectorToolCatalogEntry[] = [];
   let registeredCount = 0;
   try {
     for (const binding of bindings) {
@@ -197,6 +214,17 @@ export async function registerToolProviders(
         if (names.has(name)) throw new TypeError('Tool provider names collide after normalization');
         names.add(name);
         registrations.push(ctx.tools.register(createDefinition(options, binding, tool, name)));
+        if (trustedBinding !== undefined && trustedTool !== undefined) {
+          catalogEntries.push(Object.freeze({
+            name,
+            bindingId: trustedBinding.bindingId,
+            providerId: trustedBinding.providerId,
+            toolId: trustedTool.toolId,
+            operationId: trustedTool.operationId,
+            resourceProjection: trustedTool.resourceProjection,
+            mutating: trustedTool.mutating,
+          }));
+        }
       }
     }
   } catch (error: unknown) {
@@ -204,11 +232,14 @@ export async function registerToolProviders(
     throw error;
   }
 
+  const catalogSnapshot = Object.freeze([...catalogEntries]);
+  connectorToolCatalogs.set(ctx, catalogSnapshot);
   let disposed = false;
   const dispose = (): void => {
     if (disposed) return;
     disposed = true;
     for (const unregister of registrations.reverse()) unregister();
+    if (connectorToolCatalogs.get(ctx) === catalogSnapshot) connectorToolCatalogs.delete(ctx);
   };
   ctx.effect(() => dispose, 'navigator.toolProviders');
   return dispose;
@@ -261,11 +292,37 @@ function createDefinition(
       validateProviderConstraints(argumentsValue, tool.constraints);
       const sessionId = execution.agent?.session.id === undefined ? undefined : String(execution.agent.session.id);
       const taskId = sessionId === undefined ? undefined : options.taskIdForSession(sessionId);
-      if (taskId?.startsWith('teams-')) {
-        if (!options.connectorAuthorization) throw new Error('Teams connector authorization is unavailable');
-        const teamsCaller = await readTeamsCallerForTask(options.bridge, taskId, execution.signal);
-        if (teamsCaller === undefined) throw new Error('Trusted Teams task caller identity is missing');
-        return executeTeamsProviderCall(options, binding, tool, argumentsValue, execution, taskId!, teamsCaller);
+      if (options.connectorAuthorization !== undefined) {
+        if (!taskId) throw new Error('Connector tools require a durable Navigator task');
+        const trustedBinding = options.connectorAuthorization.bindings.get(binding.bindingId);
+        const trustedTool = trustedBinding?.tools.find(item => item.toolId === tool.id);
+        if (!trustedBinding || !trustedTool) throw new Error('Connector tool is outside the launcher-owned binding');
+        if (taskId.startsWith('teams-')) {
+          const teamsCaller = await readTeamsCallerForTask(options.bridge, taskId, execution.signal);
+          if (teamsCaller === undefined) throw new Error('Trusted Teams task caller identity is missing');
+          return executeTeamsProviderCall(options, binding, tool, argumentsValue, execution, taskId, teamsCaller);
+        }
+        if (!options.backgroundTaskAuthority) {
+          throw new Error('Background connector authorization is unavailable');
+        }
+        const task = readBackgroundTaskRecord(
+          await options.bridge.request(`/tasks/${encodeURIComponent(taskId)}`, 'GET', undefined, execution.signal),
+          taskId,
+        );
+        const principal = await options.backgroundTaskAuthority({
+          taskId,
+          task,
+          binding: trustedBinding,
+          tool: trustedTool,
+          arguments: argumentsValue,
+          signal: execution.signal,
+        });
+        if (principal === undefined) {
+          throw new Error('Background task is outside its active responsibility authorization');
+        }
+        return executeTeamsProviderCall(
+          options, binding, tool, argumentsValue, execution, taskId, principal,
+        );
       }
       if (tool.readOnly) {
         const rawResult = await callProvider(options.bridge, binding, tool, argumentsValue, execution.signal);
@@ -338,6 +395,28 @@ interface TeamsTaskCaller {
   readonly tenantId: string;
 }
 
+function readBackgroundTaskRecord(value: unknown, expectedTaskId: string): ResponsibilityTaskRecord {
+  const row = objectValue(value, 'background responsibility task');
+  const statuses = new Set(['queued', 'running', 'completed', 'failed', 'aborted', 'waiting_approval', 'waiting_input', 'awaiting_user_authorization']);
+  if (row.id !== expectedTaskId || typeof row.sessionId !== 'string' || !row.sessionId
+    || typeof row.prompt !== 'string' || !statuses.has(String(row.status))
+    || typeof row.createdAt !== 'number' || !Number.isSafeInteger(row.createdAt)
+    || typeof row.output !== 'string' || typeof row.reasoning !== 'string'
+    || typeof row.durationMs !== 'number' || !Number.isSafeInteger(row.durationMs)) {
+    throw new TypeError('Work API returned an invalid background responsibility task');
+  }
+  if (row.metadata !== undefined && (row.metadata === null || typeof row.metadata !== 'object' || Array.isArray(row.metadata))) {
+    throw new TypeError('Work API returned invalid task metadata');
+  }
+  if (row.executionClass !== undefined && row.executionClass !== 'foreground' && row.executionClass !== 'background') {
+    throw new TypeError('Work API returned an invalid task execution class');
+  }
+  if (row.parentTaskId !== undefined && row.parentTaskId !== null && typeof row.parentTaskId !== 'string') {
+    throw new TypeError('Work API returned an invalid task parent');
+  }
+  return row as unknown as ResponsibilityTaskRecord;
+}
+
 async function readTeamsCallerForTask(
   bridge: ToolProviderRegistrationOptions['bridge'],
   taskId: string,
@@ -367,7 +446,7 @@ async function executeTeamsProviderCall(
   args: Record<string, JsonValue>,
   execution: ToolRunContext,
   taskId: string,
-  caller: TeamsTaskCaller,
+  caller: TeamsTaskCaller | ResponsibilityPrincipal,
 ): Promise<unknown> {
   const authorization = options.connectorAuthorization;
   if (!authorization) throw new Error('Teams connector authorization is unavailable');
@@ -386,9 +465,11 @@ async function executeTeamsProviderCall(
     throw new Error('Provider catalog metadata does not match the launcher-owned connector binding');
   }
   const profileArgument = argumentString(args, 'profile_ref', 'profileRef');
-  const profileIsOuterClaim = hostBinding.providerId === 'github' || hostBinding.providerId === 'huggingface';
+  const profileIsOuterClaim = hostBinding.providerId === 'github'
+    || hostBinding.providerId === 'huggingface'
+    || hostBinding.providerId === 'computer';
   if (profileIsOuterClaim && (args.profile_ref !== undefined || args.profileRef !== undefined)) {
-    throw new Error('GitHub and Hugging Face provider arguments cannot contain a model-supplied profile');
+    throw new Error('This connector provider does not accept a model-supplied profile');
   }
   if (!profileIsOuterClaim && profileArgument !== undefined && profileArgument !== hostBinding.profileRef) {
     throw new Error('The requested profile is outside this launcher-owned connector binding');
@@ -400,12 +481,16 @@ async function executeTeamsProviderCall(
   const connectionRef = hostBinding.connectionRef;
   const profileRef = hostBinding.profileRef;
   const operationId = toolAuthorization.operationId;
-  const target = connectorTargetProjection(toolAuthorization.resourceProjection, profileRef, actualArguments);
+  const target = connectorTargetProjection(toolAuthorization.resourceProjection, profileRef, connectionRef, actualArguments);
   const resourceRef = `sha256:${sha256(canonicalJson({ providerId, profileRef, operationId, target }))}`;
   const targetDigestSha256 = sha256(canonicalJson({ providerId, profileRef, target }));
   const receiptTarget = `connector-target:${sha256(canonicalJson({ providerId, profileRef, target }))}`;
   const readbackReceiptTarget = `connector-readback:${targetDigestSha256}`;
+  const scopeLock = toolAuthorization.mutating
+    ? connectorScopeLock(providerId, profileRef, operationId, actualArguments)
+    : undefined;
   const requestId = boundedText(String(execution.callId), 'connector request id', 512);
+  const backgroundActionTask = taskId.startsWith('workflow-action-');
   const grantRequest: ConnectorGrantRequest = {
     requestId,
     workspaceId: authorization.workspaceId,
@@ -422,14 +507,18 @@ async function executeTeamsProviderCall(
   let operation: OperationReceipt | undefined;
   const unresolved = await listUnresolvedOperations(
     options.bridge,
-    toolAuthorization.mutating ? receiptTarget : undefined,
+    toolAuthorization.mutating && !backgroundActionTask ? receiptTarget : undefined,
     execution.signal,
   );
   if (toolAuthorization.mutating) {
-    if (unresolved.length > 0) {
-      const priorReceiptId = unresolved.find(item => typeof item.id === 'string')?.id;
+    const blockers = backgroundActionTask
+      ? unresolved.filter(item => isBackgroundActionWriteBlocked(item, taskId, providerId, profileRef, receiptTarget))
+      : unresolved;
+    if (blockers.length > 0) {
+      const priorReceiptId = blockers.find(item => typeof item.id === 'string')?.id;
       const receiptHint = typeof priorReceiptId === 'string' ? ` Work operation ID: ${priorReceiptId}.` : '';
-      throw new Error(`A prior operation on this exact provider target has no reconciled outcome; read its operation status before retrying, then reconcile its receipt with an independent readback.${receiptHint}`);
+      const scope = backgroundActionTask ? 'this workflow action' : 'this exact provider target';
+      throw new Error(`A prior operation in ${scope} has no reconciled outcome; read its operation status before retrying, then reconcile its receipt with an independent readback.${receiptHint}`);
     }
   }
   const readbackForUnresolvedWrite = !toolAuthorization.mutating
@@ -438,7 +527,7 @@ async function executeTeamsProviderCall(
   if (toolAuthorization.mutating || readbackForUnresolvedWrite) {
     operation = await beginOperation(
       options.bridge, execution, taskId, binding, tool, actualArguments, operationId,
-      toolAuthorization.mutating ? receiptTarget : readbackReceiptTarget,
+      toolAuthorization.mutating ? receiptTarget : readbackReceiptTarget, scopeLock,
     );
     if (operation.duplicate || operation.status !== 'started') {
       throw new Error('An operation receipt already exists; reconcile it before retrying this provider call');
@@ -457,6 +546,40 @@ async function executeTeamsProviderCall(
           targetDigestSha256,
         },
       }, AbortSignal.timeout(5_000));
+    }
+    if (operation && toolAuthorization.mutating) {
+      throw new Error('The provider call was cancelled before it started.', { cause: abortError(execution.signal) });
+    }
+    throw abortError(execution.signal);
+  }
+  if (backgroundActionTask && toolAuthorization.mutating && operation !== undefined) {
+    try {
+      await appendBackgroundWriteReceipt(
+        options.bridge, execution, taskId, operation.id, String(execution.callId),
+        binding.bindingId, providerId, profileRef, targetDigestSha256,
+      );
+    } catch (error: unknown) {
+      await options.bridge.request(`/operations/${encodeURIComponent(operation.id)}`, 'PATCH', {
+        status: 'verified',
+        evidence: {
+          outcome: 'cancelled_before_invoke', effect: 'write', bindingId: binding.bindingId,
+          providerId, profileRef, operationId, targetDigestSha256,
+          reason: 'operation_receipt_link_unavailable',
+        },
+      }, AbortSignal.timeout(5_000)).catch(() => undefined);
+      throw new Error('The Work operation receipt could not be linked to this action before provider invocation; no provider call was made.', {
+        cause: error,
+      });
+    }
+  }
+  if (execution.signal.aborted) {
+    if (operation) {
+      await options.bridge.request(`/operations/${encodeURIComponent(operation.id)}`, 'PATCH', {
+        status: 'verified', evidence: {
+          outcome: 'cancelled_before_invoke', effect: toolAuthorization.mutating ? 'write' : 'read',
+          bindingId: binding.bindingId, providerId, profileRef, operationId, targetDigestSha256,
+        },
+      }, AbortSignal.timeout(5_000)).catch(() => undefined);
     }
     throw abortError(execution.signal);
   }
@@ -501,11 +624,13 @@ async function executeTeamsProviderCall(
           ...(error instanceof ExchangeConnectorRequestError ? { status: error.status ?? null } : {}),
         });
         if (toolAuthorization.mutating) {
-          throw new Error(
-            `The remote write outcome is unknown. Work operation ID: ${operation.id}. Do not retry until an independent readback is reconciled.`,
-            { cause: error },
-          );
+          throw new Error('The remote write outcome is unknown. Do not retry until an independent readback is reconciled.', {
+            cause: error,
+          });
         }
+      }
+      if (toolAuthorization.mutating && operation) {
+        throw new Error('The provider rejected the write; inspect its Work receipt before choosing another action.', { cause: error });
       }
     }
     throw error;
@@ -576,6 +701,7 @@ async function executeTeamsProviderCall(
 function connectorTargetProjection(
   projection: ConnectorResourceProjection,
   profileRef: string,
+  connectionRef: string,
   args: Record<string, JsonValue>,
 ): JsonValue {
   switch (projection) {
@@ -593,6 +719,32 @@ function connectorTargetProjection(
       return { ...pickRequiredFields(args, ['repository_id', 'repository']), ...pickRequiredFields(args, ['commit_sha']) };
     case 'github_issue':
       return { ...pickRequiredFields(args, ['repository_id', 'repository']), ...pickRequiredFields(args, ['issue_number']) };
+    case 'github_actions_run':
+      return { ...pickRequiredFields(args, ['repository_id', 'repository']), ...pickRequiredFields(args, ['run_id']) };
+    case 'github_actions_job':
+      return {
+        ...pickRequiredFields(args, ['repository_id', 'repository']),
+        ...pickRequiredFields(args, ['run_id']),
+        ...pickRequiredFields(args, ['job_id']),
+      };
+    case 'github_branch':
+      return { ...pickRequiredFields(args, ['repository_id', 'repository']), ...pickRequiredFields(args, ['branch']) };
+    case 'github_file':
+      return {
+        ...pickRequiredFields(args, ['repository_id', 'repository']),
+        ...pickRequiredFields(args, ['branch']),
+        ...pickRequiredFields(args, ['path']),
+      };
+    case 'github_pull_request_draft':
+      return {
+        ...pickRequiredFields(args, ['repository_id', 'repository']),
+        ...pickRequiredFields(args, ['head_branch', 'base_branch']),
+      };
+    case 'computer_workspace':
+      return { workspace_ref: connectionRef };
+    case 'computer_file':
+    case 'computer_directory':
+      return { workspace_ref: connectionRef, ...pickRequiredFields(args, ['path']) };
     case 'huggingface_repository':
       return {
         ...pickRequiredFields(args, ['repo_type', 'repo_id']),
@@ -606,6 +758,45 @@ function connectorTargetProjection(
     default:
       throw new TypeError('Connector binding has an unsupported resource projection');
   }
+}
+
+/** Compute a host-owned serialization key for GitHub writes sharing one branch. */
+function connectorScopeLock(
+  providerId: string,
+  profileRef: string,
+  operationId: string,
+  args: Record<string, JsonValue>,
+): string | undefined {
+  if (providerId !== 'github') return undefined;
+  const branchField = operationId === 'github.branch.create' || operationId === 'github.branch.delete'
+    || operationId === 'github.file.commit'
+    ? 'branch'
+    : operationId === 'github.pull_request.draft.create'
+      ? 'head_branch'
+      : operationId === 'github.actions.rerun_failed' ? 'expected_head_branch' : undefined;
+  if (branchField === undefined) return undefined;
+
+  const idValue = args.repository_id;
+  const repositoryId = typeof idValue === 'number' && Number.isSafeInteger(idValue) && idValue > 0
+    ? String(idValue)
+    : typeof idValue === 'string' && /^[1-9]\d{0,18}$/u.test(idValue) ? idValue : undefined;
+  const repository = typeof args.repository === 'string'
+    && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(args.repository)
+    ? args.repository.toLowerCase()
+    : undefined;
+  const branch = args[branchField];
+  if (!repositoryId || !repository || typeof branch !== 'string' || branch.length === 0
+    || branch.length > 255 || branch.includes('\\') || /[\u0000-\u0020]/u.test(branch)) {
+    throw new TypeError('GitHub branch write requires a canonical repository and branch for serialization');
+  }
+  const digest = sha256(canonicalJson({
+    providerId,
+    profileRef,
+    repository_id: repositoryId,
+    repository,
+    branch,
+  }));
+  return `connector-branch:${digest}`;
 }
 
 function pickRequiredFields(args: Record<string, JsonValue>, fields: readonly string[]): Record<string, JsonValue> {
@@ -645,6 +836,7 @@ async function beginOperation(
   args: Record<string, JsonValue>,
   operationId: string = tool.operationId ?? tool.id,
   receiptTarget?: string,
+  scopeLock?: string,
 ): Promise<OperationReceipt> {
   const digest = createHash('sha256').update(taskId).update('\0').update(String(execution.callId)).digest('hex');
   const response = await bridge.mutate(execution, '/operations', 'POST', {
@@ -653,6 +845,7 @@ async function beginOperation(
     taskId,
     target: receiptTarget ?? `${binding.bindingId}/${operationId}`,
     request: { bindingId: binding.bindingId, toolId: tool.id, operationId, arguments: args },
+    ...(scopeLock === undefined ? {} : { scopeLock }),
   }, true);
   const wrapper = objectValue(response.operation ?? response, 'operation receipt');
   const id = safeIdentifier(wrapper.id, 'operation receipt id');
@@ -661,6 +854,36 @@ async function beginOperation(
   }
   if (typeof response.duplicate !== 'boolean') throw new TypeError('Operation receipt omitted duplicate status');
   return { id, status: wrapper.status, duplicate: response.duplicate };
+}
+
+/** Link a background write receipt to its durable task before any provider side effect can start. */
+async function appendBackgroundWriteReceipt(
+  bridge: ToolProviderRegistrationOptions['bridge'],
+  execution: ToolRunContext,
+  taskId: string,
+  operationId: string,
+  callId: string,
+  bindingId: string,
+  providerId: string,
+  profileRef: string,
+  targetDigestSha256: string,
+): Promise<void> {
+  if (!/^[a-f0-9]{64}$/u.test(targetDigestSha256)) throw new TypeError('Connector operation target digest is invalid');
+  const event = {
+    type: 'connector.operation.receipt.v1',
+    operationId: safeIdentifier(operationId, 'connector operation receipt id'),
+    callId: boundedText(callId, 'connector call id', 512),
+    bindingId: safeIdentifier(bindingId, 'connector binding id'),
+    providerId: safeIdentifier(providerId, 'connector provider id'),
+    profileRef: safeIdentifier(profileRef, 'connector profile reference'),
+    targetDigestSha256,
+    effect: 'write',
+    outcome: 'started',
+  };
+  await bridge.mutate(execution, `/tasks/${encodeURIComponent(taskId)}/events`, 'POST', {
+    event,
+    messageId: `connector-operation-${event.operationId}`,
+  }, false);
 }
 
 /** Record an unknown remote outcome on a fresh bounded signal, even after caller cancellation. */
@@ -687,6 +910,9 @@ async function listUnresolvedOperations(
   if (target !== undefined) query.set('target', target);
   const response = objectValue(await bridge.request(`/operations/unresolved?${query}`, 'GET', undefined, signal), 'unresolved provider operations');
   if (!Array.isArray(response.items)) throw new TypeError('Work omitted unresolved provider operation rows');
+  if (response.items.length === 500) {
+    throw new Error('The unresolved operation set reached its inspection limit; reconcile receipts before starting another write.');
+  }
   return response.items.map((item, index) => objectValue(item, `unresolved provider operation ${index}`));
 }
 
@@ -704,6 +930,23 @@ function isMatchingUnresolvedConnectorWrite(
   return row.effect !== 'read'
     && row.providerId === providerId
     && row.profileRef === profileRef;
+}
+
+/** Block replay inside one action and block exact-target replay across later child tasks. */
+export function isBackgroundActionWriteBlocked(
+  operation: Readonly<Record<string, unknown>>,
+  taskId: string,
+  providerId: string,
+  profileRef: string,
+  target: string,
+): boolean {
+  const evidence = operation.evidence;
+  if (evidence === null || typeof evidence !== 'object' || Array.isArray(evidence)) return true;
+  const row = evidence as Record<string, unknown>;
+  if (row.effect === 'read' || row.providerId !== providerId || row.profileRef !== profileRef) return false;
+  if (operation.taskId === taskId) return true;
+  if (typeof operation.target !== 'string' || !operation.target) return true;
+  return operation.target === target;
 }
 
 async function reconcileTerminalOperation(

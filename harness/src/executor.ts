@@ -10,8 +10,9 @@ import { createServer } from 'node:http';
 import type { IncomingMessage, ServerResponse, Server } from 'node:http';
 import type { Context } from '@deepseek-ai/cordis';
 import { brandString } from '@deepseek-ai/dsh-brand';
-import type { Agent, AgentOptions, ModelSelectionRef } from '@deepseek-ai/dsh-agent';
+import type { Agent, AgentOptions, ModelSelection, ModelSelectionRef } from '@deepseek-ai/dsh-agent';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
+import type { TokenUsage } from '@deepseek-ai/dsh-llm';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { SessionId, SessionSeq } from '@deepseek-ai/dsh-session';
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
@@ -28,8 +29,16 @@ import {
   validateTeamsServiceUrl,
 } from './connector-authorization.ts';
 import type { ConnectorGrantRequest, TeamsMessageRoute } from './connector-authorization.ts';
+import {
+  decodeProviderTokenUsage,
+  isModelAvailabilityFailure,
+  modelRouteKey,
+  nextFallbackRoute,
+} from './model-policy.js';
+import type { ModelRoute } from './model-policy.js';
 
 export type TaskStatus = ExecutionStatus;
+export type TaskExecutionClass = 'foreground' | 'background';
 
 export interface ExecuteTaskParams {
   readonly prompt: string;
@@ -39,6 +48,10 @@ export interface ExecuteTaskParams {
   readonly agentPreset?: string;
   readonly timeoutMs?: number;
   readonly stream?: boolean;
+  /** Host-only scheduling class; the public REST parser always chooses foreground. */
+  readonly executionClass?: TaskExecutionClass;
+  /** Host-owned provenance and policy facts persisted with the Work Task. */
+  readonly metadata?: Readonly<Record<string, unknown>>;
 }
 
 export type ExecutorStreamEvent =
@@ -50,6 +63,8 @@ export type ExecutorStreamEvent =
   | { type: 'subagent-progress'; taskId: string; provider: string; phase?: string; message?: string; timestamp: number; seq?: number }
   | { type: 'subagent-assistant-delta'; taskId: string; provider: string; text: string; timestamp: number; seq?: number }
   | { type: 'subagent-blocked'; taskId: string; provider: string; runId: string; reasonCode: 'SANDBOX_BOUNDARY_DENIED' | 'SANDBOX_PROFILE_UNAVAILABLE' | 'SANDBOX_MODE_UNVERIFIED' | 'SUBAGENT_TIMEOUT' | 'SUBAGENT_FAILED'; toolCategory: 'file' | 'command' | 'network' | 'other' | 'unknown'; count: number; timestamp: number; seq?: number }
+  | { type: 'model-route'; taskId: string; provider: string; model: string; timestamp: number; seq?: number }
+  | { type: 'model-usage'; taskId: string; provider: string; model: string; usage: TokenUsage; timestamp: number; seq?: number }
   | { type: 'permission'; taskId: string; provider: string; tool?: string; decision: 'approved' | 'denied'; timestamp: number; seq?: number }
   | { type: 'authorization-required'; taskId: string; code: string; source: string; callId?: string; connectionId?: string; authorizationRef?: string; generation?: number; timestamp: number; seq?: number }
   | { type: 'finish'; taskId: string; status: TaskStatus; output: string; durationMs: number; timestamp: number; seq?: number }
@@ -65,10 +80,26 @@ export interface TaskOutcome {
   readonly durationMs: number;
 }
 
+/** Provider-reported usage aggregated by the actual provider/model route. */
+export interface TaskModelUsageRoute {
+  readonly provider: string;
+  readonly model: string;
+  readonly reportedCalls: number;
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly totalTokens?: number;
+}
+
+export interface TaskModelUsageSnapshot {
+  readonly taskId: string;
+  readonly routes: readonly TaskModelUsageRoute[];
+}
+
 interface InternalTaskState {
   readonly id: string;
   readonly sessionId: string;
   readonly prompt: string;
+  readonly executionClass: TaskExecutionClass;
   readonly abortController: AbortController;
   readonly subscribers: Set<(event: ExecutorStreamEvent) => void>;
   record: TaskRecord;
@@ -79,6 +110,8 @@ interface InternalTaskState {
   agentError?: string;
   error?: string;
   agent?: Agent;
+  modelSelection?: ModelSelectionRef;
+  modelRoute?: ModelSelection;
   authorizationPause?: boolean;
   eventChain: Promise<void>;
   eventFailure?: unknown;
@@ -93,6 +126,8 @@ export interface ExecutorConfig {
   readonly defaultCwd?: string;
   readonly defaultTimeoutMs?: number;
   readonly maxConcurrentTasks?: number;
+  /** Real configured provider routes to use only after a provider availability failure. */
+  readonly modelFallbacks?: readonly ModelRoute[];
   readonly workState: WorkStateStore;
   readonly workspaceId: string;
   readonly authTokenEnv?: string;
@@ -156,40 +191,47 @@ const EXCHANGE_MUTATING_TOOLS = new Set([
 ]);
 
 interface TaskWaiter {
+  readonly executionClass: TaskExecutionClass;
   readonly signal: AbortSignal;
   readonly resolve: () => void;
   readonly reject: (error: unknown) => void;
   readonly onAbort: () => void;
 }
 
-/** Bound CPU and memory pressure while keeping durable queued rows available for recovery. */
+/** Bound active work, keep one background lane, and schedule foreground waiters first. */
 class TaskConcurrencyLimiter {
   private active = 0;
+  private activeForeground = 0;
+  private activeBackground = 0;
   private readonly waiting: TaskWaiter[] = [];
+  private readonly foregroundMaximum: number;
+  private readonly backgroundMaximum = 1;
 
   constructor(private readonly maximum: number) {
-    if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 32) {
-      throw new TypeError('maxConcurrentTasks must be between 1 and 32');
+    if (!Number.isSafeInteger(maximum) || maximum < 2 || maximum > 32) {
+      throw new TypeError('maxConcurrentTasks must be between 2 and 32');
     }
+    this.foregroundMaximum = Math.max(1, maximum - this.backgroundMaximum);
   }
 
-  async run<T>(signal: AbortSignal, action: () => Promise<T>): Promise<T> {
-    await this.acquire(signal);
+  async run<T>(executionClass: TaskExecutionClass, signal: AbortSignal, action: () => Promise<T>): Promise<T> {
+    await this.acquire(executionClass, signal);
     try {
       return await action();
     } finally {
-      this.release();
+      this.release(executionClass);
     }
   }
 
-  private acquire(signal: AbortSignal): Promise<void> {
+  private acquire(executionClass: TaskExecutionClass, signal: AbortSignal): Promise<void> {
     signal.throwIfAborted();
-    if (this.active < this.maximum) {
-      this.active += 1;
+    if (this.canRun(executionClass)) {
+      this.reserve(executionClass);
       return Promise.resolve();
     }
     return new Promise<void>((resolve, reject) => {
       const waiter: TaskWaiter = {
+        executionClass,
         signal,
         resolve,
         reject,
@@ -197,25 +239,49 @@ class TaskConcurrencyLimiter {
           const index = this.waiting.indexOf(waiter);
           if (index >= 0) this.waiting.splice(index, 1);
           reject(signal.reason instanceof Error ? signal.reason : new DOMException('The task was aborted', 'AbortError'));
+          this.drain();
         },
       };
       signal.addEventListener('abort', waiter.onAbort, { once: true });
-      this.waiting.push(waiter);
+      const firstBackground = this.waiting.findIndex(item => item.executionClass === 'background');
+      if (executionClass === 'foreground' && firstBackground >= 0) this.waiting.splice(firstBackground, 0, waiter);
+      else this.waiting.push(waiter);
     });
   }
 
-  private release(): void {
-    while (this.waiting.length > 0) {
-      const waiter = this.waiting.shift()!;
+  private canRun(executionClass: TaskExecutionClass): boolean {
+    if (this.active >= this.maximum) return false;
+    return executionClass === 'background'
+      ? this.activeBackground < this.backgroundMaximum
+      : this.activeForeground < this.foregroundMaximum;
+  }
+
+  private reserve(executionClass: TaskExecutionClass): void {
+    this.active += 1;
+    if (executionClass === 'background') this.activeBackground += 1;
+    else this.activeForeground += 1;
+  }
+
+  private release(executionClass: TaskExecutionClass): void {
+    this.active = Math.max(0, this.active - 1);
+    if (executionClass === 'background') this.activeBackground = Math.max(0, this.activeBackground - 1);
+    else this.activeForeground = Math.max(0, this.activeForeground - 1);
+    this.drain();
+  }
+
+  private drain(): void {
+    for (;;) {
+      const index = this.waiting.findIndex(waiter => this.canRun(waiter.executionClass));
+      if (index < 0) return;
+      const waiter = this.waiting.splice(index, 1)[0]!;
       waiter.signal.removeEventListener('abort', waiter.onAbort);
       if (waiter.signal.aborted) {
         waiter.reject(waiter.signal.reason);
         continue;
       }
+      this.reserve(waiter.executionClass);
       waiter.resolve();
-      return;
     }
-    this.active = Math.max(0, this.active - 1);
   }
 }
 
@@ -225,9 +291,11 @@ export class NavigatorExecutor {
   private readonly tasks = new Map<string, InternalTaskState>();
   private readonly agentTaskMap = new Map<Agent, string>();
   private readonly sessionTaskMap = new Map<Session, string>();
+  private readonly activeTaskBySessionId = new Map<string, string>();
+  private readonly agentModelSelections = new WeakMap<Agent, ModelSelectionRef>();
   private readonly sessionTails = new Map<string, Promise<void>>();
   private readonly taskLimiter: TaskConcurrencyLimiter;
-  private readonly defaultTimeoutMs: number;
+  private readonly defaultTimeoutMs?: number;
   private httpServer?: Server;
   private drainTimer?: ReturnType<typeof setInterval>;
   private teamsNotificationDrainTimer?: ReturnType<typeof setInterval>;
@@ -241,8 +309,8 @@ export class NavigatorExecutor {
     private readonly ctx: Context,
     private readonly config: ExecutorConfig,
   ) {
-    this.defaultTimeoutMs = config.defaultTimeoutMs ?? 300_000;
-    this.taskLimiter = new TaskConcurrencyLimiter(config.maxConcurrentTasks ?? 1);
+    this.defaultTimeoutMs = config.defaultTimeoutMs;
+    this.taskLimiter = new TaskConcurrencyLimiter(config.maxConcurrentTasks ?? 2);
     this.setupStreamListeners();
     this.ready = this.recoverInterruptedTasks();
   }
@@ -262,6 +330,15 @@ export class NavigatorExecutor {
         task.reasoning += chunk.text;
         this.publish(task, { type: 'reasoning-delta', taskId: task.id, text: chunk.text, timestamp });
         void this.patch(task, { reasoning: task.reasoning }).catch(() => undefined);
+      } else if (chunk.type === 'usage' && task.modelRoute !== undefined) {
+        void this.publish(task, {
+          type: 'model-usage',
+          taskId: task.id,
+          provider: task.modelRoute.provider,
+          model: task.modelRoute.model,
+          usage: chunk.usage,
+          timestamp,
+        }).catch(() => undefined);
       } else if (chunk.type === 'block-end' && chunk.block?.type === 'tool-call') {
         this.publish(task, {
           type: 'tool-call', taskId: task.id, callId: String(chunk.block.id),
@@ -297,6 +374,65 @@ export class NavigatorExecutor {
   private activeForAgent(agent: Agent | undefined): InternalTaskState | undefined {
     const taskId = agent ? this.agentTaskMap.get(agent) : undefined;
     return taskId ? this.tasks.get(taskId) : undefined;
+  }
+
+  /** Install one mutable DSH selection and a bounded configured-provider failover chain. */
+  private installAgentModelSelection(
+    agentCtx: Context,
+    selection: ModelSelectionRef,
+    sessionId: string,
+  ): void {
+    this.installModelRoutingHooks(agentCtx, selection, sessionId);
+    installModelSelection(agentCtx, selection);
+  }
+
+  /** Record each actual model route and retry only recognized provider-availability failures. */
+  private installModelRoutingHooks(
+    agentCtx: Context,
+    selection: ModelSelectionRef,
+    sessionId: string,
+  ): void {
+    let requestKey: string | undefined;
+    const attempted = new Set<string>();
+    agentCtx.on('agent/request', async ({ turn, step }, next) => {
+      const request = await next();
+      const nextKey = `${turn}:${step}`;
+      if (requestKey !== nextKey) {
+        requestKey = nextKey;
+        attempted.clear();
+      }
+      const taskId = this.activeTaskBySessionId.get(sessionId);
+      const task = taskId === undefined ? undefined : this.tasks.get(taskId);
+      if (task !== undefined && (task.modelRoute?.provider !== request.provider || task.modelRoute.model !== request.model)) {
+        task.modelRoute = { provider: request.provider, model: request.model };
+        await this.publish(task, {
+          type: 'model-route',
+          taskId: task.id,
+          provider: request.provider,
+          model: request.model,
+          timestamp: Date.now(),
+        });
+      }
+      return request;
+    });
+    agentCtx.on('agent/request-error', async ({ turn, step, failure }, next) => {
+      const action = await next();
+      if (!isModelAvailabilityFailure(failure)) return action;
+      const current = selection.assembled ?? selection.current;
+      if (current === undefined) return action;
+      const nextKey = `${turn}:${step}`;
+      if (requestKey !== nextKey) {
+        requestKey = nextKey;
+        attempted.clear();
+      }
+      attempted.add(modelRouteKey(current));
+      const backup = nextFallbackRoute(this.config.modelFallbacks ?? [], current, attempted);
+      if (backup === undefined) return action;
+      // This retries the failed model step before DSH can execute any tool from its response.
+      selection.current = { ...backup };
+      selection.assembled = { ...backup };
+      return { kind: 'retry' };
+    });
   }
 
   /** Fail uncertain running rows, then safely adopt queued rows with no model/tool side effects.  中文：失败关闭不确定的运行记录，并安全接管尚未产生模型/工具副作用的排队记录。 */
@@ -391,7 +527,13 @@ export class NavigatorExecutor {
   async dispatchTask(taskId: string, subscriber?: (event: ExecutorStreamEvent) => void): Promise<TaskOutcome> {
     const record = await this.getTask(taskId);
     if (!record) throw new Error('Task not found');
-    return this.executeTask({ taskId, sessionId: record.sessionId, prompt: record.prompt }, subscriber);
+    return this.executeTask({
+      taskId,
+      sessionId: record.sessionId,
+      prompt: record.prompt,
+      executionClass: recordExecutionClass(record),
+      ...(record.metadata === undefined ? {} : { metadata: record.metadata }),
+    }, subscriber);
   }
 
   /** Poll durable queued rows and race-safely claim each for execution.  中文：轮询持久排队记录并通过原子认领安全执行。 */
@@ -401,9 +543,17 @@ export class NavigatorExecutor {
     let cursor: string | undefined;
     for (;;) {
       const page = await this.config.workState.listTasks({ cursor, limit: 100 });
-      for (const record of page.items) {
-        if (record.status !== 'queued' || this.tasks.has(record.id)) continue;
-        this.adoptQueuedTask(record, { taskId: record.id, sessionId: record.sessionId, prompt: record.prompt });
+      const queued = page.items.filter(record => record.status === 'queued' && !this.tasks.has(record.id));
+      queued.sort((left, right) => Number(recordExecutionClass(right) === 'foreground')
+        - Number(recordExecutionClass(left) === 'foreground'));
+      for (const record of queued) {
+        this.adoptQueuedTask(record, {
+          taskId: record.id,
+          sessionId: record.sessionId,
+          prompt: record.prompt,
+          executionClass: recordExecutionClass(record),
+          ...(record.metadata === undefined ? {} : { metadata: record.metadata }),
+        });
         started += 1;
       }
       if (!page.nextCursor) break;
@@ -418,6 +568,11 @@ export class NavigatorExecutor {
     dispatchQueued = true,
   ): Promise<InternalTaskState> {
     if (typeof params.prompt !== 'string' || params.prompt.length === 0) throw new TypeError('Missing or invalid "prompt" parameter');
+    const requestedExecutionClass = params.executionClass === undefined
+      ? undefined
+      : normalizeExecutionClass(params.executionClass);
+    const executionClass = requestedExecutionClass ?? 'foreground';
+    const metadata = params.metadata === undefined ? undefined : normalizeTaskMetadata(params.metadata);
     if (params.timeoutMs !== undefined && (!Number.isSafeInteger(params.timeoutMs) || params.timeoutMs <= 0)) {
       throw new TypeError('timeoutMs must be a positive integer');
     }
@@ -425,6 +580,12 @@ export class NavigatorExecutor {
     if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/u.test(requestedId)) throw new TypeError('Invalid taskId');
     const existing = await this.config.workState.getTask(requestedId);
     if (existing) {
+      if (requestedExecutionClass !== undefined && recordExecutionClass(existing) !== requestedExecutionClass) {
+        throw new Error('Existing task execution class does not match this dispatch request');
+      }
+      if (metadata !== undefined && canonicalJson(existing.metadata ?? {}) !== canonicalJson(metadata)) {
+        throw new Error('Existing task provenance metadata does not match this dispatch request');
+      }
       const active = this.tasks.get(existing.id);
       if (active) {
         if (subscriber) active.subscribers.add(subscriber);
@@ -449,11 +610,23 @@ export class NavigatorExecutor {
     if (typeof sessionId !== 'string' || sessionId.length < 1 || sessionId.length > 200) throw new TypeError('Invalid sessionId');
     let record: TaskRecord;
     try {
-      record = await this.config.workState.createTask({ id: requestedId, sessionId, prompt: params.prompt });
+      record = await this.config.workState.createTask({
+        id: requestedId,
+        sessionId,
+        prompt: params.prompt,
+        executionClass,
+        ...(metadata === undefined ? {} : { metadata }),
+      });
     } catch (error) {
       // A simultaneous retry may have won the durable ID race. Read it once and never start duplicate work.
       const raced = await this.config.workState.getTask(requestedId);
       if (!raced) throw error;
+      if (requestedExecutionClass !== undefined && recordExecutionClass(raced) !== requestedExecutionClass) {
+        throw new Error('Existing task execution class does not match this dispatch request');
+      }
+      if (metadata !== undefined && canonicalJson(raced.metadata ?? {}) !== canonicalJson(metadata)) {
+        throw new Error('Existing task provenance metadata does not match this dispatch request');
+      }
       const active = this.tasks.get(raced.id);
       if (active) {
         if (subscriber) active.subscribers.add(subscriber);
@@ -476,6 +649,7 @@ export class NavigatorExecutor {
 
     const task: InternalTaskState = {
       id: record.id, sessionId: record.sessionId, prompt: record.prompt,
+      executionClass: recordExecutionClass(record),
       record, output: record.output, reasoning: record.reasoning,
       abortController: new AbortController(), subscribers: new Set(), eventChain: Promise.resolve(), patchChain: Promise.resolve(),
     };
@@ -508,7 +682,14 @@ export class NavigatorExecutor {
     task.abortController.signal.addEventListener('abort', () => {
       task.agent?.cancel({ kind: 'hook', reason: 'navigator_executor_cancelled' });
     }, { once: true });
-    task.completion = this.runSerialized(task, { ...params, taskId: task.id, sessionId: task.sessionId, prompt: task.prompt });
+    task.completion = this.runSerialized(task, {
+      ...params,
+      taskId: task.id,
+      sessionId: task.sessionId,
+      prompt: task.prompt,
+      executionClass: task.executionClass,
+      ...(record.metadata === undefined ? {} : { metadata: record.metadata }),
+    });
     return task;
   }
 
@@ -518,6 +699,7 @@ export class NavigatorExecutor {
     const completion = predecessor.then(() => this.runTask(task, params)).finally(() => {
       if (task.agent && this.agentTaskMap.get(task.agent) === task.id) this.agentTaskMap.delete(task.agent);
       if (task.agent && this.sessionTaskMap.get(task.agent.session) === task.id) this.sessionTaskMap.delete(task.agent.session);
+      if (this.activeTaskBySessionId.get(task.sessionId) === task.id) this.activeTaskBySessionId.delete(task.sessionId);
       if (this.tasks.get(task.id) === task) this.tasks.delete(task.id);
     });
     const tail = completion.then(() => undefined, () => undefined);
@@ -530,7 +712,11 @@ export class NavigatorExecutor {
 
   private async runTask(task: InternalTaskState, params: ExecuteTaskParams): Promise<TaskOutcome> {
     try {
-      return await this.taskLimiter.run(task.abortController.signal, () => this.runTaskWithSlot(task, params));
+      return await this.taskLimiter.run(
+        task.executionClass,
+        task.abortController.signal,
+        () => this.runTaskWithSlot(task, params),
+      );
     } catch (error: unknown) {
       if (!task.abortController.signal.aborted) throw error;
       const latest = await this.config.workState.getTask(task.id).catch(() => undefined);
@@ -540,8 +726,12 @@ export class NavigatorExecutor {
 
   private async runTaskWithSlot(task: InternalTaskState, params: ExecuteTaskParams): Promise<TaskOutcome> {
     const timeoutMs = params.timeoutMs ?? this.defaultTimeoutMs;
-    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new TypeError('timeoutMs must be a positive number');
-    const timeoutId = setTimeout(() => task.abortController.abort(new Error(`Task timed out after ${timeoutMs}ms`)), timeoutMs);
+    if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
+      throw new TypeError('timeoutMs must be a positive number');
+    }
+    const timeoutId = timeoutMs === undefined
+      ? undefined
+      : setTimeout(() => task.abortController.abort(new Error(`Task timed out after ${timeoutMs}ms`)), timeoutMs);
     let disposeContinuationGuard: (() => void) | undefined;
     let claimed = false;
     try {
@@ -566,15 +756,15 @@ export class NavigatorExecutor {
       if (!agents || !sessions) throw new Error('Required Cordis services (agents, sessions) are not available');
 
       const cwd = params.cwd ?? this.config.defaultCwd ?? process.cwd();
-      const selection = defaultModel?.currentSelection();
-      const agentOptions: AgentOptions = selection
-        ? { provider: selection.provider, model: selection.model }
+      const defaultSelection = defaultModel?.currentSelection();
+      const agentOptions: AgentOptions = defaultSelection
+        ? { provider: defaultSelection.provider, model: defaultSelection.model }
         : {};
+      let selectionRef: ModelSelectionRef | undefined;
       const setup = (agentCtx: Context): void => {
-        if (selection) {
-          const selected: ModelSelectionRef = { current: selection, assembled: undefined };
-          installModelSelection(agentCtx, selected);
-        }
+        if (defaultSelection === undefined) return;
+        selectionRef = { current: defaultSelection, assembled: undefined };
+        this.installAgentModelSelection(agentCtx, selectionRef, task.sessionId);
       };
 
       const sessionId = brandString<SessionId>(task.sessionId);
@@ -597,9 +787,22 @@ export class NavigatorExecutor {
         agent = handle.agent;
       }
 
+      selectionRef ??= this.agentModelSelections.get(agent);
+      if (selectionRef === undefined && defaultSelection !== undefined) {
+        selectionRef = { current: defaultSelection, assembled: undefined };
+        this.installAgentModelSelection(agent.ctx, selectionRef, task.sessionId);
+      }
+      if (selectionRef !== undefined && defaultSelection !== undefined) {
+        // A newly admitted task uses the configured default; a failure may move this live Session to a backup.
+        selectionRef.current = defaultSelection;
+      }
+      if (selectionRef !== undefined) this.agentModelSelections.set(agent, selectionRef);
+      task.modelSelection = selectionRef;
+
       task.agent = agent;
       this.agentTaskMap.set(agent, task.id);
       this.sessionTaskMap.set(agent.session, task.id);
+      this.activeTaskBySessionId.set(task.sessionId, task.id);
       if (isReadOnlyContinuation(task.record)) {
         // Agent-scoped guards are inherited by child-agent contexts, without blocking unrelated sessions.
         disposeContinuationGuard = agent.ctx.tools.guard(execution => {
@@ -712,7 +915,7 @@ export class NavigatorExecutor {
       return outcome(task.record, message, status, durationMs);
     } finally {
       disposeContinuationGuard?.();
-      clearTimeout(timeoutId);
+      if (timeoutId !== undefined) clearTimeout(timeoutId);
     }
   }
 
@@ -728,7 +931,7 @@ export class NavigatorExecutor {
     subscriber?: (event: ExecutorStreamEvent) => void,
   ): Promise<TaskOutcome> {
     let cursor = 0;
-    const deadline = performance.now() + this.defaultTimeoutMs + 10_000;
+    const deadline = performance.now() + (this.defaultTimeoutMs ?? 300_000) + 10_000;
     while (performance.now() < deadline) {
       const page = await this.config.workState.getEvents(taskId, cursor);
       for (const row of page.events) {
@@ -1061,6 +1264,72 @@ export class NavigatorExecutor {
     return undefined;
   }
 
+  /** Resolve the active Work Task scheduling class for a DSH model request. */
+  executionClassForSession(sessionId: string): TaskExecutionClass {
+    const taskId = this.activeTaskBySessionId.get(sessionId);
+    return taskId === undefined ? 'foreground' : this.tasks.get(taskId)?.executionClass ?? 'foreground';
+  }
+
+  /** Read durable task events for a workflow receipt without adding another persistence client. */
+  async readTaskEvents(taskId: string, after = 0) {
+    return this.config.workState.getEvents(taskId, after);
+  }
+
+  /** Aggregate only durable provider-reported counts; absent counts remain absent and never gate work. */
+  async readTaskModelUsage(taskId: string): Promise<TaskModelUsageSnapshot> {
+    const aggregate = new Map<string, {
+      provider: string;
+      model: string;
+      reportedCalls: number;
+      inputTokens: number;
+      outputTokens: number;
+      totalTokens: number;
+      completeTotal: boolean;
+    }>();
+    let after = 0;
+    for (;;) {
+      const page = await this.config.workState.getEvents(taskId, after);
+      for (const row of page.events) {
+        const event = row.event;
+        if (event.type !== 'model-usage' || typeof event.provider !== 'string' || typeof event.model !== 'string') continue;
+        const usage = decodeProviderTokenUsage(event.usage);
+        if (usage === undefined) continue;
+        const key = modelRouteKey({ provider: event.provider, model: event.model });
+        const current = aggregate.get(key) ?? {
+          provider: event.provider,
+          model: event.model,
+          reportedCalls: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          totalTokens: 0,
+          completeTotal: true,
+        };
+        current.reportedCalls += 1;
+        current.inputTokens += usage.inputTokens;
+        current.outputTokens += usage.outputTokens;
+        if (usage.totalTokens === undefined) current.completeTotal = false;
+        else current.totalTokens += usage.totalTokens;
+        aggregate.set(key, current);
+      }
+      const lastSeq = page.events.at(-1)?.seq;
+      if (lastSeq === undefined || lastSeq <= after || lastSeq + 1 >= page.nextSeq) break;
+      after = lastSeq;
+    }
+    return {
+      taskId,
+      routes: [...aggregate.values()]
+        .sort((left, right) => left.provider.localeCompare(right.provider) || left.model.localeCompare(right.model))
+        .map(({ provider, model, reportedCalls, inputTokens, outputTokens, totalTokens, completeTotal }) => ({
+          provider,
+          model,
+          reportedCalls,
+          inputTokens,
+          outputTokens,
+          ...(completeTotal ? { totalTokens } : {}),
+        })),
+    };
+  }
+
   /** Launch the authenticated HTTP listener; loopback is the safe default.  中文：启动认证 HTTP listener，默认仅绑定 loopback。 */
   async startServer(port: number, host = '127.0.0.1'): Promise<{ url: string; close: () => Promise<void> }> {
     if (this.httpServer) throw new Error('HTTP server is already running');
@@ -1277,7 +1546,7 @@ export class NavigatorExecutor {
       started = true;
       const retryCountValue = notification.result.retryCount ?? 0;
       if (typeof retryCountValue !== 'number' || !Number.isSafeInteger(retryCountValue)
-        || retryCountValue < 0 || retryCountValue > 3) {
+        || retryCountValue < 0) {
         throw new TypeError('Teams notification retry counter is invalid');
       }
       const requestId = `${notification.id}:attempt:${retryCountValue + 1}`;
@@ -1364,20 +1633,13 @@ export class NavigatorExecutor {
     retryAfterSeconds: number,
     result: Readonly<Record<string, unknown>>,
   ): Promise<void> {
-    try {
-      await this.config.workState.finishNotification(
-        notificationId,
-        leaseToken,
-        'retry',
-        result,
-        Math.min(Math.max(Math.ceil(retryAfterSeconds), 1), 300),
-      );
-    } catch (error: unknown) {
-      if (!(error instanceof WorkStateHttpError) || error.code !== 'WORK_NOTIFICATION_RETRY_LIMIT') throw error;
-      await this.config.workState.finishNotification(notificationId, leaseToken, 'failed', {
-        code: 'TEAMS_RATE_LIMIT_RETRY_LIMIT',
-      });
-    }
+    await this.config.workState.finishNotification(
+      notificationId,
+      leaseToken,
+      'retry',
+      result,
+      Math.min(Math.max(Math.ceil(retryAfterSeconds), 1), 300),
+    );
   }
 
   /** Route every task operation through fixed workspace state after bearer authentication.  中文：认证后将任务操作全部路由至固定 Workspace 状态。 */
@@ -1813,6 +2075,7 @@ function appendBlockedSummary(output: string, blocked: InternalTaskState['blocke
 function stateFromRecord(record: TaskRecord): InternalTaskState {
   return {
     id: record.id, sessionId: record.sessionId, prompt: record.prompt, record,
+    executionClass: recordExecutionClass(record),
     output: record.output, reasoning: record.reasoning, abortController: new AbortController(),
     subscribers: new Set(), eventChain: Promise.resolve(), patchChain: Promise.resolve(),
   };
@@ -2002,7 +2265,8 @@ interface TeamsCaller {
   readonly tenantId: string;
 }
 
-async function resolveTeamsTaskActorSubjects(
+/** Resolve the configured Teams execution principals using the same live Directory file used by ingress/delivery. */
+export async function resolveTeamsTaskActorSubjects(
   config: TeamsExecutorConfig,
   workspaceId: string,
   issuer: string,
@@ -2146,6 +2410,9 @@ function abortMessage(reason: unknown): string {
 
 function taskParams(body: Record<string, any>): ExecuteTaskParams {
   if (typeof body.prompt !== 'string' || body.prompt.length === 0) throw new TypeError('Missing or invalid "prompt" parameter');
+  if (body.executionClass !== undefined || body.metadata !== undefined) {
+    throw new TypeError('executionClass and metadata are host-owned task fields');
+  }
   if (body.stream !== undefined && typeof body.stream !== 'boolean') throw new TypeError('Invalid "stream" parameter');
   for (const key of ['taskId', 'sessionId', 'cwd', 'agentPreset'] as const) {
     if (body[key] !== undefined && typeof body[key] !== 'string') throw new TypeError(`Invalid "${key}" parameter`);
@@ -2165,6 +2432,30 @@ function taskParams(body: Record<string, any>): ExecuteTaskParams {
 }
 
 function delay(ms: number): Promise<void> { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+function normalizeExecutionClass(value: unknown): TaskExecutionClass {
+  if (value === undefined || value === 'foreground') return 'foreground';
+  if (value === 'background') return value;
+  throw new TypeError('executionClass must be foreground or background');
+}
+
+function recordExecutionClass(record: TaskRecord): TaskExecutionClass {
+  return normalizeExecutionClass(record.executionClass);
+}
+
+/** Copy bounded JSON provenance so callers cannot mutate the durable task after admission. */
+function normalizeTaskMetadata(value: Readonly<Record<string, unknown>>): Readonly<Record<string, unknown>> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError('Task metadata must be a JSON object');
+  }
+  const encoded = canonicalJson(value);
+  if (Buffer.byteLength(encoded, 'utf8') > 64_000) throw new TypeError('Task metadata exceeds its size limit');
+  const decoded: unknown = JSON.parse(encoded);
+  if (decoded === null || typeof decoded !== 'object' || Array.isArray(decoded)) {
+    throw new TypeError('Task metadata must be a JSON object');
+  }
+  return decoded as Readonly<Record<string, unknown>>;
+}
 
 export const name = 'cyrene-executor';
 export const inject = ['agents', 'sessions', 'agentDefaultModel'];

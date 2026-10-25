@@ -7,7 +7,7 @@ Role: Strict typed HTTP contracts for persistent work resources.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
@@ -35,6 +35,7 @@ TaskStatus = Literal[
     "waiting_input",
     "awaiting_user_authorization",
 ]
+TaskExecutionClass = Literal["foreground", "background"]
 
 
 class TaskCreate(WorkModel):
@@ -46,6 +47,7 @@ class TaskCreate(WorkModel):
     title: str | None = Field(default=None, max_length=512)
     description: str | None = Field(default=None, max_length=20_000)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    execution_class: TaskExecutionClass = "foreground"
 
 
 class TaskContinuationCreate(WorkModel):
@@ -91,6 +93,7 @@ class TaskRecord(WorkModel):
     metadata: dict[str, Any]
     continuation_of_task_id: str | None = None
     continuation_mode: Literal["read_only"] | None = None
+    execution_class: TaskExecutionClass = "foreground"
 
 
 class TaskContinuationReceipt(WorkModel):
@@ -241,6 +244,7 @@ class OperationCreate(WorkModel):
     operation_type: str = Field(min_length=1, max_length=128)
     task_id: str | None = Field(default=None, min_length=1, max_length=512)
     target: str | None = Field(default=None, max_length=2_000)
+    scope_lock: str | None = Field(default=None, max_length=100)
     request: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -259,6 +263,7 @@ class OperationRecord(WorkModel):
     operation_type: str
     task_id: str | None = None
     target: str | None = None
+    scope_lock: str | None = None
     request: dict[str, Any]
     status: Literal["started", "uncertain", "verified"]
     evidence: dict[str, Any]
@@ -614,6 +619,7 @@ class WorkflowTarget(WorkModel):
     label: str = Field(min_length=1, max_length=512)
     kind: str = Field(min_length=1, max_length=128)
     uri: str | None = Field(default=None, max_length=2_000)
+    binding_id: str | None = Field(default=None, min_length=1, max_length=512)
 
 
 class WorkflowNotifications(WorkModel):
@@ -623,6 +629,133 @@ class WorkflowNotifications(WorkModel):
     on_failure: bool
     on_recovery: bool
     quiet_when_unchanged: Literal[True]
+
+
+class WorkflowGitHubSearch(WorkModel):
+    """Safe typed GitHub search filters. | 有限安全搜索过滤器。"""
+
+    state: Literal["open", "closed", "all"] = "open"
+    query: str | None = Field(default=None, max_length=256)
+    labels: list[str] = Field(default_factory=list, max_length=10)
+    limit: int = Field(default=50, ge=1, le=50)
+
+
+class WorkflowV2Trigger(WorkModel):
+    """One DSH Schedule-backed proactive trigger. | 一个由 DSH Schedule 驱动的主动触发器。"""
+
+    id: str = Field(min_length=1, max_length=128)
+    kind: Literal["github_incremental_poll", "review"]
+    schedule: WorkflowSchedule
+    target_ids: list[str] = Field(default_factory=list, max_length=100)
+    initial_baseline: Literal["record_without_notification"] = "record_without_notification"
+    search: WorkflowGitHubSearch | None = None
+
+
+WorkflowAction = Literal["draft_pull_request", "rerun_source_ci", "update_issue_progress"]
+WorkflowAttentionKind = Literal["blocked_goal", "user_decision", "service_or_auth_outage"]
+WorkflowOperation = Literal[
+    "github.branch.create",
+    "github.branch.delete",
+    "github.file.commit",
+    "github.pull_request.draft.create",
+    "github.actions.rerun_failed",
+    "github.issue.comment.create",
+    "github.issue.state.update",
+]
+
+
+class WorkflowActionGrant(WorkModel):
+    """Owner-configured action with exact target scopes. | 有范围限制的操作授权。"""
+
+    id: str = Field(min_length=1, max_length=128)
+    action: WorkflowAction
+    target_ids: list[str] = Field(min_length=1, max_length=100)
+    base_branches: list[str] = Field(default_factory=list, max_length=100)
+    branch_prefixes: list[str] = Field(default_factory=list, max_length=100)
+    path_prefixes: list[str] = Field(default_factory=list, max_length=100)
+    issue_numbers: list[Annotated[int, Field(gt=0)]] = Field(
+        default_factory=list, max_length=10_000
+    )
+    source_workflow_ids: list[str] = Field(default_factory=list, max_length=100)
+    permitted_operations: list[WorkflowOperation] = Field(min_length=1, max_length=20)
+
+
+class WorkflowActionPolicy(WorkModel):
+    """Typed source permissions run in separate child tasks. | 分离执行的源代码操作授权。"""
+
+    allowed_actions: list[WorkflowActionGrant] = Field(default_factory=list, max_length=100)
+    separate_child_task: Literal[True] = True
+    production_changes: Literal["forbidden"] = "forbidden"
+    requires_user_authorization: list[Literal["merge", "release", "production", "new_spend"]] = (
+        Field(
+            default_factory=lambda: cast(
+                list[Literal["merge", "release", "production", "new_spend"]],
+                ["merge", "release", "production", "new_spend"],
+            )
+        )
+    )
+
+
+class WorkflowModelPolicy(WorkModel):
+    """Preferred installed model route and bounded fallback policy. | 模型首选项与备用策略。"""
+
+    preferred_provider: Literal["antigravity", "codebuddy", "exchange"] = "antigravity"
+    preferred_model: str = Field(default="gemini-3.8-flash-medium", min_length=1, max_length=256)
+    fallback: Literal["configured_no_additional_spend"] = "configured_no_additional_spend"
+
+
+class WorkflowAuthorizationReference(WorkModel):
+    """Owner-authenticated Teams thread reference resolved by the host. | 授权线程引用。"""
+
+    kind: Literal["teams_thread"]
+    thread_binding_id: str = Field(min_length=1, max_length=512)
+    owner_task_id: str = Field(min_length=1, max_length=512)
+
+
+class WorkflowNotificationDestination(WorkModel):
+    """Host-resolved thread; the model supplies no route. | 主机解析的通知目标。"""
+
+    kind: Literal["responsibility_thread"]
+
+
+class WorkflowQuietHours(WorkModel):
+    """Quiet period for proactive notices; direct chat is unaffected. | 主动通知安静时段。"""
+
+    start: str = Field(default="22:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    end: str = Field(default="08:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    time_zone: str = Field(default="America/New_York", min_length=1, max_length=128)
+
+
+class WorkflowDigestPolicy(WorkModel):
+    """At most one meaningful-change digest per configured day. | 每日最多一条有意义变化摘要。"""
+
+    enabled: bool = True
+    schedule: WorkflowSchedule = Field(
+        default_factory=lambda: WorkflowSchedule(
+            kind="cron", expression="0 9 * * *", time_zone="America/New_York"
+        )
+    )
+    max_per_day: Literal[1] = 1
+
+
+class WorkflowNotificationsV2(WorkModel):
+    """V2 notification policy with responsibility-local routing. | v2 通知策略与责任线程路由。"""
+
+    on_change: bool = True
+    on_failure: bool = True
+    on_recovery: bool = True
+    quiet_when_unchanged: Literal[True] = True
+    quiet_hours: WorkflowQuietHours = Field(default_factory=WorkflowQuietHours)
+    digest: WorkflowDigestPolicy = Field(default_factory=WorkflowDigestPolicy)
+    destination: WorkflowNotificationDestination = Field(
+        default_factory=lambda: WorkflowNotificationDestination(kind="responsibility_thread")
+    )
+    immediate_on: list[Literal["blocked_goal", "user_decision", "service_or_auth_outage"]] = Field(
+        default_factory=lambda: cast(
+            list[Literal["blocked_goal", "user_decision", "service_or_auth_outage"]],
+            ["blocked_goal", "user_decision", "service_or_auth_outage"],
+        )
+    )
 
 
 class WorkflowRecord(WorkModel):
@@ -640,10 +773,87 @@ class WorkflowRecord(WorkModel):
     updated_at: str | None = None
 
 
+class WorkflowV2Record(WorkModel):
+    """Proactive responsibility negotiated with definitionVersion=2. | 主动责任定义。"""
+
+    id: str = Field(min_length=1, max_length=512)
+    version: Literal[2]
+    title: str = Field(min_length=1, max_length=512)
+    description: str = Field(max_length=20_000)
+    goal: str = Field(min_length=1, max_length=20_000)
+    instructions: str = Field(min_length=1, max_length=100_000)
+    targets: list[WorkflowTarget] = Field(max_length=100)
+    triggers: list[WorkflowV2Trigger] = Field(min_length=1, max_length=100)
+    action_policy: WorkflowActionPolicy = Field(default_factory=WorkflowActionPolicy)
+    model_policy: WorkflowModelPolicy = Field(default_factory=WorkflowModelPolicy)
+    authorization: WorkflowAuthorizationReference
+    notifications: WorkflowNotificationsV2 = Field(default_factory=WorkflowNotificationsV2)
+    enabled: bool = False
+    updated_at: str | None = None
+
+
+WorkflowDefinition = Annotated[WorkflowRecord | WorkflowV2Record, Field(discriminator="version")]
+
+
 class WorkflowList(WorkModel):
     """Versioned workflow catalog for one Workspace. | 工作流目录。"""
 
-    items: list[WorkflowRecord]
+    items: list[WorkflowDefinition]
+
+
+class WorkflowNoticeCreate(WorkModel):
+    """Project a terminal v2 receipt to its owner Teams thread. | 投影工作流终态通知。"""
+
+    occurrence_id: str = Field(min_length=1, max_length=128)
+    trigger_id: str = Field(min_length=1, max_length=128)
+    scheduled_at: str = Field(min_length=1, max_length=128)
+    kind: Literal["change", "failure", "recovery", "digest", "blocker"]
+    summary: str = Field(min_length=1, max_length=400)
+    attention_kind: WorkflowAttentionKind | None = None
+
+
+class WorkflowEvidence(WorkModel):
+    """Metadata-only pointer for one scoped connector observation. | 观察证据指针。"""
+
+    target_id: str = Field(min_length=1, max_length=512)
+    tool: str = Field(min_length=1, max_length=256)
+    observed_at: str = Field(min_length=1, max_length=128)
+    result_digest: str = Field(min_length=1, max_length=64)
+
+
+class WorkflowRepositoryCursor(WorkModel):
+    """One repository's stable page chain within a fixed search window. | 仓库分页链状态。"""
+
+    target_id: str = Field(min_length=1, max_length=512)
+    page_cursor: str = Field(min_length=1, max_length=8)
+    query_digest: str = Field(min_length=64, max_length=64)
+    complete: bool
+    has_changes: bool = False
+    pages_collected: int = Field(default=0, ge=0, le=1000)
+    total_count: int | None = Field(default=None, ge=0, le=10_000_000)
+    blocked_reason: Literal["result_limit", "incomplete_results", "missing_pages"] | None = None
+
+
+class WorkflowCheckpoint(WorkModel):
+    """Durable GitHub search watermark and page cursor. | 持久化水位与分页游标。"""
+
+    kind: Literal["github_issues_search"]
+    watermark: str | None = Field(default=None, max_length=128)
+    window_end: str = Field(min_length=1, max_length=128)
+    complete: bool
+    repositories: list[WorkflowRepositoryCursor] = Field(default_factory=list, max_length=100)
+
+
+class WorkflowActionReceipt(WorkModel):
+    """Durable child action status and provider operation references. | 动作子任务及操作回执。"""
+
+    action_id: str = Field(min_length=1, max_length=128)
+    action_type: WorkflowAction
+    target_id: str = Field(min_length=1, max_length=512)
+    task_id: str = Field(min_length=1, max_length=512)
+    request_digest: str = Field(min_length=64, max_length=64)
+    status: Literal["completed", "failed", "waiting", "unknown", "skipped"]
+    operation_ids: list[str] = Field(default_factory=list, max_length=100)
 
 
 class WorkflowScheduleEvent(WorkModel):
@@ -660,6 +870,14 @@ class WorkflowScheduleEvent(WorkModel):
     error_code: str | None = Field(default=None, max_length=256)
     task_id: str | None = Field(default=None, max_length=512)
     session_id: str | None = Field(default=None, max_length=512)
+    trigger_id: str | None = Field(default=None, max_length=128)
+    baseline: bool | None = None
+    evidence: list[WorkflowEvidence] = Field(default_factory=list, max_length=1_000)
+    operation_ids: list[str] = Field(default_factory=list, max_length=100)
+    action_task_ids: list[str] = Field(default_factory=list, max_length=100)
+    checkpoint: WorkflowCheckpoint | None = None
+    attention_kind: WorkflowAttentionKind | None = None
+    action_results: list[WorkflowActionReceipt] = Field(default_factory=list, max_length=100)
     created_at: str = Field(min_length=1, max_length=128)
 
 
