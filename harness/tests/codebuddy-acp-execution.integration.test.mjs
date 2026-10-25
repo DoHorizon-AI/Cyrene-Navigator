@@ -7,7 +7,7 @@
 // └─────────────────────────────────────────────────────────────────────┘
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -50,8 +50,10 @@ async function createHarness({
   mcpCloseGraceMs,
 } = {}) {
   const priorCodeBuddyConfigDir = process.env.CODEBUDDY_CONFIG_DIR;
+  const priorCodeBuddyHome = process.env.CODEBUDDY_HOME;
   const codeBuddyConfigDir = mkdtempSync(join(tmpdir(), 'navigator-codebuddy-profile-'));
   process.env.CODEBUDDY_CONFIG_DIR = codeBuddyConfigDir;
+  process.env.CODEBUDDY_HOME = join(codeBuddyConfigDir, 'untrusted-alternate-home');
   const ctx = new Context();
   await ctx.plugin(LocalSubprocessRuntime);
   await ctx.plugin(SystemPrompt);
@@ -213,7 +215,7 @@ async function createHarness({
   };
   return {
     ctx, workState, bridgeCalls, providerCalls, unregister, unregisterExchangeTool, toolName,
-    codeBuddyConfigDir, priorCodeBuddyConfigDir, createBackend, createExecutor,
+    codeBuddyConfigDir, priorCodeBuddyConfigDir, priorCodeBuddyHome, createBackend, createExecutor,
     get executor() { return executor; },
   };
 }
@@ -228,6 +230,8 @@ async function disposeHarness(harness) {
     rmSync(harness.codeBuddyConfigDir, { recursive: true, force: true });
     if (harness.priorCodeBuddyConfigDir === undefined) delete process.env.CODEBUDDY_CONFIG_DIR;
     else process.env.CODEBUDDY_CONFIG_DIR = harness.priorCodeBuddyConfigDir;
+    if (harness.priorCodeBuddyHome === undefined) delete process.env.CODEBUDDY_HOME;
+    else process.env.CODEBUDDY_HOME = harness.priorCodeBuddyHome;
   }
 }
 
@@ -302,6 +306,29 @@ test('CodeBuddy ACP owns the top-level turn, resumes the durable native session,
       if (value === undefined) delete process.env[name];
       else process.env[name] = value;
     }
+  }
+});
+
+test('a pre-existing non-private CodeBuddy profile is rejected without changing its permissions', async () => {
+  const harness = await createHarness();
+  const originalMode = statSync(harness.codeBuddyConfigDir).mode & 0o777;
+  chmodSync(harness.codeBuddyConfigDir, 0o755);
+  try {
+    const executor = harness.createExecutor(harness.createBackend('tool'));
+    const outcome = await executor.executeTask({
+      taskId: 'teams-acp-insecure-profile-task',
+      sessionId,
+      prompt: 'Do not start with a public CodeBuddy profile directory.',
+      metadata: { teamsCaller: taskActor },
+    });
+    assert.equal(outcome.status, 'failed');
+    assert.match(outcome.error ?? '', /NATIVE_CODEBUDDY_PROFILE_NOT_PRIVATE/u);
+    assert.equal(statSync(harness.codeBuddyConfigDir).mode & 0o777, 0o755,
+      'Navigator must reject an unsafe profile without chmod or takeover');
+    assert.deepEqual(acpConfigDirectories(harness.codeBuddyConfigDir), []);
+  } finally {
+    chmodSync(harness.codeBuddyConfigDir, originalMode);
+    await disposeHarness(harness);
   }
 });
 

@@ -479,8 +479,7 @@ async function withRunDeadline<T>(
 /** Preserve only the CodeBuddy profile and basic runtime/network environment. */
 export function isolatedCodeBuddyEnvironment(childHome?: string, profileRoot?: string): NodeJS.ProcessEnv {
   const allowedNames = new Set([
-    'PATH', 'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'XDG_CONFIG_HOME', 'CODEBUDDY_HOME',
-    'CODEBUDDY_CONFIG_DIR',
+    'PATH', 'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'XDG_CONFIG_HOME', 'CODEBUDDY_CONFIG_DIR',
     'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'TMP', 'TEMP', 'TMPDIR', 'LANG', 'LC_ALL',
     'LC_CTYPE', 'TZ', 'TERM', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
     'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy', 'NODE_USE_ENV_PROXY', 'SSL_CERT_FILE',
@@ -525,14 +524,16 @@ function createPrivateMcpConfigFile(value: Record<string, unknown>): PrivateConf
   const configuredRoot = resolve(configuredHome)
   try {
     mkdirSync(configuredRoot, { mode: 0o700, recursive: true })
+    assertPrivatePath(configuredRoot, 'directory', 0o700)
   } catch {
-    throw new Error('Navigator could not access the private CodeBuddy configuration directory')
+    throw privateCodeBuddyProfileFailure()
   }
   let profileRoot: string
   try {
     profileRoot = resolve(realpathSync(configuredRoot))
+    assertPrivatePath(profileRoot, 'directory', 0o700)
   } catch {
-    throw new Error('Navigator could not resolve the private CodeBuddy configuration directory')
+    throw privateCodeBuddyProfileFailure()
   }
   const cwd = join(profileRoot, 'navigator-acp-workspace')
   const childHome = join(profileRoot, 'navigator-cli-home')
@@ -602,6 +603,13 @@ function ensurePrivateDirectory(path: string, diagnostic: string): void {
   } catch {
     throw new Error(diagnostic)
   }
+}
+
+function privateCodeBuddyProfileFailure(): NativeSubagentFailure {
+  return new NativeSubagentFailure(
+    'CodeBuddy profile is not a private owner-owned directory',
+    'NATIVE_CODEBUDDY_PROFILE_NOT_PRIVATE: CodeBuddy profile must resolve to an owner-only directory owned by this Navigator process.',
+  )
 }
 
 /** Reject symlinks, non-regular paths, wrong owners, and group/world access. */

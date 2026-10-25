@@ -77,6 +77,7 @@ try {
   assert.equal(process.env.CODEBUDDY_API_KEY, undefined);
   assert.equal(process.env.HOME, childHome);
   assert.equal(process.env.USERPROFILE, childHome);
+  assert.equal(process.env.CODEBUDDY_HOME, undefined);
   assert.equal(process.env.CODEBUDDY_CONFIG_DIR, dirname(process.cwd()));
   assert.equal(process.env.XDG_CONFIG_HOME, join(childHome, '.config'));
   assert.equal(process.env.XDG_CACHE_HOME, join(childHome, '.cache'));
