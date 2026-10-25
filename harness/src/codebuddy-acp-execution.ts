@@ -32,7 +32,6 @@ import {
   DEFAULT_TURN_TIMEOUT_MS,
   NativeSubagentFailure,
   disposeNativeChildWithOutcome,
-  withDeadline,
 } from './subagents/common.js'
 import {
   MAX_NATIVE_OUTPUT_BYTES,
@@ -55,6 +54,7 @@ export interface ConversationExecutionInput {
   readonly sessionId: string;
   readonly prompt: string;
   readonly signal: AbortSignal;
+  readonly authorizationPauseSignal: AbortSignal;
   readonly readOnly: boolean;
   readonly onText: (text: string) => void | Promise<void>;
   readonly onToolCall?: (event: { name: string; callId: string; arguments: string }) => void | Promise<void>;
@@ -63,9 +63,10 @@ export interface ConversationExecutionInput {
 
 /** Only complete native turns become successful conversation results. */
 export interface ConversationExecutionResult {
-  readonly stopReason: 'end_turn' | 'refusal';
+  readonly stopReason: 'end_turn' | 'refusal' | 'cancelled';
   readonly nativeSessionId: string;
   readonly output: string;
+  readonly pausedForUserAuthorization?: true;
 }
 
 /** Top-level task execution boundary selected by the Navigator composition root. */
@@ -88,6 +89,7 @@ export interface CodeBuddyAcpExecutionOptions {
   readonly startupTimeoutMs?: number;
   readonly turnTimeoutMs?: number;
   readonly disposeGraceMs?: number;
+  readonly mcpCloseGraceMs?: number;
 }
 
 /** Implement a top-level CodeBuddy turn without creating or invoking a DSH Agent. */
@@ -100,6 +102,7 @@ export class CodeBuddyAcpExecutionBackend implements ConversationExecutionBacken
   private readonly startupTimeoutMs: number
   private readonly turnTimeoutMs: number
   private readonly disposeGraceMs: number
+  private readonly mcpCloseGraceMs: number | undefined
 
   constructor(private readonly options: CodeBuddyAcpExecutionOptions) {
     this.command = options.command ?? 'codebuddy'
@@ -109,23 +112,51 @@ export class CodeBuddyAcpExecutionBackend implements ConversationExecutionBacken
     this.startupTimeoutMs = options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS
     this.turnTimeoutMs = options.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS
     this.disposeGraceMs = options.disposeGraceMs ?? DEFAULT_DISPOSE_GRACE_MS
+    this.mcpCloseGraceMs = options.mcpCloseGraceMs
   }
 
   /** Load or create a native session, then send exactly one user turn. */
   async execute(input: ConversationExecutionInput): Promise<ConversationExecutionResult> {
     input.signal.throwIfAborted()
-    const prior = await this.options.workState.getBackendSession(input.taskId)
-    if (prior !== undefined && (prior.backend !== 'codebuddy-acp' || prior.sessionId !== input.sessionId)) {
-      throw new NativeSubagentFailure(
-        'Navigator returned a mismatched native session mapping',
-        'NATIVE_SESSION_MAPPING_INVALID: Work returned a mapping for a different backend or session.',
-      )
+    const runController = new AbortController()
+    let currentTurn = false
+    let nativeTurnNeedsCancel = false
+    const abortRelays: Array<() => void> = []
+    const relayAbort = (signal: AbortSignal): void => {
+      if (signal.aborted) {
+        if (currentTurn) nativeTurnNeedsCancel = true
+        runController.abort(signal.reason)
+        return
+      }
+      const onAbort = (): void => {
+        if (currentTurn) nativeTurnNeedsCancel = true
+        runController.abort(signal.reason)
+      }
+      signal.addEventListener('abort', onAbort, { once: true })
+      abortRelays.push(() => signal.removeEventListener('abort', onAbort))
+    }
+    relayAbort(input.signal)
+    relayAbort(input.authorizationPauseSignal)
+    let prior: Awaited<ReturnType<WorkStateStore['getBackendSession']>>
+    try {
+      runController.signal.throwIfAborted()
+      prior = await this.options.workState.getBackendSession(input.taskId)
+      if (prior !== undefined && (prior.backend !== 'codebuddy-acp' || prior.sessionId !== input.sessionId)) {
+        throw new NativeSubagentFailure(
+          'Navigator returned a mismatched native session mapping',
+          'NATIVE_SESSION_MAPPING_INVALID: Work returned a mapping for a different backend or session.',
+        )
+      }
+    } catch (error: unknown) {
+      for (const release of abortRelays) release()
+      throw error
     }
     const mcpHost = new AcpMcpHost({
       ctx: this.options.ctx,
       sessionId: input.sessionId,
-      signal: input.signal,
+      signal: runController.signal,
       readOnly: input.readOnly,
+      ...(this.mcpCloseGraceMs === undefined ? {} : { closeGraceMs: this.mcpCloseGraceMs }),
       ...(input.onToolCall === undefined ? {} : { onToolCall: input.onToolCall }),
       ...(input.onToolResult === undefined ? {} : { onToolResult: input.onToolResult }),
     })
@@ -135,10 +166,10 @@ export class CodeBuddyAcpExecutionBackend implements ConversationExecutionBacken
     let conversationId: string | undefined
     let output = ''
     let diagnostic: string | undefined
-    let currentTurn = false
     let result: ConversationExecutionResult | undefined
     let failure: unknown
     let cleanupFailure: unknown
+    let authorizationPaused = false
 
     try {
       const mcpUrl = await mcpHost.listen()
@@ -156,7 +187,9 @@ export class CodeBuddyAcpExecutionBackend implements ConversationExecutionBacken
           },
         },
       })
-      child = this.spawnChild(mcpConfigFile.cwd, mcpConfigFile.path)
+      child = this.spawnChild(
+        mcpConfigFile.cwd, mcpConfigFile.path, mcpConfigFile.childHome, mcpConfigFile.profileRoot,
+      )
       let peerFailure: Error | undefined
       peer = new AcpStdioClient(
         child,
@@ -194,13 +227,13 @@ export class CodeBuddyAcpExecutionBackend implements ConversationExecutionBacken
         error => { diagnostic ??= safeAcpDiagnostic(error) },
       )
 
-      const initValue = await withDeadline(
+      const initValue = await withRunDeadline(
         peer.request('initialize', {
           protocolVersion: 1,
           clientInfo: { name: 'cyrene-navigator', version: '0.1.0' },
           clientCapabilities: {},
         }),
-        input.signal,
+        runController,
         this.startupTimeoutMs,
         'CodeBuddy ACP initialize',
       )
@@ -219,17 +252,17 @@ export class CodeBuddyAcpExecutionBackend implements ConversationExecutionBacken
             'NATIVE_SESSION_RESUME_UNSUPPORTED: CodeBuddy ACP did not advertise session/load; prior context was preserved.',
           )
         }
-        await withDeadline(peer.request('session/load', {
+        await withRunDeadline(peer.request('session/load', {
           sessionId: prior.nativeSessionId,
           cwd: mcpConfigFile.cwd,
           mcpServers: [],
-        }), input.signal, this.startupTimeoutMs, 'CodeBuddy ACP session load')
+        }), runController, this.startupTimeoutMs, 'CodeBuddy ACP session load')
         conversationId = prior.nativeSessionId
       } else {
-        const createdValue = await withDeadline(peer.request('session/new', {
+        const createdValue = await withRunDeadline(peer.request('session/new', {
           cwd: mcpConfigFile.cwd,
           mcpServers: [],
-        }), input.signal, this.startupTimeoutMs, 'CodeBuddy ACP session creation')
+        }), runController, this.startupTimeoutMs, 'CodeBuddy ACP session creation')
         const created = objectResult(createdValue, 'session/new')
         conversationId = requiredIdentifier(created.sessionId, 'session id')
         // Persist before prompting so a process restart never invents a replacement context.
@@ -251,10 +284,10 @@ export class CodeBuddyAcpExecutionBackend implements ConversationExecutionBacken
       const prompt = prior === undefined
         ? migrationAwarePrompt(input.prompt)
         : input.prompt
-      const promptValue = await withDeadline(peer.request('session/prompt', {
+      const promptValue = await withRunDeadline(peer.request('session/prompt', {
         sessionId: conversationId,
         prompt: [{ type: 'text', text: prompt }],
-      }), input.signal, this.turnTimeoutMs, 'CodeBuddy ACP prompt')
+      }), runController, this.turnTimeoutMs, 'CodeBuddy ACP prompt')
       const promptResult = objectResult(promptValue, 'session/prompt')
       if (peerFailure !== undefined) throw peerFailure
       switch (promptResult.stopReason) {
@@ -264,6 +297,10 @@ export class CodeBuddyAcpExecutionBackend implements ConversationExecutionBacken
           break
         case 'cancelled':
           if (input.signal.aborted) throw abortFailure(input.signal)
+          if (input.authorizationPauseSignal.aborted) {
+            authorizationPaused = true
+            break
+          }
           throw new NativeSubagentFailure('CodeBuddy ACP cancelled the turn', 'NATIVE_STOP_CANCELLED: CodeBuddy ACP cancelled the task.')
         case 'max_tokens':
           throw new NativeSubagentFailure('CodeBuddy ACP reached its output limit', 'NATIVE_STOP_MAX_TOKENS: ACP returned partial output at its token limit.')
@@ -271,12 +308,19 @@ export class CodeBuddyAcpExecutionBackend implements ConversationExecutionBacken
           throw new NativeSubagentFailure('CodeBuddy ACP turn failed', 'NATIVE_STOP_ERROR: ACP did not complete the requested turn.')
       }
     } catch (error: unknown) {
-      failure = diagnostic === undefined
-        ? safeAcpFailure(error, input.signal)
-        : new NativeSubagentFailure(diagnostic, diagnostic)
+      if (currentTurn && conversationId !== undefined) nativeTurnNeedsCancel = true
+      runController.abort(error)
+      authorizationPaused = input.authorizationPauseSignal.aborted && !input.signal.aborted
+      if (!authorizationPaused) {
+        failure = diagnostic === undefined
+          ? safeAcpFailure(error, input.signal)
+          : new NativeSubagentFailure(diagnostic, diagnostic)
+      }
     } finally {
+      // Stop connector and approval work before reaping the protocol child or MCP listener.
+      runController.abort(new Error('CodeBuddy ACP run is terminating.'))
       if (peer !== undefined) {
-        if (input.signal.aborted && conversationId !== undefined) {
+        if (nativeTurnNeedsCancel && conversationId !== undefined) {
           await peer.notify('session/cancel', { sessionId: conversationId }).catch(() => undefined)
         }
         peer.expectClose()
@@ -306,8 +350,8 @@ export class CodeBuddyAcpExecutionBackend implements ConversationExecutionBacken
         await mcpHost.close()
       } catch {
         cleanupFailure ??= new NativeSubagentFailure(
-          'Navigator MCP bridge cleanup failed',
-          'NATIVE_MCP_CLEANUP_FAILED: Navigator could not close the task-local MCP bridge.',
+          'Navigator MCP bridge cleanup is incomplete',
+          'NATIVE_MCP_CLEANUP_INCOMPLETE: An authorized tool handler did not settle after cancellation; cleanup is incomplete.',
         )
       }
       if (mcpConfigFile !== undefined) {
@@ -320,17 +364,33 @@ export class CodeBuddyAcpExecutionBackend implements ConversationExecutionBacken
           )
         }
       }
+      for (const release of abortRelays) release()
     }
 
+    if (authorizationPaused && conversationId !== undefined) {
+      result = {
+        stopReason: 'cancelled',
+        nativeSessionId: conversationId,
+        output,
+        pausedForUserAuthorization: true,
+      }
+    }
+    if (cleanupFailure !== undefined) {
+      throw new NativeSubagentFailure(
+        'CodeBuddy ACP cleanup is incomplete',
+        failure === undefined
+          ? 'NATIVE_CLEANUP_INCOMPLETE: Navigator could not confirm that all task-local CodeBuddy resources and authorized tool handlers stopped.'
+          : 'NATIVE_CLEANUP_INCOMPLETE: CodeBuddy ACP failed and Navigator could not confirm that every authorized tool handler stopped.',
+      )
+    }
     if (failure !== undefined) throw failure
-    if (cleanupFailure !== undefined) throw cleanupFailure
     if (result === undefined) {
       throw new NativeSubagentFailure('CodeBuddy ACP returned no terminal result', diagnostic ?? 'NATIVE_RESULT_MISSING: ACP returned no terminal result.')
     }
     return result
   }
 
-  private spawnChild(cwd: string, configPath: string): SubprocessHandle {
+  private spawnChild(cwd: string, configPath: string, childHome: string, profileRoot: string): SubprocessHandle {
     const args = [
       ...this.commandArgsPrefix,
       '--acp', '--acp-transport', 'stdio', '--agent', 'cli', '--permission-mode', 'default',
@@ -344,7 +404,7 @@ export class CodeBuddyAcpExecutionBackend implements ConversationExecutionBacken
       cwd,
       stdio: { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' },
       graceMs: this.disposeGraceMs,
-      env: isolatedCodeBuddyEnvironment(),
+      env: isolatedCodeBuddyEnvironment(childHome, profileRoot),
     }
     const child = this.options.ctx.subprocess.spawn(spec)
     child.stderr?.on('data', () => {})
@@ -383,8 +443,41 @@ export function validateCodeBuddyModel(value: string | undefined): string {
   return model
 }
 
+/** Abort the entire run when an ACP protocol operation exceeds its fixed deadline. */
+async function withRunDeadline<T>(
+  promise: Promise<T>,
+  controller: AbortController,
+  timeoutMs: number,
+  label: string,
+): Promise<T> {
+  const signal = controller.signal
+  signal.throwIfAborted()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let onAbort: (() => void) | undefined
+  const cancelled = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(signal.reason instanceof Error ? signal.reason : new Error(`${label} cancelled`))
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+  const timedOut = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = new NativeSubagentFailure(
+        `${label} timed out`,
+        'NATIVE_TIMEOUT: CodeBuddy ACP request timed out; task-local tool operations were cancelled and reconciled as uncertain when needed.',
+      )
+      controller.abort(error)
+      reject(error)
+    }, timeoutMs)
+  })
+  try {
+    return await Promise.race([promise, cancelled, timedOut])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
+  }
+}
+
 /** Preserve only the CodeBuddy profile and basic runtime/network environment. */
-export function isolatedCodeBuddyEnvironment(): NodeJS.ProcessEnv {
+export function isolatedCodeBuddyEnvironment(childHome?: string, profileRoot?: string): NodeJS.ProcessEnv {
   const allowedNames = new Set([
     'PATH', 'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'XDG_CONFIG_HOME', 'CODEBUDDY_HOME',
     'CODEBUDDY_CONFIG_DIR',
@@ -398,12 +491,25 @@ export function isolatedCodeBuddyEnvironment(): NodeJS.ProcessEnv {
   for (const [name, value] of Object.entries(process.env)) {
     if (value !== undefined && (allowedNames.has(name) || /^LC_[A-Z0-9_]+$/u.test(name))) env[name] = value
   }
+  if (childHome !== undefined) {
+    env.HOME = childHome
+    env.USERPROFILE = childHome
+    env.APPDATA = join(childHome, 'AppData', 'Roaming')
+    env.LOCALAPPDATA = join(childHome, 'AppData', 'Local')
+    env.XDG_CONFIG_HOME = join(childHome, '.config')
+    env.XDG_CACHE_HOME = join(childHome, '.cache')
+    env.XDG_DATA_HOME = join(childHome, '.local', 'share')
+    env.XDG_STATE_HOME = join(childHome, '.local', 'state')
+  }
+  if (profileRoot !== undefined) env.CODEBUDDY_CONFIG_DIR = profileRoot
   return env
 }
 
 interface PrivateConfigFile {
   readonly path: string;
   readonly cwd: string;
+  readonly childHome: string;
+  readonly profileRoot: string;
   cleanup(): void;
 }
 
@@ -422,20 +528,16 @@ function createPrivateMcpConfigFile(value: Record<string, unknown>): PrivateConf
   } catch {
     throw new Error('Navigator could not access the private CodeBuddy configuration directory')
   }
-  let cwd: string
+  let profileRoot: string
   try {
-    cwd = resolve(realpathSync(configuredRoot), 'navigator-acp-workspace')
+    profileRoot = resolve(realpathSync(configuredRoot))
   } catch {
     throw new Error('Navigator could not resolve the private CodeBuddy configuration directory')
   }
-  try {
-    mkdirSync(cwd, { mode: 0o700 })
-  } catch (error: unknown) {
-    if (!(error instanceof Error) || !('code' in error) || error.code !== 'EEXIST') {
-      throw new Error('Navigator could not create the private CodeBuddy working directory')
-    }
-  }
-  assertPrivatePath(cwd, 'directory', 0o700)
+  const cwd = join(profileRoot, 'navigator-acp-workspace')
+  const childHome = join(profileRoot, 'navigator-cli-home')
+  ensurePrivateDirectory(cwd, 'Navigator could not create the private CodeBuddy working directory')
+  ensurePrivateDirectory(childHome, 'Navigator could not create the private CodeBuddy HOME directory')
   const directory = join(cwd, `cyrene-navigator-codebuddy-acp-${randomUUID()}`)
   const path = join(directory, 'mcp.json')
   let directoryCreated = false
@@ -474,6 +576,8 @@ function createPrivateMcpConfigFile(value: Record<string, unknown>): PrivateConf
   return {
     path,
     cwd,
+    childHome,
+    profileRoot,
     cleanup(): void {
       assertPrivatePath(path, 'file', 0o600)
       assertPrivatePath(directory, 'directory', 0o700)
@@ -481,6 +585,22 @@ function createPrivateMcpConfigFile(value: Record<string, unknown>): PrivateConf
       unlinkSync(path)
       rmdirSync(directory)
     },
+  }
+}
+
+/** Create or verify one same-owner directory without following a replaced path. */
+function ensurePrivateDirectory(path: string, diagnostic: string): void {
+  try {
+    mkdirSync(path, { mode: 0o700 })
+  } catch (error: unknown) {
+    if (!(error instanceof Error) || !('code' in error) || error.code !== 'EEXIST') {
+      throw new Error(diagnostic)
+    }
+  }
+  try {
+    assertPrivatePath(path, 'directory', 0o700)
+  } catch {
+    throw new Error(diagnostic)
   }
 }
 

@@ -17,6 +17,7 @@ import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import ToolRuntime from '@deepseek-ai/dsh-tools';
 import { CodeBuddyAcpExecutionBackend } from '../dist/codebuddy-acp-execution.js';
+import { AcpMcpHost } from '../dist/acp-mcp-host.js';
 import { NavigatorExecutor } from '../dist/executor.js';
 import { InMemoryWorkStateStore } from '../dist/work-state-client.js';
 import { registerToolProviders } from '../dist/tool-providers.js';
@@ -41,7 +42,13 @@ function acpConfigDirectories(configRoot) {
   }
 }
 
-async function createHarness({ teamsCaller = taskActor } = {}) {
+async function createHarness({
+  teamsCaller = taskActor,
+  exchangeQueryExecution,
+  providerOperationExecution,
+  turnTimeoutMs = 2_000,
+  mcpCloseGraceMs,
+} = {}) {
   const priorCodeBuddyConfigDir = process.env.CODEBUDDY_CONFIG_DIR;
   const codeBuddyConfigDir = mkdtempSync(join(tmpdir(), 'navigator-codebuddy-profile-'));
   process.env.CODEBUDDY_CONFIG_DIR = codeBuddyConfigDir;
@@ -112,6 +119,7 @@ async function createHarness({ teamsCaller = taskActor } = {}) {
     },
     async execute(_arguments, execution) {
       assert.equal(execution.agent?.session.id, sessionId);
+      if (exchangeQueryExecution !== undefined) return exchangeQueryExecution(execution);
       return { content: [{ type: 'text', text: 'Exchange query accepted.' }] };
     },
   });
@@ -152,8 +160,11 @@ async function createHarness({ teamsCaller = taskActor } = {}) {
       bridgeCalls.push({ kind: 'grant', principalSubject: request.principalSubject, target: request.resourceRef });
       return { grant: 'fixture-grant' };
     },
-    async callProviderOperation(request) {
+    async callProviderOperation(request, grant, signal) {
       providerCalls.push(request);
+      if (providerOperationExecution !== undefined) {
+        return providerOperationExecution(request, grant, signal);
+      }
       return {
         outcome: 'verified',
         result: {
@@ -186,8 +197,9 @@ async function createHarness({ teamsCaller = taskActor } = {}) {
     ],
     mcpServerEntrypoint: mcpEntrypoint,
     startupTimeoutMs: 2_000,
-    turnTimeoutMs: 2_000,
+    turnTimeoutMs,
     disposeGraceMs: 1_000,
+    ...(mcpCloseGraceMs === undefined ? {} : { mcpCloseGraceMs }),
   });
   const createExecutor = backend => {
     executor = new NavigatorExecutor(ctx, {
@@ -306,6 +318,7 @@ test('CodeBuddy ACP cancellation, premature EOF, and nonzero process exits remai
         sessionId: record.sessionId,
         prompt: 'fixture failure mode',
         signal: controller.signal,
+        authorizationPauseSignal: new AbortController().signal,
         readOnly: false,
         onText,
       });
@@ -327,6 +340,193 @@ test('CodeBuddy ACP cancellation, premature EOF, and nonzero process exits remai
     await assert.rejects(cancelled, /cancelled|aborted|stopped/u);
     assert.deepEqual(acpConfigDirectories(harness.codeBuddyConfigDir), priorConfigDirectories);
   } finally {
+    await disposeHarness(harness);
+  }
+});
+
+test('Exchange reauthorization pauses and cancels the ACP turn without aborting the Work Task', async () => {
+  let executor;
+  const harness = await createHarness({
+    exchangeQueryExecution: async execution => {
+      assert.equal(await executor.markTaskAwaitingUserAuthorization(execution.agent.session.id, {
+        code: 'EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED',
+        source: 'issue-action',
+        callId: String(execution.callId),
+        connectionId: '33333333-3333-4333-8333-333333333333',
+      }), true);
+      return {
+        status: 'awaiting_user_authorization',
+        code: 'EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED',
+      };
+    },
+  });
+  const priorConfigDirectories = acpConfigDirectories(harness.codeBuddyConfigDir);
+  try {
+    executor = harness.createExecutor(harness.createBackend('reauth'));
+    const events = [];
+    const outcome = await executor.executeTask({
+      taskId: 'teams-acp-reauth-task',
+      sessionId,
+      prompt: 'Check the issue connection and wait if it needs authorization.',
+    }, event => events.push(event));
+    assert.equal(outcome.status, 'awaiting_user_authorization');
+    assert.match(outcome.output, /AUTHORIZATION_PAUSE_CANCELLED/u);
+    assert.doesNotMatch(outcome.output, /WAITING_FOR_AUTHORIZATION/u,
+      'the native turn must stop before the agent can continue after the authorization pause');
+    assert.ok(events.some(event => event.type === 'authorization-required'
+      && event.code === 'EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED'));
+    assert.ok(events.some(event => event.type === 'finish' && event.status === 'awaiting_user_authorization'));
+    assert.equal(events.some(event => event.type === 'error' || event.type === 'status' && event.status === 'aborted'), false);
+    const durable = await harness.workState.getTask(outcome.taskId);
+    assert.equal(durable.status, 'awaiting_user_authorization');
+    const durableEvents = await harness.workState.getEvents(outcome.taskId);
+    assert.ok(durableEvents.events.some(row => row.event.type === 'finish'
+      && row.event.status === 'awaiting_user_authorization'));
+    assert.deepEqual(acpConfigDirectories(harness.codeBuddyConfigDir), priorConfigDirectories);
+  } finally {
+    await disposeHarness(harness);
+  }
+});
+
+test('authorization pause stays resumable when another authorized provider ignores cancellation', async () => {
+  let executor;
+  let releaseProvider;
+  let resolveProviderStarted;
+  let resolvePaused;
+  const providerStarted = new Promise(resolve => { resolveProviderStarted = resolve; });
+  const paused = new Promise(resolve => { resolvePaused = resolve; });
+  const harness = await createHarness({
+    turnTimeoutMs: 1_000,
+    mcpCloseGraceMs: 80,
+    exchangeQueryExecution: async execution => {
+      await providerStarted;
+      assert.equal(await executor.markTaskAwaitingUserAuthorization(execution.agent.session.id, {
+        code: 'EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED',
+        source: 'issue-action',
+        callId: String(execution.callId),
+        connectionId: '33333333-3333-4333-8333-333333333333',
+      }), true);
+      return { content: [{ type: 'text', text: 'Authorization is required.' }] };
+    },
+    providerOperationExecution: async () => {
+      resolveProviderStarted();
+      return new Promise(resolve => { releaseProvider = () => resolve({
+        outcome: 'verified',
+        result: {
+          content: [{ type: 'text', text: 'late provider result' }],
+          structuredContent: { state: 'COMPLETED' },
+        },
+      }); });
+    },
+  });
+  try {
+    executor = harness.createExecutor(harness.createBackend('reauth-slow-tool'));
+    const execution = executor.executeTask({
+      taskId: 'teams-acp-reauth-slow-task',
+      sessionId,
+      prompt: 'Pause for authorization while a connector call is active.',
+      metadata: { teamsCaller: taskActor },
+    }, event => {
+      if (event.type === 'authorization-required') resolvePaused();
+    });
+    await providerStarted;
+    await paused;
+    const outcome = await execution;
+    assert.equal(outcome.status, 'awaiting_user_authorization');
+    assert.match(outcome.error ?? '', /NATIVE_CLEANUP_INCOMPLETE/u);
+    assert.ok(harness.bridgeCalls.some(call => call.path === '/operations/operation-acp-1'
+      && call.method === 'PATCH' && call.body.status === 'uncertain'));
+    assert.equal(harness.bridgeCalls.some(call => call.path === '/operations/operation-acp-1'
+      && call.method === 'PATCH' && call.body.status === 'verified'), false);
+    const durable = await harness.workState.getTask(outcome.taskId);
+    assert.equal(durable.status, 'awaiting_user_authorization');
+    const durableEvents = await harness.workState.getEvents(outcome.taskId);
+    assert.ok(durableEvents.events.some(row => row.event.type === 'error'
+      && row.event.code === 'NATIVE_CLEANUP_INCOMPLETE'));
+    assert.ok(durableEvents.events.some(row => row.event.type === 'finish'
+      && row.event.status === 'awaiting_user_authorization'));
+    assert.equal(durableEvents.events.some(row => row.event.type === 'status'
+      && row.event.status === 'aborted' || row.event.type === 'finish' && row.event.status === 'failed'), false);
+    releaseProvider();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(harness.bridgeCalls.some(call => call.path === '/operations/operation-acp-1'
+      && call.method === 'PATCH' && call.body.status === 'verified'), false);
+  } finally {
+    releaseProvider?.();
+    await disposeHarness(harness);
+  }
+});
+
+test('an ignored provider abort leaves an uncertain receipt and reports incomplete MCP cleanup', async () => {
+  let releaseProvider;
+  let resolveProviderStarted;
+  const providerStarted = new Promise(resolve => { resolveProviderStarted = resolve; });
+  const harness = await createHarness({
+    turnTimeoutMs: 100,
+    mcpCloseGraceMs: 80,
+    providerOperationExecution: async () => {
+      resolveProviderStarted();
+      return new Promise(resolve => { releaseProvider = () => resolve({
+        outcome: 'verified',
+        result: {
+          content: [{ type: 'text', text: 'late provider result' }],
+          structuredContent: { state: 'COMPLETED' },
+        },
+      }); });
+    },
+  });
+  try {
+    const executor = harness.createExecutor(harness.createBackend('slow-tool'));
+    const execution = executor.executeTask({
+      taskId: 'teams-acp-slow-tool-task',
+      sessionId,
+      prompt: 'Run one authorized write that stalls in the provider.',
+      metadata: { teamsCaller: taskActor },
+    });
+    await providerStarted;
+    const outcome = await execution;
+    assert.equal(outcome.status, 'failed');
+    assert.match(outcome.error ?? '', /cleanup is incomplete|cleanup incomplete/u);
+    assert.equal(harness.bridgeCalls.some(call => call.path === '/operations/operation-acp-1'
+      && call.method === 'PATCH' && call.body.status === 'uncertain'), true);
+    assert.equal(harness.bridgeCalls.some(call => call.path === '/operations/operation-acp-1'
+      && call.method === 'PATCH' && call.body.status === 'verified'), false);
+    assert.equal(harness.providerCalls.length, 1);
+    releaseProvider();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(harness.bridgeCalls.some(call => call.path === '/operations/operation-acp-1'
+      && call.method === 'PATCH' && call.body.status === 'verified'), false,
+    'a late provider success must not overwrite the uncertain Work receipt');
+  } finally {
+    releaseProvider?.();
+    await disposeHarness(harness);
+  }
+});
+
+test('MCP catalog failures return a bounded response without escaping the request handler', async () => {
+  const harness = await createHarness();
+  const originalGet = harness.ctx.tools.get.bind(harness.ctx.tools);
+  const controller = new AbortController();
+  const host = new AcpMcpHost({
+    ctx: harness.ctx,
+    sessionId,
+    signal: controller.signal,
+    readOnly: false,
+    closeGraceMs: 100,
+  });
+  try {
+    const endpoint = await host.listen();
+    harness.ctx.tools.get = () => { throw new Error('dynamic catalog was unloaded'); };
+    const response = await fetch(new URL('/tools/list', endpoint), {
+      headers: { authorization: `Bearer ${host.token}` },
+    });
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { error: 'tool_catalog_unavailable' });
+    harness.ctx.tools.get = originalGet;
+  } finally {
+    controller.abort();
+    harness.ctx.tools.get = originalGet;
+    await host.close();
     await disposeHarness(harness);
   }
 });

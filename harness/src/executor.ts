@@ -108,6 +108,7 @@ interface InternalTaskState {
   reasoning: string;
   blocked?: Map<string, Extract<ExecutorStreamEvent, { type: 'subagent-blocked' }>>;
   authorizationWaits?: Map<string, ExchangeAuthorizationWaitReceipt>;
+  authorizationPauseController?: AbortController;
   agentError?: string;
   error?: string;
   agent?: Agent;
@@ -887,11 +888,16 @@ export class NavigatorExecutor {
       }
       const endedAt = Date.now();
       const isAborted = task.abortController.signal.aborted;
-      const awaitingAuthorization = !isAborted
-        && (task.authorizationPause || task.record.status === 'awaiting_user_authorization');
-      const status: TaskStatus = isAborted ? 'aborted' : awaitingAuthorization ? 'awaiting_user_authorization' : 'failed';
+      const awaitingAuthorization = task.record.status === 'awaiting_user_authorization'
+        && task.authorizationPause && task.error === undefined;
+      const cleanupIncomplete = err instanceof Error && err.message === 'CodeBuddy ACP cleanup is incomplete';
+      const status: TaskStatus = awaitingAuthorization
+        ? 'awaiting_user_authorization'
+        : isAborted ? 'aborted' : 'failed';
       const message = task.error ?? (awaitingAuthorization
-        ? task.record.error ?? 'Exchange connection authorization is required. Progress is preserved and automatic replay is disabled.'
+        ? cleanupIncomplete
+          ? `NATIVE_CLEANUP_INCOMPLETE: ${safeErrorMessage(err)} Authorization remains required; task context is preserved and no automatic replay occurred.`
+          : task.record.error ?? 'Exchange connection authorization is required. Progress is preserved and automatic replay is disabled.'
         : isAborted ? abortMessage(task.abortController.signal.reason) : safeErrorMessage(err));
       const durationMs = endedAt - (task.record.startedAt ?? task.record.createdAt);
       task.output ||= task.agent ? this.extractLatestAssistantText(task.agent.session) : '';
@@ -903,10 +909,11 @@ export class NavigatorExecutor {
         task.record = await this.config.workState.patchTask(task.id, {
           status, output: task.output, reasoning: task.reasoning, error: message,
         });
-        if (!awaitingAuthorization) {
+        if (!awaitingAuthorization || cleanupIncomplete) {
           await this.publish(task, {
             type: 'error', taskId: task.id, message,
-            code: isAborted ? 'TASK_ABORTED' : 'EXECUTION_FAILED', timestamp: endedAt,
+            code: cleanupIncomplete ? 'NATIVE_CLEANUP_INCOMPLETE'
+              : isAborted ? 'TASK_ABORTED' : 'EXECUTION_FAILED', timestamp: endedAt,
           });
         }
         await this.publish(task, {
@@ -930,12 +937,14 @@ export class NavigatorExecutor {
   private async runConversationBackendTask(task: InternalTaskState, params: ExecuteTaskParams): Promise<TaskOutcome> {
     const backend = this.config.conversationBackend;
     if (backend === undefined) throw new Error('The configured conversation backend is unavailable');
+    task.authorizationPauseController ??= new AbortController();
     this.activeTaskBySessionId.set(task.sessionId, task.id);
     const result = await backend.execute({
       taskId: task.id,
       sessionId: task.sessionId,
       prompt: params.prompt,
       signal: task.abortController.signal,
+      authorizationPauseSignal: task.authorizationPauseController.signal,
       readOnly: isReadOnlyContinuation(task.record),
       onText: text => {
         task.output += text;
@@ -1132,6 +1141,7 @@ export class NavigatorExecutor {
       task.agent?.cancel({ kind: 'hook', reason: 'exchange_authorization_wait_persist_failed' });
       throw error;
     }
+    task.authorizationPauseController?.abort(new Error('Exchange authorization is required.'));
     task.agent?.cancel({ kind: 'hook', reason: 'exchange_reauthorization_required' });
     return true;
   }

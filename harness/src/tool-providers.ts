@@ -691,6 +691,20 @@ async function executeTeamsProviderCall(
 
   let providerResponse: Awaited<ReturnType<ExchangeConnectorAuthorizationClient['callProviderOperation']>>;
   let result: ProviderToolResult;
+  let abortReceiptUpdate: Promise<void> | undefined;
+  const markProviderCallUncertainOnAbort = (): void => {
+    if (operation === undefined) return;
+    abortReceiptUpdate ??= markUncertain(options.bridge, operation.id, {
+      outcome: 'unknown_after_cancellation_during_provider_call',
+      effect: toolAuthorization.mutating ? 'write' : 'read',
+      bindingId: binding.bindingId,
+      providerId,
+      profileRef,
+      operationId,
+      targetDigestSha256,
+    });
+  };
+  execution.signal.addEventListener('abort', markProviderCallUncertainOnAbort, { once: true });
   try {
     providerResponse = await authorization.client.callProviderOperation({
       requestId,
@@ -701,8 +715,24 @@ async function executeTeamsProviderCall(
       resourceRef,
       arguments: actualArguments,
     }, grant, execution.signal);
+    if (execution.signal.aborted) {
+      markProviderCallUncertainOnAbort();
+      await abortReceiptUpdate;
+      throw new Error('The provider call was cancelled after invocation; its remote outcome is unknown.');
+    }
     result = parseProviderResult(providerResponse.result);
   } catch (error: unknown) {
+    execution.signal.removeEventListener('abort', markProviderCallUncertainOnAbort);
+    if (execution.signal.aborted) {
+      markProviderCallUncertainOnAbort();
+      await abortReceiptUpdate;
+      if (toolAuthorization.mutating && operation !== undefined) {
+        throw new Error('The remote write outcome is unknown after cancellation. Do not retry until an independent readback is reconciled.', {
+          cause: error,
+        });
+      }
+      throw error;
+    }
     if (operation) {
       if (error instanceof ExchangeConnectorRequestError && !error.outcomeUnknown) {
         await options.bridge.request(`/operations/${encodeURIComponent(operation.id)}`, 'PATCH', {
@@ -740,6 +770,7 @@ async function executeTeamsProviderCall(
     }
     throw error;
   }
+  execution.signal.removeEventListener('abort', markProviderCallUncertainOnAbort);
   const operationRef = providerResponse.operationRef ?? providerResultOperationRef(result);
   const effectiveOutcome = effectiveProviderOutcome(providerResponse.outcome, result, operationRef);
   const knownOutcome = effectiveOutcome === 'verified' || effectiveOutcome === 'failed';

@@ -23,6 +23,8 @@ export interface AcpMcpHostOptions {
   readonly sessionId: string;
   readonly signal: AbortSignal;
   readonly readOnly: boolean;
+  /** Bounded shutdown wait; callers only shorten this in local protocol tests. */
+  readonly closeGraceMs?: number;
   readonly onToolCall?: (event: { name: string; callId: string; arguments: string }) => void | Promise<void>;
   readonly onToolResult?: (event: { name: string; callId: string; result: string; isError: boolean }) => void | Promise<void>;
 }
@@ -31,9 +33,35 @@ export interface AcpMcpHostOptions {
 export class AcpMcpHost {
   readonly token = randomBytes(32).toString('base64url')
   private readonly server: Server
+  private readonly activeHandlers = new Set<Promise<void>>()
+  private closing = false
+  private closePromise: Promise<void> | undefined
 
   constructor(private readonly options: AcpMcpHostOptions) {
-    this.server = createServer((request, response) => { void this.handle(request, response) })
+    if (options.closeGraceMs !== undefined
+      && (!Number.isSafeInteger(options.closeGraceMs) || options.closeGraceMs < 1 || options.closeGraceMs > 30_000)) {
+      throw new TypeError('MCP bridge close grace must be between 1 and 30000 milliseconds')
+    }
+    this.server = createServer((request, response) => {
+      if (this.closing) {
+        send(response, 503, { error: 'bridge_closing' })
+        return
+      }
+      let active!: Promise<void>
+      active = this.handle(request, response)
+        .catch(() => {
+          try {
+            if (!response.destroyed && !response.headersSent) {
+              send(response, 500, { error: 'bridge_request_failed' })
+            }
+          } catch {
+            response.destroy()
+          }
+        })
+        .finally(() => this.activeHandlers.delete(active))
+      this.activeHandlers.add(active)
+      void active.catch(() => {})
+    })
     this.server.headersTimeout = 5_000
     this.server.requestTimeout = 30_000
     this.server.maxHeadersCount = 32
@@ -53,26 +81,10 @@ export class AcpMcpHost {
     return `http://127.0.0.1:${address.port}/`
   }
 
-  /** Close this exact listener; the task runner owns all config-file cleanup. */
-  async close(): Promise<void> {
-    if (!this.server.listening) return
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const closed = new Promise<void>((resolve, reject) => {
-      this.server.close(error => error ? reject(error) : resolve())
-    })
-    try {
-      await Promise.race([
-        closed,
-        new Promise<void>(resolve => {
-          timer = setTimeout(() => {
-            this.server.closeAllConnections()
-            resolve()
-          }, MCP_HOST_CLOSE_GRACE_MS)
-        }),
-      ])
-    } finally {
-      if (timer !== undefined) clearTimeout(timer)
-    }
+  /** Stop accepting calls and wait for every active tool handler to settle. */
+  close(): Promise<void> {
+    this.closePromise ??= this.closeWithinGrace()
+    return this.closePromise
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -81,7 +93,11 @@ export class AcpMcpHost {
       return
     }
     if (request.method === 'GET' && request.url === '/tools/list') {
-      send(response, 200, { tools: getCodeBuddyAcpToolCatalog(this.options.ctx) })
+      try {
+        send(response, 200, { tools: getCodeBuddyAcpToolCatalog(this.options.ctx) })
+      } catch {
+        send(response, 503, { error: 'tool_catalog_unavailable' })
+      }
       return
     }
     if (request.method !== 'POST' || request.url !== '/tools/call') {
@@ -136,6 +152,7 @@ export class AcpMcpHost {
       arguments: argumentsJson,
     }
     await this.options.onToolCall?.(callEvent)
+    this.options.signal.throwIfAborted()
 
     let result: ToolExecutionResult | undefined
     try {
@@ -182,6 +199,34 @@ export class AcpMcpHost {
       ...(!result.isError && result.value !== null && typeof result.value === 'object' && !Array.isArray(result.value)
         ? { structuredContent: result.value }
         : {}),
+    }
+  }
+
+  private async closeWithinGrace(): Promise<void> {
+    this.closing = true
+    let closed: Promise<void> = Promise.resolve()
+    if (this.server.listening) {
+      closed = new Promise<void>((resolve, reject) => {
+        this.server.close(error => error ? reject(error) : resolve())
+      })
+    }
+    // The signal belongs to the run and is aborted by the backend before close.
+    // Server.close alone only observes sockets and cannot prove tool promises ended.
+    const settled = Promise.all([closed, ...this.activeHandlers]).then(() => undefined)
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        settled,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error('MCP bridge still has active tool handlers')),
+            this.options.closeGraceMs ?? MCP_HOST_CLOSE_GRACE_MS)
+        }),
+      ])
+    } catch {
+      this.server.closeAllConnections()
+      throw new Error('Navigator MCP bridge cleanup incomplete: an active tool handler did not settle after cancellation')
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
     }
   }
 }
@@ -236,6 +281,7 @@ function safeJsonText(value: unknown, maximum: number): string {
 }
 
 function send(response: ServerResponse, status: number, body: Record<string, unknown>): void {
+  if (response.destroyed || response.writableEnded) return
   const text = JSON.stringify(body)
   if (Buffer.byteLength(text, 'utf8') > MAX_RESPONSE_BYTES) {
     response.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'response_limit' }))

@@ -9,7 +9,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { lstatSync, readFileSync } from 'node:fs';
-import { basename, dirname, isAbsolute, relative } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import { createInterface } from 'node:readline';
 
 const fixtureMode = valueAfter('--fixture-mode') ?? 'tool';
@@ -47,12 +47,17 @@ try {
   bootstrapStage = 'private config path';
   const configInfo = lstatSync(configPath);
   const directoryInfo = lstatSync(dirname(configPath));
+  const childHome = join(dirname(process.cwd()), 'navigator-cli-home');
+  const homeInfo = lstatSync(childHome);
   assert.equal(configInfo.isSymbolicLink(), false);
   assert.equal(directoryInfo.isSymbolicLink(), false);
+  assert.equal(homeInfo.isSymbolicLink(), false);
   assert.equal(configInfo.isFile(), true);
   assert.equal(directoryInfo.isDirectory(), true);
+  assert.equal(homeInfo.isDirectory(), true);
   assert.equal(configInfo.mode & 0o077, 0);
   assert.equal(directoryInfo.mode & 0o077, 0);
+  assert.equal(homeInfo.mode & 0o077, 0);
   bootstrapStage = 'MCP config';
   const config = JSON.parse(readFileSync(configPath, 'utf8'));
   assert.deepEqual(Object.keys(config.mcpServers ?? {}), ['navigator']);
@@ -70,6 +75,13 @@ try {
   assert.equal(process.env.GLM_API_KEY, undefined);
   assert.equal(process.env.DEEPSEEK_API_KEY, undefined);
   assert.equal(process.env.CODEBUDDY_API_KEY, undefined);
+  assert.equal(process.env.HOME, childHome);
+  assert.equal(process.env.USERPROFILE, childHome);
+  assert.equal(process.env.CODEBUDDY_CONFIG_DIR, dirname(process.cwd()));
+  assert.equal(process.env.XDG_CONFIG_HOME, join(childHome, '.config'));
+  assert.equal(process.env.XDG_CACHE_HOME, join(childHome, '.cache'));
+  assert.equal(process.env.XDG_DATA_HOME, join(childHome, '.local', 'share'));
+  assert.equal(process.env.XDG_STATE_HOME, join(childHome, '.local', 'state'));
 } catch {
   process.stderr.write(`ACP fixture bootstrap failed at ${bootstrapStage}\n`);
   process.exit(41);
@@ -130,6 +142,12 @@ async function handleAgentRequest(message) {
       return;
     case 'session/cancel':
       if (promptRequest !== undefined) {
+        if (fixtureMode === 'reauth') {
+          send({ jsonrpc: '2.0', method: 'session/update', params: {
+            sessionId: message.params.sessionId,
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'AUTHORIZATION_PAUSE_CANCELLED' } },
+          } });
+        }
         send({ jsonrpc: '2.0', id: promptRequest, result: { stopReason: 'cancelled' } });
         promptRequest = undefined;
       }
@@ -175,11 +193,33 @@ async function handlePrompt(message) {
   assert.equal(permission.outcome.optionId, 'reject');
 
   if (fixtureMode === 'unauthorized' || fixtureMode === 'guarded') {
-    const denied = await exerciseMcpClient(false);
+    const denied = await exerciseMcpClient({ includeExchange: false, expectComputerError: true });
     send({ jsonrpc: '2.0', method: 'session/update', params: {
       sessionId: message.params.sessionId,
       update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `connector denied=${denied.knownDenied}` } },
     } });
+    send({ jsonrpc: '2.0', id: promptRequest, result: { stopReason: 'end_turn' } });
+    promptRequest = undefined;
+    return;
+  }
+
+  if (fixtureMode === 'reauth') {
+    const result = await exerciseMcpClient({ includeComputer: false, includeUnknown: false });
+    assert.equal(result.exchangeDenied, false);
+    send({ jsonrpc: '2.0', method: 'session/update', params: {
+      sessionId: message.params.sessionId,
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'WAITING_FOR_AUTHORIZATION' } },
+    } });
+    return;
+  }
+
+  if (fixtureMode === 'reauth-slow-tool') {
+    await exerciseMcpClient({ parallelAuthorizedTools: true, includeUnknown: false });
+    return;
+  }
+
+  if (fixtureMode === 'slow-tool') {
+    await exerciseMcpClient({ includeExchange: false, includeUnknown: false });
     send({ jsonrpc: '2.0', id: promptRequest, result: { stopReason: 'end_turn' } });
     promptRequest = undefined;
     return;
@@ -229,7 +269,13 @@ async function handlePrompt(message) {
   promptRequest = undefined;
 }
 
-async function exerciseMcpClient(includeExchange = true) {
+async function exerciseMcpClient({
+  includeExchange = true,
+  includeComputer = true,
+  expectComputerError = false,
+  includeUnknown = true,
+  parallelAuthorizedTools = false,
+} = {}) {
   const server = spawn(navigatorServer.command, navigatorServer.args, {
     cwd: process.cwd(),
     env: { ...process.env, ...navigatorServer.env },
@@ -259,27 +305,36 @@ async function exerciseMcpClient(includeExchange = true) {
   assert.equal(catalog.tools.length, 2);
   const computerTool = catalog.tools.find(tool => tool.description.includes('host-authorized computer workspace'));
   assert.ok(computerTool);
-  const known = await call(3, 'tools/call', {
+  const computerCall = () => call(3, 'tools/call', {
     name: computerTool.name,
     arguments: { path: '/workspace/result.txt', content: 'from CodeBuddy ACP' },
   });
-  assert.equal(known.isError, !includeExchange);
-  const exchange = includeExchange ? await call(4, 'tools/call', {
+  const exchangeCall = () => call(4, 'tools/call', {
     name: 'exchange_issue_query', arguments: { query: 'owner/repo#1' },
-  }) : undefined;
-  if (exchange !== undefined) assert.equal(exchange.isError, false);
-  const unknown = await call(5, 'tools/call', {
-    name: 'shell', arguments: { command: 'touch /tmp/forbidden' },
   });
-  assert.equal(unknown.isError, true);
+  let known;
+  let exchange;
+  if (parallelAuthorizedTools && includeComputer && includeExchange) {
+    [known, exchange] = await Promise.all([computerCall(), exchangeCall()]);
+  } else {
+    known = includeComputer ? await computerCall() : undefined;
+    exchange = includeExchange ? await exchangeCall() : undefined;
+  }
+  if (known !== undefined) assert.equal(known.isError, expectComputerError);
+  if (exchange !== undefined) assert.equal(exchange.isError, false);
+  const unknown = includeUnknown ? await call(5, 'tools/call', {
+    name: 'shell', arguments: { command: 'touch /tmp/forbidden' },
+  }) : undefined;
+  if (unknown !== undefined) assert.equal(unknown.isError, true);
   server.stdin.end();
   await new Promise(resolve => server.once('exit', resolve));
   return {
-    text: known.content[0].text,
+    text: known?.content[0].text ?? '',
     toolName: computerTool.name,
     exchangeText: exchange?.content[0].text ?? '',
-    knownDenied: known.isError === true,
-    unknownDenied: unknown.isError,
+    knownDenied: known?.isError === true,
+    exchangeDenied: exchange?.isError === true,
+    unknownDenied: unknown?.isError === true,
     permissionDenied: true,
   };
 }
