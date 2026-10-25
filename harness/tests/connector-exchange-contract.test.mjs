@@ -152,6 +152,11 @@ contractTest('all mapped official GitHub, Hugging Face, Azure, and RunPod schema
   const hfUploadDsh = findSchema(context, 'Upload Hugging Face File', fixture.bindings.huggingface.bindingId);
   assert.equal(hfUploadDsh.parameters.properties.content_base64.maxLength, undefined);
 
+  const githubIssueSearch = fixture.bindings.github.catalog.find(tool => tool.id === 'github.issues.search');
+  assert.equal(githubIssueSearch?.inputSchema.properties.labels.uniqueItems, true);
+  const githubIssueSearchDsh = findSchema(context, 'Search GitHub Issues', fixture.bindings.github.bindingId);
+  assert.equal(githubIssueSearchDsh.parameters.properties.labels.uniqueItems, undefined);
+
   const azureTarget = fixture.bindings.azure.catalog.find(tool => tool.id === 'cloud_resource_get');
   assert.equal(azureTarget?.inputSchema.properties.target.minProperties, 1);
   assert.equal(azureTarget?.inputSchema.properties.target.maxProperties, 8);
@@ -401,6 +406,28 @@ contractTest('full official GitHub schema validation rejects an invalid reposito
   }, requestId);
 
   assert.equal(result.isError, true);
+  assert.equal(mintedGrants.has(requestId), false);
+  const audit = await readAudit(fixture.baseUrl);
+  assert.equal(audit.authorityGrants.length, grantsBefore);
+  assert.equal(audit.githubCalls.length, providerCallsBefore);
+});
+
+contractTest('full official GitHub schema rejects duplicate search labels before grant mint', async () => {
+  const binding = fixture.bindings.github;
+  const schema = findSchema(context, 'Search GitHub Issues', binding.bindingId);
+  const grantsBefore = (await readAudit(fixture.baseUrl)).authorityGrants.length;
+  const providerCallsBefore = (await readAudit(fixture.baseUrl)).githubCalls.length;
+  const requestId = 'cross-invalid-gh-duplicate-labels-1';
+  const result = await executeTool(context, schema.name, {
+    repository_id: fixture.githubRepositoryId,
+    repository: fixture.githubRepository,
+    state: 'OPEN',
+    labels: ['bug', 'bug'],
+    limit: 10,
+  }, requestId);
+
+  assert.equal(result.isError, true);
+  assert.match(result.error.message, /labels violates its configured bounds or uniqueness/u);
   assert.equal(mintedGrants.has(requestId), false);
   const audit = await readAudit(fixture.baseUrl);
   assert.equal(audit.authorityGrants.length, grantsBefore);
