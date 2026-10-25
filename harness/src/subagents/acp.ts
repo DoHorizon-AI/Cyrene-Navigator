@@ -41,7 +41,7 @@ interface PendingRequest {
 }
 
 /** Small JSON-RPC 2.0 client for the documented ACP stdio transport. */
-class AcpStdioClient {
+export class AcpStdioClient {
   private nextId = 1
   private readonly pending = new Map<string, PendingRequest>()
   private failure?: Error
@@ -183,12 +183,12 @@ class RpcProtocolError extends Error {
 }
 
 /** ACP uses -32000 for auth_required; never retain its message or data fields. */
-function isAuthRequired(error: unknown): error is RpcProtocolError {
+export function isAuthRequired(error: unknown): boolean {
   return error instanceof RpcProtocolError && error.code === -32000
 }
 
 /** Return a fixed diagnostic that does not include child-provided RPC content. */
-function authUnavailableFailure(): NativeSubagentFailure {
+export function authUnavailableFailure(): NativeSubagentFailure {
   return new NativeSubagentFailure(
     'Native ACP requires native CLI authentication',
     'NATIVE_AUTH_UNAVAILABLE: Native requires native CLI sign-in; Navigator did not start a login flow or proxy credentials.',

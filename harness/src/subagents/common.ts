@@ -198,6 +198,14 @@ export function spawnNativeChild(
 
 /** Graceful EOF followed by the subprocess seam's managed-range termination ladder. */
 export async function disposeNativeChild(child: SubprocessHandle, graceMs: number): Promise<void> {
+  await disposeNativeChildWithOutcome(child, graceMs)
+}
+
+/** Close stdin, wait for natural EOF, then reap the managed range if it stalls. */
+export async function disposeNativeChildWithOutcome(
+  child: SubprocessHandle,
+  graceMs: number,
+): Promise<boolean> {
   child.stdin?.end()
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), graceMs)
@@ -217,9 +225,10 @@ export async function disposeNativeChild(child: SubprocessHandle, graceMs: numbe
   } finally {
     clearTimeout(timer)
   }
-  if (exited) return
+  if (exited) return true
   child.terminate()
   await child.waitForExit()
+  return false
 }
 
 /** Race one protocol operation against caller cancellation and a fixed deadline. */

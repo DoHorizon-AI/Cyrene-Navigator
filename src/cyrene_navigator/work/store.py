@@ -337,6 +337,108 @@ class WorkStore:
         with self._read() as conn:
             return self._task_view(self._require_task(conn, org, workspace, task_id))
 
+    def get_backend_session(
+        self,
+        organization_id: str | None,
+        workspace_id: str,
+        task_id: str,
+        backend: str,
+    ) -> JsonObject | None:
+        """Read a native session mapping through one currently running Work Task.
+
+        The mapping is keyed by the canonical Work session in the same SQLite
+        store. A legacy DSH Session id is never interpreted as an ACP id.
+        中文：通过正在运行的 Work Task 读取同库中的原生 Session 映射。
+        """
+
+        org, workspace = _scope(organization_id, workspace_id)
+        task_id = _identifier(task_id, "task id")
+        backend = _identifier(backend, "backend")
+        if backend != "codebuddy-acp":
+            raise _invalid(
+                "WORK_BACKEND_SESSION_INVALID", "The native execution backend is not supported."
+            )
+        with self._read() as conn:
+            task = self._require_task(conn, org, workspace, task_id)
+            if str(task["status"]) != "running":
+                raise _conflict(
+                    "WORK_BACKEND_SESSION_TASK_NOT_RUNNING",
+                    "Native session mappings require the active running Work Task.",
+                )
+            row = conn.execute(
+                """SELECT backend,native_session_id FROM work_backend_sessions
+                   WHERE organization_id=? AND workspace_id=? AND session_id=? AND backend=?""",
+                (org, workspace, str(task["session_id"]), backend),
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "backend": str(row["backend"]),
+                "sessionId": str(task["session_id"]),
+                "nativeSessionId": str(row["native_session_id"]),
+            }
+
+    def bind_backend_session(
+        self,
+        organization_id: str | None,
+        workspace_id: str,
+        task_id: str,
+        backend: str,
+        native_session_id: str,
+    ) -> JsonObject:
+        """Bind a new ACP identity once; never replace another session mapping.
+
+        The task claim and unique workspace/session key make the first binding
+        authoritative. Repeated identical writes are idempotent; conflicting
+        native ids fail closed to prevent accidental context replacement.
+        中文：同一 Workspace/Work Session 的 ACP ID 只允许首次绑定或原值重放。
+        """
+
+        org, workspace = _scope(organization_id, workspace_id)
+        task_id = _identifier(task_id, "task id")
+        backend = _identifier(backend, "backend")
+        native_session_id = _identifier(native_session_id, "native session id")
+        if backend != "codebuddy-acp":
+            raise _invalid(
+                "WORK_BACKEND_SESSION_INVALID", "The native execution backend is not supported."
+            )
+        now = _unix_ms()
+        with self._mutation() as conn:
+            task = self._require_task(conn, org, workspace, task_id)
+            if str(task["status"]) != "running":
+                raise _conflict(
+                    "WORK_BACKEND_SESSION_TASK_NOT_RUNNING",
+                    "Native session mappings require the active running Work Task.",
+                )
+            session_id = str(task["session_id"])
+            row = conn.execute(
+                """SELECT native_session_id FROM work_backend_sessions
+                   WHERE organization_id=? AND workspace_id=? AND session_id=? AND backend=?""",
+                (org, workspace, session_id, backend),
+            ).fetchone()
+            if row is not None:
+                if str(row["native_session_id"]) != native_session_id:
+                    raise _conflict(
+                        "WORK_BACKEND_SESSION_CONFLICT",
+                        "The Work session is already bound to a different native session.",
+                    )
+                return {
+                    "backend": backend,
+                    "sessionId": session_id,
+                    "nativeSessionId": native_session_id,
+                }
+            conn.execute(
+                """INSERT INTO work_backend_sessions(
+                       organization_id,workspace_id,session_id,backend,native_session_id,created_at
+                   ) VALUES(?,?,?,?,?,?)""",
+                (org, workspace, session_id, backend, native_session_id, now),
+            )
+            return {
+                "backend": backend,
+                "sessionId": session_id,
+                "nativeSessionId": native_session_id,
+            }
+
     def list_tasks(
         self,
         organization_id: str | None,
@@ -3807,6 +3909,10 @@ CREATE TABLE IF NOT EXISTS work_tasks (
  PRIMARY KEY(organization_id,workspace_id,task_id));
 CREATE INDEX IF NOT EXISTS work_tasks_order
  ON work_tasks(organization_id,workspace_id,created_at DESC,task_id);
+CREATE TABLE IF NOT EXISTS work_backend_sessions (
+ organization_id TEXT NOT NULL, workspace_id TEXT NOT NULL, session_id TEXT NOT NULL,
+ backend TEXT NOT NULL, native_session_id TEXT NOT NULL, created_at INTEGER NOT NULL,
+ PRIMARY KEY(organization_id,workspace_id,session_id,backend));
 CREATE TABLE IF NOT EXISTS work_task_events (
  organization_id TEXT NOT NULL, workspace_id TEXT NOT NULL, task_id TEXT NOT NULL,
  seq INTEGER NOT NULL, event_json TEXT NOT NULL, event_digest TEXT NOT NULL,

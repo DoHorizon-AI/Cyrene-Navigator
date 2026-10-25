@@ -96,6 +96,24 @@ class TaskRecord(WorkModel):
     execution_class: TaskExecutionClass = "foreground"
 
 
+class BackendSessionBind(WorkModel):
+    """Bind one Work Task's session to a native execution session. | 绑定原生执行会话。"""
+
+    backend: Literal["codebuddy-acp"]
+    native_session_id: str = Field(min_length=1, max_length=512)
+
+
+class BackendSessionRecord(WorkModel):
+    """Workspace-scoped native session identity owned by Navigator.
+
+    中文：由 Navigator 拥有并按 Workspace 隔离的原生会话标识。
+    """
+
+    backend: Literal["codebuddy-acp"]
+    session_id: str
+    native_session_id: str
+
+
 class TaskContinuationReceipt(WorkModel):
     """Atomic child-task receipt with its server-derived source and mode.
 
