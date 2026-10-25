@@ -123,6 +123,7 @@ interface ProviderInputConstraint {
   readonly maxLength?: number;
   readonly minItems?: number;
   readonly maxItems?: number;
+  readonly uniqueItems?: boolean;
   readonly minProperties?: number;
   readonly maxProperties?: number;
 }
@@ -1239,7 +1240,7 @@ function parseTools(value: unknown, bindingId: string): ProviderTool[] {
     const constraints = collectProviderConstraints(schemaValue);
     const dshSchema = projectProviderSchemaForDsh(schemaValue);
     assertObjectJsonSchema(dshSchema);
-    // DSH's enforced schema subset rejects pattern; it remains enforced at the host tool boundary.
+    // DSH's enforced subset omits these provider keywords; host validation preserves their constraints.
     return {
       id,
       name,
@@ -1257,7 +1258,7 @@ function parseTools(value: unknown, bindingId: string): ProviderTool[] {
 
 const PROJECTED_PROVIDER_CONSTRAINTS = new Set([
   'pattern', 'minimum', 'maximum', 'minLength', 'maxLength',
-  'minItems', 'maxItems', 'minProperties', 'maxProperties',
+  'minItems', 'maxItems', 'uniqueItems', 'minProperties', 'maxProperties',
 ]);
 
 function collectProviderConstraints(schema: JsonValue): ProviderInputConstraint[] {
@@ -1281,6 +1282,7 @@ function collectProviderConstraints(schema: JsonValue): ProviderInputConstraint[
       maxLength?: number;
       minItems?: number;
       maxItems?: number;
+      uniqueItems?: boolean;
       minProperties?: number;
       maxProperties?: number;
     } = { path: frame.path };
@@ -1318,6 +1320,12 @@ function collectProviderConstraints(schema: JsonValue): ProviderInputConstraint[
       if (Object.hasOwn(node, 'maxItems')) constraint.maxItems = boundedSchemaInteger(node.maxItems, 'maxItems');
       if (constraint.minItems !== undefined && constraint.maxItems !== undefined
         && constraint.minItems > constraint.maxItems) throw new TypeError('Provider item bounds conflict');
+    }
+    if (Object.hasOwn(node, 'uniqueItems')) {
+      if (node.type !== 'array' || typeof node.uniqueItems !== 'boolean') {
+        throw new TypeError('Provider uniqueItems requires an array schema and boolean value');
+      }
+      constraint.uniqueItems = node.uniqueItems;
     }
     if (['minProperties', 'maxProperties'].some(key => Object.hasOwn(node, key))) {
       if (node.type !== 'object') throw new TypeError('Provider property bounds require an object schema');
@@ -1433,6 +1441,11 @@ function validateProviderConstraints(
         valid = valid && length >= (constraint.minItems ?? 0)
           && (constraint.maxItems === undefined || length <= constraint.maxItems);
       }
+      if (constraint.uniqueItems === true) {
+        const items = Array.isArray(value) ? value : [];
+        valid = valid && Array.isArray(value)
+          && new Set(items.map(item => canonicalJson(item))).size === items.length;
+      }
       if (constraint.minProperties !== undefined || constraint.maxProperties !== undefined) {
         const count = value !== null && typeof value === 'object' && !Array.isArray(value)
           ? Object.keys(value).length : -1;
@@ -1441,7 +1454,7 @@ function validateProviderConstraints(
       }
       if (!valid) {
         const field = constraint.path.filter(segment => segment !== '*').join('.') || 'arguments';
-        throw new TypeError(`Provider argument ${field} violates its configured bounds`);
+        throw new TypeError(`Provider argument ${field} violates its configured bounds or uniqueness`);
       }
     }
   }

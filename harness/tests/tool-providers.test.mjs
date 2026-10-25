@@ -53,12 +53,13 @@ function createBridgeFixture(options = {}) {
   const events = [];
   let beginCount = 0;
   let callCount = 0;
+  const toolCatalog = options.toolCatalog ?? tools;
   const bridge = {
     async request(path, method, body, signal) {
       events.push({ type: 'request', path, method, body, signal });
       if (path === '/tool-providers' && method === 'GET') return catalog;
-      if (path === `/tool-providers/${bindingId}/tools` && method === 'GET') return tools;
-      if (path.endsWith(`/tools/${readToolId}/call`) && method === 'POST') {
+      if (path === `/tool-providers/${bindingId}/tools` && method === 'GET') return toolCatalog;
+      if (path.startsWith(`/tool-providers/${bindingId}/tools/`) && path.endsWith('/call') && method === 'POST') {
         callCount += 1;
         return { content: [{ type: 'text', text: 'Found Ada Lovelace.' }], structuredContent: { count: 1 } };
       }
@@ -252,6 +253,96 @@ test('registers canonical read tools and routes calls through the configured bin
     const rejected = await execute(ctx, name, { query: 'Ada/Lovelace' }, 'pattern-invalid-call', false);
     assert.equal(rejected.isError, true);
     assert.match(rejected.error.message, /violates its configured bounds/u);
+    assert.equal(fixture.callCount(), 1);
+  } finally {
+    dispose();
+    await ctx.fiber.dispose();
+  }
+});
+
+test('projects uniqueItems to the host and rejects duplicate values before provider invocation', async () => {
+  const toolCatalog = {
+    tools: [{
+      id: 'labels_search',
+      name: 'Search labels',
+      description: 'Search labels with duplicate values rejected by the host.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          labels: {
+            type: 'array',
+            items: { type: 'string' },
+            minItems: 1,
+            maxItems: 10,
+            uniqueItems: true,
+          },
+          selectors: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string' },
+                filter: {
+                  type: 'object',
+                  properties: {
+                    active: { type: 'boolean' },
+                    labels: { type: 'array', items: { type: 'string' } },
+                  },
+                  required: ['active', 'labels'],
+                  additionalProperties: false,
+                },
+              },
+              required: ['name', 'filter'],
+              additionalProperties: false,
+            },
+            uniqueItems: true,
+          },
+        },
+        required: ['labels', 'selectors'],
+        additionalProperties: false,
+      },
+      readOnly: true,
+    }],
+  };
+  const fixture = createBridgeFixture({ toolCatalog });
+  const { ctx, dispose } = await createToolContext(fixture);
+  try {
+    const schema = ctx.tools.schemas().find(item =>
+      item.description.startsWith(`Search labels (configured provider ${bindingId})`));
+    assert.ok(schema);
+    assert.equal(schema.parameters.properties.labels.uniqueItems, undefined);
+    assert.equal(schema.parameters.properties.labels.minItems, undefined);
+    assert.equal(schema.parameters.properties.labels.maxItems, undefined);
+    assert.equal(schema.parameters.properties.selectors.uniqueItems, undefined);
+
+    const baseArguments = {
+      labels: ['bug', 'feature'],
+      selectors: [{ name: 'primary', filter: { active: true, labels: ['bug', 'feature'] } }],
+    };
+    const duplicateLabels = await execute(
+      ctx,
+      schema.name,
+      { ...baseArguments, labels: ['bug', 'bug'] },
+      'duplicate-labels',
+      false,
+    );
+    assert.equal(duplicateLabels.isError, true);
+    assert.match(duplicateLabels.error.message, /violates its configured bounds or uniqueness/u);
+    assert.equal(fixture.callCount(), 0);
+
+    const duplicateNestedObjects = await execute(ctx, schema.name, {
+      ...baseArguments,
+      selectors: [
+        { name: 'primary', filter: { active: true, labels: ['bug', 'feature'] } },
+        { filter: { labels: ['bug', 'feature'], active: true }, name: 'primary' },
+      ],
+    }, 'duplicate-nested-selectors', false);
+    assert.equal(duplicateNestedObjects.isError, true);
+    assert.match(duplicateNestedObjects.error.message, /violates its configured bounds or uniqueness/u);
+    assert.equal(fixture.callCount(), 0);
+
+    const unique = await execute(ctx, schema.name, baseArguments, 'unique-labels', false);
+    assert.equal(unique.isError, false);
     assert.equal(fixture.callCount(), 1);
   } finally {
     dispose();
