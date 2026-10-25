@@ -6,8 +6,14 @@
 
 import { createHash } from 'node:crypto';
 import type { Context } from '@deepseek-ai/cordis';
+import type { Agent } from '@deepseek-ai/dsh-agent';
 import { assertObjectJsonSchema } from '@deepseek-ai/dsh-tools';
-import type { JsonSchemaNode, ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools';
+import type {
+  JsonSchemaNode,
+  ToolDefinition,
+  ToolRunContext,
+  ToolExecutionResult,
+} from '@deepseek-ai/dsh-tools';
 import { isJsonValue, snapshotJsonValue } from '@deepseek-ai/dsh-util-values';
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
 import type { WorkAssistantBridge } from './work-tools.js';
@@ -33,6 +39,25 @@ const MAX_SCHEMA_BYTES = 64_000;
 const MAX_ARGUMENT_BYTES = 1_500_000;
 const MAX_RESULT_BYTES = 2_000_000;
 const MAX_CONTENT_BLOCKS = 512;
+const CODEBUDDY_ACP_EXCHANGE_TOOLS = [
+  'exchange_connections_list',
+  'exchange_authorization_health',
+  'exchange_reauthorization_start',
+  'exchange_reauthorization_status',
+  'exchange_cloud_resources_query',
+  'exchange_issue_query',
+  'exchange_issue_comment',
+  'exchange_issue_state_update',
+  'exchange_operation_read',
+] as const;
+const CODEBUDDY_ACP_READ_ONLY_CONTINUATION_TOOLS = new Set([
+  'exchange_connections_list',
+  'exchange_authorization_health',
+  'exchange_reauthorization_status',
+  'exchange_cloud_resources_query',
+  'exchange_issue_query',
+  'exchange_operation_read',
+]);
 
 const OUTPUT_SCHEMA = {
   type: 'object',
@@ -90,6 +115,85 @@ const connectorToolCatalogs = new WeakMap<Context, readonly ConnectorToolCatalog
 /** Read the canonical provider/tool map installed for this Context, without parsing opaque tool names. */
 export function getConnectorToolCatalog(ctx: Context): readonly ConnectorToolCatalogEntry[] {
   return connectorToolCatalogs.get(ctx) ?? [];
+}
+
+/** MCP projection of the fixed Exchange tools and bindings authorized by Navigator. */
+export interface CodeBuddyAcpToolSchema {
+  readonly name: string;
+  readonly description: string;
+  readonly inputSchema: JsonSchemaNode;
+}
+
+/** Return detached schemas for only registered Exchange and authorized connector tools. */
+export function getCodeBuddyAcpToolCatalog(ctx: Context): readonly CodeBuddyAcpToolSchema[] {
+  const authorizedConnectorTools = getConnectorToolCatalog(ctx).map(entry => {
+    const definition = ctx.tools.get(entry.name);
+    if (definition === undefined) throw new Error('Authorized connector tool registration is unavailable');
+    return {
+      name: entry.name,
+      description: definition.description,
+      inputSchema: structuredClone(definition.parameters),
+    };
+  });
+  const registeredExchangeTools = CODEBUDDY_ACP_EXCHANGE_TOOLS.flatMap(name => {
+    const definition = ctx.tools.get(name);
+    return definition === undefined ? [] : [{
+      name,
+      description: definition.description,
+      inputSchema: structuredClone(definition.parameters),
+    }];
+  });
+  return [...registeredExchangeTools, ...authorizedConnectorTools];
+}
+
+/** Run one existing Exchange tool definition with host validation and its existing authorization/receipt body. */
+export async function executeCodeBuddyAcpTool(
+  ctx: Context,
+  input: {
+    readonly name: string;
+    readonly arguments: Record<string, unknown>;
+    readonly callId: string;
+    readonly sessionId: string;
+    readonly signal: AbortSignal;
+    readonly readOnly: boolean;
+  },
+): Promise<ToolExecutionResult | undefined> {
+  const declared = getCodeBuddyAcpToolCatalog(ctx).find(item => item.name === input.name);
+  if (declared === undefined) return undefined;
+  if (input.readOnly && !CODEBUDDY_ACP_READ_ONLY_CONTINUATION_TOOLS.has(declared.name)) {
+    throw new Error('This authorization continuation is read-only; this tool is outside the approved read-only set.');
+  }
+  const definition = ctx.tools.get(declared.name);
+  if (definition === undefined || typeof definition.execute !== 'function') {
+    throw new Error('Authorized connector tool implementation is unavailable.');
+  }
+  const agent = {
+    id: input.sessionId,
+    session: { id: input.sessionId },
+    navigatorExecutionBackend: 'codebuddy-acp',
+  } as unknown as Agent;
+  const callId = input.callId as Parameters<typeof ctx.tools.execute>[0]['callId'];
+  try {
+    return await ctx.tools.execute({
+      name: declared.name,
+      callId,
+      rootCallId: callId,
+      arguments: input.arguments,
+      signal: input.signal,
+      agent,
+    });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : 'Connector tool execution failed.';
+    return toolExecutionFailure(declared.name, 'TOOL_EXECUTION_FAILED', message);
+  }
+}
+
+function toolExecutionFailure(name: string, code: string, message: string): ToolExecutionResult {
+  return {
+    isError: true,
+    error: { message, info: { name, code } },
+    content: [{ type: 'text', text: `Error: ${message}` }],
+  };
 }
 
 interface ProviderBinding {

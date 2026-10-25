@@ -5,7 +5,7 @@
 // └─────────────────────────────────────────────────────────────────────┘
 import { createHash, randomUUID } from 'node:crypto';
 import type { Context } from '@deepseek-ai/cordis';
-import type {} from '@deepseek-ai/dsh-agent';
+import type { Agent } from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-tools';
 import z from '@deepseek-ai/schemastery';
 import { SessionLogOffset } from '@deepseek-ai/dsh-session';
@@ -81,6 +81,10 @@ export default class CyreneSessionPersistence extends SessionPersistence {
     });
     ctx.on('tools/execute', async (execution, next) => {
       if (execution.agent) {
+        const backend = (execution.agent as Agent & { readonly navigatorExecutionBackend?: unknown }).navigatorExecutionBackend;
+        // ACP Work output and session identity are durable through Work; no DSH Session writer exists.
+        // 中文：ACP 输出和原生会话标识由 Work 持久化，不存在 DSH Session writer。
+        if (backend === 'codebuddy-acp') return next();
         const writer = this.writers.get(execution.agent.id);
         if (!writer) throw new SessionOwnershipLostError(execution.agent.id);
         // A tool must not start while its owning call exists only in volatile memory.

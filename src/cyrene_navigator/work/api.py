@@ -29,6 +29,8 @@ from cyrene_navigator.work.models import (
     ApprovalResolve,
     AttachmentCreate,
     AttachmentRecord,
+    BackendSessionBind,
+    BackendSessionRecord,
     ConnectorEventCreate,
     ConnectorEventReceipt,
     ConnectorEvents,
@@ -144,6 +146,21 @@ def mount_work_routes(
                 WORKSPACE_FORBIDDEN,
                 403,
                 "A trusted Workspace owner principal is required for connector login operations.",
+            )
+        return principal
+
+    def require_native_session_owner(request: Request, workspace_id: str) -> PersistencePrincipal:
+        """Keep native ACP session IDs behind the trusted Work writer.
+
+        中文：仅可信宿主可以读取或写入原生 ACP Session ID。
+        """
+
+        principal = authenticate(request, workspace_id)
+        if not principal.can_takeover:
+            raise PersistenceError(
+                WORKSPACE_FORBIDDEN,
+                403,
+                "A trusted Workspace owner principal is required for native session mappings.",
             )
         return principal
 
@@ -265,6 +282,38 @@ def mount_work_routes(
     def get_task(workspace_id: str, task_id: str, request: Request) -> dict[str, Any]:
         principal = principal_for(request, workspace_id)
         return store.get_task(principal.organization_id, workspace_id, task_id)
+
+    @app.get(
+        base + "/tasks/{task_id}/backend-session",
+        response_model=BackendSessionRecord | None,
+    )
+    def get_backend_session(
+        workspace_id: str,
+        task_id: str,
+        request: Request,
+        backend: str = Query(min_length=1, max_length=64),
+    ) -> dict[str, Any] | None:
+        principal = require_native_session_owner(request, workspace_id)
+        return store.get_backend_session(principal.organization_id, workspace_id, task_id, backend)
+
+    @app.put(
+        base + "/tasks/{task_id}/backend-session",
+        response_model=BackendSessionRecord,
+    )
+    def bind_backend_session(
+        workspace_id: str,
+        task_id: str,
+        body: BackendSessionBind,
+        request: Request,
+    ) -> dict[str, Any]:
+        principal = require_native_session_owner(request, workspace_id)
+        return store.bind_backend_session(
+            principal.organization_id,
+            workspace_id,
+            task_id,
+            body.backend,
+            body.native_session_id,
+        )
 
     @app.patch(base + "/tasks/{task_id}", response_model=TaskRecord)
     def patch_task(

@@ -409,6 +409,48 @@ test('WorkStateClient: requests use the configured workspace bearer and decode n
   }
 });
 
+test('WorkStateClient reads and binds the native session through the active Work Task', async () => {
+  const previousToken = process.env.CYRENE_SESSION_TOKEN;
+  process.env.CYRENE_SESSION_TOKEN = 'work-test-token';
+  const seen = [];
+  const server = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = Buffer.concat(chunks).toString('utf8');
+    seen.push({ url: req.url, method: req.method, authorization: req.headers.authorization, body });
+    res.setHeader('Content-Type', 'application/json');
+    if (req.method === 'GET' && req.url === '/api/v1/workspaces/acme/work/tasks/task-1/backend-session?backend=codebuddy-acp') {
+      res.end('null');
+      return;
+    }
+    if (req.method === 'PUT' && req.url === '/api/v1/workspaces/acme/work/tasks/task-1/backend-session') {
+      res.end(JSON.stringify({
+        backend: 'codebuddy-acp', sessionId: 'work-session', nativeSessionId: 'native-session',
+      }));
+      return;
+    }
+    res.writeHead(404).end(JSON.stringify({ code: 'WORK_TASK_NOT_FOUND' }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const client = new WorkStateClient({ baseUrl: `http://127.0.0.1:${server.address().port}`, workspaceId: 'acme' });
+    assert.equal(await client.getBackendSession('task-1'), undefined);
+    assert.deepEqual(await client.bindBackendSession('task-1', 'native-session'), {
+      backend: 'codebuddy-acp', sessionId: 'work-session', nativeSessionId: 'native-session',
+    });
+    assert.deepEqual(seen.map(row => [row.method, row.url]), [
+      ['GET', '/api/v1/workspaces/acme/work/tasks/task-1/backend-session?backend=codebuddy-acp'],
+      ['PUT', '/api/v1/workspaces/acme/work/tasks/task-1/backend-session'],
+    ]);
+    assert.deepEqual(JSON.parse(seen[1].body), { backend: 'codebuddy-acp', nativeSessionId: 'native-session' });
+    assert.ok(seen.every(row => row.authorization === 'Bearer work-test-token'));
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+    if (previousToken === undefined) delete process.env.CYRENE_SESSION_TOKEN;
+    else process.env.CYRENE_SESSION_TOKEN = previousToken;
+  }
+});
+
 test('WorkStateClient reads consecutive persisted Teams messages with line breaks', async () => {
   const tenantId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
   const ownerId = '11111111-1111-4111-8111-111111111111';

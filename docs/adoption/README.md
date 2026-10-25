@@ -18,6 +18,10 @@ real upstream packages.
 - CodeBuddy LLM turns use restricted structured output; the existing DSH
   AgentLoop remains the sole executor and returned tool arguments are checked
   against the active catalog before a DSH tool-call block is emitted.
+- The explicit `codebuddy-acp` task backend runs the official CodeBuddy ACP
+  stdio process without a DSH reasoning loop. Navigator retains Work/session
+  ownership and exposes only host-authorized Exchange tools through a task-local
+  MCP bridge that reuses the existing authorization and receipt path.
 
 The native host is launched through `CYRENE_NATIVE_HOST`. It has no external
 Platform tool or source dependency. Its implemented methods are reported by the
@@ -42,6 +46,17 @@ local fake CLI and establish process flags, DSH history serialization, schema
 validation, terminal-result checks, timeout, and cancellation; they do not
 claim a credentialed model call.
 
+`CYRENE_HARNESS_EXECUTION_BACKEND` defaults to `dsh`; `codebuddy-acp` is a
+separate top-level execution choice and ignores the legacy model-source selector.
+It requires empty `CYRENE_HARNESS_MODEL_SOURCE` and `CYRENE_HARNESS_MODEL`, a
+false CodeBuddy fallback setting, and the explicit
+`CYRENE_HARNESS_CODEBUDDY_NO_PAID_TOPUP=true` deployment declaration. The
+vendor CLI has no setting that enforces a no-top-up billing rule, so this
+declaration is not a billing guarantee. Local stub tests verify ACP, strict MCP,
+permission denial, bounded child environment, Work receipts, cancellation,
+restart loading, EOF, and process-exit behavior. They do not prove CodeBuddy
+login or model billing.
+
 The native supervisor matrix retains cancellation, reaping, protocol-version,
 bounded-output, and credential-isolation checks. Its controlled fault fixture
 only tests the transport; Codex import still crosses the real Navigator Rust host.
@@ -65,6 +80,7 @@ explicit, reviewable adapter; it must not be hidden in an installation script.
 - 客户端交付反馈会将已提交输入与持久化回执关联，并保留失败输入供用户显式恢复。
 - Compaction 只在 compaction 请求中移除工具声明；输出不含文本时按 fail-closed 处理。
 - CodeBuddy LLM 调用只使用受限结构化输出；现有 DSH AgentLoop 仍是唯一工具执行者，并且在发出 DSH tool-call block 前按当前工具目录检查工具名和参数。
+- 显式 `codebuddy-acp` Work Task backend 使用官方 ACP stdio 进程，不套 DSH reasoning loop。Navigator 继续拥有 Work/session 状态，并通过任务级 MCP bridge 只公开宿主授权的 Exchange 工具，复用现有授权与回执路径。
 
 原生宿主通过 `CYRENE_NATIVE_HOST` 启动，不依赖外部 Platform 工具或源码。实现的方法由 `hello` 握手报告，范围仅限 Navigator 所有的操作。
 
@@ -75,6 +91,8 @@ Profile 测试使用真实固定版本 Harness CLI、Bundle、Rust host 和本�
 原生 supervisor 矩阵保留取消、回收、协议版本、有界输出和凭据隔离检查。受控故障 fixture 只验证传输；Codex 导入仍通过真实 Navigator Rust host。
 
 `CYRENE_HARNESS_MODEL_SOURCE` 为兼容旧部署默认 `exchange`，也可选择 `codebuddy` 或 `antigravity`。Antigravity 默认使用 `gemini-3.8-flash-medium`，要求服务 HOME 中存在固定的纯模型 agent profile；若设置 `CYRENE_HARNESS_MODEL`，其值必须属于 allowlist。生产 Docker executor 通过 `node scripts/serve-executor.mjs` 选择该 adapter；独立的 Python local-stack launcher 目前尚未接入。CodeBuddy adapter 默认模型为 `glm-5.3-flash`，并提供 `deepseek-v4.1-flash`。重点 adapter 测试用本地 fake CLI 验证进程参数、DSH 历史序列化、schema 校验、终态检查、超时和取消；这些测试不代表进行了带凭据的真实模型调用。
+
+`CYRENE_HARNESS_EXECUTION_BACKEND` 默认 `dsh`；`codebuddy-acp` 是独立的顶层执行选择，并忽略旧 model-source selector。ACP 要求 `CYRENE_HARNESS_MODEL_SOURCE` 与 `CYRENE_HARNESS_MODEL` 为空、CodeBuddy fallback 为 false，并显式声明 `CYRENE_HARNESS_CODEBUDDY_NO_PAID_TOPUP=true`。供应商 CLI 没有可强制禁止使用已购 credits 的设置，因此该声明不构成扣费保证。本地 stub 测试覆盖 ACP、strict MCP、权限拒绝、子进程环境隔离、Work 回执、取消、重启加载、EOF 和进程退出；不代表完成真实 CodeBuddy 登录或模型计费验收。
 
 生成的 Profile 清单是 lockfile 组合快照。Profile patch 或上游 pin 变化时必须重新生成，不能把它作为运行成功证据。
 

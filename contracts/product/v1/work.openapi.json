@@ -258,6 +258,55 @@
         "title": "AttachmentRecord",
         "type": "object"
       },
+      "BackendSessionBind": {
+        "additionalProperties": false,
+        "description": "Bind one Work Task's session to a native execution session. | \u7ed1\u5b9a\u539f\u751f\u6267\u884c\u4f1a\u8bdd\u3002",
+        "properties": {
+          "backend": {
+            "const": "codebuddy-acp",
+            "title": "Backend",
+            "type": "string"
+          },
+          "nativeSessionId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Nativesessionid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "backend",
+          "nativeSessionId"
+        ],
+        "title": "BackendSessionBind",
+        "type": "object"
+      },
+      "BackendSessionRecord": {
+        "additionalProperties": false,
+        "description": "Workspace-scoped native session identity owned by Navigator.\n\n\u4e2d\u6587\uff1a\u7531 Navigator \u62e5\u6709\u5e76\u6309 Workspace \u9694\u79bb\u7684\u539f\u751f\u4f1a\u8bdd\u6807\u8bc6\u3002",
+        "properties": {
+          "backend": {
+            "const": "codebuddy-acp",
+            "title": "Backend",
+            "type": "string"
+          },
+          "nativeSessionId": {
+            "title": "Nativesessionid",
+            "type": "string"
+          },
+          "sessionId": {
+            "title": "Sessionid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "backend",
+          "sessionId",
+          "nativeSessionId"
+        ],
+        "title": "BackendSessionRecord",
+        "type": "object"
+      },
       "ConnectorEventCreate": {
         "additionalProperties": false,
         "description": "Register one connector event and optional atomic task admission. | \u8fde\u63a5\u4e8b\u4ef6\u3002",
@@ -6190,6 +6239,129 @@
           }
         },
         "summary": "Create Approval"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/tasks/{task_id}/backend-session": {
+      "get": {
+        "operationId": "get_backend_session_api_v1_workspaces__workspace_id__work_tasks__task_id__backend_session_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "backend",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "minLength": 1,
+              "title": "Backend",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/BackendSessionRecord"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Response Get Backend Session Api V1 Workspaces  Workspace Id  Work Tasks  Task Id  Backend Session Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Backend Session"
+      },
+      "put": {
+        "operationId": "bind_backend_session_api_v1_workspaces__workspace_id__work_tasks__task_id__backend_session_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BackendSessionBind"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackendSessionRecord"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Bind Backend Session"
       }
     },
     "/api/v1/workspaces/{workspace_id}/work/tasks/{task_id}/claim": {

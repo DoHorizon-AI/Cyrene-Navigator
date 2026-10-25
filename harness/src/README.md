@@ -128,6 +128,48 @@ in-memory Agent sessions keep their captured selection; new sessions use the
 configured source. After a service restart, a persisted session is resumed with
 the currently configured model selection and its prior history.
 
+## Native CodeBuddy ACP execution
+
+`CYRENE_HARNESS_EXECUTION_BACKEND` selects the top-level Work Task executor and
+defaults to `dsh`. Set it to `codebuddy-acp` to run one native CodeBuddy ACP
+process per Work Task. This is independent of `CYRENE_HARNESS_MODEL_SOURCE`; the
+ACP mode does not install the DSH `AgentLoop` or DSH LLM adapters. Leave
+`CYRENE_HARNESS_MODEL_SOURCE` and `CYRENE_HARNESS_MODEL` unset or empty, set
+`CYRENE_HARNESS_CODEBUDDY_FALLBACK_ENABLED=false`, and declare
+`CYRENE_HARNESS_CODEBUDDY_NO_PAID_TOPUP=true`. The last setting is a deployment
+declaration only: CodeBuddy CLI does not provide a switch that technically
+blocks consumption of purchased credits. Optional
+`CYRENE_HARNESS_CODEBUDDY_ACP_MODEL` accepts only `glm-5.3-flash` or
+`deepseek-v4.1-flash` and defaults to `glm-5.3-flash`. The command selector
+`CYRENE_HARNESS_CODEBUDDY_ACP_COMMAND` accepts only `codebuddy`.
+
+Navigator starts CodeBuddy with `--acp --acp-transport stdio --agent cli`,
+`--permission-mode default`, `--tools ""`, `--strict-mcp-config`, fixed
+`--setting-sources project,local`, fixed `--settings` that disable hooks and add
+no enabled plugins, a host-created `--mcp-config` file, and the allowlisted
+model. The CLI uses one stable private workspace under its configured profile;
+caller-selected project paths do not reach ACP. Each task's configuration sits
+below that workspace in a private `0700` directory as a `0600` file, contains
+one Navigator-owned loopback MCP bridge, and is removed after process cleanup.
+Its MCP token stays out of argv,
+prompt content, and Work events; only the dedicated MCP stdio child receives the
+bridge endpoint and token. The CodeBuddy process receives only its HOME/profile
+path, PATH, locale, proxy, and certificate settings. Work, Exchange, Directory,
+authority, and Docker credentials are removed. Built-in shell, file, and
+terminal tools are disabled, and strict MCP configuration discards user and
+project MCP servers.
+
+The bridge exposes the registered Exchange tools and the connector tools in the
+host-authorized Exchange catalog, including configured computer bindings. Each
+call follows the existing Navigator schema, actor and target checks, approvals,
+Exchange grant, and Work operation receipt path. Native ACP session IDs live in
+the existing Workspace-scoped Work SQLite database, keyed by Navigator Work
+Session. Restarts require `session/load`; Navigator never substitutes a Work or
+legacy DSH Session ID. Legacy DSH history is not imported or replayed. A new ACP
+session receives an explicit fresh-context instruction, and its native ID is
+stored before the user prompt. Local protocol-stub tests verify this adapter
+boundary; they do not prove a credentialed CodeBuddy login or model call.
+
 Foreground chat and background responsibilities use separate durable DSH
 Sessions. Foreground work has its own bounded task and model-call lane, while at
 most one background task runs at a time. `CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS`
@@ -163,6 +205,36 @@ Agent 完成当前 Session。
 可用性故障可让同一 DSH 模型步骤使用显式配置的备用路由重试；持久化请求和用量事件会记录实际调用的 provider
 与 model。用量记录只保留供应商返回的 token 数。已经驻留内存的 Agent Session 保持当前选择；新 Session
 使用已配置的主路由。服务重启后，持久化 Session 会在恢复原历史的同时使用当前配置的模型选择。
+
+## CodeBuddy 原生 ACP 主执行
+
+`CYRENE_HARNESS_EXECUTION_BACKEND` 选择 Work Task 的顶层执行器，默认 `dsh`。
+设为 `codebuddy-acp` 后，每个 Work Task 由 CodeBuddy 原生 ACP 子进程执行；它与
+`CYRENE_HARNESS_MODEL_SOURCE` 分离，该模式不会安装 DSH `AgentLoop` 或 LLM adapter。
+`CYRENE_HARNESS_MODEL_SOURCE` 和 `CYRENE_HARNESS_MODEL` 应未设置或为空，
+`CYRENE_HARNESS_CODEBUDDY_FALLBACK_ENABLED=false`，并声明
+`CYRENE_HARNESS_CODEBUDDY_NO_PAID_TOPUP=true`。最后一项只是部署声明；CodeBuddy CLI
+没有能从技术上阻止使用已购 credits 的配置。可选的
+`CYRENE_HARNESS_CODEBUDDY_ACP_MODEL` 仅接受 `glm-5.3-flash` 或
+`deepseek-v4.1-flash`，默认 `glm-5.3-flash`；
+`CYRENE_HARNESS_CODEBUDDY_ACP_COMMAND` 仅接受 `codebuddy`。
+
+Navigator 固定以 `--acp --acp-transport stdio --agent cli`、`--permission-mode default`、
+`--tools ""`、`--strict-mcp-config`、`--setting-sources project,local`、禁用 hooks 且不添加已启用插件的固定
+`--settings`、宿主生成的 `--mcp-config` 文件和 allowlist 模型启动 CodeBuddy。CLI 使用其配置 profile 下稳定的私有 workspace；
+调用方指定的项目路径不会传给 ACP。每任务配置保存在 workspace 下权限为 `0700` 的私有目录和权限为
+`0600` 的文件中，只包含一个 Navigator 所有的 loopback MCP bridge，进程清理后移除。MCP token
+不进入 argv、prompt 或 Work event；只有专用 MCP stdio 子进程会收到 bridge endpoint 和 token。
+CodeBuddy 子进程只接收 HOME/profile 路径、PATH、locale、代理和证书设置。Work、Exchange、Directory、
+Authority 与 Docker 凭据都会清除。原生 shell、file 与 terminal 工具被禁用；strict MCP 配置会丢弃用户和项目级 MCP。
+
+Bridge 仅公开已注册的 Exchange 工具以及宿主 Exchange 授权目录内的连接器工具，包括已配置的
+computer binding。每次调用仍执行现有 Navigator schema、actor/target 校验、审批、Exchange grant
+与 Work operation receipt 路径。原生 ACP Session ID 保存在现有 Workspace-scoped Work SQLite
+数据库中，并以 Navigator Work Session 为键。进程重启必须使用 `session/load`；Navigator 不会拿
+Work 或旧 DSH Session ID 代替。旧 DSH 历史不导入、不重放。新 ACP Session 会收到明确的新上下文
+提示，并在发送用户 prompt 前写入原生 ID。本地协议 stub 测试只验证适配器边界，不代表已完成
+CodeBuddy 登录或模型调用。
 
 前台聊天和后台责任任务使用不同的持久 DSH Session。前台任务和模型调用有独立的有界槽位，后台同时最多运行一个任务。
 `CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS` 限制活动任务总数，默认值为 `2`，并且必须至少为 `2`，以便后台槽位繁忙时仍保留一个前台槽位；排队的前台任务优先于排队的后台任务。

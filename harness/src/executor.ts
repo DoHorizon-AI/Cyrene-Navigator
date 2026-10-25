@@ -36,6 +36,7 @@ import {
   nextFallbackRoute,
 } from './model-policy.js';
 import type { ModelRoute } from './model-policy.js';
+import type { ConversationExecutionBackend } from './codebuddy-acp-execution.js';
 
 export type TaskStatus = ExecutionStatus;
 export type TaskExecutionClass = 'foreground' | 'background';
@@ -129,6 +130,8 @@ export interface ExecutorConfig {
   /** Real configured provider routes to use only after a provider availability failure. */
   readonly modelFallbacks?: readonly ModelRoute[];
   readonly workState: WorkStateStore;
+  /** Optional top-level conversation engine; omission preserves the DSH AgentLoop backend. */
+  readonly conversationBackend?: ConversationExecutionBackend;
   readonly workspaceId: string;
   readonly authTokenEnv?: string;
   readonly allowedOrigins?: readonly string[];
@@ -750,6 +753,10 @@ export class NavigatorExecutor {
         type: 'status', taskId: task.id, sessionId: task.sessionId, status: 'running', timestamp: startedAt,
       });
 
+      if (this.config.conversationBackend !== undefined) {
+        return await this.runConversationBackendTask(task, params);
+      }
+
       const agents = this.ctx.get('agents');
       const sessions = this.ctx.get('sessions');
       const defaultModel = this.ctx.get('agentDefaultModel');
@@ -917,6 +924,66 @@ export class NavigatorExecutor {
       disposeContinuationGuard?.();
       if (timeoutId !== undefined) clearTimeout(timeoutId);
     }
+  }
+
+  /** Execute one host-owned backend turn while preserving the same durable Work lifecycle. */
+  private async runConversationBackendTask(task: InternalTaskState, params: ExecuteTaskParams): Promise<TaskOutcome> {
+    const backend = this.config.conversationBackend;
+    if (backend === undefined) throw new Error('The configured conversation backend is unavailable');
+    this.activeTaskBySessionId.set(task.sessionId, task.id);
+    const result = await backend.execute({
+      taskId: task.id,
+      sessionId: task.sessionId,
+      prompt: params.prompt,
+      signal: task.abortController.signal,
+      readOnly: isReadOnlyContinuation(task.record),
+      onText: text => {
+        task.output += text;
+        this.publish(task, { type: 'text-delta', taskId: task.id, text, timestamp: Date.now() });
+        void this.patch(task, { output: task.output }).catch(() => undefined);
+      },
+      onToolCall: event => this.publish(task, {
+        type: 'tool-call', taskId: task.id, callId: event.callId, tool: event.name,
+        args: event.arguments, timestamp: Date.now(),
+      }),
+      onToolResult: event => this.publish(task, {
+        type: 'tool-result', taskId: task.id, callId: event.callId,
+        result: event.result, isError: event.isError, timestamp: Date.now(),
+      }),
+    });
+    task.output = result.output;
+    await this.flushEvents(task);
+    await this.flushPatches(task);
+    task.abortController.signal.throwIfAborted();
+    const latest = await this.config.workState.getTask(task.id);
+    if (latest) task.record = latest;
+    if (PAUSED_STATUSES.has(task.record.status)) {
+      const finishedAt = Date.now();
+      await this.publish(task, {
+        type: 'finish', taskId: task.id, status: task.record.status,
+        output: task.record.output, durationMs: Math.max(0, finishedAt - (task.record.startedAt ?? task.record.createdAt)),
+        timestamp: finishedAt,
+      });
+      await this.flushEvents(task);
+      return outcome(task.record);
+    }
+    if (TERMINAL_STATUSES.has(task.record.status)) return outcome(task.record);
+
+    const finishedAt = Date.now();
+    const durationMs = Math.max(0, finishedAt - (task.record.startedAt ?? task.record.createdAt));
+    task.record = await this.config.workState.patchTask(task.id, {
+      status: 'completed', output: task.output, reasoning: '',
+    });
+    await this.publish(task, {
+      type: 'status', taskId: task.id, sessionId: task.sessionId,
+      status: 'completed', timestamp: finishedAt,
+    });
+    await this.publish(task, {
+      type: 'finish', taskId: task.id, status: 'completed', output: task.output,
+      durationMs, timestamp: finishedAt,
+    });
+    await this.flushEvents(task);
+    return outcome(task.record);
   }
 
   private deliver(task: InternalTaskState, event: ExecutorStreamEvent): void {
@@ -1256,12 +1323,13 @@ export class NavigatorExecutor {
     await this.publish(task, event);
   }
 
-  /** Resolve the active executor task for one DSH Session, preserving Work Task ownership at tool boundaries.  中文：按 DSH Session 查找活动执行任务，供工具绑定 Work Task authority。 */
+  /** Resolve the active Work task for one Navigator Session at tool boundaries.  中文：按 Navigator Session 查找活动任务并绑定 Work authority。 */
   activeTaskId(sessionId: string): string | undefined {
-    for (const task of this.tasks.values()) {
-      if (task.sessionId === sessionId && task.agent && !TERMINAL_STATUSES.has(task.record.status)) return task.id;
-    }
-    return undefined;
+    const taskId = this.activeTaskBySessionId.get(sessionId);
+    if (taskId === undefined) return undefined;
+    const task = this.tasks.get(taskId);
+    if (!task || task.sessionId !== sessionId || TERMINAL_STATUSES.has(task.record.status)) return undefined;
+    return task.agent !== undefined || this.config.conversationBackend !== undefined ? task.id : undefined;
   }
 
   /** Resolve the active Work Task scheduling class for a DSH model request. */

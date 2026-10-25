@@ -55,6 +55,8 @@ import { readCodeBuddyFallbackConfig } from './model-policy.js';
 import { PrioritizedModelAdapter, PrioritizedModelGate } from './model-gate.js';
 import { registerSubagents } from './subagents/index.js';
 import type { SubagentAdapterConfig, SubagentAdapterEvent } from './subagents/types.js';
+import { CodeBuddyAcpExecutionBackend, validateCodeBuddyModel } from './codebuddy-acp-execution.js';
+import type { ConversationExecutionBackend } from './codebuddy-acp-execution.js';
 import { WorkflowsClient } from './workflows/store.js';
 import { registerWorkflowRuntime } from './workflows/runtime.js';
 import { registerCloudConnections, validateCloudConnectionConfig } from './integrations/cloud-connections.js';
@@ -118,6 +120,8 @@ export interface CreateExecutorAppOptions {
   readonly backgroundTaskAuthority?: BackgroundTaskAuthorizationResolver;
   /** Host-approved repository/action list for owner responsibility commands. */
   readonly responsibilityTargets?: readonly ResponsibilityTargetConfig[];
+  /** Test-only override for backend selection; production uses CYRENE_HARNESS_EXECUTION_BACKEND. */
+  readonly executionBackend?: 'dsh' | 'codebuddy-acp';
 }
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -134,6 +138,7 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
     throw new Error('Custom test model adapters require explicit testMode');
   }
   if (options.enableTestEchoAdapter && !testMode) throw new Error('The echo adapter is test-only');
+  const executionBackend = resolveExecutionBackend(options.executionBackend, testMode);
 
   const persistenceUrl = options.persistenceUrl ?? process.env.CYRENE_PERSISTENCE_URL;
   const workspaceId = options.workspaceId ?? process.env.CYRENE_WORKSPACE_ID;
@@ -226,7 +231,7 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
 
   // Core Cordis runtime and Agent loop
   await ctx.plugin(LocalSubprocessRuntime);
-  await ctx.plugin(LlmRuntime);
+  if (executionBackend === 'dsh') await ctx.plugin(LlmRuntime);
   await ctx.plugin(SessionStore);
   await ctx.plugin(SessionProjectionRegistry);
   await ctx.plugin(SystemPrompt);
@@ -272,97 +277,134 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
     });
   }
 
-  await ctx.plugin(AgentLoop, { agents: [] });
+  if (executionBackend === 'dsh') await ctx.plugin(AgentLoop, { agents: [] });
 
-  // LLM Model Adapter setup
-  const exchangeUrl = options.exchangeUrl ?? process.env.CYRENE_EXCHANGE_URL;
-  const configuredModelSource = options.modelSource ?? process.env.CYRENE_HARNESS_MODEL_SOURCE ?? 'antigravity';
-  if (configuredModelSource !== 'exchange'
-    && configuredModelSource !== 'codebuddy'
-    && configuredModelSource !== 'antigravity') {
-    throw new Error('CYRENE_HARNESS_MODEL_SOURCE must be exchange, codebuddy or antigravity');
-  }
-  const modelId = options.model
-    ?? process.env.CYRENE_HARNESS_MODEL
-    ?? (configuredModelSource === 'codebuddy'
-      ? 'glm-5.3-flash'
-      : configuredModelSource === 'antigravity'
-        ? DEFAULT_ANTIGRAVITY_MODEL
-        : testMode ? 'test-model' : undefined);
-  const codeBuddyFallback = readCodeBuddyFallbackConfig(process.env);
-  if (codeBuddyFallback.enabled && configuredModelSource !== 'antigravity') {
-    throw new TypeError('CodeBuddy fallback is supported only when Antigravity is the primary model source');
-  }
-  if (options.modelFallbacks !== undefined && !testMode) {
-    throw new Error('Explicit model fallback routes are test-only; production fallbacks come from host configuration');
-  }
-  const modelFallbacks = options.modelFallbacks ?? (!options.customLlmAdapter
-    && codeBuddyFallback.enabled && codeBuddyFallback.model !== undefined
-    ? [{ provider: 'codebuddy', model: codeBuddyFallback.model }]
-    : []);
-  const modelGate = new PrioritizedModelGate();
-  const prioritized = (adapter: LlmAdapter): LlmAdapter => new PrioritizedModelAdapter(
-    adapter,
-    modelGate,
-    sessionId => ctx.get('executor')?.executionClassForSession(sessionId) ?? 'foreground',
-  );
-
-  if (configuredModelSource === 'exchange' && exchangeUrl) {
-    const exchangeToken = process.env.CYRENE_EXCHANGE_TOKEN;
-    if (!exchangeToken) throw new Error('CYRENE_EXCHANGE_TOKEN is required when Exchange is configured');
-    if (!modelId) throw new Error('CYRENE_HARNESS_MODEL is required when Exchange is configured');
-    ctx.llm.registerAdapter(['cyrene-exchange'], prioritized(new ExchangeLlmAdapter({
-      baseUrl: exchangeUrl,
-      tokenEnv: 'CYRENE_EXCHANGE_TOKEN',
-      requestTimeoutMs: 120_000,
-    })));
-    ctx.provide('agentDefaultModel', {
-      currentSelection: () => ({ provider: 'cyrene-exchange', model: modelId }),
-    });
-  } else if (options.customLlmAdapter) {
-    const custom = options.customLlmAdapter;
-    ctx.llm.registerAdapter([custom.provider], prioritized(custom.adapter));
-    for (const fixture of options.customTestModelAdapters ?? []) {
-      ctx.llm.registerAdapter([fixture.provider], prioritized(fixture.adapter));
+  // Model source remains a DSH-only setting; ACP has its own native profile.
+  let modelFallbacks: readonly ModelRoute[] = [];
+  let codeBuddyAcpModel: string | undefined;
+  let codeBuddyAcpCommand = 'codebuddy';
+  if (executionBackend === 'codebuddy-acp') {
+    const modelSource = options.modelSource ?? process.env.CYRENE_HARNESS_MODEL_SOURCE;
+    const legacyModel = options.model ?? process.env.CYRENE_HARNESS_MODEL;
+    if (modelSource !== undefined && modelSource !== '') {
+      throw new Error('CYRENE_HARNESS_MODEL_SOURCE must be unset or empty when CYRENE_HARNESS_EXECUTION_BACKEND=codebuddy-acp');
     }
-    ctx.provide('agentDefaultModel', {
-      currentSelection: () => ({ provider: custom.provider, model: modelId! }),
-    });
-  } else if (configuredModelSource === 'codebuddy') {
-    ctx.llm.registerAdapter(['codebuddy'], prioritized(new CodeBuddyLlmAdapter()));
-    ctx.provide('agentDefaultModel', {
-      currentSelection: () => ({ provider: 'codebuddy', model: modelId! }),
-    });
-  } else if (configuredModelSource === 'antigravity') {
-    const antigravityAdapter = new AntigravityLlmAdapter();
-    await antigravityAdapter.resolveModel('antigravity', modelId!);
-    ctx.llm.registerAdapter(['antigravity'], prioritized(antigravityAdapter));
-    // Existing in-memory CodeBuddy Agents retain their original provider selection.
-    ctx.llm.registerAdapter(['codebuddy'], prioritized(new CodeBuddyLlmAdapter()));
-    ctx.provide('agentDefaultModel', {
-      currentSelection: () => ({ provider: 'antigravity', model: modelId! }),
-    });
-  } else if (testMode && options.enableTestEchoAdapter === true) {
-    // Explicit test-only deterministic adapter; it is never the production default.
-    class CloudDefaultAdapter extends LlmAdapter {
-      async *stream(genOptions: GenerateOptions): AsyncGenerator<StreamChunk> {
-        const prompt = genOptions.messages?.at(-1)?.content?.[0]?.type === 'text'
-          ? (genOptions.messages.at(-1)?.content?.[0] as { type: 'text'; text: string }).text
-          : 'acknowledged';
-        const reply = `[Cloud Executor] Task processed: "${prompt}"`;
-        yield { type: 'block-start', index: 0, blockType: 'text' };
-        yield { type: 'text-delta', index: 0, text: reply };
-        yield { type: 'block-end', index: 0, block: { type: 'text', text: reply } };
-        yield { type: 'usage', usage: { inputTokens: 20, outputTokens: reply.length, totalTokens: 20 + reply.length } };
-        yield { type: 'finish', reason: { kind: 'stop' } };
+    if (legacyModel !== undefined && legacyModel !== '') {
+      throw new Error('CYRENE_HARNESS_MODEL must be unset or empty when CYRENE_HARNESS_EXECUTION_BACKEND=codebuddy-acp');
+    }
+    if (options.customLlmAdapter || options.customTestModelAdapters !== undefined || options.enableTestEchoAdapter) {
+      throw new Error('DSH LLM adapters cannot be configured with the CodeBuddy ACP execution backend');
+    }
+    if (options.modelFallbacks !== undefined) {
+      throw new Error('DSH model fallbacks cannot be configured with the CodeBuddy ACP execution backend');
+    }
+    if (subagentConfigPath !== undefined) {
+      throw new Error('DSH subagents cannot be configured with the CodeBuddy ACP execution backend');
+    }
+    const fallbackPolicy = readCodeBuddyFallbackConfig(process.env);
+    if (fallbackPolicy.enabled) {
+      throw new Error('CYRENE_HARNESS_CODEBUDDY_FALLBACK_ENABLED must be false with the CodeBuddy ACP execution backend');
+    }
+    if (!fallbackPolicy.noPaidTopUp) {
+      throw new Error('CYRENE_HARNESS_CODEBUDDY_NO_PAID_TOPUP=true is required as an explicit ACP deployment policy');
+    }
+    const configuredCommand = process.env.CYRENE_HARNESS_CODEBUDDY_ACP_COMMAND;
+    if (configuredCommand !== undefined && configuredCommand !== '' && configuredCommand !== 'codebuddy') {
+      throw new Error('CYRENE_HARNESS_CODEBUDDY_ACP_COMMAND only allows the codebuddy executable');
+    }
+    codeBuddyAcpCommand = configuredCommand || 'codebuddy';
+    codeBuddyAcpModel = validateCodeBuddyModel(process.env.CYRENE_HARNESS_CODEBUDDY_ACP_MODEL);
+  } else {
+    // DSH LLM Model Adapter setup
+    const exchangeUrl = options.exchangeUrl ?? process.env.CYRENE_EXCHANGE_URL;
+    const configuredModelSource = options.modelSource ?? (process.env.CYRENE_HARNESS_MODEL_SOURCE || 'antigravity');
+    if (configuredModelSource !== 'exchange'
+      && configuredModelSource !== 'codebuddy'
+      && configuredModelSource !== 'antigravity') {
+      throw new Error('CYRENE_HARNESS_MODEL_SOURCE must be exchange, codebuddy or antigravity');
+    }
+    const modelId = options.model
+      ?? (process.env.CYRENE_HARNESS_MODEL || undefined)
+      ?? (configuredModelSource === 'codebuddy'
+        ? 'glm-5.3-flash'
+        : configuredModelSource === 'antigravity'
+          ? DEFAULT_ANTIGRAVITY_MODEL
+          : testMode ? 'test-model' : undefined);
+    const codeBuddyFallback = readCodeBuddyFallbackConfig(process.env);
+    if (codeBuddyFallback.enabled && configuredModelSource !== 'antigravity') {
+      throw new TypeError('CodeBuddy fallback is supported only when Antigravity is the primary model source');
+    }
+    if (options.modelFallbacks !== undefined && !testMode) {
+      throw new Error('Explicit model fallback routes are test-only; production fallbacks come from host configuration');
+    }
+    modelFallbacks = options.modelFallbacks ?? (!options.customLlmAdapter
+      && codeBuddyFallback.enabled && codeBuddyFallback.model !== undefined
+      ? [{ provider: 'codebuddy', model: codeBuddyFallback.model }]
+      : []);
+    const modelGate = new PrioritizedModelGate();
+    const prioritized = (adapter: LlmAdapter): LlmAdapter => new PrioritizedModelAdapter(
+      adapter,
+      modelGate,
+      sessionId => ctx.get('executor')?.executionClassForSession(sessionId) ?? 'foreground',
+    );
+
+    if (configuredModelSource === 'exchange' && exchangeUrl) {
+      const exchangeToken = process.env.CYRENE_EXCHANGE_TOKEN;
+      if (!exchangeToken) throw new Error('CYRENE_EXCHANGE_TOKEN is required when Exchange is configured');
+      if (!modelId) throw new Error('CYRENE_HARNESS_MODEL is required when Exchange is configured');
+      ctx.llm.registerAdapter(['cyrene-exchange'], prioritized(new ExchangeLlmAdapter({
+        baseUrl: exchangeUrl,
+        tokenEnv: 'CYRENE_EXCHANGE_TOKEN',
+        requestTimeoutMs: 120_000,
+      })));
+      ctx.provide('agentDefaultModel', {
+        currentSelection: () => ({ provider: 'cyrene-exchange', model: modelId }),
+      });
+    } else if (options.customLlmAdapter) {
+      const custom = options.customLlmAdapter;
+      ctx.llm.registerAdapter([custom.provider], prioritized(custom.adapter));
+      for (const fixture of options.customTestModelAdapters ?? []) {
+        ctx.llm.registerAdapter([fixture.provider], prioritized(fixture.adapter));
       }
+      ctx.provide('agentDefaultModel', {
+        currentSelection: () => ({ provider: custom.provider, model: modelId! }),
+      });
+    } else if (configuredModelSource === 'codebuddy') {
+      ctx.llm.registerAdapter(['codebuddy'], prioritized(new CodeBuddyLlmAdapter()));
+      ctx.provide('agentDefaultModel', {
+        currentSelection: () => ({ provider: 'codebuddy', model: modelId! }),
+      });
+    } else if (configuredModelSource === 'antigravity') {
+      const antigravityAdapter = new AntigravityLlmAdapter();
+      await antigravityAdapter.resolveModel('antigravity', modelId!);
+      ctx.llm.registerAdapter(['antigravity'], prioritized(antigravityAdapter));
+      // Existing in-memory CodeBuddy Agents retain their original provider selection.
+      ctx.llm.registerAdapter(['codebuddy'], prioritized(new CodeBuddyLlmAdapter()));
+      ctx.provide('agentDefaultModel', {
+        currentSelection: () => ({ provider: 'antigravity', model: modelId! }),
+      });
+    } else if (testMode && options.enableTestEchoAdapter === true) {
+      // Explicit test-only deterministic adapter; it is never the production default.
+      class CloudDefaultAdapter extends LlmAdapter {
+        async *stream(genOptions: GenerateOptions): AsyncGenerator<StreamChunk> {
+          const prompt = genOptions.messages?.at(-1)?.content?.[0]?.type === 'text'
+            ? (genOptions.messages.at(-1)?.content?.[0] as { type: 'text'; text: string }).text
+            : 'acknowledged';
+          const reply = `[Cloud Executor] Task processed: "${prompt}"`;
+          yield { type: 'block-start', index: 0, blockType: 'text' };
+          yield { type: 'text-delta', index: 0, text: reply };
+          yield { type: 'block-end', index: 0, block: { type: 'text', text: reply } };
+          yield { type: 'usage', usage: { inputTokens: 20, outputTokens: reply.length, totalTokens: 20 + reply.length } };
+          yield { type: 'finish', reason: { kind: 'stop' } };
+        }
+      }
+      ctx.llm.registerAdapter(['cloud-default'], prioritized(new CloudDefaultAdapter()));
+      ctx.provide('agentDefaultModel', {
+        currentSelection: () => ({ provider: 'cloud-default', model: modelId }),
+      });
+    } else if (!testMode) {
+      throw new Error('CYRENE_EXCHANGE_URL and CYRENE_HARNESS_MODEL are required when CYRENE_HARNESS_MODEL_SOURCE=exchange');
     }
-    ctx.llm.registerAdapter(['cloud-default'], prioritized(new CloudDefaultAdapter()));
-    ctx.provide('agentDefaultModel', {
-      currentSelection: () => ({ provider: 'cloud-default', model: modelId }),
-    });
-  } else if (!testMode) {
-    throw new Error('CYRENE_EXCHANGE_URL and CYRENE_HARNESS_MODEL are required when CYRENE_HARNESS_MODEL_SOURCE=exchange');
   }
 
   const pluginsDir = configuredPluginsDir ?? join(repository, 'plugins');
@@ -387,6 +429,15 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
         sessionId, signal: AbortSignal.timeout(15_000),
       }));
 
+  const conversationBackend: ConversationExecutionBackend | undefined = executionBackend === 'codebuddy-acp'
+    ? new CodeBuddyAcpExecutionBackend({
+      ctx,
+      workState,
+      command: codeBuddyAcpCommand,
+      model: codeBuddyAcpModel,
+    })
+    : undefined;
+
   // Autonomous Cloud Executor Daemon service
   applyExecutor(ctx, {
     defaultCwd: options.defaultCwd ?? process.cwd(),
@@ -395,6 +446,7 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
     authTokenEnv: publicTokenEnv,
     maxConcurrentTasks,
     modelFallbacks,
+    ...(conversationBackend === undefined ? {} : { conversationBackend }),
     ...(teams === undefined ? {} : { teams }),
     allowedOrigins: options.allowedOrigins,
     ...(revalidateExchangeAuthorization === undefined ? {} : { revalidateExchangeAuthorization }),
@@ -560,7 +612,7 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
   if (workflowRuntimeReady && workflowStore !== undefined && responsibilityAuthority !== undefined
     && responsibilityTargets !== undefined) {
     try {
-      const modelPolicy = currentResponsibilityModelPolicy(ctx);
+      const modelPolicy = currentResponsibilityModelPolicy(ctx, codeBuddyAcpModel);
       if (modelPolicy === undefined) throw new TypeError('No supported host model route is configured for responsibilities');
       const dispose = registerResponsibilityTools(ctx, {
         workflows: workflowStore,
@@ -650,6 +702,22 @@ function parseTaskConcurrency(value: string | undefined): number {
   if (value === undefined || value === '') return 2;
   if (!/^\d{1,2}$/u.test(value)) throw new TypeError('CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS must be an integer');
   return validateTaskConcurrency(Number(value), 'CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS');
+}
+
+/** Select the top-level task engine independently from the DSH model source. */
+export function resolveExecutionBackend(
+  override: 'dsh' | 'codebuddy-acp' | undefined,
+  testMode: boolean,
+  environmentValue = process.env.CYRENE_HARNESS_EXECUTION_BACKEND,
+): 'dsh' | 'codebuddy-acp' {
+  if (override !== undefined && !testMode) {
+    throw new Error('Execution backend overrides are available only in explicit testMode');
+  }
+  const configured = override ?? (environmentValue === '' ? undefined : environmentValue) ?? 'dsh';
+  if (configured !== 'dsh' && configured !== 'codebuddy-acp') {
+    throw new TypeError('CYRENE_HARNESS_EXECUTION_BACKEND must be dsh or codebuddy-acp');
+  }
+  return configured;
 }
 
 /** Validate the bounded foreground/background task budget before creating any runtime resources. */
@@ -920,7 +988,17 @@ async function readHostResponsibilityTargets(pathValue: string): Promise<readonl
   });
 }
 
-function currentResponsibilityModelPolicy(ctx: Context): WorkflowV2Write['modelPolicy'] | undefined {
+export function currentResponsibilityModelPolicy(
+  ctx: Context,
+  codeBuddyAcpModel?: string,
+): WorkflowV2Write['modelPolicy'] | undefined {
+  if (codeBuddyAcpModel !== undefined) {
+    return {
+      preferredProvider: 'codebuddy',
+      preferredModel: codeBuddyAcpModel,
+      fallback: 'configured_no_additional_spend',
+    };
+  }
   const selection = ctx.get('agentDefaultModel')?.currentSelection();
   if (selection === undefined) return undefined;
   const preferredProvider = selection.provider === 'cyrene-exchange' ? 'exchange' : selection.provider;
