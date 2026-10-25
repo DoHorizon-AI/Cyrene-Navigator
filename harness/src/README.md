@@ -17,6 +17,13 @@ Loop 或可写消息历史。
 | `codebuddy-adapter.ts` | Restricted CodeBuddy structured-output provider; DSH remains the sole tool executor / 受限 CodeBuddy 结构化输出 provider；DSH 保持唯一工具执行者 |
 | `antigravity-adapter.ts` | Pinned Antigravity model-only structured-output provider; native tools are rejected and DSH remains the sole executor / 固定 Antigravity 纯模型结构化输出 provider；拒绝原生工具并保持 DSH 唯一执行权 |
 | `exchange-adapter.ts` | OpenAI-compatible streaming adapter for Exchange / Exchange 的 OpenAI 兼容流式 adapter |
+| `model-policy.ts` | Explicit provider fallback policy and provider-reported token usage decoding / 显式备用路由策略和供应商 token 用量解码 |
+| `model-gate.ts` | Separate bounded foreground and background model-call lanes / 分开的前台与后台有界模型调用槽 |
+| `responsibility-authority.ts` | V2 workflow provenance, connector scope, and Teams notice validation / V2 工作流来源、连接器范围和 Teams 通知校验 |
+| `responsibility-tools.ts` | Owner-scoped Teams commands for durable duty management and provider usage / 按所有者隔离的 Teams 职责管理及供应商用量命令 |
+| `workflow-teams-delivery.ts` | Project verified workflow transitions into the durable Teams outbox / 将已校验的工作流状态投影到持久 Teams outbox |
+| `executor.ts` | Durable task admission, foreground/background scheduling, and task receipts / 持久任务接纳、前后台调度和执行回执 |
+| `serve.ts` | Compose the pinned Harness adapters, policy providers, and executor / 装配固定 Harness 适配器、权限与执行器 |
 | `native-ipc.ts` | Supervised inherited-stdio request, cancellation, and protocol framing / 受监管 inherited-stdio 请求、取消和协议封装 |
 | `native.ts` | Cordis Tool registration over the Rust host / 通过 Rust host 注册 Cordis Tool |
 | `import-codex.ts` | Codex read-only archive and explicit AgentLoop Continue / Codex 只读 archive 与显式 AgentLoop Continue |
@@ -85,7 +92,8 @@ The parent `harness/README.md` and `upstream.lock.json` define the Bundle and
 exact upstream pin.
 
 `CYRENE_HARNESS_MODEL_SOURCE` selects `exchange`, `codebuddy`, or `antigravity`
-and defaults to `exchange` for existing deployments. The production Docker
+and defaults to `antigravity` with `gemini-3.8-flash-medium`. Set it explicitly
+to `exchange` or `codebuddy` to retain another primary route. The production Docker
 executor enters through `node scripts/serve-executor.mjs`; setting the source
 there selects the model adapter. The separate `scripts/serve-local.py` launcher
 is not wired for Antigravity yet. CodeBuddy defaults to
@@ -93,12 +101,15 @@ is not wired for Antigravity yet. CodeBuddy defaults to
 to `gemini-3.8-flash-medium` and advertises only the verified 3.8 Flash low,
 medium, and high model slugs. If `CYRENE_HARNESS_MODEL` is set, it must use one
 of those Antigravity slugs; remove a stale model from another provider or set
-the desired Antigravity model explicitly. It requires the service HOME's exact
+the desired Antigravity model explicitly. An optional CodeBuddy fallback is
+disabled by default and requires `CYRENE_HARNESS_CODEBUDDY_FALLBACK_ENABLED=true`,
+`CYRENE_HARNESS_CODEBUDDY_NO_PAID_TOPUP=true`, and an allowlisted
+`CYRENE_HARNESS_CODEBUDDY_FALLBACK_MODEL`. It requires the service HOME's exact
 `~/.gemini/config/agents/cyrene-dsh-model.md` profile and an operator-installed,
 authenticated `agy` executable on PATH. Each request is one stdin JSON event in
 a temporary empty working directory; the user prompt is never a command-line
-argument. The adapter validates the pinned profile before startup and each
-request, requires Antigravity to report the selected model and agent with strict
+argument. The adapter validates the pinned profile before each request, requires
+Antigravity to report the selected model and agent with strict
 permission mode, and accepts only one `finish` tool step plus a successful
 schema-constrained terminal result. Its `init.tools` registry list is not used
 as the effective allowlist. The CLI receives only the HOME, PATH, temporary
@@ -109,19 +120,37 @@ registered in Antigravity mode so already-live CodeBuddy Agents can finish.
 
 The adapter rejects missing, changed, or unsuccessful terminal results and
 locally validates requested tool names and arguments against the active DSH
-catalog. Existing in-memory Agent sessions keep their captured model; new
-sessions use the configured source. After a service restart, a persisted session
-is resumed with the currently configured model selection and its prior history.
+catalog. A recognized provider availability failure can retry the same DSH
+model step through the explicitly configured backup route; the persisted
+request and usage events identify the provider and model that actually ran.
+Usage records contain only token counts reported by that provider. Existing
+in-memory Agent sessions keep their captured selection; new sessions use the
+configured source. After a service restart, a persisted session is resumed with
+the currently configured model selection and its prior history.
+
+Foreground chat and background responsibilities use separate durable DSH
+Sessions. Foreground work has its own bounded task and model-call lane, while at
+most one background task runs at a time. `CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS`
+sets the total active task bound and defaults to `2`; queued foreground tasks are
+admitted before queued background work. The bound must be at least `2` so one
+foreground task slot remains available while the single background slot is busy.
+Tasks have no default total-run timeout
+or turn-count gate. Provider, connector, and explicitly requested task timeouts
+remain in force.
 
 `CYRENE_HARNESS_MODEL_SOURCE` 用于选择 `exchange`、`codebuddy` 或
-`antigravity`，未设置时仍默认 `exchange`，以兼容既有部署。CodeBuddy provider 在未设置
+`antigravity`，当前默认 `antigravity` 和 `gemini-3.8-flash-medium`。需要保留其他主路由时请显式设置为
+`exchange` 或 `codebuddy`。CodeBuddy provider 在未设置
 `CYRENE_HARNESS_MODEL` 时默认使用 `glm-5.3-flash`，同时公布
 `deepseek-v4.1-flash`。Antigravity 默认使用 `gemini-3.8-flash-medium`，只公布已验证的
 3.8 Flash low、medium、high 模型 slug。若设置了 `CYRENE_HARNESS_MODEL`，其值必须属于这三个 slug；
-切换 provider 时应移除旧模型值或显式设置目标 Antigravity 模型。它要求服务 HOME 下存在精确的
+切换 provider 时应移除旧模型值或显式设置目标 Antigravity 模型。CodeBuddy 备用路由默认关闭；启用时必须同时设置
+`CYRENE_HARNESS_CODEBUDDY_FALLBACK_ENABLED=true`、
+`CYRENE_HARNESS_CODEBUDDY_NO_PAID_TOPUP=true`，并将
+`CYRENE_HARNESS_CODEBUDDY_FALLBACK_MODEL` 设为允许的模型。它要求服务 HOME 下存在精确的
 `~/.gemini/config/agents/cyrene-dsh-model.md` profile，并且 `agy` 已由 operator 安装和授权。
 每次请求通过 stdin 发送单条 JSON event，工作目录是新建的空临时目录；用户 prompt 不会进入命令行参数。
-适配器在启动和每次请求前校验固定 profile，要求 Antigravity 回报匹配的 model、agent 和 strict
+适配器在每次请求前校验固定 profile，要求 Antigravity 回报匹配的 model、agent 和 strict
 permission mode，且只接受一个 `finish` tool step 和成功的 schema 结构化终态。`init.tools` 中的工具
 注册表清单不代表当前 agent 的有效 allowlist。CLI 子进程只继承 HOME、PATH、临时目录、locale 设置和
 可选 CA 路径；不会接收 Cyrene、Exchange 或 Provider 凭据。生产 Docker executor 通过
@@ -130,9 +159,14 @@ Antigravity。模型只能返回 DSH catalog 中的工具请求，业务工具�
 现有 DSH AgentLoop 唯一执行。Antigravity 模式也会保留 CodeBuddy adapter，以便已运行的 CodeBuddy
 Agent 完成当前 Session。
 
-适配器拒绝缺失、变更或失败的终态，并根据当前 DSH 工具目录在本地校验工具名和参数。已经驻留内存的
-Agent Session 保持原模型；新 Session 使用当前配置。服务重启后，持久化 Session 会在恢复原历史的同时
-使用当前配置的模型选择。
+适配器拒绝缺失、变更或失败的终态，并根据当前 DSH 工具目录在本地校验工具名和参数。已识别的 provider
+可用性故障可让同一 DSH 模型步骤使用显式配置的备用路由重试；持久化请求和用量事件会记录实际调用的 provider
+与 model。用量记录只保留供应商返回的 token 数。已经驻留内存的 Agent Session 保持当前选择；新 Session
+使用已配置的主路由。服务重启后，持久化 Session 会在恢复原历史的同时使用当前配置的模型选择。
+
+前台聊天和后台责任任务使用不同的持久 DSH Session。前台任务和模型调用有独立的有界槽位，后台同时最多运行一个任务。
+`CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS` 限制活动任务总数，默认值为 `2`，并且必须至少为 `2`，以便后台槽位繁忙时仍保留一个前台槽位；排队的前台任务优先于排队的后台任务。
+任务默认没有整体运行时长或轮数上限；供应商、连接器和调用方明确设置的超时仍然有效。
 
 Rust 协议和可执行文件 authority 见 `../../native/`；父目录的 `harness/README.md`
 与 `upstream.lock.json` 定义 Bundle 和精确上游 pin。

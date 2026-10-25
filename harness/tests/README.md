@@ -48,6 +48,8 @@ request and does not claim an Exchange ListTools export test.
 Exchange's terminal `uncertain` tombstone, and bounded retries only for explicit
 HTTP 429 responses.
 
+`workflows-v2.test.mjs` exercises the real DSH Schedule hook and a launcher-authorized GitHub tool catalog for two repositories. A truncated first page cannot advance the watermark; a later occurrence resumes the stored cursor and accepts the window only after the contiguous page chain is complete. The fixture is local and makes no external GitHub or Teams request.
+
 `delivery-feedback.test.mjs` is a browser state regression over freshly built
 `harness/dist/client.js`. `windows-native-imports.test.mjs` checks the packaged
 host's PE imports on Windows. Both remain narrower than installed desktop smoke
@@ -72,5 +74,7 @@ and interactive GUI evidence.
 `persistence.integration.test.mjs` 还通过真实 Python persistence ASGI 服务和 SQLite 验证操作回执读取与对账。provider 响应和 catalog 文件是合成 fixture；测试不会请求 GitHub，也不代表已验证 Exchange ListTools 导出。
 
 `connector-authorization.test.mjs` 验证 Teams 出站请求字段、Exchange 终态 `uncertain` 墓碑，以及仅在明确 HTTP 429 时进行有界重排。
+
+`workflows-v2.test.mjs` 使用真实 DSH Schedule hook 和两个仓库的启动器授权 GitHub 工具目录。首次分页被截断时水位不会推进；后续 occurrence 续接已存游标，只有分页链连续完整后才接受该窗口。测试使用本地 fixture，不访问外部 GitHub 或 Teams。
 
 `delivery-feedback.test.mjs` 针对刚构建的 `harness/dist/client.js` 验证浏览器状态回归。`windows-native-imports.test.mjs` 在 Windows 上检查打包宿主的 PE 导入。两者的证据范围都小于已安装桌面冒烟和交互式 GUI 验证。

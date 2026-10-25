@@ -1394,6 +1394,18 @@
             "title": "Request",
             "type": "object"
           },
+          "scopeLock": {
+            "anyOf": [
+              {
+                "maxLength": 100,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scopelock"
+          },
           "target": {
             "anyOf": [
               {
@@ -1475,6 +1487,17 @@
             "additionalProperties": true,
             "title": "Request",
             "type": "object"
+          },
+          "scopeLock": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scopelock"
           },
           "status": {
             "enum": [
@@ -1922,6 +1945,15 @@
             ],
             "title": "Description"
           },
+          "executionClass": {
+            "default": "foreground",
+            "enum": [
+              "foreground",
+              "background"
+            ],
+            "title": "Executionclass",
+            "type": "string"
+          },
           "id": {
             "anyOf": [
               {
@@ -2308,6 +2340,15 @@
             ],
             "title": "Error"
           },
+          "executionClass": {
+            "default": "foreground",
+            "enum": [
+              "foreground",
+              "background"
+            ],
+            "title": "Executionclass",
+            "type": "string"
+          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -2645,13 +2686,416 @@
         "title": "ValidationError",
         "type": "object"
       },
+      "WorkflowActionGrant": {
+        "additionalProperties": false,
+        "description": "Owner-configured action with exact target scopes. | \u6709\u8303\u56f4\u9650\u5236\u7684\u64cd\u4f5c\u6388\u6743\u3002",
+        "properties": {
+          "action": {
+            "enum": [
+              "draft_pull_request",
+              "rerun_source_ci",
+              "update_issue_progress"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "baseBranches": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "title": "Basebranches",
+            "type": "array"
+          },
+          "branchPrefixes": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "title": "Branchprefixes",
+            "type": "array"
+          },
+          "id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "issueNumbers": {
+            "items": {
+              "exclusiveMinimum": 0.0,
+              "type": "integer"
+            },
+            "maxItems": 10000,
+            "title": "Issuenumbers",
+            "type": "array"
+          },
+          "pathPrefixes": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "title": "Pathprefixes",
+            "type": "array"
+          },
+          "permittedOperations": {
+            "items": {
+              "enum": [
+                "github.branch.create",
+                "github.branch.delete",
+                "github.file.commit",
+                "github.pull_request.draft.create",
+                "github.actions.rerun_failed",
+                "github.issue.comment.create",
+                "github.issue.state.update"
+              ],
+              "type": "string"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "title": "Permittedoperations",
+            "type": "array"
+          },
+          "sourceWorkflowIds": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "title": "Sourceworkflowids",
+            "type": "array"
+          },
+          "targetIds": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "title": "Targetids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "action",
+          "targetIds",
+          "permittedOperations"
+        ],
+        "title": "WorkflowActionGrant",
+        "type": "object"
+      },
+      "WorkflowActionPolicy": {
+        "additionalProperties": false,
+        "description": "Typed source permissions run in separate child tasks. | \u5206\u79bb\u6267\u884c\u7684\u6e90\u4ee3\u7801\u64cd\u4f5c\u6388\u6743\u3002",
+        "properties": {
+          "allowedActions": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowActionGrant"
+            },
+            "maxItems": 100,
+            "title": "Allowedactions",
+            "type": "array"
+          },
+          "productionChanges": {
+            "const": "forbidden",
+            "default": "forbidden",
+            "title": "Productionchanges",
+            "type": "string"
+          },
+          "requiresUserAuthorization": {
+            "items": {
+              "enum": [
+                "merge",
+                "release",
+                "production",
+                "new_spend"
+              ],
+              "type": "string"
+            },
+            "title": "Requiresuserauthorization",
+            "type": "array"
+          },
+          "separateChildTask": {
+            "const": true,
+            "default": true,
+            "title": "Separatechildtask",
+            "type": "boolean"
+          }
+        },
+        "title": "WorkflowActionPolicy",
+        "type": "object"
+      },
+      "WorkflowActionReceipt": {
+        "additionalProperties": false,
+        "description": "Durable child action status and provider operation references. | \u52a8\u4f5c\u5b50\u4efb\u52a1\u53ca\u64cd\u4f5c\u56de\u6267\u3002",
+        "properties": {
+          "actionId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Actionid",
+            "type": "string"
+          },
+          "actionType": {
+            "enum": [
+              "draft_pull_request",
+              "rerun_source_ci",
+              "update_issue_progress"
+            ],
+            "title": "Actiontype",
+            "type": "string"
+          },
+          "operationIds": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "title": "Operationids",
+            "type": "array"
+          },
+          "requestDigest": {
+            "maxLength": 64,
+            "minLength": 64,
+            "title": "Requestdigest",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "completed",
+              "failed",
+              "waiting",
+              "unknown",
+              "skipped"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "targetId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Targetid",
+            "type": "string"
+          },
+          "taskId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Taskid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "actionId",
+          "actionType",
+          "targetId",
+          "taskId",
+          "requestDigest",
+          "status"
+        ],
+        "title": "WorkflowActionReceipt",
+        "type": "object"
+      },
+      "WorkflowAuthorizationReference": {
+        "additionalProperties": false,
+        "description": "Owner-authenticated Teams thread reference resolved by the host. | \u6388\u6743\u7ebf\u7a0b\u5f15\u7528\u3002",
+        "properties": {
+          "kind": {
+            "const": "teams_thread",
+            "title": "Kind",
+            "type": "string"
+          },
+          "ownerTaskId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Ownertaskid",
+            "type": "string"
+          },
+          "threadBindingId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Threadbindingid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "threadBindingId",
+          "ownerTaskId"
+        ],
+        "title": "WorkflowAuthorizationReference",
+        "type": "object"
+      },
+      "WorkflowCheckpoint": {
+        "additionalProperties": false,
+        "description": "Durable GitHub search watermark and page cursor. | \u6301\u4e45\u5316\u6c34\u4f4d\u4e0e\u5206\u9875\u6e38\u6807\u3002",
+        "properties": {
+          "complete": {
+            "title": "Complete",
+            "type": "boolean"
+          },
+          "kind": {
+            "const": "github_issues_search",
+            "title": "Kind",
+            "type": "string"
+          },
+          "repositories": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowRepositoryCursor"
+            },
+            "maxItems": 100,
+            "title": "Repositories",
+            "type": "array"
+          },
+          "watermark": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Watermark"
+          },
+          "windowEnd": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Windowend",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "windowEnd",
+          "complete"
+        ],
+        "title": "WorkflowCheckpoint",
+        "type": "object"
+      },
+      "WorkflowDigestPolicy": {
+        "additionalProperties": false,
+        "description": "At most one meaningful-change digest per configured day. | \u6bcf\u65e5\u6700\u591a\u4e00\u6761\u6709\u610f\u4e49\u53d8\u5316\u6458\u8981\u3002",
+        "properties": {
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "maxPerDay": {
+            "const": 1,
+            "default": 1,
+            "title": "Maxperday",
+            "type": "integer"
+          },
+          "schedule": {
+            "$ref": "#/components/schemas/WorkflowSchedule"
+          }
+        },
+        "title": "WorkflowDigestPolicy",
+        "type": "object"
+      },
+      "WorkflowEvidence": {
+        "additionalProperties": false,
+        "description": "Metadata-only pointer for one scoped connector observation. | \u89c2\u5bdf\u8bc1\u636e\u6307\u9488\u3002",
+        "properties": {
+          "observedAt": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Observedat",
+            "type": "string"
+          },
+          "resultDigest": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Resultdigest",
+            "type": "string"
+          },
+          "targetId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Targetid",
+            "type": "string"
+          },
+          "tool": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Tool",
+            "type": "string"
+          }
+        },
+        "required": [
+          "targetId",
+          "tool",
+          "observedAt",
+          "resultDigest"
+        ],
+        "title": "WorkflowEvidence",
+        "type": "object"
+      },
+      "WorkflowGitHubSearch": {
+        "additionalProperties": false,
+        "description": "Safe typed GitHub search filters. | \u6709\u9650\u5b89\u5168\u641c\u7d22\u8fc7\u6ee4\u5668\u3002",
+        "properties": {
+          "labels": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 10,
+            "title": "Labels",
+            "type": "array"
+          },
+          "limit": {
+            "default": 50,
+            "maximum": 50.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "query": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Query"
+          },
+          "state": {
+            "default": "open",
+            "enum": [
+              "open",
+              "closed",
+              "all"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "title": "WorkflowGitHubSearch",
+        "type": "object"
+      },
       "WorkflowList": {
         "additionalProperties": false,
         "description": "Versioned workflow catalog for one Workspace. | \u5de5\u4f5c\u6d41\u76ee\u5f55\u3002",
         "properties": {
           "items": {
             "items": {
-              "$ref": "#/components/schemas/WorkflowRecord"
+              "discriminator": {
+                "mapping": {
+                  "1": "#/components/schemas/WorkflowRecord",
+                  "2": "#/components/schemas/WorkflowV2Record"
+                },
+                "propertyName": "version"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/WorkflowRecord"
+                },
+                {
+                  "$ref": "#/components/schemas/WorkflowV2Record"
+                }
+              ]
             },
             "title": "Items",
             "type": "array"
@@ -2661,6 +3105,119 @@
           "items"
         ],
         "title": "WorkflowList",
+        "type": "object"
+      },
+      "WorkflowModelPolicy": {
+        "additionalProperties": false,
+        "description": "Preferred installed model route and bounded fallback policy. | \u6a21\u578b\u9996\u9009\u9879\u4e0e\u5907\u7528\u7b56\u7565\u3002",
+        "properties": {
+          "fallback": {
+            "const": "configured_no_additional_spend",
+            "default": "configured_no_additional_spend",
+            "title": "Fallback",
+            "type": "string"
+          },
+          "preferredModel": {
+            "default": "gemini-3.8-flash-medium",
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Preferredmodel",
+            "type": "string"
+          },
+          "preferredProvider": {
+            "default": "antigravity",
+            "enum": [
+              "antigravity",
+              "codebuddy",
+              "exchange"
+            ],
+            "title": "Preferredprovider",
+            "type": "string"
+          }
+        },
+        "title": "WorkflowModelPolicy",
+        "type": "object"
+      },
+      "WorkflowNoticeCreate": {
+        "additionalProperties": false,
+        "description": "Project a terminal v2 receipt to its owner Teams thread. | \u6295\u5f71\u5de5\u4f5c\u6d41\u7ec8\u6001\u901a\u77e5\u3002",
+        "properties": {
+          "attentionKind": {
+            "anyOf": [
+              {
+                "enum": [
+                  "blocked_goal",
+                  "user_decision",
+                  "service_or_auth_outage"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attentionkind"
+          },
+          "kind": {
+            "enum": [
+              "change",
+              "failure",
+              "recovery",
+              "digest",
+              "blocker"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "occurrenceId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Occurrenceid",
+            "type": "string"
+          },
+          "scheduledAt": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Scheduledat",
+            "type": "string"
+          },
+          "summary": {
+            "maxLength": 400,
+            "minLength": 1,
+            "title": "Summary",
+            "type": "string"
+          },
+          "triggerId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Triggerid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "occurrenceId",
+          "triggerId",
+          "scheduledAt",
+          "kind",
+          "summary"
+        ],
+        "title": "WorkflowNoticeCreate",
+        "type": "object"
+      },
+      "WorkflowNotificationDestination": {
+        "additionalProperties": false,
+        "description": "Host-resolved thread; the model supplies no route. | \u4e3b\u673a\u89e3\u6790\u7684\u901a\u77e5\u76ee\u6807\u3002",
+        "properties": {
+          "kind": {
+            "const": "responsibility_thread",
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "WorkflowNotificationDestination",
         "type": "object"
       },
       "WorkflowNotifications": {
@@ -2692,6 +3249,83 @@
           "quietWhenUnchanged"
         ],
         "title": "WorkflowNotifications",
+        "type": "object"
+      },
+      "WorkflowNotificationsV2": {
+        "additionalProperties": false,
+        "description": "V2 notification policy with responsibility-local routing. | v2 \u901a\u77e5\u7b56\u7565\u4e0e\u8d23\u4efb\u7ebf\u7a0b\u8def\u7531\u3002",
+        "properties": {
+          "destination": {
+            "$ref": "#/components/schemas/WorkflowNotificationDestination"
+          },
+          "digest": {
+            "$ref": "#/components/schemas/WorkflowDigestPolicy"
+          },
+          "immediateOn": {
+            "items": {
+              "enum": [
+                "blocked_goal",
+                "user_decision",
+                "service_or_auth_outage"
+              ],
+              "type": "string"
+            },
+            "title": "Immediateon",
+            "type": "array"
+          },
+          "onChange": {
+            "default": true,
+            "title": "Onchange",
+            "type": "boolean"
+          },
+          "onFailure": {
+            "default": true,
+            "title": "Onfailure",
+            "type": "boolean"
+          },
+          "onRecovery": {
+            "default": true,
+            "title": "Onrecovery",
+            "type": "boolean"
+          },
+          "quietHours": {
+            "$ref": "#/components/schemas/WorkflowQuietHours"
+          },
+          "quietWhenUnchanged": {
+            "const": true,
+            "default": true,
+            "title": "Quietwhenunchanged",
+            "type": "boolean"
+          }
+        },
+        "title": "WorkflowNotificationsV2",
+        "type": "object"
+      },
+      "WorkflowQuietHours": {
+        "additionalProperties": false,
+        "description": "Quiet period for proactive notices; direct chat is unaffected. | \u4e3b\u52a8\u901a\u77e5\u5b89\u9759\u65f6\u6bb5\u3002",
+        "properties": {
+          "end": {
+            "default": "08:00",
+            "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$",
+            "title": "End",
+            "type": "string"
+          },
+          "start": {
+            "default": "22:00",
+            "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$",
+            "title": "Start",
+            "type": "string"
+          },
+          "timeZone": {
+            "default": "America/New_York",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Timezone",
+            "type": "string"
+          }
+        },
+        "title": "WorkflowQuietHours",
         "type": "object"
       },
       "WorkflowRecord": {
@@ -2776,6 +3410,83 @@
         "title": "WorkflowRecord",
         "type": "object"
       },
+      "WorkflowRepositoryCursor": {
+        "additionalProperties": false,
+        "description": "One repository's stable page chain within a fixed search window. | \u4ed3\u5e93\u5206\u9875\u94fe\u72b6\u6001\u3002",
+        "properties": {
+          "blockedReason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "result_limit",
+                  "incomplete_results",
+                  "missing_pages"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Blockedreason"
+          },
+          "complete": {
+            "title": "Complete",
+            "type": "boolean"
+          },
+          "hasChanges": {
+            "default": false,
+            "title": "Haschanges",
+            "type": "boolean"
+          },
+          "pageCursor": {
+            "maxLength": 8,
+            "minLength": 1,
+            "title": "Pagecursor",
+            "type": "string"
+          },
+          "pagesCollected": {
+            "default": 0,
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Pagescollected",
+            "type": "integer"
+          },
+          "queryDigest": {
+            "maxLength": 64,
+            "minLength": 64,
+            "title": "Querydigest",
+            "type": "string"
+          },
+          "targetId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Targetid",
+            "type": "string"
+          },
+          "totalCount": {
+            "anyOf": [
+              {
+                "maximum": 10000000.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totalcount"
+          }
+        },
+        "required": [
+          "targetId",
+          "pageCursor",
+          "queryDigest",
+          "complete"
+        ],
+        "title": "WorkflowRepositoryCursor",
+        "type": "object"
+      },
       "WorkflowSchedule": {
         "additionalProperties": false,
         "description": "Desired DSH cron cadence; DSH remains the scheduling authority. | DSH \u5b9a\u65f6\u610f\u56fe\u3002",
@@ -2810,6 +3521,49 @@
         "additionalProperties": false,
         "description": "Safe durable schedule execution history, without tool output or arguments. | \u8c03\u5ea6\u5386\u53f2\u3002",
         "properties": {
+          "actionResults": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowActionReceipt"
+            },
+            "maxItems": 100,
+            "title": "Actionresults",
+            "type": "array"
+          },
+          "actionTaskIds": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "title": "Actiontaskids",
+            "type": "array"
+          },
+          "attentionKind": {
+            "anyOf": [
+              {
+                "enum": [
+                  "blocked_goal",
+                  "user_decision",
+                  "service_or_auth_outage"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attentionkind"
+          },
+          "baseline": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Baseline"
+          },
           "changed": {
             "anyOf": [
               {
@@ -2820,6 +3574,16 @@
               }
             ],
             "title": "Changed"
+          },
+          "checkpoint": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowCheckpoint"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "createdAt": {
             "maxLength": 128,
@@ -2851,11 +3615,27 @@
             ],
             "title": "Errorcode"
           },
+          "evidence": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowEvidence"
+            },
+            "maxItems": 1000,
+            "title": "Evidence",
+            "type": "array"
+          },
           "id": {
             "maxLength": 512,
             "minLength": 1,
             "title": "Id",
             "type": "string"
+          },
+          "operationIds": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "title": "Operationids",
+            "type": "array"
           },
           "scheduledAt": {
             "maxLength": 128,
@@ -2921,6 +3701,18 @@
             ],
             "title": "Taskid"
           },
+          "triggerId": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Triggerid"
+          },
           "workflowId": {
             "maxLength": 512,
             "minLength": 1,
@@ -2972,6 +3764,19 @@
         "additionalProperties": false,
         "description": "Generic resource scope for a versioned workflow. | \u901a\u7528\u5de5\u4f5c\u6d41\u76ee\u6807\u3002",
         "properties": {
+          "bindingId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bindingid"
+          },
           "id": {
             "maxLength": 512,
             "minLength": 1,
@@ -3009,6 +3814,158 @@
           "kind"
         ],
         "title": "WorkflowTarget",
+        "type": "object"
+      },
+      "WorkflowV2Record": {
+        "additionalProperties": false,
+        "description": "Proactive responsibility negotiated with definitionVersion=2. | \u4e3b\u52a8\u8d23\u4efb\u5b9a\u4e49\u3002",
+        "properties": {
+          "actionPolicy": {
+            "$ref": "#/components/schemas/WorkflowActionPolicy"
+          },
+          "authorization": {
+            "$ref": "#/components/schemas/WorkflowAuthorizationReference"
+          },
+          "description": {
+            "maxLength": 20000,
+            "title": "Description",
+            "type": "string"
+          },
+          "enabled": {
+            "default": false,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "goal": {
+            "maxLength": 20000,
+            "minLength": 1,
+            "title": "Goal",
+            "type": "string"
+          },
+          "id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "instructions": {
+            "maxLength": 100000,
+            "minLength": 1,
+            "title": "Instructions",
+            "type": "string"
+          },
+          "modelPolicy": {
+            "$ref": "#/components/schemas/WorkflowModelPolicy"
+          },
+          "notifications": {
+            "$ref": "#/components/schemas/WorkflowNotificationsV2"
+          },
+          "targets": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowTarget"
+            },
+            "maxItems": 100,
+            "title": "Targets",
+            "type": "array"
+          },
+          "title": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Title",
+            "type": "string"
+          },
+          "triggers": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowV2Trigger"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "title": "Triggers",
+            "type": "array"
+          },
+          "updatedAt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updatedat"
+          },
+          "version": {
+            "const": 2,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "version",
+          "title",
+          "description",
+          "goal",
+          "instructions",
+          "targets",
+          "triggers",
+          "authorization"
+        ],
+        "title": "WorkflowV2Record",
+        "type": "object"
+      },
+      "WorkflowV2Trigger": {
+        "additionalProperties": false,
+        "description": "One DSH Schedule-backed proactive trigger. | \u4e00\u4e2a\u7531 DSH Schedule \u9a71\u52a8\u7684\u4e3b\u52a8\u89e6\u53d1\u5668\u3002",
+        "properties": {
+          "id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "initialBaseline": {
+            "const": "record_without_notification",
+            "default": "record_without_notification",
+            "title": "Initialbaseline",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "github_incremental_poll",
+              "review"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "schedule": {
+            "$ref": "#/components/schemas/WorkflowSchedule"
+          },
+          "search": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowGitHubSearch"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "targetIds": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "title": "Targetids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "schedule"
+        ],
+        "title": "WorkflowV2Trigger",
         "type": "object"
       }
     },
@@ -4741,6 +5698,54 @@
         "summary": "Append Schedule Event"
       }
     },
+    "/api/v1/workspaces/{workspace_id}/work/schedule-events/{event_id}": {
+      "get": {
+        "operationId": "get_schedule_event_api_v1_workspaces__workspace_id__work_schedule_events__event_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "event_id",
+            "required": true,
+            "schema": {
+              "title": "Event Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowScheduleEvent"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Schedule Event"
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/work/sources": {
       "get": {
         "operationId": "list_sources_api_v1_workspaces__workspace_id__work_sources_get",
@@ -5707,6 +6712,18 @@
               "title": "Workspace Id",
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "definitionVersion",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "maximum": 2,
+              "minimum": 1,
+              "title": "Definitionversion",
+              "type": "integer"
+            }
           }
         ],
         "responses": {
@@ -5755,13 +6772,40 @@
               "title": "Workflow Id",
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "definitionVersion",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "maximum": 2,
+              "minimum": 1,
+              "title": "Definitionversion",
+              "type": "integer"
+            }
           }
         ],
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/WorkflowRecord"
+                "discriminator": {
+                  "mapping": {
+                    "1": "#/components/schemas/WorkflowRecord",
+                    "2": "#/components/schemas/WorkflowV2Record"
+                  },
+                  "propertyName": "version"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/WorkflowRecord"
+                  },
+                  {
+                    "$ref": "#/components/schemas/WorkflowV2Record"
+                  }
+                ],
+                "title": "Body"
               }
             }
           },
@@ -5772,7 +6816,22 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/WorkflowRecord"
+                  "discriminator": {
+                    "mapping": {
+                      "1": "#/components/schemas/WorkflowRecord",
+                      "2": "#/components/schemas/WorkflowV2Record"
+                    },
+                    "propertyName": "version"
+                  },
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WorkflowRecord"
+                    },
+                    {
+                      "$ref": "#/components/schemas/WorkflowV2Record"
+                    }
+                  ],
+                  "title": "Response Put Workflow Api V1 Workspaces  Workspace Id  Work Workflows  Workflow Id  Put"
                 }
               }
             },
@@ -5790,6 +6849,65 @@
           }
         },
         "summary": "Put Workflow"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/workflows/{workflow_id}/notices": {
+      "post": {
+        "description": "Project a terminal responsibility receipt into its stored Teams owner thread.\n\n\u4e2d\u6587\uff1a\u4ece v2 \u5de5\u4f5c\u6d41\u3001\u8fd0\u884c\u56de\u6267\u4e0e owner Teams \u4efb\u52a1\u751f\u6210\u901a\u77e5\uff1b\u8c03\u7528\u65b9\u4e0d\u80fd\u6307\u5b9a\u8def\u7531\u3002",
+        "operationId": "enqueue_workflow_notice_api_v1_workspaces__workspace_id__work_workflows__workflow_id__notices_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "workflow_id",
+            "required": true,
+            "schema": {
+              "title": "Workflow Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkflowNoticeCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationQueued"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Enqueue Workflow Notice"
       }
     }
   },

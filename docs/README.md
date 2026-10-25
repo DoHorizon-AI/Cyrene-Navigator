@@ -8,6 +8,7 @@ Navigator 是 Native Client（`Cyrene-Client`）的内置 Harness 组件，基�
 | --- | --- |
 | [API](API.md) | Session & Harness API / 会话与 Harness 接口 |
 | [Work Assistant API](work-assistant-api.md) | Durable task, approval, memory, notification, and connector contracts / 持久任务、审批、记忆、通知与连接器接口 |
+| [Responsibility management tools](responsibility-tools.md) | Owner-scoped Teams commands for creating, managing, and reviewing durable duties / 通过 Teams 命令创建、管理和查看持久职责 |
 | [Official cloud connections](cloud-connections.md) | Source-backed cloud profiles, readonly workflow scope, and credential references / 有来源的云 profile、工作流只读范围与凭据引用 |
 | [Exchange issue tools](architecture/tool-system.md) | Typed issue query and approval-gated writes through Exchange / 通过 Exchange 进行类型化 issue 查询与审批写入 |
 | [Repository lifecycle](REPOSITORY-LIFECYCLE.md) | Repository delivery conventions / 仓库交付约定 |

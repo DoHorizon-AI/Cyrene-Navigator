@@ -11,10 +11,11 @@ import { lstat, open, rm, mkdtemp } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, parse, resolve } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
-import { LlmAdapter, ToolCallId } from '@deepseek-ai/dsh-llm';
+import { LlmAdapter, LlmError, ToolCallId } from '@deepseek-ai/dsh-llm';
 import type { GenerateOptions, LlmModelInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm';
 import { assertSupportedJsonSchema, validateJsonSchemaValue } from '@deepseek-ai/dsh-tools';
 import type { JsonSchemaNode } from '@deepseek-ai/dsh-tools';
+import { decodeProviderTokenUsage } from './model-policy.js';
 
 export const ANTIGRAVITY_MODEL_AGENT_NAME = 'cyrene-dsh-model';
 export const DEFAULT_ANTIGRAVITY_MODEL = 'gemini-3.8-flash-medium';
@@ -89,6 +90,32 @@ function modelError(message: string): Error {
   return new Error(message);
 }
 
+/** Stable availability failures can move the current DSH step to an enabled backup route. */
+function providerUnavailable(
+  message: string,
+  code: 'PROVIDER_UNAVAILABLE' | 'PROVIDER_TIMEOUT' | 'PROVIDER_AUTH_REQUIRED' | 'PROVIDER_RATE_LIMITED' | 'PROVIDER_QUOTA_EXHAUSTED',
+): LlmError {
+  return new LlmError(message, code);
+}
+
+/** Classify only provider-owned error facts and keep raw upstream text out of task output. */
+function providerFailureCode(result: Record<string, unknown>):
+  'PROVIDER_UNAVAILABLE' | 'PROVIDER_AUTH_REQUIRED' | 'PROVIDER_RATE_LIMITED' | 'PROVIDER_QUOTA_EXHAUSTED' {
+  const error = isRecord(result.error) ? result.error : {};
+  const rawError = typeof result.error === 'string' ? result.error : undefined;
+  const facts = [result.code, result.error_code, result.error_message, result.message, result.reason,
+    rawError, error.code, error.type, error.message]
+    .filter((item): item is string => typeof item === 'string')
+    .join(' ')
+    .toLowerCase();
+  if (/quota|resource_exhausted|billing_limit/u.test(facts)) return 'PROVIDER_QUOTA_EXHAUSTED';
+  if (/rate.?limit|too_many_requests|http.?429/u.test(facts)) return 'PROVIDER_RATE_LIMITED';
+  if (/unauthori[sz]ed|authentication|invalid.?credential|http.?401|http.?403/u.test(facts)) {
+    return 'PROVIDER_AUTH_REQUIRED';
+  }
+  return 'PROVIDER_UNAVAILABLE';
+}
+
 function safeAbortError(): Error {
   const error = new Error('Antigravity model request was cancelled');
   error.name = 'AbortError';
@@ -125,10 +152,17 @@ export async function assertAntigravityModelProfile(): Promise<void> {
     } finally {
       await handle.close();
     }
-  } catch {
+  } catch (error: unknown) {
     // Avoid reflecting private home paths or config details into task output.
-    throw modelError('Antigravity model-only profile is unavailable or differs from the pinned profile');
+    const code = isFilesystemUnavailable(error) ? 'PROVIDER_UNAVAILABLE' : 'MODEL_PROFILE_INVALID';
+    throw new LlmError('Antigravity model-only profile is unavailable or differs from the pinned profile', code, { cause: error });
   }
+}
+
+function isFilesystemUnavailable(value: unknown): boolean {
+  if (value === null || typeof value !== 'object') return false;
+  const code = (value as { readonly code?: unknown }).code;
+  return code === 'ENOENT' || code === 'EACCES';
 }
 
 /** Reject symlinks in the provisioned custom-agent directory tree. */
@@ -403,7 +437,9 @@ function consumeEvent(
         throw modelError('Antigravity terminal result is missing its initialized finish call');
       }
       const result = event.result;
-      if (result.status !== 'SUCCESS') throw modelError('Antigravity reported an unsuccessful model turn');
+      if (result.status !== 'SUCCESS') {
+        throw providerUnavailable('Antigravity provider did not complete the model request', providerFailureCode(result));
+      }
       if (!isRecord(result.structured_output)) {
         throw modelError('Antigravity terminal result omitted structured output');
       }
@@ -458,12 +494,12 @@ function runCli(
     };
     const onAbort = () => setFailure(safeAbortError());
     const timeout = setTimeout(
-      () => setFailure(modelError(`Antigravity request timed out after ${timeoutMs} ms`)),
+      () => setFailure(providerUnavailable(`Antigravity request timed out after ${timeoutMs} ms`, 'PROVIDER_TIMEOUT')),
       timeoutMs,
     );
     signal.addEventListener('abort', onAbort, { once: true });
     if (signal.aborted) onAbort();
-    child.on('error', () => setFailure(modelError('Antigravity CLI could not be started')));
+    child.on('error', () => setFailure(providerUnavailable('Antigravity CLI could not be started', 'PROVIDER_UNAVAILABLE')));
     child.stdout.on('data', (chunk: Buffer | string) => {
       const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       outputBytes += value.byteLength;
@@ -510,7 +546,7 @@ function runCli(
         }
       }
       if (code !== 0) {
-        reject(modelError(`Antigravity CLI failed with exit code ${String(code)}`));
+        reject(providerUnavailable(`Antigravity CLI failed with exit code ${String(code)}`, 'PROVIDER_UNAVAILABLE'));
         return;
       }
       if (!state.resultSeen || state.result === undefined) {
@@ -615,10 +651,12 @@ export class AntigravityLlmAdapter extends LlmAdapter {
     }
 
     const response = parseStructuredOutput(result.structured_output, options);
+    const usage = decodeProviderTokenUsage(result.usage ?? result.token_usage);
     if (response.kind === 'final') {
       yield { type: 'block-start', index: 0, blockType: 'text' };
       yield { type: 'text-delta', index: 0, text: response.text };
       yield { type: 'block-end', index: 0, block: { type: 'text', text: response.text } };
+      if (usage !== undefined) yield { type: 'usage', usage };
       yield { type: 'finish', reason: { kind: 'stop' } };
       return;
     }
@@ -631,6 +669,7 @@ export class AntigravityLlmAdapter extends LlmAdapter {
       index: 0,
       block: { type: 'tool-call', id, name: response.name, arguments: response.arguments },
     };
+    if (usage !== undefined) yield { type: 'usage', usage };
     yield { type: 'finish', reason: { kind: 'tool-calls' } };
   }
 }

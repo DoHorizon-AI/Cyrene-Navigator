@@ -6,9 +6,25 @@
 
 import type { Context } from '@deepseek-ai/cordis';
 import type { CloudConnectionRegistry } from '../integrations/cloud-connections.js';
-import type { WorkflowRecord } from './store.js';
+import { getConnectorToolCatalog } from '../tool-providers.js';
+import type { WorkflowDefinition } from './store.js';
 
 const WORKFLOW_MEMORY_TOOLS = new Set(['work_memory_search', 'work_sources']);
+const GITHUB_READONLY_TOOLS = new Set([
+  'github.issues.search',
+  'github.issue.get',
+  'github.repository.get',
+  'github.branches.list',
+  'github.pull_requests.list',
+  'github.pull_request.get',
+  'github.actions.runs.list',
+  'github.actions.jobs.list',
+  'github.actions.job.logs.read',
+  'github.ci.status',
+  'github.branch.get',
+  'github.file.get',
+  'github.pull_request.draft.find',
+]);
 const READONLY_CONNECTIONS: Readonly<Record<string, { readonly publisher: string; readonly endpoint: string }>> = Object.freeze({
   'microsoft-learn': { publisher: 'Microsoft', endpoint: 'https://learn.microsoft.com/api/mcp' },
   'google-developer-knowledge': {
@@ -31,6 +47,9 @@ export interface WorkflowObservationTarget {
   readonly id: string;
   readonly tools: ReadonlySet<string>;
   readonly projectId?: string;
+  readonly repositoryId?: string;
+  readonly repository?: string;
+  readonly bindingId?: string;
 }
 
 /**
@@ -40,7 +59,7 @@ export interface WorkflowObservationTarget {
  * @param workflow - Persisted workflow definition whose target references grant bounded read access.
  * @returns Memory tools plus approved target tools, or `supported:false` for any unsupported target.
  */
-export function resolveWorkflowReadonlyPolicy(ctx: Context, workflow: WorkflowRecord): WorkflowReadonlyPolicy {
+export function resolveWorkflowReadonlyPolicy(ctx: Context, workflow: WorkflowDefinition): WorkflowReadonlyPolicy {
   const registry = ctx.get('cloudConnections');
   const allowedTools = new Set(WORKFLOW_MEMORY_TOOLS);
   const observationTargets: WorkflowObservationTarget[] = [];
@@ -52,6 +71,17 @@ export function resolveWorkflowReadonlyPolicy(ctx: Context, workflow: WorkflowRe
     let projectId: string | undefined;
     if (target.kind === 'cloud-connection' && target.id in READONLY_CONNECTIONS) {
       names = readonlyConnectionTools(registry, target.id);
+    } else if (target.kind === 'github_repository') {
+      const catalog = getConnectorToolCatalog(ctx).filter(entry => entry.providerId === 'github'
+        && entry.bindingId === target.bindingId && !entry.mutating && GITHUB_READONLY_TOOLS.has(entry.operationId));
+      names = catalog.map(entry => entry.name);
+      if (workflow.version === 2 && workflow.triggers.some(trigger => trigger.kind === 'github_incremental_poll')
+        && !catalog.some(entry => entry.operationId === 'github.issues.search')) names = [];
+      if (!/^\d+$/.test(target.id) || !/^[^/\s]+\/[^/\s]+$/.test(target.label)
+        || !target.bindingId || target.uri !== `https://github.com/${target.label}`) names = [];
+      if (names.length > 0) {
+        observationTargets.push({ index, id: target.id, tools: new Set(names), repositoryId: target.id, repository: target.label, bindingId: target.bindingId });
+      }
     } else if (target.kind === 'google-cloud-project') {
       const projects = registry?.workflowReadonlyProjectIds('google-cloud-readonly') ?? [];
       const tools = registry?.workflowReadonlyTools('google-cloud-readonly') ?? [];
@@ -65,7 +95,9 @@ export function resolveWorkflowReadonlyPolicy(ctx: Context, workflow: WorkflowRe
       supported = false;
       continue;
     }
-    observationTargets.push({ index, id: target.id, tools: new Set(names), ...(projectId === undefined ? {} : { projectId }) });
+    if (target.kind !== 'github_repository') {
+      observationTargets.push({ index, id: target.id, tools: new Set(names), ...(projectId === undefined ? {} : { projectId }) });
+    }
     for (const name of names) {
       allowedTools.add(name);
     }
@@ -96,8 +128,24 @@ export function installWorkflowReadonlyGuard(
         return 'Scheduled workflows may only inspect a Google Cloud project named in their configured targets.';
       }
     }
+    const repositoryTargets = policy.observationTargets.filter(target => target.tools.has(execution.name)
+      && target.repositoryId !== undefined);
+    if (repositoryTargets.length > 0) {
+      const args = asRecord(execution.arguments);
+      if (args === undefined || !repositoryTargets.some(target =>
+        target.repositoryId !== undefined
+          && matchesRepositoryId(args.repository_id, target.repositoryId)
+          && args.repository === target.repository)) {
+        return 'Scheduled workflows may only inspect the exact GitHub repository named in their configured targets.';
+      }
+    }
     return undefined;
   });
+}
+
+function matchesRepositoryId(value: unknown, expected: string): boolean {
+  return value === expected
+    || (typeof value === 'number' && Number.isSafeInteger(value) && String(value) === expected);
 }
 
 /** Return tools classified for a validated official profile, including a bounded probe after transient failure. */

@@ -81,12 +81,27 @@ class WorkStore:
         task_id = _identifier(body.get("id") or uuid4().hex, "task id")
         session_id = _identifier(body.get("sessionId"), "sessionId")
         prompt = _bounded_text(body.get("prompt"), "prompt", 100_000)
+        execution_class = body.get("executionClass", "foreground")
+        if execution_class not in {"foreground", "background"}:
+            raise _invalid("WORK_TASK_INVALID_EXECUTION_CLASS", "executionClass is not supported")
         title = _optional_text(body.get("title"), "title", 512)
         description = _optional_text(body.get("description"), "description", 20_000)
         metadata = _json_object(body.get("metadata", {}), "metadata")
         _task_notification_descriptor(metadata)
+        _validate_task_execution_metadata(execution_class, metadata)
         created_by_actor_id = _identifier(actor_id, "actorId") if actor_id else ""
         create_digest = _digest(
+            {
+                "sessionId": session_id,
+                "prompt": prompt,
+                "title": title,
+                "description": description,
+                "metadata": metadata,
+                "executionClass": execution_class,
+                "createdByActorId": created_by_actor_id,
+            }
+        )
+        prior_actor_digest = _digest(
             {
                 "sessionId": session_id,
                 "prompt": prompt,
@@ -114,8 +129,9 @@ class WorkStore:
             ).fetchone()
             if row is not None:
                 if str(row["creation_digest"]) != create_digest and not (
-                    not str(row["created_by_actor_id"] or "")
-                    and str(row["creation_digest"]) == legacy_create_digest
+                    execution_class == "foreground"
+                    and str(row["execution_class"] or "foreground") == "foreground"
+                    and str(row["creation_digest"]) in {prior_actor_digest, legacy_create_digest}
                 ):
                     raise _conflict(
                         "WORK_TASK_ID_CONFLICT",
@@ -126,8 +142,9 @@ class WorkStore:
                 """INSERT INTO work_tasks (
                     organization_id,workspace_id,task_id,session_id,prompt,status,
                     created_at,started_at,ended_at,output,reasoning,error,duration_ms,
-                    sequence,title,description,metadata_json,creation_digest,created_by_actor_id
-                ) VALUES (?,?,?,?,?,'queued',?,NULL,NULL,'','',NULL,0,0,?,?,?,?,?)""",
+                    sequence,title,description,metadata_json,creation_digest,created_by_actor_id,
+                    execution_class
+                ) VALUES (?,?,?,?,?,'queued',?,NULL,NULL,'','',NULL,0,0,?,?,?,?,?,?)""",
                 (
                     org,
                     workspace,
@@ -140,6 +157,7 @@ class WorkStore:
                     _json_text(metadata),
                     create_digest,
                     created_by_actor_id,
+                    execution_class,
                 ),
             )
             self._append_event(conn, org, workspace, task_id, {"type": "task.created"}, None, now)
@@ -218,8 +236,8 @@ class WorkStore:
                     organization_id,workspace_id,task_id,session_id,prompt,status,
                     created_at,started_at,ended_at,output,reasoning,error,duration_ms,sequence,
                     title,description,metadata_json,creation_digest,created_by_actor_id,
-                    continuation_of_task_id,continuation_mode)
-                   VALUES(?,?,?,?,?,'queued',?,NULL,NULL,'','',NULL,0,0,NULL,NULL,'{}',?,?,?,?)""",
+                    continuation_of_task_id,continuation_mode,execution_class)
+                   VALUES(?,?,?,?,?,'queued',?,NULL,NULL,'','',NULL,0,0,NULL,NULL,'{}',?,?,?,?,?)""",
                 (
                     org,
                     workspace,
@@ -231,6 +249,7 @@ class WorkStore:
                     actor,
                     source_task_id,
                     "read_only",
+                    str(source["execution_class"] or "foreground"),
                 ),
             )
             self._append_event(
@@ -1096,15 +1115,35 @@ class WorkStore:
         operation_type = _bounded_text(body.get("operationType"), "operationType", 128)
         task_id = _optional_text(body.get("taskId"), "taskId", 512)
         target = _optional_text(body.get("target"), "target", 2_000)
+        scope_lock = _optional_text(body.get("scopeLock"), "scopeLock", 100)
         request = _json_object(body.get("request", {}), "request")
-        digest = _digest(
-            {
-                "operationType": operation_type,
-                "taskId": task_id,
-                "target": target,
-                "request": request,
-            }
-        )
+        digest_value = {
+            "operationType": operation_type,
+            "taskId": task_id,
+            "target": target,
+            "request": request,
+        }
+        if scope_lock is not None:
+            if (
+                not re.fullmatch(r"connector-branch:[a-f0-9]{64}", scope_lock)
+                or not operation_type.startswith("tool.provider.v1:")
+                or operation_type.rsplit(":", 1)[-1]
+                not in {
+                    "github.branch.create",
+                    "github.branch.delete",
+                    "github.file.commit",
+                    "github.pull_request.draft.create",
+                    "github.actions.rerun_failed",
+                }
+                or target is None
+                or not target.startswith("connector-target:")
+            ):
+                raise _invalid(
+                    "WORK_OPERATION_SCOPE_LOCK_INVALID",
+                    "scopeLock is reserved for a host-bound GitHub branch operation.",
+                )
+            digest_value["scopeLock"] = scope_lock
+        digest = _digest(digest_value)
         now = _unix_ms()
         with self._mutation() as conn:
             if task_id is not None:
@@ -1136,12 +1175,23 @@ class WorkStore:
                         "WORK_OPERATION_TARGET_UNRESOLVED",
                         "An operation on this exact provider target still needs reconciliation.",
                     )
+            if scope_lock is not None:
+                unresolved_scope = conn.execute(
+                    """SELECT 1 FROM work_operations WHERE organization_id=? AND workspace_id=?
+                       AND scope_lock=? AND status IN ('started','uncertain') LIMIT 1""",
+                    (org, workspace, scope_lock),
+                ).fetchone()
+                if unresolved_scope is not None:
+                    raise _conflict(
+                        "WORK_OPERATION_SCOPE_LOCKED",
+                        "Another operation on this provider branch still needs reconciliation.",
+                    )
             operation_id = uuid4().hex
             conn.execute(
                 """INSERT INTO work_operations(
                    organization_id,workspace_id,operation_id,idempotency_key,operation_type,
-                   task_id,target,request_json,status,evidence_json,request_digest,created_at,updated_at
-                   ) VALUES(?,?,?,?,?,?,?,?,'started','{}',?,?,?)""",
+                   task_id,target,scope_lock,request_json,status,evidence_json,request_digest,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,'started','{}',?,?,?)""",
                 (
                     org,
                     workspace,
@@ -1150,6 +1200,7 @@ class WorkStore:
                     operation_type,
                     task_id,
                     target,
+                    scope_lock,
                     _json_text(request),
                     digest,
                     now,
@@ -2725,18 +2776,252 @@ class WorkStore:
             )
             return value
 
-    def list_workflows(self, organization_id: str | None, workspace_id: str) -> list[JsonObject]:
-        """List versioned Work instructions for one organization and Workspace. | 列工作流。"""
+    def list_workflows(
+        self, organization_id: str | None, workspace_id: str, definition_version: int = 1
+    ) -> list[JsonObject]:
+        """List only the explicitly negotiated workflow schema version. | 按协商版本列工作流。"""
 
         org, workspace = _scope(organization_id, workspace_id)
+        if definition_version not in {1, 2}:
+            raise _invalid("WORK_WORKFLOW_VERSION_UNSUPPORTED", "definitionVersion must be 1 or 2")
         with self._read() as conn:
             rows = conn.execute(
                 """SELECT workflow_json FROM work_workflows WHERE organization_id=? AND
-                workspace_id=?
+                workspace_id=? AND version=?
                    ORDER BY workflow_id""",
-                (org, workspace),
+                (org, workspace, definition_version),
             ).fetchall()
             return [_stored_object(row["workflow_json"], "workflow") for row in rows]
+
+    def enqueue_workflow_notice(
+        self,
+        organization_id: str | None,
+        workspace_id: str,
+        workflow_id: str,
+        body: Mapping[str, Any],
+    ) -> tuple[JsonObject, bool]:
+        """Project one verified v2 terminal receipt into its stored owner Teams thread.
+
+        Args:
+            organization_id: Authenticated organization scope.
+            workspace_id: Authenticated Workspace scope.
+            workflow_id: Canonical v2 responsibility whose owner thread is used.
+            body: Notice identity and exact summary from a durable terminal event.
+        Returns:
+            A `teams.message` outbox receipt; route and source task come from Work state.
+        Raises:
+            PersistenceError: If the workflow, terminal event, owner task, or stored route disagree.
+
+        中文：只允许服务端从 v2 工作流、完成回执和已验证 Teams owner 任务生成回复队列。
+        """
+
+        org, workspace = _scope(organization_id, workspace_id)
+        workflow_id = _identifier(workflow_id, "workflowId")
+        occurrence_id = _identifier(body.get("occurrenceId"), "occurrenceId")
+        trigger_id = _identifier(body.get("triggerId"), "triggerId")
+        scheduled_at = _bounded_text(body.get("scheduledAt"), "scheduledAt", 128)
+        kind = body.get("kind")
+        summary = _bounded_text(body.get("summary"), "summary", 400)
+        attention_kind = body.get("attentionKind")
+        if kind not in {"change", "failure", "recovery", "digest", "blocker"}:
+            raise _invalid("WORK_WORKFLOW_NOTICE_INVALID", "kind is not supported")
+        if attention_kind is not None and attention_kind not in {
+            "blocked_goal",
+            "user_decision",
+            "service_or_auth_outage",
+        }:
+            raise _invalid("WORK_WORKFLOW_NOTICE_INVALID", "attentionKind is not supported")
+        expected_occurrence = (
+            "occ-"
+            + hashlib.sha256(f"{workflow_id}\0{trigger_id}\0{scheduled_at}".encode()).hexdigest()[
+                :40
+            ]
+        )
+        if occurrence_id != expected_occurrence:
+            raise _invalid(
+                "WORK_WORKFLOW_NOTICE_INVALID", "occurrenceId does not match its schedule identity"
+            )
+
+        with self._mutation() as conn:
+            workflow_row = conn.execute(
+                """SELECT workflow_json FROM work_workflows
+                   WHERE organization_id=? AND workspace_id=? AND workflow_id=? AND version=2""",
+                (org, workspace, workflow_id),
+            ).fetchone()
+            if workflow_row is None:
+                raise _not_found(
+                    "WORK_WORKFLOW_NOT_FOUND",
+                    "The v2 responsibility does not exist in this Workspace.",
+                )
+            workflow = _stored_object(workflow_row["workflow_json"], "workflow")
+            workflow = _validate_workflow_v2(workflow)
+            authorization = workflow["authorization"]
+            owner_task_id = str(authorization["ownerTaskId"])
+            thread_binding_id = str(authorization["threadBindingId"])
+            event_key = f"{workflow_id}\0{trigger_id}\0{scheduled_at}"
+            matching_events: list[JsonObject] = []
+            for status in ("succeeded", "failed"):
+                event_id = (
+                    "workflow-" + hashlib.sha256(f"{event_key}\0{status}".encode()).hexdigest()[:48]
+                )
+                event_row = conn.execute(
+                    """SELECT event_json FROM work_schedule_events
+                       WHERE organization_id=? AND workspace_id=?
+                       AND event_id=? AND workflow_id=?""",
+                    (org, workspace, event_id, workflow_id),
+                ).fetchone()
+                if event_row is not None:
+                    matching_events.append(
+                        _stored_object(event_row["event_json"], "workflow schedule event")
+                    )
+            terminal = next(
+                (item for item in matching_events if item.get("triggerId") == trigger_id), None
+            )
+            if terminal is None:
+                raise _conflict(
+                    "WORK_WORKFLOW_NOTICE_NOT_TERMINAL",
+                    "A matching terminal schedule receipt is required.",
+                )
+            if terminal.get("summary") != summary:
+                raise _conflict(
+                    "WORK_WORKFLOW_NOTICE_SUMMARY_MISMATCH",
+                    "Notice summary must match the stored terminal receipt.",
+                )
+            if kind == "blocker" and terminal.get("attentionKind") != attention_kind:
+                raise _conflict(
+                    "WORK_WORKFLOW_NOTICE_ATTENTION_MISMATCH",
+                    "Notice attention kind must match its stored receipt.",
+                )
+            terminal_checkpoint = terminal.get("checkpoint")
+            incomplete = (
+                isinstance(terminal_checkpoint, Mapping)
+                and terminal_checkpoint.get("complete") is False
+            )
+            if kind == "change" and (
+                terminal.get("status") != "succeeded"
+                or terminal.get("changed") is not True
+                or terminal.get("baseline") is True
+                or incomplete
+            ):
+                raise _conflict(
+                    "WORK_WORKFLOW_NOTICE_KIND_MISMATCH",
+                    "Change notices require a complete changed observation.",
+                )
+            if kind == "failure" and terminal.get("status") != "failed":
+                raise _conflict(
+                    "WORK_WORKFLOW_NOTICE_KIND_MISMATCH",
+                    "Failure notices require a failed terminal receipt.",
+                )
+            if kind == "digest" and trigger_id != "daily-digest":
+                raise _conflict(
+                    "WORK_WORKFLOW_NOTICE_KIND_MISMATCH",
+                    "Daily digests require the dedicated DSH trigger.",
+                )
+            if kind == "digest" and (
+                terminal.get("status") != "succeeded" or terminal.get("changed") is not True
+            ):
+                raise _conflict(
+                    "WORK_WORKFLOW_NOTICE_KIND_MISMATCH",
+                    "Daily digest notices require material changes.",
+                )
+
+            owner_task = self._require_task(conn, org, workspace, owner_task_id)
+            metadata = _stored_object(owner_task["metadata_json"], "owner task metadata")
+            caller = metadata.get("teamsCaller")
+            thread = metadata.get("teamsThread")
+            if not isinstance(caller, Mapping) or not isinstance(thread, Mapping):
+                raise _conflict(
+                    "WORK_WORKFLOW_NOTICE_OWNER_INVALID",
+                    "The owner task is not an accepted Teams task.",
+                )
+            for field in ("issuer", "subject", "tenantId"):
+                _identifier(caller.get(field), f"ownerTask.teamsCaller.{field}")
+            if str(thread.get("threadId") or "") != thread_binding_id:
+                raise _conflict(
+                    "WORK_WORKFLOW_NOTICE_THREAD_MISMATCH",
+                    "The owner task thread does not match the v2 authorization reference.",
+                )
+            thread_rows = conn.execute(
+                """SELECT * FROM work_connector_threads WHERE organization_id=? AND workspace_id=?
+                   AND thread_id=?""",
+                (org, workspace, thread_binding_id),
+            ).fetchall()
+            if not thread_rows:
+                raise _not_found(
+                    "WORK_CONNECTOR_THREAD_NOT_FOUND",
+                    "The authorized Teams thread mapping does not exist.",
+                )
+            if len(thread_rows) != 1:
+                raise _conflict(
+                    "WORK_WORKFLOW_NOTICE_THREAD_AMBIGUOUS",
+                    "The Teams thread binding resolves to more than one connector.",
+                )
+            thread_row = thread_rows[0]
+            connector_id = str(thread_row["connector_id"])
+            route = {
+                "tenantId": str(thread_row["tenant_id"]),
+                "teamId": str(thread_row["team_id"]),
+                "channelId": str(thread_row["channel_id"]),
+                "conversationId": str(thread_row["conversation_id"]),
+                "rootThreadId": str(thread_row["root_thread_id"]),
+                **(
+                    {"serviceUrl": str(thread_row["service_url"])}
+                    if str(thread_row["service_url"] or "")
+                    else {}
+                ),
+            }
+            if str(caller.get("tenantId") or "").lower() != str(route["tenantId"] or "").lower():
+                raise _conflict(
+                    "WORK_WORKFLOW_NOTICE_TENANT_MISMATCH",
+                    "The owner task tenant does not match the stored thread.",
+                )
+            for field in ("tenantId", "teamId", "channelId", "conversationId", "rootThreadId"):
+                if str(thread.get(field) or "") != str(route.get(field) or ""):
+                    raise _conflict(
+                        "WORK_WORKFLOW_NOTICE_ROUTE_MISMATCH",
+                        "The owner task route does not match the stored Teams thread.",
+                    )
+            if thread.get("serviceUrl") is not None and str(thread.get("serviceUrl") or "") != str(
+                route.get("serviceUrl") or ""
+            ):
+                raise _conflict(
+                    "WORK_WORKFLOW_NOTICE_ROUTE_MISMATCH",
+                    "The owner task service URL does not match the stored Teams thread.",
+                )
+            if str(owner_task["session_id"]) != str(thread_row["session_id"]):
+                raise _conflict(
+                    "WORK_WORKFLOW_NOTICE_SESSION_MISMATCH",
+                    "The owner task is not bound to the stored Teams session.",
+                )
+            descriptor = _task_notification_descriptor(metadata)
+            if descriptor is not None and (
+                descriptor["type"] != "teams.message"
+                or descriptor["connectorId"] != connector_id
+                or descriptor["payload"] != route
+            ):
+                raise _conflict(
+                    "WORK_WORKFLOW_NOTICE_ROUTE_MISMATCH",
+                    "The owner task reply descriptor differs from the stored Teams thread.",
+                )
+
+            prefix = f"{workflow['title']} — "
+            rendered = _bounded_text(prefix + summary, "workflow notice text", 20_000)
+            payload = {**route, "text": rendered}
+            deduplication_key = f"workflow:{workflow_id}:{occurrence_id}:{kind}"
+            notification, duplicate = self._enqueue_notification(
+                conn,
+                org,
+                workspace,
+                deduplication_key,
+                "teams.message",
+                payload,
+                connector_id,
+                f"teams:{thread_binding_id}",
+                owner_task_id,
+                _unix_ms(),
+                _unix_ms(),
+            )
+            return {"notification": notification, "duplicate": duplicate}, duplicate
 
     def append_schedule_event(
         self,
@@ -2828,6 +3113,26 @@ class WorkStore:
                 next_cursor = _encode_cursor(int(last["created_at"]), str(last["event_id"]))
             return {"items": items, "nextCursor": next_cursor}
 
+    def get_schedule_event(
+        self, organization_id: str | None, workspace_id: str, event_id: str
+    ) -> JsonObject:
+        """Read one immutable schedule receipt by its stable event id. | 按稳定事件标识读取回执。"""
+
+        org, workspace = _scope(organization_id, workspace_id)
+        event_id = _identifier(event_id, "schedule event id")
+        with self._read() as conn:
+            row = conn.execute(
+                """SELECT event_json FROM work_schedule_events
+                   WHERE organization_id=? AND workspace_id=? AND event_id=?""",
+                (org, workspace, event_id),
+            ).fetchone()
+            if row is None:
+                raise _not_found(
+                    "WORK_SCHEDULE_EVENT_NOT_FOUND",
+                    "The schedule event does not exist in this Workspace.",
+                )
+            return _stored_object(row["event_json"], "schedule event")
+
     def _notification_transition(
         self,
         organization_id: str | None,
@@ -2895,11 +3200,6 @@ class WorkStore:
                             500,
                             "Stored notification retry count is invalid.",
                         )
-                    if retry_count >= 3:
-                        raise _conflict(
-                            "WORK_NOTIFICATION_RETRY_LIMIT",
-                            "The bounded notification retry limit has been reached.",
-                        )
                     assert retry_after_seconds is not None
                     stored_result = {**normalized_result, "retryCount": retry_count + 1}
                     conn.execute(
@@ -2952,9 +3252,10 @@ class WorkStore:
                     "created_by_actor_id": "TEXT NOT NULL DEFAULT ''",
                     "continuation_of_task_id": "TEXT",
                     "continuation_mode": "TEXT",
+                    "execution_class": "TEXT NOT NULL DEFAULT 'foreground'",
                 },
                 "work_notifications": {"connector_id": "TEXT", "task_id": "TEXT"},
-                "work_operations": {"task_id": "TEXT"},
+                "work_operations": {"task_id": "TEXT", "scope_lock": "TEXT"},
                 "work_connector_states": {"configured": "INTEGER NOT NULL DEFAULT 0"},
                 "work_connector_threads": {
                     "service_url": "TEXT NOT NULL DEFAULT ''",
@@ -2980,6 +3281,10 @@ class WorkStore:
                 """CREATE INDEX IF NOT EXISTS work_notifications_connector_claim
                    ON work_notifications(organization_id,workspace_id,notification_type,
                        connector_id,recipient,status,available_at,created_at)"""
+            )
+            conn.execute(
+                """CREATE INDEX IF NOT EXISTS work_operations_scope_lock
+                   ON work_operations(organization_id,workspace_id,scope_lock,status)"""
             )
         finally:
             conn.close()
@@ -3163,6 +3468,7 @@ class WorkStore:
             "metadata": _stored_object(row["metadata_json"], "task metadata"),
             "continuationOfTaskId": row["continuation_of_task_id"],
             "continuationMode": row["continuation_mode"],
+            "executionClass": str(row["execution_class"] or "foreground"),
         }
 
     @staticmethod
@@ -3211,6 +3517,7 @@ class WorkStore:
             "operationType": str(row["operation_type"]),
             "taskId": row["task_id"],
             "target": row["target"],
+            "scopeLock": row["scope_lock"],
             "request": _stored_object(row["request_json"], "operation request"),
             "status": str(row["status"]),
             "evidence": _stored_object(row["evidence_json"], "operation evidence"),
@@ -3496,6 +3803,7 @@ CREATE TABLE IF NOT EXISTS work_tasks (
  duration_ms INTEGER NOT NULL DEFAULT 0, sequence INTEGER NOT NULL DEFAULT 0,
  title TEXT, description TEXT, metadata_json TEXT NOT NULL, creation_digest TEXT NOT NULL,
  created_by_actor_id TEXT NOT NULL DEFAULT '', continuation_of_task_id TEXT, continuation_mode TEXT,
+ execution_class TEXT NOT NULL DEFAULT 'foreground',
  PRIMARY KEY(organization_id,workspace_id,task_id));
 CREATE INDEX IF NOT EXISTS work_tasks_order
  ON work_tasks(organization_id,workspace_id,created_at DESC,task_id);
@@ -3533,6 +3841,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS work_inputs_one_pending
 CREATE TABLE IF NOT EXISTS work_operations (
  organization_id TEXT NOT NULL, workspace_id TEXT NOT NULL, operation_id TEXT NOT NULL,
  idempotency_key TEXT NOT NULL, operation_type TEXT NOT NULL, task_id TEXT, target TEXT,
+ scope_lock TEXT,
  request_json TEXT NOT NULL, status TEXT NOT NULL, evidence_json TEXT NOT NULL,
  request_digest TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
  PRIMARY KEY(organization_id,workspace_id,operation_id),
@@ -3999,6 +4308,57 @@ def _task_notification_descriptor(metadata: Mapping[str, Any]) -> JsonObject | N
     }
 
 
+def _validate_task_execution_metadata(execution_class: object, metadata: Mapping[str, Any]) -> None:
+    """Keep background task authority host-generated and bound to a v2 responsibility.
+
+    Args:
+        execution_class: Persisted foreground/background admission class.
+        metadata: Host-generated task metadata stored alongside the durable record.
+    Raises:
+        PersistenceError: If a background task has no verifiable workflow provenance.
+
+    中文：后台任务必须携带责任、发生实例和 owner Teams 线程引用，不能由普通任务冒充。
+    """
+
+    if execution_class == "foreground":
+        return
+    if execution_class != "background":
+        raise _invalid("WORK_TASK_INVALID_EXECUTION_CLASS", "executionClass is not supported")
+    if metadata.get("source") != "workflow":
+        raise _invalid(
+            "WORK_TASK_BACKGROUND_PROVENANCE_REQUIRED",
+            "Background tasks require workflow provenance",
+        )
+    for field in ("workflowId", "triggerId", "occurrenceId"):
+        _identifier(metadata.get(field), f"metadata.{field}")
+    authorization = metadata.get("authorizationRef")
+    if not isinstance(authorization, Mapping) or set(authorization) != {
+        "kind",
+        "threadBindingId",
+        "ownerTaskId",
+    }:
+        raise _invalid(
+            "WORK_TASK_BACKGROUND_AUTHORIZATION_REQUIRED",
+            "Background task authorization reference is invalid",
+        )
+    if authorization.get("kind") != "teams_thread":
+        raise _invalid(
+            "WORK_TASK_BACKGROUND_AUTHORIZATION_REQUIRED",
+            "Background task authorization source is invalid",
+        )
+    _identifier(authorization.get("threadBindingId"), "metadata.authorizationRef.threadBindingId")
+    _identifier(authorization.get("ownerTaskId"), "metadata.authorizationRef.ownerTaskId")
+    action_id = metadata.get("actionId")
+    if action_id is not None:
+        _identifier(action_id, "metadata.actionId")
+        _identifier(metadata.get("actionType"), "metadata.actionType")
+        _identifier(metadata.get("parentTaskId"), "metadata.parentTaskId")
+    elif metadata.get("parentTaskId") is not None or metadata.get("actionType") is not None:
+        raise _invalid(
+            "WORK_TASK_BACKGROUND_PARENT_INVALID", "Only action children may have a parent task"
+        )
+
+
 def _json_text(value: object) -> str:
     """Encode canonical JSON and reject NaN or infinity. | 编码规范 JSON。"""
 
@@ -4114,6 +4474,8 @@ def _validate_workflow(workflow: Mapping[str, Any]) -> JsonObject:
     """Validate the intentionally generic DSH-owned workflow metadata. | 校验工作流定义。"""
 
     value = _json_object(workflow, "workflow")
+    if value.get("version") == 2:
+        return _validate_workflow_v2(value)
     workflow_id = _identifier(value.get("id"), "workflow id")
     if value.get("version") != 1 or type(value.get("enabled")) is not bool:
         raise _invalid(
@@ -4144,6 +4506,11 @@ def _validate_workflow(workflow: Mapping[str, Any]) -> JsonObject:
                 "id": _identifier(target.get("id"), "target id"),
                 "label": _bounded_text(target.get("label"), "target label", 512),
                 "kind": _bounded_text(target.get("kind"), "target kind", 128),
+                **(
+                    {"bindingId": _identifier(target["bindingId"], "target bindingId")}
+                    if target.get("bindingId")
+                    else {}
+                ),
                 **(
                     {"uri": _bounded_text(target["uri"], "target uri", 2_000)}
                     if target.get("uri")
@@ -4189,6 +4556,610 @@ def _validate_workflow(workflow: Mapping[str, Any]) -> JsonObject:
     return result
 
 
+def _validate_workflow_v2(value: Mapping[str, Any]) -> JsonObject:
+    """Validate a host-managed proactive responsibility and its exact action scopes.
+
+    Args:
+        value: V2 workflow document using the published camelCase contract.
+    Returns:
+        A normalized JSON-safe record with no unrecognized policy fields.
+    Raises:
+        PersistenceError: If a trigger, model route, notification rule, or action scope is invalid.
+
+    中文：校验主动责任定义，并拒绝未识别字段和未绑定目标的操作授权。
+    """
+
+    allowed = {
+        "id",
+        "version",
+        "title",
+        "description",
+        "goal",
+        "instructions",
+        "targets",
+        "triggers",
+        "actionPolicy",
+        "modelPolicy",
+        "authorization",
+        "notifications",
+        "enabled",
+        "updatedAt",
+    }
+    if set(value) - allowed or value.get("version") != 2 or type(value.get("enabled")) is not bool:
+        raise _invalid(
+            "WORK_WORKFLOW_V2_INVALID", "workflow v2 has an unsupported field or version"
+        )
+    result: JsonObject = {
+        "id": _identifier(value.get("id"), "workflow id"),
+        "version": 2,
+        "title": _bounded_text(value.get("title"), "title", 512),
+        "description": value.get("description", ""),
+        "goal": _bounded_text(value.get("goal"), "goal", 20_000),
+        "instructions": _bounded_text(value.get("instructions"), "instructions", 100_000),
+        "enabled": value["enabled"],
+    }
+    if not isinstance(result["description"], str) or len(result["description"]) > 20_000:
+        raise _invalid("WORK_WORKFLOW_V2_INVALID", "description must be bounded text")
+
+    targets = value.get("targets")
+    if not isinstance(targets, list) or len(targets) > 100:
+        raise _invalid(
+            "WORK_WORKFLOW_V2_INVALID", "targets must be an array with at most 100 entries"
+        )
+    normalized_targets: list[JsonObject] = []
+    target_by_id: dict[str, JsonObject] = {}
+    for target in targets:
+        if not isinstance(target, Mapping) or set(target) - {
+            "id",
+            "label",
+            "kind",
+            "uri",
+            "bindingId",
+        }:
+            raise _invalid("WORK_WORKFLOW_V2_INVALID", "each target must use the supported fields")
+        target_id = _identifier(target.get("id"), "target id")
+        label = _bounded_text(target.get("label"), "target label", 512)
+        kind = _bounded_text(target.get("kind"), "target kind", 128)
+        normalized: JsonObject = {"id": target_id, "label": label, "kind": kind}
+        if target.get("bindingId") is not None:
+            normalized["bindingId"] = _identifier(target["bindingId"], "target bindingId")
+        uri_value = target.get("uri")
+        if uri_value is not None:
+            uri = _bounded_text(uri_value, "target uri", 2_000)
+            from urllib.parse import urlsplit
+
+            parsed = urlsplit(uri)
+            if parsed.username or parsed.password or parsed.query or parsed.fragment:
+                raise _invalid(
+                    "WORK_WORKFLOW_V2_TARGET_INVALID",
+                    "target URI cannot contain credentials or query data",
+                )
+            if parsed.scheme != "https" or not parsed.netloc:
+                raise _invalid("WORK_WORKFLOW_V2_TARGET_INVALID", "target URI must use HTTPS")
+            normalized["uri"] = uri
+        if kind == "github_repository":
+            if (
+                not target_id.isdigit()
+                or not re.fullmatch(r"[^/\s]+/[^/\s]+", label)
+                or "bindingId" not in normalized
+            ):
+                raise _invalid(
+                    "WORK_WORKFLOW_V2_TARGET_INVALID",
+                    "GitHub target requires numeric id, owner/repo label, and connector binding",
+                )
+            if normalized.get("uri") != f"https://github.com/{label}":
+                raise _invalid(
+                    "WORK_WORKFLOW_V2_TARGET_INVALID",
+                    "GitHub target URI must match owner/repo label",
+                )
+        if target_id in target_by_id:
+            raise _invalid("WORK_WORKFLOW_V2_TARGET_INVALID", "target ids must be unique")
+        normalized_targets.append(normalized)
+        target_by_id[target_id] = normalized
+    result["targets"] = normalized_targets
+
+    triggers = value.get("triggers")
+    if not isinstance(triggers, list) or not 1 <= len(triggers) <= 100:
+        raise _invalid(
+            "WORK_WORKFLOW_V2_TRIGGER_INVALID", "at least one supported trigger is required"
+        )
+    normalized_triggers: list[JsonObject] = []
+    trigger_ids: set[str] = set()
+    for trigger in triggers:
+        if not isinstance(trigger, Mapping) or set(trigger) - {
+            "id",
+            "kind",
+            "schedule",
+            "targetIds",
+            "initialBaseline",
+            "search",
+        }:
+            raise _invalid("WORK_WORKFLOW_V2_TRIGGER_INVALID", "trigger uses unsupported fields")
+        trigger_id = _identifier(trigger.get("id"), "trigger id")
+        trigger_kind = trigger.get("kind")
+        if (
+            trigger_id in trigger_ids
+            or trigger_id == "daily-digest"
+            or trigger_kind not in {"github_incremental_poll", "review"}
+        ):
+            raise _invalid("WORK_WORKFLOW_V2_TRIGGER_INVALID", "trigger id or kind is invalid")
+        trigger_ids.add(trigger_id)
+        schedule = _validate_workflow_schedule(trigger.get("schedule"))
+        trigger_targets = trigger.get("targetIds", [])
+        if not isinstance(trigger_targets, list) or len(trigger_targets) > 100:
+            raise _invalid(
+                "WORK_WORKFLOW_V2_TRIGGER_INVALID", "trigger targetIds must be a bounded array"
+            )
+        target_ids = [_identifier(item, "trigger target id") for item in trigger_targets]
+        if len(set(target_ids)) != len(target_ids) or any(
+            item not in target_by_id for item in target_ids
+        ):
+            raise _invalid(
+                "WORK_WORKFLOW_V2_TRIGGER_INVALID",
+                "trigger targetIds must reference unique configured targets",
+            )
+        if trigger_kind == "github_incremental_poll" and (
+            not target_ids
+            or any(target_by_id[item]["kind"] != "github_repository" for item in target_ids)
+        ):
+            raise _invalid(
+                "WORK_WORKFLOW_V2_TRIGGER_INVALID",
+                "GitHub polling requires GitHub repository targets",
+            )
+        search = trigger.get("search")
+        normalized_search: JsonObject | None = None
+        if trigger_kind == "github_incremental_poll":
+            if (
+                not isinstance(search, Mapping)
+                or set(search) - {"state", "query", "labels", "limit"}
+                or not {"state", "labels", "limit"}.issubset(search)
+            ):
+                raise _invalid(
+                    "WORK_WORKFLOW_V2_TRIGGER_INVALID",
+                    "GitHub polling requires safe typed search filters",
+                )
+            state = search.get("state")
+            if state not in {"open", "closed", "all"}:
+                raise _invalid(
+                    "WORK_WORKFLOW_V2_TRIGGER_INVALID", "GitHub search state is not supported"
+                )
+            query = search.get("query")
+            if query is not None:
+                query = _bounded_text(query, "GitHub search query", 256)
+                if re.search(
+                    r"(?:^|\s)(?:repo|is|label|state|updated|author|assignee|milestone):",
+                    query,
+                    re.I,
+                ):
+                    raise _invalid(
+                        "WORK_WORKFLOW_V2_TRIGGER_INVALID",
+                        "GitHub search query cannot contain qualifiers",
+                    )
+            labels = search.get("labels")
+            if not isinstance(labels, list) or len(labels) > 10:
+                raise _invalid(
+                    "WORK_WORKFLOW_V2_TRIGGER_INVALID",
+                    "GitHub search labels are bounded to ten entries",
+                )
+            normalized_labels = [
+                _bounded_text(label, "GitHub search label", 128) for label in labels
+            ]
+            if len(set(normalized_labels)) != len(normalized_labels):
+                raise _invalid(
+                    "WORK_WORKFLOW_V2_TRIGGER_INVALID", "GitHub search labels must be unique"
+                )
+            limit = search.get("limit")
+            if type(limit) is not int or not 1 <= limit <= 50:
+                raise _invalid(
+                    "WORK_WORKFLOW_V2_TRIGGER_INVALID", "GitHub search page size must be 1 to 50"
+                )
+            normalized_search = {"state": state, "labels": normalized_labels, "limit": limit}
+            if query is not None:
+                normalized_search["query"] = query
+        elif search is not None:
+            raise _invalid(
+                "WORK_WORKFLOW_V2_TRIGGER_INVALID",
+                "Only GitHub polling triggers can contain search filters",
+            )
+        baseline = trigger.get("initialBaseline", "record_without_notification")
+        if baseline != "record_without_notification":
+            raise _invalid(
+                "WORK_WORKFLOW_V2_TRIGGER_INVALID", "initial scans must establish a quiet baseline"
+            )
+        normalized_trigger: JsonObject = {
+            "id": trigger_id,
+            "kind": trigger_kind,
+            "schedule": schedule,
+            "targetIds": target_ids,
+            "initialBaseline": baseline,
+        }
+        if normalized_search is not None:
+            normalized_trigger["search"] = normalized_search
+        normalized_triggers.append(normalized_trigger)
+    result["triggers"] = normalized_triggers
+
+    action_policy = value.get("actionPolicy")
+    if not isinstance(action_policy, Mapping) or set(action_policy) - {
+        "allowedActions",
+        "separateChildTask",
+        "productionChanges",
+        "requiresUserAuthorization",
+    }:
+        raise _invalid(
+            "WORK_WORKFLOW_V2_ACTION_POLICY_INVALID",
+            "actionPolicy is required and must use supported fields",
+        )
+    grants = action_policy.get("allowedActions", [])
+    if not isinstance(grants, list) or len(grants) > 100:
+        raise _invalid(
+            "WORK_WORKFLOW_V2_ACTION_POLICY_INVALID", "allowedActions must be a bounded array"
+        )
+    normalized_grants: list[JsonObject] = []
+    grant_ids: set[str] = set()
+    permitted_by_action = {
+        "draft_pull_request": {
+            "github.branch.create",
+            "github.branch.delete",
+            "github.file.commit",
+            "github.pull_request.draft.create",
+        },
+        "rerun_source_ci": {"github.actions.rerun_failed"},
+        "update_issue_progress": {"github.issue.comment.create", "github.issue.state.update"},
+    }
+    known_operations = set().union(*permitted_by_action.values())
+    for grant in grants:
+        required = {"id", "action", "targetIds", "permittedOperations", "sourceWorkflowIds"}
+        optional = {"baseBranches", "branchPrefixes", "pathPrefixes", "issueNumbers"}
+        if (
+            not isinstance(grant, Mapping)
+            or not required.issubset(grant)
+            or set(grant) - required - optional
+        ):
+            raise _invalid(
+                "WORK_WORKFLOW_V2_ACTION_POLICY_INVALID", "action grant fields are invalid"
+            )
+        grant_id = _identifier(grant.get("id"), "action grant id")
+        action = grant.get("action")
+        grant_target_ids = grant.get("targetIds")
+        operations = grant.get("permittedOperations")
+        if (
+            grant_id in grant_ids
+            or action not in permitted_by_action
+            or not isinstance(grant_target_ids, list)
+            or not grant_target_ids
+        ):
+            raise _invalid(
+                "WORK_WORKFLOW_V2_ACTION_POLICY_INVALID",
+                "action grant id, action, or targetIds are invalid",
+            )
+        grant_ids.add(grant_id)
+        normalized_target_ids = [_identifier(item, "action target id") for item in grant_target_ids]
+        if len(set(normalized_target_ids)) != len(normalized_target_ids) or any(
+            item not in target_by_id or target_by_id[item]["kind"] != "github_repository"
+            for item in normalized_target_ids
+        ):
+            raise _invalid(
+                "WORK_WORKFLOW_V2_ACTION_POLICY_INVALID",
+                "actions must bind unique configured GitHub repositories",
+            )
+        if not isinstance(operations, list) or not operations or len(operations) > 20:
+            raise _invalid(
+                "WORK_WORKFLOW_V2_ACTION_POLICY_INVALID",
+                "permittedOperations must be a non-empty array",
+            )
+        normalized_operations = [
+            _bounded_text(item, "permitted operation", 128) for item in operations
+        ]
+        if len(set(normalized_operations)) != len(normalized_operations) or not set(
+            normalized_operations
+        ).issubset(permitted_by_action[action] & known_operations):
+            raise _invalid(
+                "WORK_WORKFLOW_V2_ACTION_POLICY_INVALID",
+                "operation id is not permitted for this action",
+            )
+        base_branches = _workflow_text_list(grant.get("baseBranches", []), "baseBranches", 256)
+        branch_prefixes = _workflow_text_list(
+            grant.get("branchPrefixes", []), "branchPrefixes", 256
+        )
+        path_prefixes = _workflow_text_list(grant.get("pathPrefixes", []), "pathPrefixes", 512)
+        source_workflow_ids = _workflow_text_list(
+            grant.get("sourceWorkflowIds"), "sourceWorkflowIds", 20
+        )
+        if len(set(source_workflow_ids)) != len(source_workflow_ids) or any(
+            not re.fullmatch(r"[1-9][0-9]{0,19}", item) for item in source_workflow_ids
+        ):
+            raise _invalid(
+                "WORK_WORKFLOW_V2_ACTION_POLICY_INVALID",
+                "sourceWorkflowIds must contain unique numeric workflow ids",
+            )
+        issue_numbers_raw = grant.get("issueNumbers", [])
+        if not isinstance(issue_numbers_raw, list) or len(issue_numbers_raw) > 10_000:
+            raise _invalid(
+                "WORK_WORKFLOW_V2_ACTION_POLICY_INVALID", "issueNumbers must be a bounded array"
+            )
+        if any(type(number) is not int or number < 1 for number in issue_numbers_raw):
+            raise _invalid(
+                "WORK_WORKFLOW_V2_ACTION_POLICY_INVALID",
+                "issueNumbers must contain positive integers",
+            )
+        issue_numbers = sorted(set(issue_numbers_raw))
+        if action == "draft_pull_request":
+            if (
+                not {
+                    "github.branch.create",
+                    "github.file.commit",
+                    "github.pull_request.draft.create",
+                }.issubset(normalized_operations)
+                or not base_branches
+                or not branch_prefixes
+                or not path_prefixes
+                or issue_numbers
+                or source_workflow_ids
+                or any(not _valid_assistant_branch_prefix(item) for item in branch_prefixes)
+            ):
+                raise _invalid(
+                    "WORK_WORKFLOW_V2_ACTION_POLICY_INVALID",
+                    "draft PR grants require exact branch, base, path, and operation scope",
+                )
+        elif action == "rerun_source_ci":
+            if (
+                normalized_operations != ["github.actions.rerun_failed"]
+                or base_branches
+                or path_prefixes
+                or issue_numbers
+                or not branch_prefixes
+                or not source_workflow_ids
+                or any(not _valid_assistant_branch_prefix(item) for item in branch_prefixes)
+            ):
+                raise _invalid(
+                    "WORK_WORKFLOW_V2_ACTION_POLICY_INVALID",
+                    "CI rerun grants must bind source workflows and assistant branches",
+                )
+        elif action == "update_issue_progress" and (
+            not issue_numbers
+            or not set(normalized_operations).issubset(
+                {"github.issue.comment.create", "github.issue.state.update"}
+            )
+            or any((base_branches, branch_prefixes, path_prefixes))
+            or source_workflow_ids
+        ):
+            raise _invalid(
+                "WORK_WORKFLOW_V2_ACTION_POLICY_INVALID",
+                "issue progress grants require exact issue numbers",
+            )
+        normalized_grants.append(
+            {
+                "id": grant_id,
+                "action": action,
+                "targetIds": normalized_target_ids,
+                "baseBranches": base_branches,
+                "branchPrefixes": branch_prefixes,
+                "pathPrefixes": path_prefixes,
+                "issueNumbers": issue_numbers,
+                "sourceWorkflowIds": sorted(source_workflow_ids),
+                "permittedOperations": normalized_operations,
+            }
+        )
+    if (
+        action_policy.get("separateChildTask", True) is not True
+        or action_policy.get("productionChanges", "forbidden") != "forbidden"
+    ):
+        raise _invalid(
+            "WORK_WORKFLOW_V2_ACTION_POLICY_INVALID",
+            "actions must use separate child tasks and forbid production changes",
+        )
+    authorization_required = action_policy.get(
+        "requiresUserAuthorization", ["merge", "release", "production", "new_spend"]
+    )
+    if authorization_required != ["merge", "release", "production", "new_spend"]:
+        raise _invalid(
+            "WORK_WORKFLOW_V2_ACTION_POLICY_INVALID",
+            "merge, release, production, and new spend require user authorization",
+        )
+    result["actionPolicy"] = {
+        "allowedActions": normalized_grants,
+        "separateChildTask": True,
+        "productionChanges": "forbidden",
+        "requiresUserAuthorization": authorization_required,
+    }
+
+    model_policy = value.get("modelPolicy")
+    if not isinstance(model_policy, Mapping) or set(model_policy) != {
+        "preferredProvider",
+        "preferredModel",
+        "fallback",
+    }:
+        raise _invalid(
+            "WORK_WORKFLOW_V2_MODEL_POLICY_INVALID",
+            "modelPolicy must use the supported model route fields",
+        )
+    if model_policy.get("preferredProvider") not in {"antigravity", "codebuddy", "exchange"}:
+        raise _invalid("WORK_WORKFLOW_V2_MODEL_POLICY_INVALID", "preferredProvider is unsupported")
+    if model_policy.get("fallback") != "configured_no_additional_spend":
+        raise _invalid(
+            "WORK_WORKFLOW_V2_MODEL_POLICY_INVALID",
+            "model fallback must stay within configured no-additional-spend routes",
+        )
+    result["modelPolicy"] = {
+        "preferredProvider": model_policy["preferredProvider"],
+        "preferredModel": _bounded_text(model_policy.get("preferredModel"), "preferredModel", 256),
+        "fallback": "configured_no_additional_spend",
+    }
+
+    authorization = value.get("authorization")
+    if (
+        not isinstance(authorization, Mapping)
+        or set(authorization) != {"kind", "threadBindingId", "ownerTaskId"}
+        or authorization.get("kind") != "teams_thread"
+    ):
+        raise _invalid(
+            "WORK_WORKFLOW_V2_AUTHORIZATION_INVALID",
+            "authorization must bind an owner Teams thread",
+        )
+    result["authorization"] = {
+        "kind": "teams_thread",
+        "threadBindingId": _identifier(authorization.get("threadBindingId"), "threadBindingId"),
+        "ownerTaskId": _identifier(authorization.get("ownerTaskId"), "ownerTaskId"),
+    }
+
+    result["notifications"] = _validate_workflow_notifications_v2(value.get("notifications"))
+    if value["enabled"] and not normalized_targets:
+        raise _invalid(
+            "WORK_WORKFLOW_V2_INVALID", "enabled responsibilities require at least one target"
+        )
+    if value.get("updatedAt") is not None:
+        result["updatedAt"] = _bounded_text(value["updatedAt"], "updatedAt", 128)
+    return result
+
+
+def _validate_workflow_schedule(value: object) -> JsonObject:
+    """Validate one cron value stored for DSH Schedule. | 校验 DSH cron 配置。"""
+
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"kind", "expression", "timeZone"}
+        or value.get("kind") != "cron"
+    ):
+        raise _invalid(
+            "WORK_WORKFLOW_V2_TRIGGER_INVALID",
+            "schedule must contain cron expression and IANA timezone",
+        )
+    expression = _bounded_text(value.get("expression"), "cron expression", 256)
+    time_zone = _bounded_text(value.get("timeZone"), "timeZone", 128)
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    try:
+        ZoneInfo(time_zone)
+    except ZoneInfoNotFoundError as exc:
+        raise _invalid(
+            "WORK_WORKFLOW_V2_TRIGGER_INVALID", "timeZone must be a known IANA zone"
+        ) from exc
+    return {"kind": "cron", "expression": expression, "timeZone": time_zone}
+
+
+def _workflow_text_list(value: object, field: str, maximum: int) -> list[str]:
+    """Normalize one bounded unique text allowlist. | 规范去重后的文本范围列表。"""
+
+    if not isinstance(value, list) or len(value) > 100:
+        raise _invalid("WORK_WORKFLOW_V2_ACTION_POLICY_INVALID", f"{field} must be a bounded array")
+    normalized = [_bounded_text(item, field, maximum) for item in value]
+    if len(set(normalized)) != len(normalized):
+        raise _invalid("WORK_WORKFLOW_V2_ACTION_POLICY_INVALID", f"{field} entries must be unique")
+    if field == "pathPrefixes" and any(
+        item != "**"
+        and (item.startswith("/") or ".." in item.split("/") or "\\" in item or "*" in item)
+        for item in normalized
+    ):
+        raise _invalid(
+            "WORK_WORKFLOW_V2_ACTION_POLICY_INVALID",
+            "pathPrefixes must be repository-relative literal prefixes or the exact ** sentinel",
+        )
+    return normalized
+
+
+def _valid_assistant_branch_prefix(value: str) -> bool:
+    """Keep autonomous grants under the assistant namespace. | 限定助手分支范围。"""
+
+    return (
+        value.startswith("cyrene/assistant/")
+        and "\\" not in value
+        and not any(character.isspace() for character in value)
+        and ".." not in value.split("/")
+    )
+
+
+def _validate_workflow_notifications_v2(value: object) -> JsonObject:
+    """Validate quiet hours and the once-per-day digest policy. | 校验静默时段与摘要策略。"""
+
+    if not isinstance(value, Mapping) or set(value) != {
+        "onChange",
+        "onFailure",
+        "onRecovery",
+        "quietWhenUnchanged",
+        "quietHours",
+        "digest",
+        "destination",
+        "immediateOn",
+    }:
+        raise _invalid(
+            "WORK_WORKFLOW_V2_NOTIFICATIONS_INVALID", "v2 notifications have an unsupported shape"
+        )
+    if (
+        any(type(value.get(key)) is not bool for key in ("onChange", "onFailure", "onRecovery"))
+        or value.get("quietWhenUnchanged") is not True
+    ):
+        raise _invalid(
+            "WORK_WORKFLOW_V2_NOTIFICATIONS_INVALID",
+            "notification transition preferences are invalid",
+        )
+    quiet_hours = value.get("quietHours")
+    if not isinstance(quiet_hours, Mapping) or set(quiet_hours) != {"start", "end", "timeZone"}:
+        raise _invalid("WORK_WORKFLOW_V2_NOTIFICATIONS_INVALID", "quietHours are invalid")
+    for field in ("start", "end"):
+        if not isinstance(quiet_hours.get(field), str) or not re.fullmatch(
+            r"(?:[01]\d|2[0-3]):[0-5]\d", quiet_hours[field]
+        ):
+            raise _invalid("WORK_WORKFLOW_V2_NOTIFICATIONS_INVALID", "quiet hours must use HH:MM")
+    quiet_zone = _bounded_text(quiet_hours.get("timeZone"), "quietHours.timeZone", 128)
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    try:
+        ZoneInfo(quiet_zone)
+    except ZoneInfoNotFoundError as exc:
+        raise _invalid(
+            "WORK_WORKFLOW_V2_NOTIFICATIONS_INVALID",
+            "quietHours.timeZone must be a known IANA zone",
+        ) from exc
+    digest_policy = value.get("digest")
+    if not isinstance(digest_policy, Mapping) or set(digest_policy) != {
+        "enabled",
+        "schedule",
+        "maxPerDay",
+    }:
+        raise _invalid("WORK_WORKFLOW_V2_NOTIFICATIONS_INVALID", "digest policy is invalid")
+    if type(digest_policy.get("enabled")) is not bool or digest_policy.get("maxPerDay") != 1:
+        raise _invalid(
+            "WORK_WORKFLOW_V2_NOTIFICATIONS_INVALID",
+            "digest is limited to one notification per day",
+        )
+    destination = value.get("destination")
+    if not isinstance(destination, Mapping) or dict(destination) != {
+        "kind": "responsibility_thread"
+    }:
+        raise _invalid(
+            "WORK_WORKFLOW_V2_NOTIFICATIONS_INVALID",
+            "destination must be the responsibility root thread",
+        )
+    immediate_on = value.get("immediateOn")
+    allowed_immediate = {"blocked_goal", "user_decision", "service_or_auth_outage"}
+    if not isinstance(immediate_on, list) or not set(immediate_on).issubset(allowed_immediate):
+        raise _invalid(
+            "WORK_WORKFLOW_V2_NOTIFICATIONS_INVALID", "immediateOn contains an unsupported event"
+        )
+    if len(set(immediate_on)) != len(immediate_on):
+        raise _invalid(
+            "WORK_WORKFLOW_V2_NOTIFICATIONS_INVALID", "immediateOn entries must be unique"
+        )
+    return {
+        "onChange": value["onChange"],
+        "onFailure": value["onFailure"],
+        "onRecovery": value["onRecovery"],
+        "quietWhenUnchanged": True,
+        "quietHours": {
+            "start": quiet_hours["start"],
+            "end": quiet_hours["end"],
+            "timeZone": quiet_zone,
+        },
+        "digest": {
+            "enabled": digest_policy["enabled"],
+            "schedule": _validate_workflow_schedule(digest_policy["schedule"]),
+            "maxPerDay": 1,
+        },
+        "destination": {"kind": "responsibility_thread"},
+        "immediateOn": immediate_on,
+    }
+
+
 def _validate_schedule_event(event: Mapping[str, Any]) -> JsonObject:
     """Validate one output-only schedule execution history row. | 校验调度执行记录。"""
 
@@ -4214,9 +5185,219 @@ def _validate_schedule_event(event: Mapping[str, Any]) -> JsonObject:
         ("errorCode", 256),
         ("taskId", 512),
         ("sessionId", 512),
+        ("triggerId", 128),
     ):
         if value.get(key) is not None:
             result[key] = _bounded_text(value[key], key, limit)
+    if value.get("baseline") is not None:
+        if type(value["baseline"]) is not bool:
+            raise _invalid("WORK_SCHEDULE_INVALID_EVENT", "baseline must be a boolean")
+        result["baseline"] = value["baseline"]
+    evidence = value.get("evidence", [])
+    if not isinstance(evidence, list) or len(evidence) > 1_000:
+        raise _invalid("WORK_SCHEDULE_INVALID_EVENT", "evidence must be a bounded array")
+    normalized_evidence: list[JsonObject] = []
+    for item in evidence:
+        if not isinstance(item, Mapping) or set(item) != {
+            "targetId",
+            "tool",
+            "observedAt",
+            "resultDigest",
+        }:
+            raise _invalid(
+                "WORK_SCHEDULE_INVALID_EVENT", "evidence pointers must use the metadata-only schema"
+            )
+        result_digest = _bounded_text(item.get("resultDigest"), "evidence.resultDigest", 64)
+        if not re.fullmatch(r"[a-f0-9]{64}", result_digest):
+            raise _invalid("WORK_SCHEDULE_INVALID_EVENT", "evidence resultDigest must be SHA-256")
+        normalized_evidence.append(
+            {
+                "targetId": _identifier(item.get("targetId"), "evidence.targetId"),
+                "tool": _bounded_text(item.get("tool"), "evidence.tool", 256),
+                "observedAt": _bounded_text(item.get("observedAt"), "evidence.observedAt", 128),
+                "resultDigest": result_digest,
+            }
+        )
+    result["evidence"] = normalized_evidence
+    for field in ("operationIds", "actionTaskIds"):
+        values = value.get(field, [])
+        if not isinstance(values, list) or len(values) > 100:
+            raise _invalid("WORK_SCHEDULE_INVALID_EVENT", f"{field} must be a bounded array")
+        normalized_values = [_identifier(item, field) for item in values]
+        if len(set(normalized_values)) != len(normalized_values):
+            raise _invalid("WORK_SCHEDULE_INVALID_EVENT", f"{field} must not contain duplicates")
+        result[field] = normalized_values
+    checkpoint = value.get("checkpoint")
+    if checkpoint is not None:
+        if (
+            not isinstance(checkpoint, Mapping)
+            or set(checkpoint) - {"kind", "watermark", "windowEnd", "complete", "repositories"}
+            or checkpoint.get("kind") != "github_issues_search"
+            or type(checkpoint.get("complete")) is not bool
+        ):
+            raise _invalid("WORK_SCHEDULE_INVALID_EVENT", "checkpoint uses an unsupported shape")
+        watermark_value = checkpoint.get("watermark")
+        watermark = (
+            None
+            if watermark_value is None
+            else _bounded_text(watermark_value, "checkpoint.watermark", 128)
+        )
+        window_end = _bounded_text(checkpoint.get("windowEnd"), "checkpoint.windowEnd", 128)
+        rfc3339_utc = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+        if (
+            watermark is not None and not rfc3339_utc.fullmatch(watermark)
+        ) or not rfc3339_utc.fullmatch(window_end):
+            raise _invalid(
+                "WORK_SCHEDULE_INVALID_EVENT", "checkpoint timestamps must be UTC RFC3339 seconds"
+            )
+        repositories = checkpoint.get("repositories")
+        if not isinstance(repositories, list) or len(repositories) > 100:
+            raise _invalid(
+                "WORK_SCHEDULE_INVALID_EVENT", "checkpoint repositories must be a bounded array"
+            )
+        normalized_repositories: list[JsonObject] = []
+        target_ids: set[str] = set()
+        for cursor in repositories:
+            if (
+                not isinstance(cursor, Mapping)
+                or set(cursor)
+                - {
+                    "targetId",
+                    "pageCursor",
+                    "queryDigest",
+                    "complete",
+                    "hasChanges",
+                    "pagesCollected",
+                    "totalCount",
+                    "blockedReason",
+                }
+                or not {
+                    "targetId",
+                    "pageCursor",
+                    "queryDigest",
+                    "complete",
+                    "hasChanges",
+                    "pagesCollected",
+                }.issubset(cursor)
+            ):
+                raise _invalid(
+                    "WORK_SCHEDULE_INVALID_EVENT", "repository cursor has an unsupported shape"
+                )
+            target_id = _identifier(cursor.get("targetId"), "checkpoint.targetId")
+            page_cursor = _bounded_text(cursor.get("pageCursor"), "checkpoint.pageCursor", 8)
+            query_digest = _bounded_text(cursor.get("queryDigest"), "checkpoint.queryDigest", 64)
+            complete_cursor = cursor.get("complete")
+            pages_collected = cursor.get("pagesCollected")
+            total_count = cursor.get("totalCount")
+            blocked_reason = cursor.get("blockedReason")
+            if (
+                target_id in target_ids
+                or not page_cursor.isdigit()
+                or not 1 <= int(page_cursor) <= 1000
+                or not re.fullmatch(r"[a-f0-9]{64}", query_digest)
+                or type(complete_cursor) is not bool
+                or type(cursor.get("hasChanges")) is not bool
+                or type(pages_collected) is not int
+                or not 0 <= pages_collected <= 1000
+            ):
+                raise _invalid(
+                    "WORK_SCHEDULE_INVALID_EVENT", "repository cursor fields are invalid"
+                )
+            if total_count is not None and (
+                type(total_count) is not int or not 0 <= total_count <= 10_000_000
+            ):
+                raise _invalid("WORK_SCHEDULE_INVALID_EVENT", "repository totalCount is invalid")
+            if blocked_reason not in {None, "result_limit", "incomplete_results", "missing_pages"}:
+                raise _invalid("WORK_SCHEDULE_INVALID_EVENT", "repository blockedReason is invalid")
+            target_ids.add(target_id)
+            normalized_repositories.append(
+                {
+                    "targetId": target_id,
+                    "pageCursor": page_cursor,
+                    "queryDigest": query_digest,
+                    "complete": complete_cursor,
+                    "hasChanges": cursor["hasChanges"],
+                    "pagesCollected": pages_collected,
+                    **({"totalCount": total_count} if total_count is not None else {}),
+                    **({"blockedReason": blocked_reason} if blocked_reason is not None else {}),
+                }
+            )
+        checkpoint_complete = checkpoint["complete"]
+        if checkpoint_complete and (normalized_repositories or watermark != window_end):
+            raise _invalid(
+                "WORK_SCHEDULE_INVALID_EVENT",
+                "a complete checkpoint must advance to its window end",
+            )
+        if not checkpoint_complete and (
+            not normalized_repositories or all(item["complete"] for item in normalized_repositories)
+        ):
+            raise _invalid(
+                "WORK_SCHEDULE_INVALID_EVENT",
+                "an incomplete checkpoint must retain pending repository cursors",
+            )
+        normalized_checkpoint: JsonObject = {
+            "kind": "github_issues_search",
+            "watermark": watermark,
+            "windowEnd": window_end,
+            "complete": checkpoint_complete,
+            "repositories": normalized_repositories,
+        }
+        result["checkpoint"] = normalized_checkpoint
+    if value.get("attentionKind") is not None:
+        attention_kind = value["attentionKind"]
+        if attention_kind not in {"blocked_goal", "user_decision", "service_or_auth_outage"}:
+            raise _invalid("WORK_SCHEDULE_INVALID_EVENT", "attentionKind is not supported")
+        result["attentionKind"] = attention_kind
+    action_results = value.get("actionResults", [])
+    if not isinstance(action_results, list) or len(action_results) > 100:
+        raise _invalid("WORK_SCHEDULE_INVALID_EVENT", "actionResults must be a bounded array")
+    normalized_action_results: list[JsonObject] = []
+    action_types = {"draft_pull_request", "rerun_source_ci", "update_issue_progress"}
+    action_states = {"completed", "failed", "waiting", "unknown", "skipped"}
+    for receipt in action_results:
+        if not isinstance(receipt, Mapping) or set(receipt) != {
+            "actionId",
+            "actionType",
+            "targetId",
+            "taskId",
+            "requestDigest",
+            "status",
+            "operationIds",
+        }:
+            raise _invalid(
+                "WORK_SCHEDULE_INVALID_EVENT",
+                "action result does not match the durable receipt schema",
+            )
+        request_digest = _bounded_text(
+            receipt.get("requestDigest"), "actionResult.requestDigest", 64
+        )
+        if (
+            receipt.get("actionType") not in action_types
+            or receipt.get("status") not in action_states
+        ):
+            raise _invalid("WORK_SCHEDULE_INVALID_EVENT", "action type or status is not supported")
+        if not re.fullmatch(r"[a-f0-9]{64}", request_digest):
+            raise _invalid("WORK_SCHEDULE_INVALID_EVENT", "action requestDigest must be SHA-256")
+        operation_ids = receipt.get("operationIds")
+        if not isinstance(operation_ids, list) or len(operation_ids) > 100:
+            raise _invalid(
+                "WORK_SCHEDULE_INVALID_EVENT", "action operationIds must be a bounded array"
+            )
+        normalized_operation_ids = [
+            _identifier(item, "action operationId") for item in operation_ids
+        ]
+        normalized_action_results.append(
+            {
+                "actionId": _identifier(receipt.get("actionId"), "actionResult.actionId"),
+                "actionType": receipt["actionType"],
+                "targetId": _identifier(receipt.get("targetId"), "actionResult.targetId"),
+                "taskId": _identifier(receipt.get("taskId"), "actionResult.taskId"),
+                "requestDigest": request_digest,
+                "status": receipt["status"],
+                "operationIds": normalized_operation_ids,
+            }
+        )
+    result["actionResults"] = normalized_action_results
     forbidden = {"output", "reasoning", "toolArgs", "credentials"}.intersection(value)
     if forbidden:
         raise _invalid(

@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "ownerRepository": "DoHorizon-AI/Cyrene-Exchange",
-  "ownerCommitSha": "28ee1124c90abd8bb6095502d3f0d0c3d9c30d5a",
+  "ownerCommitSha": "3bbd85a2bc235ef7f2b3341c784639588eb45218",
   "sourceArtifacts": {
     "contracts/product/v1/openapi.yaml": "a67f57e65ff6ec27e4015d1a136ddaf5a5711bc8e65be7d4c4e4bb7c5fc5a50f",
     "contracts/product/v2/catalog.json": "2e2b32c3c3b12d0c5804a7ee396d12276cb03bf5c2310f047f85b3eba61ccfe4"
