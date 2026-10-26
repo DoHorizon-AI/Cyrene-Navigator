@@ -47,6 +47,7 @@ class PersistencePrincipal:
     can_takeover: bool = False
     organization_id: str | None = None
     can_write_harness: bool = False
+    can_publish_credential_health: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.actor_id, str) or not self.actor_id.strip():
@@ -57,6 +58,8 @@ class PersistencePrincipal:
             raise ValueError("principal organization_id must be non-empty text when configured")
         if not isinstance(self.can_write_harness, bool):
             raise ValueError("principal can_write_harness must be a boolean")
+        if not isinstance(self.can_publish_credential_health, bool):
+            raise ValueError("principal can_publish_credential_health must be a boolean")
 
 
 # The shorter name is convenient for callers while keeping the API contract explicit.

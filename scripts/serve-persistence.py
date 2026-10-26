@@ -47,6 +47,7 @@ class PrincipalConfig(BaseModel):
     organization_id: str | None = None
     can_takeover: bool = False
     can_write_harness: bool = False
+    can_publish_credential_health: bool = False
 
 
 class ProductDirectoryConfig(BaseModel):
@@ -136,6 +137,7 @@ def main() -> None:
             can_takeover=row.can_takeover,
             organization_id=row.organization_id,
             can_write_harness=row.can_write_harness,
+            can_publish_credential_health=row.can_publish_credential_health,
         )
     product_directory = _load_product_directory(config.product_directory)
     product_service_credentials = _load_product_service_credentials(

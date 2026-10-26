@@ -57,11 +57,24 @@ The mounted principal-config.json follows this shape. Store the configuration fi
 }
 ~~~
 
+The optional principal flag `can_publish_credential_health:true` authorizes only
+the internal `POST /api/v1/workspaces/{workspaceId}/work/credential-health/snapshots`
+route. Keep it unset for ordinary principals; set it only on the trusted
+Navigator service principal that consumes Exchange's cached health projection.
+The permission does not create Tasks or grant any provider or Teams connector
+capability. The notice destination and Exchange profile remain in the separate
+host-mounted `TEAMS_CREDENTIAL_NOTIFICATIONS_CONFIG_FILE`.
+
 For every additional principal/Workspace scope, add a unique environment variable and one service credential entry for each of the five Products. Each token must be distinct across inbound and downstream roles. Put bearer values in Key Vault-backed ACA secrets and bind them through secretRef; never place values in YAML, image layers, build arguments, or command-line arguments. Grant the app's managed identity Key Vault Secrets User access before creating a revision that references those secrets.
 
 docker/container-entrypoint.sh 要求可读的 JSON principal 配置，并使用 --require-product-service-configuration 启动 runner。缺少任一 Product origin，或任一组织/Workspace principal 未配置每个 Product 的独立 service bearer，服务都会拒绝启动。Product origin 继续使用现有 URL 策略校验，包括 loopback 以外必须使用 HTTPS。密钥值按 JSON 配置中的环境变量名读取，entrypoint 不会打印密钥值。
 
 挂载的 principal-config.json 采用上述结构。该配置文件必须作为 Key Vault secret 保存，并通过 ACA secret volume 挂载；将所有名称和 ID 替换成精确的部署分配值。每增加一个 principal/Workspace scope，都要为五个 Product 分别添加唯一环境变量和 service credential。各 bearer 在入站与下游角色之间也必须互不相同。bearer 值必须存放在 Key Vault-backed ACA secret 中，并通过 secretRef 注入；不要写入 YAML、镜像层、build 参数或命令行参数。创建引用这些密钥的 revision 前，必须先授予 app managed identity 的 Key Vault Secrets User 权限。
+
+可选 principal 字段 `can_publish_credential_health:true` 只授权内部路由
+`POST /api/v1/workspaces/{workspaceId}/work/credential-health/snapshots`。普通 principal
+保持未设置；只为读取 Exchange 缓存健康投影的可信 Navigator service principal 配置该权限。此权限不创建 Task，也不授予 provider 或 Teams connector 能力。通知目标和 Exchange profile 仍保存在单独挂载的
+`TEAMS_CREDENTIAL_NOTIFICATIONS_CONFIG_FILE` 中。
 
 ## Health probes
 

@@ -20,13 +20,15 @@ intentional wire change; CI checks its paths and schemas against the service.
 
 All routes require the configured bearer credential. The existing persistence
 authenticator must grant access to the `{workspaceId}` in the path. Reads are
-workspace-scoped; mutations require the current persistence writer authority
-(`can_takeover`). QQ login routes also require the configured owner authority.
+workspace-scoped; ordinary mutations require the current persistence writer
+authority (`can_takeover`). The credential-health snapshot route instead
+requires its explicit `can_publish_credential_health` service grant. QQ login
+routes also require the configured owner authority.
 An object from a different organization or Workspace is returned as not found.
 
 所有路由都需要已配置的 bearer 凭据。现有 persistence authenticator 必须授权路径中的
-`{workspaceId}`。读取受 Workspace 限制；写入沿用当前 persistence writer 权限
-（`can_takeover`）。QQ 登录路由还需要已配置的 owner 权限。其他组织或 Workspace
+`{workspaceId}`。读取受 Workspace 限制；普通写入沿用当前 persistence writer 权限
+（`can_takeover`），凭据健康快照路由单独要求 `can_publish_credential_health` service grant。QQ 登录路由还需要已配置的 owner 权限。其他组织或 Workspace
 中的对象按未找到处理。
 
 The trusted executor principal also needs `can_write_harness:true` to persist
@@ -204,6 +206,7 @@ inventories retain the previous snapshot and never mark omitted facts missing.
 | Method and path | Behavior |
 | --- | --- |
 | `POST /notifications` | Enqueue `{ "deduplicationKey":"key-1", "type":"wecom.message", "connectorId":"binding-1", "recipient":"bot:7/group/room-1", "taskId":"task-123", "payload":{"text":"Hello"} }`; returns `{ "notification":{...}, "duplicate":false }`. |
+| `POST /credential-health/snapshots` | Host-only endpoint accepting a bounded, secret-free Exchange health projection; atomically checkpoints incident state and writes credential notices to the same outbox. |
 | `GET /notifications?status=uncertain&limit=100` | Inspect outbox state, including unknown delivery. |
 | `POST /notifications/claim` | Lease with `{ "workerId":"wecom-1", "limit":10, "leaseSeconds":60, "type":"wecom.message", "connectorId":"binding-1", "recipient":"bot:7/group/room-1" }`. Type/connector/recipient filters apply before leasing. |
 | `POST /notifications/{notificationId}/start` | `{ "leaseToken":"..." }` immediately before attempting the remote send. |
@@ -247,6 +250,35 @@ Only a configured adapter sends it; the store has no external-send callback.
 在同一事务提交。路由字段保留，并增加有长度上限的 `text`、`taskId` 和 `status`。只有
 已配置适配器会实际发送，Store 不执行外部发送。
 
+The reserved `teams.credential-health` type cannot be enqueued through the
+generic notification route or task metadata. `POST /credential-health/snapshots`
+requires a configured principal with `can_publish_credential_health:true` and
+organization scope. It accepts only Exchange authorization-health fields;
+unknown fields, free-form errors, authorization references, tokens, and launch
+URLs are rejected. The request's `organizationId` must exactly match the
+authenticated principal. Checkpoint changes and outbox inserts share one transaction.
+Fresh explicit `REAUTHORIZATION_REQUIRED` or `PERMISSION_DENIED` states open one
+incident, repeat reminders are limited to once every 24 hours, and a valid state
+closes the incident with one recovery notice. Unknown, unavailable, and stale
+snapshots remain silent.
+
+Credential notices reuse `work_notifications` but do not have a task, workflow
+occurrence, or model-facing tool. Navigator reads Exchange's cached provider
+snapshots on the existing Teams notification worker tick and uses the
+host-mounted `TEAMS_CREDENTIAL_NOTIFICATIONS_CONFIG_FILE` to pin the connection
+selectors, owner, dedicated Exchange notification profile, and verified Teams
+thread. Exchange remains the only provider health poller and owns automatic
+refresh. Navigator does not call the model or initiate credential renewal for
+this deterministic job.
+
+系统保留类型 `teams.credential-health` 不能通过通用通知路由或任务 metadata 入队。
+`POST /credential-health/snapshots` 只允许显式配置
+`can_publish_credential_health:true` 且有组织范围的 principal。请求只接受 Exchange 授权健康字段；未知字段、自由文本错误、授权引用、令牌和授权启动 URL 都会被拒绝。请求中的 `organizationId` 必须与认证 principal 完全一致。健康检查点与 outbox 记录在同一事务中提交。最新的
+`REAUTHORIZATION_REQUIRED` 或 `PERMISSION_DENIED` 会打开一个事件；重复提醒最多每 24 小时一次；授权恢复后关闭事件并发送一次恢复通知。未知、不可用和过期快照保持静默。
+
+凭据通知复用 `work_notifications`，不关联任务、工作流发生记录或模型工具。Navigator 在现有 Teams 通知 worker tick 中读取 Exchange 已缓存快照，并使用宿主挂载的
+`TEAMS_CREDENTIAL_NOTIFICATIONS_CONFIG_FILE` 固定连接选择器、owner、专用 Exchange 通知 profile 和已验证的 Teams 线程。Exchange 仍是唯一 provider 健康轮询器并负责自动刷新。Navigator 的这项确定性工作不会调用模型或发起凭据续期。
+
 ## Connectors, QQ login, and workflows / 连接器、QQ 登录与工作流
 
 | Method and path | Behavior |
@@ -273,7 +305,7 @@ returns `409`.
 
 Teams activity text and stable route identifiers are committed with the event. A verified participant message can be stored without a task; a later authorized request may establish the DSH Session mapping in the same transaction as its task. The mapping key is a host-derived SHA-256 over tenant, team, channel, and root-thread IDs. Context lookup is Workspace-scoped, returns no display names, and accepts an `exclude_message_id` query so retries reproduce the original task prompt.
 
-Teams terminal replies use the existing notification outbox with `type="teams.message"`, a configured connector binding, and route payload `{ "tenantId":"...", "teamId":"...", "channelId":"...", "conversationId":"...", "rootThreadId":"...", "serviceUrl":"https://smba.trafficmanager.net/emea/" }`. Navigator validates and keeps the service URL private; it never enters the task prompt. The Navigator runtime is the only outbox dispatcher: it claims and starts the durable lease, mints a short-lived exact Exchange connector grant from the task's persisted caller identity and final text, invokes Exchange, and records `delivered`, `failed`, or `uncertain`. Only an explicit HTTP 429 with a matching `rate_limited` response and bounded `Retry-After` may return to `queued`; each delivery attempt gets a new provider request ID. An uncertain Bot Framework send is never automatically replayed.
+Teams terminal replies use the existing notification outbox with `type="teams.message"`, a configured connector binding, and route payload `{ "tenantId":"...", "teamId":"...", "channelId":"...", "conversationId":"...", "rootThreadId":"...", "serviceUrl":"https://smba.trafficmanager.net/emea/" }`. Navigator validates and keeps the service URL private; it never enters the task prompt. The same Navigator runtime dispatches the fixed `teams.credential-health` type through its separately configured owner identity and dedicated single-thread Exchange profile; neither its route nor its health status is model-selectable. It claims and starts the durable lease, obtains an exact Exchange connector grant, invokes Exchange, and records `delivered`, `failed`, or `uncertain`. Only a known HTTP 429 rate-limit outcome is retried; an uncertain Bot Framework send is never automatically replayed.
 
 QQ bridge health/login calls use only the launcher-installed bridge keyed by
 organization, Workspace, and binding. Browser inputs cannot select a host or account. QR payloads
@@ -281,5 +313,5 @@ are returned directly and are not stored in public memory.
 
 连接器接纳请求可包含一个嵌套任务；事件与任务在同一事务写入。Teams 可额外提交经验证的参与者消息；普通参与者消息只保存为后续上下文，不建立任务。精确查询会排除当前活动，确保重试生成相同任务。
 键 `(organization, workspace, connector, messageId)` 用于重试去重；相同 id 内容改变会返回 `409`。Teams 任务的 prompt 与会话由首次持久接纳确定，重试返回原任务，不重新构造。
-Teams 完成结果进入持久 outbox，由 Navigator 用任务中保存的调用者身份向 Exchange 申请短期精确 grant 后发送；发送结果未知时进入 `uncertain` 并禁止自动重放。QQ 健康状态与登录只调用启动器按 Workspace 和 binding 安装的桥接器，浏览器不能
+Teams 完成结果进入持久 outbox，由 Navigator 用任务中保存的调用者身份向 Exchange 申请短期精确 grant 后发送；系统凭据通知使用独立固定 owner identity 与单线程 Exchange profile，模型不能选择状态或目标。发送结果未知时进入 `uncertain` 并禁止自动重放。QQ 健康状态与登录只调用启动器按 Workspace 和 binding 安装的桥接器，浏览器不能
 指定 host 或 account。QR 内容直接返回且不写入公共记忆。

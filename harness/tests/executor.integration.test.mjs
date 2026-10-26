@@ -14,6 +14,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createExecutorApp } from '../dist/serve.js';
+import { parseCredentialNotificationsConfig } from '../dist/executor.js';
 import { InMemoryWorkStateStore, WorkStateClient, WorkStateHttpError } from '../dist/work-state-client.js';
 import { disposeWithin } from '../../scripts/serve-executor.mjs';
 import { LlmAdapter, ToolCallId } from '@deepseek-ai/dsh-llm';
@@ -100,6 +101,43 @@ async function waitForActiveTask(executor, sessionId, expectedTaskId, timeoutMs 
   }
   throw new Error('Task ' + expectedTaskId + ' did not acquire the active DSH session');
 }
+
+test('credential notification configuration pins the owner and only one allowed Teams destination', () => {
+  const tenantId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const config = {
+    schemaVersion: 1,
+    organizationId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+    workspaceId: 'workspace-credential-health',
+    owner: {
+      actorAadObjectId: '11111111-1111-4111-8111-111111111111',
+      issuer: `https://login.microsoftonline.com/${tenantId}/v2.0`,
+      subject: '11111111-1111-4111-8111-111111111111',
+      tenantId,
+    },
+    connections: [{ connectionId: '22222222-2222-4222-8222-222222222222', provider: 'hf' }],
+    destination: {
+      tenantId,
+      teamId: 'team-1',
+      channelId: '19:notice-channel@thread.tacv2',
+      conversationId: '19:notice-channel@thread.tacv2;messageid=1793027795187',
+      rootThreadId: '1793027795187',
+      serviceUrl: 'https://smba.trafficmanager.net/amer/',
+    },
+    exchange: {
+      connectionRef: '33333333-3333-4333-8333-333333333333',
+      profileRef: 'teams-credential-notifications-20261026',
+    },
+    pollIntervalMs: 900_000,
+  };
+  const parsed = parseCredentialNotificationsConfig(config, config.workspaceId, tenantId, ['team-1']);
+  assert.equal(parsed.owner.subject, config.owner.subject);
+  assert.deepEqual(parsed.connections, config.connections);
+  assert.deepEqual(parsed.destination, config.destination);
+  assert.equal(parsed.pollIntervalMs, 900_000);
+  assert.throws(() => parseCredentialNotificationsConfig({ ...config, accessToken: 'forbidden' }, config.workspaceId, tenantId, ['team-1']), /invalid scope or schema/u);
+  assert.throws(() => parseCredentialNotificationsConfig(config, config.workspaceId, tenantId, ['other-team']), /outside the configured Teams scope/u);
+  assert.throws(() => parseCredentialNotificationsConfig({ ...config, owner: { ...config.owner, subject: '44444444-4444-4444-8444-444444444444' } }, config.workspaceId, tenantId, ['team-1']), /owner does not match/u);
+});
 
 async function createPausedAuthorizationTask(store, taskId, sessionId) {
   const record = await store.createTask({ id: taskId, sessionId, prompt: 'Original task prompt must not replay.' });
@@ -488,6 +526,75 @@ test('NavigatorExecutor: drain waits for an existing notification claim and paus
   }
 });
 
+test('NavigatorExecutor: drain lets an active credential snapshot finish but starts no later outbox claim', async () => {
+  const store = new InMemoryWorkStateStore();
+  const app = await createTestApp(new TestMockAdapter(), { workStateStore: store });
+  const { executor } = app;
+  const tenantId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  let signalStarted;
+  const started = new Promise(resolve => { signalStarted = resolve; });
+  let releaseSnapshot;
+  const snapshotGate = new Promise(resolve => { releaseSnapshot = resolve; });
+  let claimCount = 0;
+  executor.config.workState.claimNotifications = async () => {
+    claimCount += 1;
+    return [];
+  };
+  executor.config.teams = {
+    connectorId: 'teams-v1',
+    tenantId,
+    allowedTeamIds: ['team-1'],
+    botAppId: 'fixture-bot-app',
+    taskActorSubjects: [],
+    ingressSecretEnv: 'TEAMS_NAVIGATOR_HMAC_KEY',
+    exchangeConnectionRef: 'chat-connection',
+    exchangeProfileRef: 'chat-profile',
+    credentialNotifications: {
+      organizationId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      workspaceId: 'drain-health-workspace',
+      owner: {
+        issuer: `https://login.microsoftonline.com/${tenantId}/v2.0`,
+        subject: '11111111-1111-4111-8111-111111111111',
+        tenantId,
+      },
+      connections: [{ connectionId: '22222222-2222-4222-8222-222222222222', provider: 'hf' }],
+      destination: {
+        tenantId,
+        teamId: 'team-1',
+        channelId: '19:notice-channel@thread.tacv2',
+        conversationId: '19:notice-channel@thread.tacv2;messageid=1793027795187',
+        rootThreadId: '1793027795187',
+        serviceUrl: 'https://smba.trafficmanager.net/amer/',
+      },
+      exchangeConnectionRef: 'notice-connection',
+      exchangeProfileRef: 'notice-profile',
+      pollIntervalMs: 900_000,
+    },
+    exchangeAuthorization: {
+      async getAuthorizationHealthSnapshots() {
+        signalStarted();
+        return snapshotGate;
+      },
+    },
+  };
+  try {
+    const poll = executor['drainTeamsNotifications']();
+    await started;
+    executor.startDrain();
+    const duringPoll = await executor.getDrainStatus();
+    assert.equal(duringPoll.notifications.inFlight, true);
+    assert.equal(duringPoll.notifications.pollingPaused, true);
+    releaseSnapshot([]);
+    await poll;
+    const drained = await executor.waitForIdle(1_000);
+    assert.equal(drained.activeWorkDrained, true);
+    assert.equal(claimCount, 0, 'a drain that starts during a poll must not begin an outbox claim afterward');
+  } finally {
+    releaseSnapshot([]);
+    await disposeApp(app);
+  }
+});
+
 test('NavigatorExecutor: Teams outbox delivers completed multiline answers byte-for-byte and rejects NUL before send', async () => {
   const store = new InMemoryWorkStateStore();
   const app = await createTestApp(new TestMockAdapter(), {
@@ -591,6 +698,162 @@ test('NavigatorExecutor: Teams outbox delivers completed multiline answers byte-
     assert.deepEqual(finished.map(item => [item.notificationId, item.outcome]), [
       ['multiline-delivery', 'delivered'],
       ['nul-delivery', 'failed'],
+    ]);
+  } finally {
+    await disposeApp(app);
+  }
+});
+
+test('NavigatorExecutor: credential notices use cached Exchange health and the fixed taskless Teams route', async () => {
+  const store = new InMemoryWorkStateStore();
+  const adapter = new TestMockAdapter();
+  const app = await createTestApp(adapter, { workStateStore: store, workspaceId: 'health-workspace' });
+  const { executor } = app;
+  const tenantId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const ownerSubject = '11111111-1111-4111-8111-111111111111';
+  const destination = {
+    tenantId,
+    teamId: 'team-1',
+    channelId: '19:notice-channel@thread.tacv2',
+    conversationId: '19:notice-channel@thread.tacv2;messageid=1793027795187',
+    rootThreadId: '1793027795187',
+    serviceUrl: 'https://smba.trafficmanager.net/amer/',
+  };
+  const snapshot = {
+    connectionId: '22222222-2222-4222-8222-222222222222',
+    provider: 'hf',
+    loginState: 'PRESENT',
+    authorizationState: 'REAUTHORIZATION_REQUIRED',
+    checkedAt: '2026-10-26T15:00:00Z',
+    expiresAt: '2026-10-26T16:00:00Z',
+    generation: 3,
+    capabilities: [{
+      capabilityId: 'model.read', state: 'REAUTHORIZATION_REQUIRED',
+      lastVerifiedAt: '2026-10-26T15:00:00Z', expiresAt: null, reasonCode: 'TOKEN_EXPIRED',
+    }],
+    reasonCode: 'TOKEN_EXPIRED',
+  };
+  const owner = {
+    issuer: `https://login.microsoftonline.com/${tenantId}/v2.0`,
+    subject: ownerSubject,
+    tenantId,
+  };
+  const credentialConfig = {
+    organizationId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+    workspaceId: 'health-workspace',
+    owner,
+    connections: [{ connectionId: snapshot.connectionId, provider: 'hf' }],
+    destination,
+    exchangeConnectionRef: '33333333-3333-4333-8333-333333333333',
+    exchangeProfileRef: 'teams-credential-notifications-20261026',
+    pollIntervalMs: 900_000,
+  };
+  const noticeLease = {
+    notification: {
+      id: 'credential-notice-1',
+      deduplicationKey: 'credential-health:incident:opened',
+      type: 'teams.credential-health',
+      payload: {
+        schemaVersion: 1,
+        event: 'action_required',
+        incidentId: '0123456789abcdef0123456789abcdef',
+        connectionId: snapshot.connectionId,
+        provider: 'hf',
+        generation: snapshot.generation,
+        loginState: snapshot.loginState,
+        authorizationState: snapshot.authorizationState,
+        capabilities: [{ capabilityId: 'model.read', state: 'REAUTHORIZATION_REQUIRED' }],
+        checkedAt: snapshot.checkedAt,
+        expiresAt: snapshot.expiresAt,
+        reasonCode: snapshot.reasonCode,
+      },
+      connectorId: 'teams-v1',
+      recipient: 'teams:credential-health',
+      status: 'leased',
+      result: { retryCount: 0 },
+    },
+    leaseToken: 'credential-lease-1',
+  };
+  const claims = [];
+  const started = [];
+  const finished = [];
+  const snapshotRequests = [];
+  const grantRequests = [];
+  const sentMessages = [];
+  let noticePending = true;
+  store.claimNotifications = async input => {
+    claims.push(input);
+    if (input.type === 'teams.credential-health' && noticePending) {
+      noticePending = false;
+      return [noticeLease];
+    }
+    return [];
+  };
+  store.processCredentialHealthSnapshots = async (organizationId, snapshots) => {
+    assert.equal(organizationId, credentialConfig.organizationId);
+    return { processed: snapshots.length, stale: 0, notificationsQueued: 0 };
+  };
+  store.startNotification = async (notificationId, leaseToken) => started.push({ notificationId, leaseToken });
+  store.finishNotification = async (notificationId, leaseToken, outcome, result) => {
+    finished.push({ notificationId, leaseToken, outcome, result });
+  };
+  executor.config.teams = {
+    connectorId: 'teams-v1',
+    tenantId,
+    allowedTeamIds: ['team-1'],
+    botAppId: 'fixture-bot-app',
+    taskActorSubjects: [ownerSubject],
+    ingressSecretEnv: 'TEAMS_NAVIGATOR_HMAC_KEY',
+    exchangeConnectionRef: 'teams-chat-connection',
+    exchangeProfileRef: 'teams-chat-profile',
+    credentialNotifications: credentialConfig,
+    exchangeAuthorization: {
+      async getAuthorizationHealthSnapshots(input) {
+        snapshotRequests.push(input);
+        return [snapshot];
+      },
+      async mintGrant(request) {
+        grantRequests.push(request);
+        return { connectorGrantBin: 'fixture-grant', organizationId: credentialConfig.organizationId };
+      },
+      async sendTeamsMessage(message) {
+        sentMessages.push(message);
+        return { outcome: 'accepted', vendorMessageId: 'credential-notice-sent' };
+      },
+    },
+  };
+
+  try {
+    await executor['drainTeamsNotifications']();
+    await executor['drainTeamsNotifications']();
+    assert.equal(adapter.calls, 0, 'credential monitoring must not create a model task');
+    assert.equal(snapshotRequests.length, 1, 'cached Exchange state is read on a bounded interval');
+    assert.deepEqual(snapshotRequests[0], {
+      requestId: snapshotRequests[0].requestId,
+      organizationId: credentialConfig.organizationId,
+      workspaceId: credentialConfig.workspaceId,
+      connectionIds: [snapshot.connectionId],
+    });
+    assert.deepEqual(claims.map(item => [item.type, item.recipient ?? null]), [
+      ['teams.message', null],
+      ['teams.credential-health', 'teams:credential-health'],
+      ['teams.message', null],
+      ['teams.credential-health', 'teams:credential-health'],
+    ]);
+    assert.deepEqual(started, [{ notificationId: 'credential-notice-1', leaseToken: 'credential-lease-1' }]);
+    assert.equal(grantRequests.length, 1);
+    assert.equal(grantRequests[0].principalIssuer, owner.issuer);
+    assert.equal(grantRequests[0].principalSubject, owner.subject);
+    assert.equal(grantRequests[0].connectionRef, credentialConfig.exchangeConnectionRef);
+    assert.equal(grantRequests[0].profileRef, credentialConfig.exchangeProfileRef);
+    assert.equal(grantRequests[0].operationId, 'msteams.message.reply');
+    assert.deepEqual(grantRequests[0].arguments.conversation, destination);
+    assert.equal(sentMessages[0].conversation, destination);
+    assert.match(sentMessages[0].text, /Hugging Face/u);
+    assert.match(sentMessages[0].text, /TOKEN_EXPIRED/u);
+    assert.doesNotMatch(sentMessages[0].text, /bearer|token value|authorizationRef/iu);
+    assert.deepEqual(finished.map(item => [item.notificationId, item.outcome]), [
+      ['credential-notice-1', 'delivered'],
     ]);
   } finally {
     await disposeApp(app);
@@ -879,6 +1142,75 @@ test('WorkStateClient: requests use the configured workspace bearer and decode n
     await new Promise(resolve => server.close(resolve));
     if (previousToken === undefined) delete process.env.CYRENE_SESSION_TOKEN;
     else process.env.CYRENE_SESSION_TOKEN = previousToken;
+  }
+});
+
+test('WorkStateClient: credential health checkpoints use the dedicated taskless route', async () => {
+  const tokenEnv = 'CREDENTIAL_HEALTH_WORK_TOKEN';
+  const previousToken = process.env[tokenEnv];
+  process.env[tokenEnv] = 'credential-health-work-token';
+  const seen = [];
+  const server = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    seen.push({
+      url: req.url,
+      method: req.method,
+      authorization: req.headers.authorization,
+      body: Buffer.concat(chunks).toString('utf8'),
+    });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(req.url?.endsWith('/notifications/claim')
+      ? JSON.stringify({ items: [] })
+      : JSON.stringify({ processed: 1, stale: 0, notificationsQueued: 1 }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const client = new WorkStateClient({
+      baseUrl: `http://127.0.0.1:${server.address().port}`,
+      workspaceId: 'acme',
+      tokenEnv,
+    });
+    const snapshot = {
+      connectionId: '22222222-2222-4222-8222-222222222222',
+      provider: 'hf',
+      loginState: 'PRESENT',
+      authorizationState: 'REAUTHORIZATION_REQUIRED',
+      checkedAt: '2026-10-26T15:00:00Z',
+      expiresAt: '2026-10-26T16:00:00Z',
+      generation: 3,
+      capabilities: [],
+      reasonCode: 'TOKEN_EXPIRED',
+    };
+    assert.deepEqual(await client.processCredentialHealthSnapshots('org-1', [snapshot]), {
+      processed: 1, stale: 0, notificationsQueued: 1,
+    });
+    assert.deepEqual(await client.claimNotifications({
+      workerId: 'credential-health-worker',
+      limit: 10,
+      leaseSeconds: 60,
+      type: 'teams.credential-health',
+      connectorId: 'teams-v1',
+      recipient: 'teams:credential-health',
+    }), []);
+    assert.deepEqual(seen, [{
+      url: '/api/v1/workspaces/acme/work/credential-health/snapshots',
+      method: 'POST',
+      authorization: 'Bearer credential-health-work-token',
+      body: JSON.stringify({ organizationId: 'org-1', connections: [snapshot] }),
+    }, {
+      url: '/api/v1/workspaces/acme/work/notifications/claim',
+      method: 'POST',
+      authorization: 'Bearer credential-health-work-token',
+      body: JSON.stringify({
+        workerId: 'credential-health-worker', limit: 10, leaseSeconds: 60,
+        type: 'teams.credential-health', connectorId: 'teams-v1', recipient: 'teams:credential-health',
+      }),
+    }]);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+    if (previousToken === undefined) delete process.env[tokenEnv];
+    else process.env[tokenEnv] = previousToken;
   }
 });
 

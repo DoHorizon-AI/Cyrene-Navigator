@@ -20,8 +20,13 @@ import AgentRegistry from '@deepseek-ai/dsh-agent';
 import AgentLoop from '@deepseek-ai/dsh-agent-loop';
 import CyreneSessionPersistence from './persistence.js';
 import { DynamicPluginManager, apply as applyPluginManager } from './plugin-manager.js';
-import { NavigatorExecutor, apply as applyExecutor, resolveTeamsTaskActorSubjects } from './executor.js';
-import type { TeamsExecutorConfig } from './executor.js';
+import {
+  NavigatorExecutor,
+  apply as applyExecutor,
+  parseCredentialNotificationsConfig,
+  resolveTeamsTaskActorSubjects,
+} from './executor.js';
+import type { CredentialNotificationsConfig, TeamsExecutorConfig } from './executor.js';
 import { ExchangeLlmAdapter } from './exchange-adapter.js';
 import { CodeBuddyLlmAdapter } from './codebuddy-adapter.js';
 import { AntigravityLlmAdapter, DEFAULT_ANTIGRAVITY_MODEL } from './antigravity-adapter.js';
@@ -142,7 +147,7 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
 
   const persistenceUrl = options.persistenceUrl ?? process.env.CYRENE_PERSISTENCE_URL;
   const workspaceId = options.workspaceId ?? process.env.CYRENE_WORKSPACE_ID;
-  const teams = options.teams ?? createTeamsExecutorConfig(workspaceId);
+  const teams = options.teams ?? await createTeamsExecutorConfig(workspaceId);
   const maxConcurrentTasks = validateTaskConcurrency(
     options.maxConcurrentTasks ?? parseTaskConcurrency(process.env.CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS),
   );
@@ -650,7 +655,7 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
   return { ctx, executor, pluginManager, pluginsDir };
 }
 
-function createTeamsExecutorConfig(workspaceId: string | undefined): TeamsExecutorConfig | undefined {
+async function createTeamsExecutorConfig(workspaceId: string | undefined): Promise<TeamsExecutorConfig | undefined> {
   const enabled = process.env.TEAMS_ENABLED;
   if (enabled === undefined || enabled === 'false') return undefined;
   if (enabled !== 'true') throw new TypeError('TEAMS_ENABLED must be true or false');
@@ -684,7 +689,7 @@ function createTeamsExecutorConfig(workspaceId: string | undefined): TeamsExecut
   const audience = process.env.CYRENE_AUTHORITY_EXCHANGE_WORKLOAD_AUDIENCE ?? 'exchange';
   const exchangeConnectionRef = requiredUuidEnvironment('TEAMS_EXCHANGE_CONNECTION_REF');
   const exchangeProfileRef = requiredEnvironment('TEAMS_EXCHANGE_PROFILE_REF');
-  return {
+  const config: TeamsExecutorConfig = {
     connectorId: 'teams-v1',
     tenantId,
     allowedTeamIds,
@@ -696,6 +701,40 @@ function createTeamsExecutorConfig(workspaceId: string | undefined): TeamsExecut
     exchangeProfileRef,
     exchangeAuthorization: new ExchangeConnectorAuthorizationClient({ baseUrl, hmacKeyFile, hmacKeyId, audience }),
   };
+  const credentialConfigPath = process.env.TEAMS_CREDENTIAL_NOTIFICATIONS_CONFIG_FILE;
+  if (credentialConfigPath === undefined) return config;
+  const path = resolve(configText(
+    credentialConfigPath,
+    'TEAMS_CREDENTIAL_NOTIFICATIONS_CONFIG_FILE',
+    2_000,
+  ));
+  let raw: Buffer;
+  try {
+    raw = await readFile(path);
+  } catch {
+    throw new Error('Credential notifications configuration file is unavailable');
+  }
+  if (raw.byteLength > 64_000) {
+    throw new Error('Credential notifications configuration file exceeds its size limit');
+  }
+  let credentialNotifications: CredentialNotificationsConfig;
+  try {
+    credentialNotifications = parseCredentialNotificationsConfig(
+      JSON.parse(raw.toString('utf8')) as unknown,
+      workspaceId,
+      tenantId,
+      allowedTeamIds,
+    );
+  } catch {
+    throw new Error('Credential notifications configuration is invalid');
+  }
+  const allowedSubjects = await resolveTeamsTaskActorSubjects(
+    config, workspaceId, credentialNotifications.owner.issuer,
+  );
+  if (!allowedSubjects.includes(credentialNotifications.owner.subject)) {
+    throw new Error('Credential notification owner is not in the configured Teams actor scope');
+  }
+  return { ...config, credentialNotifications };
 }
 
 function parseTaskConcurrency(value: string | undefined): number {

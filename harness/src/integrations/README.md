@@ -59,8 +59,11 @@ only a recent authorization reference returned by that same session's scoped
 health read, then waits for Navigator's existing human approval before sending an
 empty typed Product request with Idempotency-Key. Browser authorization URLs
 and QR attachment references stay out of model results. The resource tool reads
-Exchange's latest projection; Exchange owns polling, comparison, refresh jobs,
-and notification delivery.
+Exchange's latest projection. Exchange owns provider polling, comparison, and
+automatic refresh; when host credential notifications are opted in, Navigator
+reads those cached snapshots on its existing Teams notification tick and
+records incident/recovery notices in the durable Work outbox. The monitor does
+not initiate renewal or create model tasks.
 The connection-list tool returns Product-generated connection IDs with only
 provider, display, repository, enabled, and timestamp fields. Binding, target,
 account, actor, and tenant references do not enter the model surface.
@@ -103,8 +106,9 @@ exchange_authorization_health、exchange_reauthorization_start、
 exchange_reauthorization_status 和 exchange_cloud_resources_query。连接列表、健康与资源读取使用当前 DSH Session 的 user Bearer 及宿主配置的
 Workspace。续期启动只接受同一 Session 最近一次受范围保护的健康查询返回的授权引用，并在发送无
 请求体、带 Idempotency-Key 的 Product 请求前等待 Navigator 现有人工审批。浏览器授权 URL 与
-二维码附件引用不会进入模型结果。资源工具只读取 Exchange 最新投影；轮询、比较、刷新任务与通知
-投递由 Exchange 负责。
+二维码附件引用不会进入模型结果。资源工具只读取 Exchange 最新投影。Exchange 负责 provider
+轮询、比较和自动刷新；启用宿主凭据通知后，Navigator 在现有 Teams 通知 tick 中读取缓存快照，并把
+事件／恢复通知写入持久 Work outbox。该监控不会发起续期或创建模型任务。
 连接列表只返回 Product 生成的连接 ID 及 Provider、显示名、仓库、启用状态和时间戳；模型看不到
 binding、target、account、actor 或 tenant 引用。
 

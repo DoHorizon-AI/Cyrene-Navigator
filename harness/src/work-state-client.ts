@@ -123,6 +123,25 @@ export interface NotificationLease {
   readonly leaseToken: string;
 }
 
+/** Credential-free authorization health returned by Exchange's fixed snapshot projection. */
+export interface CredentialHealthSnapshot {
+  readonly connectionId: string;
+  readonly provider: 'hf' | 'runpod' | 'azure' | 'gcp';
+  readonly loginState: 'PRESENT' | 'MISSING' | 'UNKNOWN' | 'UNAVAILABLE';
+  readonly authorizationState: 'VALID' | 'REAUTHORIZATION_REQUIRED' | 'PERMISSION_DENIED' | 'UNKNOWN' | 'UNAVAILABLE';
+  readonly checkedAt: string | null;
+  readonly expiresAt: string | null;
+  readonly generation: number;
+  readonly capabilities: readonly {
+    readonly capabilityId: string;
+    readonly state: 'VALID' | 'REAUTHORIZATION_REQUIRED' | 'PERMISSION_DENIED' | 'UNKNOWN' | 'UNAVAILABLE';
+    readonly lastVerifiedAt: string | null;
+    readonly expiresAt: string | null;
+    readonly reasonCode: string | null;
+  }[];
+  readonly reasonCode: string | null;
+}
+
 /** One ordered durable event attached to a task.  中文：与任务关联的一条有序持久化事件。 */
 export interface DurableTaskEvent {
   readonly seq: number;
@@ -176,7 +195,22 @@ export interface WorkStateStore {
   listUnresolvedOperations(options?: { target?: string; limit?: number }): Promise<readonly UnresolvedOperationSummary[]>;
   registerConnectorEvent(input: ConnectorEventInput): Promise<ConnectorEventReceipt>;
   getConnectorThread(connectorId: string, threadId: string, messageLimit?: number, excludeMessageId?: string): Promise<ConnectorThreadRecord>;
-  claimNotifications(input: { workerId: string; limit: number; leaseSeconds: number; type: string; connectorId: string }): Promise<readonly NotificationLease[]>;
+  claimNotifications(input: {
+    workerId: string;
+    limit: number;
+    leaseSeconds: number;
+    type: string;
+    connectorId: string;
+    recipient?: string;
+  }): Promise<readonly NotificationLease[]>;
+  processCredentialHealthSnapshots(
+    organizationId: string,
+    connections: readonly CredentialHealthSnapshot[],
+  ): Promise<{
+    readonly processed: number;
+    readonly stale: number;
+    readonly notificationsQueued: number;
+  }>;
   startNotification(notificationId: string, leaseToken: string): Promise<void>;
   finishNotification(
     notificationId: string,
@@ -212,6 +246,13 @@ function timeField(value: unknown, key: string, optional = false): number | unde
   if (optional && (value === undefined || value === null)) return undefined;
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
     throw new TypeError(`Invalid Work Task ${key}`);
+  }
+  return value;
+}
+
+function countField(value: unknown, key: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`Invalid Work credential health ${key}`);
   }
   return value;
 }
@@ -538,7 +579,7 @@ export class WorkStateClient implements WorkStateStore {
 
   /** Lease one connector's durable messages; expired started sends are never replayed. */
   async claimNotifications(input: {
-    workerId: string; limit: number; leaseSeconds: number; type: string; connectorId: string;
+    workerId: string; limit: number; leaseSeconds: number; type: string; connectorId: string; recipient?: string;
   }): Promise<readonly NotificationLease[]> {
     const row = object(await this.requestAt(`${this.workUrl}/notifications/claim`, 'POST', input), 'Work notification claim');
     if (!Array.isArray(row.items)) throw new TypeError('Invalid Work notification claim response');
@@ -550,7 +591,8 @@ export class WorkStateClient implements WorkStateStore {
       if (!['queued', 'leased', 'started', 'uncertain', 'delivered', 'failed'].includes(String(status))) {
         throw new TypeError('Invalid Work notification state');
       }
-      if (notice.type !== input.type || notice.connectorId !== input.connectorId) {
+      if (notice.type !== input.type || notice.connectorId !== input.connectorId
+        || (input.recipient !== undefined && notice.recipient !== input.recipient)) {
         throw new TypeError('Work returned a notification outside the requested connector scope');
       }
       return {
@@ -567,6 +609,23 @@ export class WorkStateClient implements WorkStateStore {
         leaseToken: boundedString(lease.leaseToken, 'notification lease token', 512),
       };
     });
+  }
+
+  /** Atomically checkpoint Exchange health and enqueue its incident transitions. */
+  async processCredentialHealthSnapshots(
+    organizationId: string,
+    connections: readonly CredentialHealthSnapshot[],
+  ): Promise<{ readonly processed: number; readonly stale: number; readonly notificationsQueued: number }> {
+    const row = object(await this.requestAt(
+      `${this.workUrl}/credential-health/snapshots`,
+      'POST',
+      { organizationId, connections },
+    ), 'Work credential health receipt');
+    return {
+      processed: countField(row.processed, 'processed'),
+      stale: countField(row.stale, 'stale'),
+      notificationsQueued: countField(row.notificationsQueued, 'notificationsQueued'),
+    };
   }
 
   async startNotification(notificationId: string, leaseToken: string): Promise<void> {
@@ -683,6 +742,7 @@ export class InMemoryWorkStateStore implements WorkStateStore {
   private readonly connectorThreads = new Map<string, ConnectorThreadRecord>();
   private readonly connectorThreadRoutes = new Map<string, Omit<ConnectorThreadRecord, 'sessionId' | 'messages'>>();
   private readonly connectorThreadMessages = new Map<string, ConnectorThreadRecord['messages'][number][]>();
+  private readonly credentialHealth = new Map<string, CredentialHealthSnapshot>();
 
   async createTask(input: {
     id?: string;
@@ -934,6 +994,23 @@ export class InMemoryWorkStateStore implements WorkStateStore {
   }
 
   async claimNotifications(): Promise<readonly NotificationLease[]> { return []; }
+  async processCredentialHealthSnapshots(
+    _organizationId: string,
+    connections: readonly CredentialHealthSnapshot[],
+  ): Promise<{ readonly processed: number; readonly stale: number; readonly notificationsQueued: number }> {
+    let processed = 0;
+    let stale = 0;
+    for (const snapshot of connections) {
+      const prior = this.credentialHealth.get(snapshot.connectionId);
+      if (prior && snapshot.generation < prior.generation) {
+        stale += 1;
+        continue;
+      }
+      this.credentialHealth.set(snapshot.connectionId, snapshot);
+      processed += 1;
+    }
+    return { processed, stale, notificationsQueued: 0 };
+  }
   async startNotification(): Promise<void> { throw new WorkStateHttpError(404, 'NOTIFICATION_NOT_FOUND'); }
   async finishNotification(): Promise<void> { throw new WorkStateHttpError(404, 'NOTIFICATION_NOT_FOUND'); }
 }
