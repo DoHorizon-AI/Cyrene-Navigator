@@ -85,6 +85,12 @@ the child CLI's private `--mcp-config` file is not treated as a substitute for
 the per-session list. The bridge URL and task-scoped bearer remain in the
 owner-only CLI config and are also supplied in the stdio server environment.
 Navigator does not copy them into prompts, Work events, or fixed diagnostics.
+Following CodeBuddy's [MCP deferred-loading configuration](https://www.codebuddy.ai/docs/cli/mcp),
+the generated server config sets `defer_loading: false` so Navigator tools are
+directly available while [`--tools ""` disables built-in tools](https://www.codebuddy.ai/docs/cli/cli-reference).
+`alwaysLoad: true` remains in place for the first-prompt connection wait. These
+settings stay scoped to the generated Navigator server and do not change global
+defer settings or permissions.
 A CodeBuddy native run remains necessary to verify the vendor's own
 session/transcript handling.
 
@@ -108,8 +114,11 @@ CodeBuddy ACP 的 `session/new` 与 `session/load` 都显式提供唯一的 `nav
 server。ACP v1 描述使用标准 `name`、绝对路径 `command`、`args` 和
 `env: [{name, value}]` 字段；CLI 私有 `--mcp-config` 不会替代每个 session 的服务列表。
 bridge URL 与 task 级 bearer 仍保留在 owner-only CLI 配置中，并同时传入 stdio server 环境。
-Navigator 不会把它们复制到提示、Work 事件或固定诊断中。仍需原生 CodeBuddy 验收来确认厂商自身对
-session/transcript 的处理。
+Navigator 不会把它们复制到提示、Work 事件或固定诊断中。生成的 server 配置会设置
+[`defer_loading: false`](https://www.codebuddy.ai/docs/cli/mcp)，让 Navigator 工具直接出现在工具列表中；
+[`--tools ""`](https://www.codebuddy.ai/docs/cli/cli-reference) 仍只禁用 CodeBuddy 内置工具。
+`alwaysLoad: true` 保留首个 prompt 前等待连接的行为。该配置仅作用于生成的 Navigator server，不改全局延迟
+加载或权限配置。仍需原生 CodeBuddy 验收来确认厂商自身对 session/transcript 的处理。
 
 内置 stdio bridge 支持 `2024-11-05`、`2025-03-26` 和 `2025-06-18` 版本。客户端请求格式正确但
 更新的日期版本时，bridge 会协商自身最新支持的 `2025-06-18`，工具目录与授权规则保持不变，符合官方

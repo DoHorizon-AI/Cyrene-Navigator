@@ -95,6 +95,7 @@ try {
   cliNavigatorServer = config.mcpServers.navigator;
   assert.equal(cliNavigatorServer.type, 'stdio');
   assert.equal(cliNavigatorServer.alwaysLoad, true);
+  assert.equal(cliNavigatorServer.defer_loading, false);
   assert.equal(typeof cliNavigatorServer.env.NAVIGATOR_ACP_BRIDGE_TOKEN, 'string');
   assert.ok(!process.argv.join(' ').includes(cliNavigatorServer.env.NAVIGATOR_ACP_BRIDGE_TOKEN));
   bootstrapStage = 'environment';

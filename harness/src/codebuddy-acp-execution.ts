@@ -193,6 +193,7 @@ export class CodeBuddyAcpExecutionBackend implements ConversationExecutionBacken
             command: acpMcpServer.command,
             args: acpMcpServer.args,
             alwaysLoad: true,
+            defer_loading: false,
             env: Object.fromEntries(acpMcpServer.env.map(({ name, value }) => [name, value])),
           },
         },
