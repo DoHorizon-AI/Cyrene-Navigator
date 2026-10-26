@@ -26,6 +26,10 @@ JsonObject = dict[str, Any]
 _MAX_JSON_BYTES = 2_000_000
 _TASK_RESULT_NOTIFICATION_MAX_CHARS = 20_000
 _TASK_RESULT_NOTIFICATION_TRUNCATION = "\n...[middle task result truncated]...\n"
+_CREDENTIAL_HEALTH_NOTIFICATION_TYPE = "teams.credential-health"
+_CREDENTIAL_HEALTH_CONNECTOR_ID = "teams-v1"
+_CREDENTIAL_HEALTH_RECIPIENT = "teams:credential-health"
+_CREDENTIAL_HEALTH_REMINDER_COOLDOWN_MS = 24 * 60 * 60 * 1_000
 _TERMINAL_TASK_STATES = frozenset({"completed", "failed", "aborted"})
 _TASK_TRANSITIONS: dict[str, frozenset[str]] = {
     "queued": frozenset({"running", "failed", "aborted", "waiting_approval", "waiting_input"}),
@@ -1953,6 +1957,12 @@ class WorkStore:
         connector_id = _optional_text(body.get("connectorId"), "connectorId", 512)
         task_id = _optional_text(body.get("taskId"), "taskId", 512)
         recipient = _optional_text(body.get("recipient"), "recipient", 2_000)
+        if notification_type == _CREDENTIAL_HEALTH_NOTIFICATION_TYPE:
+            raise _invalid(
+                "WORK_NOTIFICATION_RESERVED_TYPE",
+                "Credential health notifications are created only from the trusted "
+                "health snapshot route.",
+            )
         available_at = body.get("availableAt", _unix_ms())
         _nonnegative_integer(available_at, "availableAt")
         now = _unix_ms()
@@ -2102,6 +2112,166 @@ class WorkStore:
             now,
             now,
         )
+
+    def process_credential_health_snapshots(
+        self,
+        organization_id: str | None,
+        workspace_id: str,
+        snapshots: Sequence[Mapping[str, Any]],
+    ) -> JsonObject:
+        """Checkpoint Exchange health and enqueue only incident transitions atomically.
+
+        Unknown or stale projections remain silent. Repeated action-required snapshots
+        produce a reminder at most once per cooldown, while recovery is emitted once.
+        中文：在同一事务中保存授权健康检查点并按状态转换加入持久 outbox。
+        """
+
+        org, workspace = _scope(organization_id, workspace_id)
+        if not isinstance(snapshots, Sequence) or isinstance(snapshots, (str, bytes)):
+            raise _invalid("WORK_CREDENTIAL_HEALTH_INVALID", "connections must be an array")
+        if not 1 <= len(snapshots) <= 100:
+            raise _invalid(
+                "WORK_CREDENTIAL_HEALTH_INVALID", "connections must contain 1 to 100 items"
+            )
+        normalized = [_credential_health_snapshot(item) for item in snapshots]
+        connection_ids = [item["connectionId"] for item in normalized]
+        if len(set(connection_ids)) != len(connection_ids):
+            raise _invalid("WORK_CREDENTIAL_HEALTH_INVALID", "connection ids must be unique")
+
+        now = _unix_ms()
+        processed = 0
+        stale = 0
+        queued = 0
+        with self._mutation() as conn:
+            for snapshot in normalized:
+                connection_id = str(snapshot["connectionId"])
+                prior = conn.execute(
+                    """SELECT * FROM work_credential_authorization_health
+                       WHERE organization_id=? AND workspace_id=? AND connection_id=?""",
+                    (org, workspace, connection_id),
+                ).fetchone()
+                generation = int(snapshot["generation"])
+                checked_at = snapshot["checkedAt"]
+                prior_checked_at = (
+                    str(prior["checked_at"]) if prior is not None and prior["checked_at"] else None
+                )
+                if prior is not None and (
+                    (checked_at is None and prior_checked_at is not None)
+                    or (
+                        checked_at is not None
+                        and prior_checked_at is not None
+                        and _credential_timestamp_ms(checked_at)
+                        < _credential_timestamp_ms(prior_checked_at)
+                    )
+                ):
+                    stale += 1
+                    continue
+
+                status = _credential_health_decision(snapshot, now)
+                fingerprint = _credential_health_fingerprint(snapshot)
+                state_changed = prior is None or str(prior["fingerprint"]) != fingerprint
+                incident_id = (
+                    str(prior["incident_id"])
+                    if prior is not None and prior["incident_id"]
+                    else None
+                )
+                incident_started_at = (
+                    int(prior["incident_started_at"])
+                    if prior is not None and prior["incident_started_at"] is not None
+                    else None
+                )
+                last_notified_at = (
+                    int(prior["last_notified_at"])
+                    if prior is not None and prior["last_notified_at"] is not None
+                    else None
+                )
+                reminder_count = int(prior["reminder_count"]) if prior is not None else 0
+                notification: JsonObject | None = None
+                deduplication_key: str | None = None
+
+                if status == "action_required":
+                    if incident_id is None:
+                        incident_id = uuid4().hex
+                        incident_started_at = now
+                        last_notified_at = now
+                        reminder_count = 0
+                        deduplication_key = (
+                            f"credential-health:{connection_id}:{incident_id}:opened"
+                        )
+                        notification = _credential_health_notice(
+                            snapshot, "action_required", incident_id
+                        )
+                    elif (
+                        last_notified_at is None
+                        or now - last_notified_at >= _CREDENTIAL_HEALTH_REMINDER_COOLDOWN_MS
+                    ):
+                        reminder_count += 1
+                        last_notified_at = now
+                        deduplication_key = (
+                            f"credential-health:{connection_id}:{incident_id}:"
+                            f"reminder:{reminder_count}"
+                        )
+                        notification = _credential_health_notice(snapshot, "reminder", incident_id)
+                elif status == "healthy" and incident_id is not None and state_changed:
+                    deduplication_key = f"credential-health:{connection_id}:{incident_id}:recovered"
+                    notification = _credential_health_notice(snapshot, "recovered", incident_id)
+                    incident_id = None
+                    incident_started_at = None
+                    last_notified_at = None
+                    reminder_count = 0
+
+                if notification is not None and deduplication_key is not None:
+                    _, duplicate = self._enqueue_notification(
+                        conn,
+                        org,
+                        workspace,
+                        deduplication_key,
+                        _CREDENTIAL_HEALTH_NOTIFICATION_TYPE,
+                        notification,
+                        _CREDENTIAL_HEALTH_CONNECTOR_ID,
+                        _CREDENTIAL_HEALTH_RECIPIENT,
+                        None,
+                        now,
+                        now,
+                    )
+                    if not duplicate:
+                        queued += 1
+
+                conn.execute(
+                    """INSERT INTO work_credential_authorization_health(
+                       organization_id,workspace_id,connection_id,provider,generation,fingerprint,
+                       decision,checked_at,expires_at,reason_code,incident_id,incident_started_at,
+                       last_notified_at,reminder_count,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(organization_id,workspace_id,connection_id) DO UPDATE SET
+                       provider=excluded.provider,
+                       generation=excluded.generation,
+                       fingerprint=excluded.fingerprint,decision=excluded.decision,
+                       checked_at=excluded.checked_at,expires_at=excluded.expires_at,
+                       reason_code=excluded.reason_code,incident_id=excluded.incident_id,
+                       incident_started_at=excluded.incident_started_at,
+                       last_notified_at=excluded.last_notified_at,
+                       reminder_count=excluded.reminder_count,updated_at=excluded.updated_at""",
+                    (
+                        org,
+                        workspace,
+                        connection_id,
+                        snapshot["provider"],
+                        generation,
+                        fingerprint,
+                        status,
+                        snapshot["checkedAt"],
+                        snapshot["expiresAt"],
+                        snapshot["reasonCode"],
+                        incident_id,
+                        incident_started_at,
+                        last_notified_at,
+                        reminder_count,
+                        now,
+                    ),
+                )
+                processed += 1
+        return {"processed": processed, "stale": stale, "notificationsQueued": queued}
 
     def list_notifications(
         self,
@@ -4004,6 +4174,13 @@ CREATE TABLE IF NOT EXISTS work_notifications (
  result_json TEXT NOT NULL, request_digest TEXT NOT NULL,
  PRIMARY KEY(organization_id,workspace_id,notification_id),
  UNIQUE(organization_id,workspace_id,deduplication_key));
+CREATE TABLE IF NOT EXISTS work_credential_authorization_health (
+ organization_id TEXT NOT NULL, workspace_id TEXT NOT NULL, connection_id TEXT NOT NULL,
+ provider TEXT NOT NULL, generation INTEGER NOT NULL, fingerprint TEXT NOT NULL,
+ decision TEXT NOT NULL, checked_at TEXT, expires_at TEXT, reason_code TEXT,
+ incident_id TEXT, incident_started_at INTEGER, last_notified_at INTEGER,
+ reminder_count INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL,
+ PRIMARY KEY(organization_id,workspace_id,connection_id));
 CREATE INDEX IF NOT EXISTS work_notifications_claim
  ON work_notifications(organization_id,workspace_id,status,available_at,created_at);
 CREATE TABLE IF NOT EXISTS work_attachments (
@@ -4225,6 +4402,222 @@ def _optional_text(value: object, field: str, maximum: int) -> str | None:
     if not isinstance(value, str) or len(value) > maximum or any(ord(ch) == 0 for ch in value):
         raise _invalid("WORK_INVALID_TEXT", f"{field} must be text of at most {maximum} characters")
     return value
+
+
+def _credential_health_snapshot(value: object) -> JsonObject:
+    """Normalize one strict, credential-free Exchange authorization snapshot."""
+
+    allowed = {
+        "connectionId",
+        "provider",
+        "loginState",
+        "authorizationState",
+        "checkedAt",
+        "expiresAt",
+        "generation",
+        "capabilities",
+        "reasonCode",
+    }
+    if not isinstance(value, Mapping) or set(value) != allowed:
+        raise _invalid(
+            "WORK_CREDENTIAL_HEALTH_INVALID",
+            "A credential health snapshot has an unsupported shape.",
+        )
+    connection_id = _identifier(value.get("connectionId"), "connectionId")
+    try:
+        connection_id = str(UUID(connection_id))
+    except ValueError as exc:
+        raise _invalid(
+            "WORK_CREDENTIAL_HEALTH_INVALID", "connectionId must be a canonical UUID"
+        ) from exc
+    provider = _bounded_text(value.get("provider"), "provider", 32)
+    if provider not in {"hf", "runpod", "azure", "gcp"}:
+        raise _invalid("WORK_CREDENTIAL_HEALTH_INVALID", "provider is not supported")
+    login_state = _bounded_text(value.get("loginState"), "loginState", 32)
+    if login_state not in {"PRESENT", "MISSING", "UNKNOWN", "UNAVAILABLE"}:
+        raise _invalid("WORK_CREDENTIAL_HEALTH_INVALID", "loginState is not supported")
+    authorization_state = _bounded_text(value.get("authorizationState"), "authorizationState", 64)
+    if authorization_state not in {
+        "VALID",
+        "REAUTHORIZATION_REQUIRED",
+        "PERMISSION_DENIED",
+        "UNKNOWN",
+        "UNAVAILABLE",
+    }:
+        raise _invalid("WORK_CREDENTIAL_HEALTH_INVALID", "authorizationState is not supported")
+    checked_at = _credential_utc_timestamp(value.get("checkedAt"), "checkedAt")
+    expires_at = _credential_utc_timestamp(value.get("expiresAt"), "expiresAt")
+    generation = _nonnegative_integer(value.get("generation"), "generation")
+    raw_capabilities = value.get("capabilities")
+    if not isinstance(raw_capabilities, list) or len(raw_capabilities) > 100:
+        raise _invalid("WORK_CREDENTIAL_HEALTH_INVALID", "capabilities must be a bounded array")
+    capabilities: list[JsonObject] = []
+    capability_ids: set[str] = set()
+    for item in raw_capabilities:
+        if not isinstance(item, Mapping) or set(item) != {
+            "capabilityId",
+            "state",
+            "lastVerifiedAt",
+            "expiresAt",
+            "reasonCode",
+        }:
+            raise _invalid(
+                "WORK_CREDENTIAL_HEALTH_INVALID",
+                "A capability health snapshot has an unsupported shape.",
+            )
+        capability_id = _identifier(item.get("capabilityId"), "capabilityId")
+        if capability_id in capability_ids:
+            raise _invalid("WORK_CREDENTIAL_HEALTH_INVALID", "capability ids must be unique")
+        capability_ids.add(capability_id)
+        state = _bounded_text(item.get("state"), "capability.state", 64)
+        if state not in {
+            "VALID",
+            "REAUTHORIZATION_REQUIRED",
+            "PERMISSION_DENIED",
+            "UNKNOWN",
+            "UNAVAILABLE",
+        }:
+            raise _invalid("WORK_CREDENTIAL_HEALTH_INVALID", "capability state is not supported")
+        capabilities.append(
+            {
+                "capabilityId": capability_id,
+                "state": state,
+                "lastVerifiedAt": _credential_utc_timestamp(
+                    item.get("lastVerifiedAt"), "capability.lastVerifiedAt"
+                ),
+                "expiresAt": _credential_utc_timestamp(
+                    item.get("expiresAt"), "capability.expiresAt"
+                ),
+                "reasonCode": _credential_reason_code(
+                    item.get("reasonCode"), "capability.reasonCode"
+                ),
+            }
+        )
+    reason_code = _credential_reason_code(value.get("reasonCode"), "reasonCode")
+    return {
+        "connectionId": connection_id,
+        "provider": provider,
+        "loginState": login_state,
+        "authorizationState": authorization_state,
+        "checkedAt": checked_at,
+        "expiresAt": expires_at,
+        "generation": generation,
+        "capabilities": sorted(capabilities, key=lambda item: str(item["capabilityId"])),
+        "reasonCode": reason_code,
+    }
+
+
+def _credential_utc_timestamp(value: object, field: str) -> str | None:
+    """Accept only parseable UTC RFC3339 timestamps from the Exchange projection."""
+
+    if value is None:
+        return None
+    timestamp = _bounded_text(value, field, 64)
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", timestamp):
+        raise _invalid("WORK_CREDENTIAL_HEALTH_INVALID", f"{field} must be UTC RFC3339")
+    from datetime import UTC, datetime
+
+    try:
+        datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone(UTC)
+    except ValueError as exc:
+        raise _invalid("WORK_CREDENTIAL_HEALTH_INVALID", f"{field} is invalid") from exc
+    return timestamp
+
+
+def _credential_timestamp_ms(value: str) -> int:
+    """Convert a validated UTC projection timestamp to Unix milliseconds."""
+
+    from datetime import UTC, datetime
+
+    return int(
+        datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC).timestamp() * 1_000
+    )
+
+
+def _credential_reason_code(value: object, field: str) -> str | None:
+    """Allow bounded symbolic provider codes and reject free-form error text."""
+
+    reason_code = _optional_text(value, field, 160)
+    if reason_code is not None and not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._:-]{0,159}", reason_code
+    ):
+        raise _invalid("WORK_CREDENTIAL_HEALTH_INVALID", f"{field} must be a symbolic code")
+    return reason_code
+
+
+def _credential_health_decision(snapshot: Mapping[str, Any], now: int) -> str:
+    """Treat only fresh explicit authorization failures as actionable. | 判定授权状态。"""
+
+    checked_at = snapshot.get("checkedAt")
+    if checked_at is None:
+        return "unknown"
+    checked_ms = _credential_timestamp_ms(str(checked_at))
+    if checked_ms > now + 5 * 60 * 1_000 or now - checked_ms > 30 * 60 * 1_000:
+        return "unknown"
+    states = [str(snapshot["authorizationState"])] + [
+        str(item["state"]) for item in snapshot["capabilities"]
+    ]
+    if snapshot["loginState"] in {"UNKNOWN", "UNAVAILABLE"} or any(
+        state in {"UNKNOWN", "UNAVAILABLE"} for state in states
+    ):
+        return "unknown"
+    if any(state in {"REAUTHORIZATION_REQUIRED", "PERMISSION_DENIED"} for state in states):
+        return "action_required"
+    if (
+        snapshot["loginState"] == "PRESENT"
+        and snapshot["authorizationState"] == "VALID"
+        and all(item["state"] == "VALID" for item in snapshot["capabilities"])
+    ):
+        return "healthy"
+    return "unknown"
+
+
+def _credential_health_fingerprint(snapshot: Mapping[str, Any]) -> str:
+    """Fingerprint meaningful state because Exchange generation tracks configuration, not probes."""
+
+    return _digest(
+        {
+            "provider": snapshot["provider"],
+            "loginState": snapshot["loginState"],
+            "authorizationState": snapshot["authorizationState"],
+            "expiresAt": snapshot["expiresAt"],
+            "generation": snapshot["generation"],
+            "capabilities": [
+                {
+                    "capabilityId": item["capabilityId"],
+                    "state": item["state"],
+                    "expiresAt": item["expiresAt"],
+                    "reasonCode": item["reasonCode"],
+                }
+                for item in snapshot["capabilities"]
+            ],
+            "reasonCode": snapshot["reasonCode"],
+        }
+    )
+
+
+def _credential_health_notice(
+    snapshot: Mapping[str, Any], event: str, incident_id: str
+) -> JsonObject:
+    """Build a minimal notice payload without auth references or provider error text."""
+
+    return {
+        "schemaVersion": 1,
+        "event": event,
+        "incidentId": incident_id,
+        "connectionId": snapshot["connectionId"],
+        "provider": snapshot["provider"],
+        "generation": snapshot["generation"],
+        "loginState": snapshot["loginState"],
+        "authorizationState": snapshot["authorizationState"],
+        "capabilities": [
+            {"capabilityId": item["capabilityId"], "state": item["state"]}
+            for item in snapshot["capabilities"]
+        ],
+        "checkedAt": snapshot["checkedAt"],
+        "expiresAt": snapshot["expiresAt"],
+        "reasonCode": snapshot["reasonCode"],
+    }
 
 
 def _nonnegative_integer(value: object, field: str) -> int:

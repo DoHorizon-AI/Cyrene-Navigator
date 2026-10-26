@@ -8,6 +8,7 @@ import { createHash, createHmac } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { isJsonValue } from '@deepseek-ai/dsh-util-values';
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
+import type { CredentialHealthSnapshot } from './work-state-client.js';
 
 const GRANT_TTL_MAX_SECONDS = 15;
 const REQUEST_TIMEOUT_MS = 10_000;
@@ -246,6 +247,96 @@ export class ExchangeConnectorAuthorizationClient {
       ...(boundedRetryAfter(row.retryAfterSeconds) === undefined
         ? {} : { retryAfterSeconds: boundedRetryAfter(row.retryAfterSeconds) }),
     };
+  }
+
+  /** Read only the selected Exchange-owned authorization snapshots for one fixed Workspace. */
+  async getAuthorizationHealthSnapshots(input: {
+    readonly requestId: string;
+    readonly organizationId: string;
+    readonly workspaceId: string;
+    readonly connectionIds: readonly string[];
+  }, signal: AbortSignal): Promise<readonly CredentialHealthSnapshot[]> {
+    if (input.connectionIds.length < 1 || input.connectionIds.length > 100
+      || new Set(input.connectionIds).size !== input.connectionIds.length) {
+      throw new TypeError('Credential health snapshot selectors are invalid');
+    }
+    const request = {
+      requestId: safeText(input.requestId, 'authorization health request id', 200),
+      organizationId: safeText(input.organizationId, 'authorization health organization id', 512),
+      workspaceId: safeText(input.workspaceId, 'authorization health workspace id', 512),
+      connectionIds: input.connectionIds.map((value, index) => safeText(
+        value, `authorization health connection id ${index}`, 512,
+      )),
+    };
+    const body = JSON.stringify(request);
+    const response = await this.postSigned(
+      '/internal/v1/authorization-health/snapshots', body, signal,
+    );
+    const envelope = object(await readJson(response), 'Exchange authorization health snapshots');
+    if (!exactObjectKeys(envelope, ['connections']) || !Array.isArray(envelope.connections)
+      || envelope.connections.length > request.connectionIds.length) {
+      throw new TypeError('Exchange returned an invalid authorization health snapshot envelope');
+    }
+    const requested = new Set(request.connectionIds);
+    const received = new Set<string>();
+    return envelope.connections.map((value, index) => {
+      const row = object(value, `Exchange authorization health connection ${index}`);
+      if (!exactObjectKeys(row, [
+        'connectionId', 'provider', 'loginState', 'authorizationState', 'checkedAt',
+        'expiresAt', 'generation', 'capabilities', 'reasonCode',
+      ])) {
+        throw new TypeError('Exchange returned an unsupported authorization health snapshot');
+      }
+      const connectionId = safeText(row.connectionId, 'authorization health connection id', 512);
+      if (!requested.has(connectionId) || received.has(connectionId)) {
+        throw new TypeError('Exchange returned a duplicate or unrequested authorization health connection');
+      }
+      received.add(connectionId);
+      const provider = enumText(row.provider, ['hf', 'runpod', 'azure', 'gcp'], 'authorization health provider');
+      const loginState = enumText(row.loginState, ['PRESENT', 'MISSING', 'UNKNOWN', 'UNAVAILABLE'], 'authorization login state');
+      const authorizationState = enumText(
+        row.authorizationState,
+        ['VALID', 'REAUTHORIZATION_REQUIRED', 'PERMISSION_DENIED', 'UNKNOWN', 'UNAVAILABLE'],
+        'authorization state',
+      );
+      if (typeof row.generation !== 'number' || !Number.isSafeInteger(row.generation) || row.generation < 0) {
+        throw new TypeError('Exchange returned an invalid authorization generation');
+      }
+      if (!Array.isArray(row.capabilities) || row.capabilities.length > 100) {
+        throw new TypeError('Exchange returned an invalid authorization capability list');
+      }
+      const capabilities = row.capabilities.map((item, capabilityIndex) => {
+        const capability = object(item, `Exchange authorization capability ${capabilityIndex}`);
+        if (!exactObjectKeys(capability, ['capabilityId', 'state', 'lastVerifiedAt', 'expiresAt', 'reasonCode'])) {
+          throw new TypeError('Exchange returned an unsupported authorization capability');
+        }
+        return {
+          capabilityId: safeText(capability.capabilityId, 'authorization capability id', 256),
+          state: enumText(
+            capability.state,
+            ['VALID', 'REAUTHORIZATION_REQUIRED', 'PERMISSION_DENIED', 'UNKNOWN', 'UNAVAILABLE'],
+            'authorization capability state',
+          ),
+          lastVerifiedAt: nullableUtcTimestamp(capability.lastVerifiedAt, 'authorization capability verifiedAt'),
+          expiresAt: nullableUtcTimestamp(capability.expiresAt, 'authorization capability expiresAt'),
+          reasonCode: nullableSymbolicCode(capability.reasonCode, 'authorization capability reason code'),
+        };
+      });
+      if (new Set(capabilities.map(item => item.capabilityId)).size !== capabilities.length) {
+        throw new TypeError('Exchange returned duplicate authorization capability ids');
+      }
+      return {
+        connectionId,
+        provider,
+        loginState,
+        authorizationState,
+        checkedAt: nullableUtcTimestamp(row.checkedAt, 'authorization health checkedAt'),
+        expiresAt: nullableUtcTimestamp(row.expiresAt, 'authorization health expiresAt'),
+        generation: row.generation,
+        capabilities,
+        reasonCode: nullableSymbolicCode(row.reasonCode, 'authorization health reason code'),
+      };
+    });
   }
 
   private async postSigned(path: string, body: string, signal: AbortSignal): Promise<Response> {
@@ -498,6 +589,32 @@ function canonicalValue(value: unknown): unknown {
 function object(value: unknown, label: string): Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError(`${label} must be an object`);
   return value as Record<string, unknown>;
+}
+
+function exactObjectKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  return Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
+}
+
+function enumText<const T extends readonly string[]>(value: unknown, values: T, label: string): T[number] {
+  if (typeof value !== 'string' || !values.includes(value)) throw new TypeError(`Invalid ${label}`);
+  return value as T[number];
+}
+
+function nullableUtcTimestamp(value: unknown, label: string): string | null {
+  if (value === null) return null;
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/u.test(value)
+    || !Number.isFinite(Date.parse(value))) {
+    throw new TypeError(`Invalid ${label}`);
+  }
+  return value;
+}
+
+function nullableSymbolicCode(value: unknown, label: string): string | null {
+  if (value === null) return null;
+  if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/u.test(value)) {
+    throw new TypeError(`Invalid ${label}`);
+  }
+  return value;
 }
 
 function safeText(value: unknown, label: string, limit: number): string {

@@ -37,6 +37,8 @@ from cyrene_navigator.work.models import (
     ConnectorList,
     ConnectorRecord,
     ConnectorStatusUpdate,
+    CredentialHealthSnapshotBatch,
+    CredentialHealthSnapshotReceipt,
     InputList,
     InputReceipt,
     InputRecord,
@@ -161,6 +163,25 @@ def mount_work_routes(
                 WORKSPACE_FORBIDDEN,
                 403,
                 "A trusted Workspace owner principal is required for native session mappings.",
+            )
+        return principal
+
+    def require_credential_health_publisher(
+        request: Request, workspace_id: str
+    ) -> PersistencePrincipal:
+        """Require the explicit host credential-health publication grant.
+
+        This route accepts only Exchange's bounded health projection; it cannot
+        choose a Teams destination or enqueue arbitrary connector messages.
+        中文：仅允许配置了专用权限的可信宿主提交授权健康快照。
+        """
+
+        principal = authenticate(request, workspace_id)
+        if not principal.can_publish_credential_health or principal.organization_id is None:
+            raise PersistenceError(
+                WORKSPACE_FORBIDDEN,
+                403,
+                "A trusted Workspace credential-health publisher is required.",
             )
         return principal
 
@@ -633,6 +654,33 @@ def mount_work_routes(
         if duplicate:
             response.status_code = 200
         return {"notification": notification, "duplicate": duplicate}
+
+    @app.post(
+        base + "/credential-health/snapshots",
+        response_model=CredentialHealthSnapshotReceipt,
+    )
+    def process_credential_health_snapshots(
+        workspace_id: str,
+        body: CredentialHealthSnapshotBatch,
+        request: Request,
+    ) -> dict[str, Any]:
+        """Persist a fixed Exchange projection and its state-change notices.
+
+        中文：该宿主专用入口不能接收凭据、授权材料或通知目标。
+        """
+
+        principal = require_credential_health_publisher(request, workspace_id)
+        if body.organization_id != principal.organization_id:
+            raise PersistenceError(
+                WORKSPACE_FORBIDDEN,
+                403,
+                "Credential health snapshots must match the authenticated organization.",
+            )
+        return store.process_credential_health_snapshots(
+            principal.organization_id,
+            workspace_id,
+            [item.model_dump(by_alias=True) for item in body.connections],
+        )
 
     @app.get(base + "/notifications", response_model=NotificationList)
     def list_notifications(

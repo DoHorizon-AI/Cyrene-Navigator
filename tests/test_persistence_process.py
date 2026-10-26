@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,7 @@ import httpx
 import pytest
 
 BASE = "/api/v1/harness/workspaces/w1/sessions"
+WORK_BASE = "/api/v1/workspaces/w1/work"
 TOKEN = "process-alice-token"
 
 
@@ -213,6 +215,56 @@ def test_real_http_process_restart_recovers_committed_events(tmp_path: Path) -> 
             assert appended_after_restart.json() == {"nextSeq": 2}
     finally:
         _stop_service(second_process)
+
+
+def test_service_principal_flag_authorizes_only_the_credential_health_route(tmp_path: Path) -> None:
+    """The mounted principal config preserves the narrow health publisher grant."""
+
+    config_path = tmp_path / "credential-health-principals.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "principals": [
+                    {
+                        "token_env": "PERSISTENCE_TEST_TOKEN",
+                        "actor_id": "navigator-service",
+                        "organization_id": "org-health",
+                        "workspace_ids": ["w1"],
+                        "can_publish_credential_health": True,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    process, url = _start_service(tmp_path / "credential-health.db", config_path)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    checked_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    try:
+        with httpx.Client(base_url=url, headers=headers, timeout=5) as client:
+            response = client.post(
+                WORK_BASE + "/credential-health/snapshots",
+                json={
+                    "organizationId": "org-health",
+                    "connections": [
+                        {
+                            "connectionId": "22222222-2222-4222-8222-222222222222",
+                            "provider": "hf",
+                            "loginState": "PRESENT",
+                            "authorizationState": "VALID",
+                            "checkedAt": checked_at,
+                            "expiresAt": None,
+                            "generation": 1,
+                            "capabilities": [],
+                            "reasonCode": None,
+                        }
+                    ],
+                },
+            )
+        assert response.status_code == 200, response.text
+        assert response.json() == {"processed": 1, "stale": 0, "notificationsQueued": 0}
+    finally:
+        _stop_service(process)
 
 
 def test_real_tls_process_accepts_httpx_and_node_clients(

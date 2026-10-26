@@ -486,6 +486,87 @@ class NotificationClaimResult(WorkModel):
     items: list[NotificationLease]
 
 
+CredentialHealthProvider = Literal["hf", "runpod", "azure", "gcp"]
+CredentialHealthState = Literal[
+    "VALID", "REAUTHORIZATION_REQUIRED", "PERMISSION_DENIED", "UNKNOWN", "UNAVAILABLE"
+]
+CredentialLoginState = Literal["PRESENT", "MISSING", "UNKNOWN", "UNAVAILABLE"]
+
+
+class CredentialCapabilityHealth(WorkModel):
+    """Credential-free state for one provider capability. | 单个能力的无凭据健康状态。"""
+
+    capability_id: str = Field(
+        min_length=1,
+        max_length=256,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$",
+    )
+    state: CredentialHealthState
+    last_verified_at: str | None = Field(
+        default=None,
+        max_length=64,
+        pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$",
+    )
+    expires_at: str | None = Field(
+        default=None,
+        max_length=64,
+        pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$",
+    )
+    reason_code: str | None = Field(
+        default=None,
+        max_length=160,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$",
+    )
+
+
+class CredentialHealthSnapshot(WorkModel):
+    """Secret-free Exchange authorization projection consumed by the host worker.
+
+    中文：由可信 Navigator worker 提交的 Exchange 授权状态快照，不包含凭据或授权材料。
+    """
+
+    connection_id: str = Field(
+        min_length=36,
+        max_length=36,
+        pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+    )
+    provider: CredentialHealthProvider
+    login_state: CredentialLoginState
+    authorization_state: CredentialHealthState
+    checked_at: str | None = Field(
+        default=None,
+        max_length=64,
+        pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$",
+    )
+    expires_at: str | None = Field(
+        default=None,
+        max_length=64,
+        pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$",
+    )
+    generation: int = Field(ge=0, le=2**53 - 1)
+    capabilities: list[CredentialCapabilityHealth] = Field(default_factory=list, max_length=100)
+    reason_code: str | None = Field(
+        default=None,
+        max_length=160,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$",
+    )
+
+
+class CredentialHealthSnapshotBatch(WorkModel):
+    """Bounded batch from the fixed Exchange snapshot projection. | 有界健康快照批次。"""
+
+    organization_id: str = Field(min_length=1, max_length=512)
+    connections: list[CredentialHealthSnapshot] = Field(min_length=1, max_length=100)
+
+
+class CredentialHealthSnapshotReceipt(WorkModel):
+    """Atomic checkpoint and outbox accounting for one snapshot batch. | 快照处理回执。"""
+
+    processed: int = Field(ge=0)
+    stale: int = Field(ge=0)
+    notifications_queued: int = Field(ge=0)
+
+
 class AttachmentCreate(WorkModel):
     """Upload a bounded base64 attachment. | 上传有大小上限的 base64 附件。"""
 

@@ -601,6 +601,236 @@
         "title": "ConnectorStatusUpdate",
         "type": "object"
       },
+      "CredentialCapabilityHealth": {
+        "additionalProperties": false,
+        "description": "Credential-free state for one provider capability. | \u5355\u4e2a\u80fd\u529b\u7684\u65e0\u51ed\u636e\u5065\u5eb7\u72b6\u6001\u3002",
+        "properties": {
+          "capabilityId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$",
+            "title": "Capabilityid",
+            "type": "string"
+          },
+          "expiresAt": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expiresat"
+          },
+          "lastVerifiedAt": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lastverifiedat"
+          },
+          "reasonCode": {
+            "anyOf": [
+              {
+                "maxLength": 160,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoncode"
+          },
+          "state": {
+            "enum": [
+              "VALID",
+              "REAUTHORIZATION_REQUIRED",
+              "PERMISSION_DENIED",
+              "UNKNOWN",
+              "UNAVAILABLE"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "capabilityId",
+          "state"
+        ],
+        "title": "CredentialCapabilityHealth",
+        "type": "object"
+      },
+      "CredentialHealthSnapshot": {
+        "additionalProperties": false,
+        "description": "Secret-free Exchange authorization projection consumed by the host worker.\n\n\u4e2d\u6587\uff1a\u7531\u53ef\u4fe1 Navigator worker \u63d0\u4ea4\u7684 Exchange \u6388\u6743\u72b6\u6001\u5feb\u7167\uff0c\u4e0d\u5305\u542b\u51ed\u636e\u6216\u6388\u6743\u6750\u6599\u3002",
+        "properties": {
+          "authorizationState": {
+            "enum": [
+              "VALID",
+              "REAUTHORIZATION_REQUIRED",
+              "PERMISSION_DENIED",
+              "UNKNOWN",
+              "UNAVAILABLE"
+            ],
+            "title": "Authorizationstate",
+            "type": "string"
+          },
+          "capabilities": {
+            "items": {
+              "$ref": "#/components/schemas/CredentialCapabilityHealth"
+            },
+            "maxItems": 100,
+            "title": "Capabilities",
+            "type": "array"
+          },
+          "checkedAt": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Checkedat"
+          },
+          "connectionId": {
+            "maxLength": 36,
+            "minLength": 36,
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+            "title": "Connectionid",
+            "type": "string"
+          },
+          "expiresAt": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expiresat"
+          },
+          "generation": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "loginState": {
+            "enum": [
+              "PRESENT",
+              "MISSING",
+              "UNKNOWN",
+              "UNAVAILABLE"
+            ],
+            "title": "Loginstate",
+            "type": "string"
+          },
+          "provider": {
+            "enum": [
+              "hf",
+              "runpod",
+              "azure",
+              "gcp"
+            ],
+            "title": "Provider",
+            "type": "string"
+          },
+          "reasonCode": {
+            "anyOf": [
+              {
+                "maxLength": 160,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoncode"
+          }
+        },
+        "required": [
+          "connectionId",
+          "provider",
+          "loginState",
+          "authorizationState",
+          "generation"
+        ],
+        "title": "CredentialHealthSnapshot",
+        "type": "object"
+      },
+      "CredentialHealthSnapshotBatch": {
+        "additionalProperties": false,
+        "description": "Bounded batch from the fixed Exchange snapshot projection. | \u6709\u754c\u5065\u5eb7\u5feb\u7167\u6279\u6b21\u3002",
+        "properties": {
+          "connections": {
+            "items": {
+              "$ref": "#/components/schemas/CredentialHealthSnapshot"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "title": "Connections",
+            "type": "array"
+          },
+          "organizationId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Organizationid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "organizationId",
+          "connections"
+        ],
+        "title": "CredentialHealthSnapshotBatch",
+        "type": "object"
+      },
+      "CredentialHealthSnapshotReceipt": {
+        "additionalProperties": false,
+        "description": "Atomic checkpoint and outbox accounting for one snapshot batch. | \u5feb\u7167\u5904\u7406\u56de\u6267\u3002",
+        "properties": {
+          "notificationsQueued": {
+            "minimum": 0.0,
+            "title": "Notificationsqueued",
+            "type": "integer"
+          },
+          "processed": {
+            "minimum": 0.0,
+            "title": "Processed",
+            "type": "integer"
+          },
+          "stale": {
+            "minimum": 0.0,
+            "title": "Stale",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "processed",
+          "stale",
+          "notificationsQueued"
+        ],
+        "title": "CredentialHealthSnapshotReceipt",
+        "type": "object"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -4766,6 +4996,56 @@
           }
         },
         "summary": "Get Connector Thread"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/credential-health/snapshots": {
+      "post": {
+        "description": "Persist a fixed Exchange projection and its state-change notices.\n\n\u4e2d\u6587\uff1a\u8be5\u5bbf\u4e3b\u4e13\u7528\u5165\u53e3\u4e0d\u80fd\u63a5\u6536\u51ed\u636e\u3001\u6388\u6743\u6750\u6599\u6216\u901a\u77e5\u76ee\u6807\u3002",
+        "operationId": "process_credential_health_snapshots_api_v1_workspaces__workspace_id__work_credential_health_snapshots_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CredentialHealthSnapshotBatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CredentialHealthSnapshotReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Process Credential Health Snapshots"
       }
     },
     "/api/v1/workspaces/{workspace_id}/work/inputs": {

@@ -27,6 +27,12 @@ TOKENS = {
     "other-writer": PersistencePrincipal(
         "another-owner", frozenset({"w1"}), can_takeover=True, organization_id="org-a"
     ),
+    "credential-monitor": PersistencePrincipal(
+        "credential-monitor",
+        frozenset({"w1"}),
+        organization_id="org-a",
+        can_publish_credential_health=True,
+    ),
 }
 BASE = "/api/v1/workspaces/{workspace}/work"
 
@@ -501,6 +507,153 @@ def test_outbox_deduplicates_filters_claims_and_never_resends_unknown(tmp_path: 
         assert [item["id"] for item in uncertain.json()["items"]] == [notification_id]
         queued = client.get(base + "/notifications?status=queued", headers=_headers())
         assert [item["connectorId"] for item in queued.json()["items"]] == ["binding-2"]
+
+
+def test_credential_health_incident_outbox_is_atomic_deduplicated_and_owner_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fresh actionable snapshots notify once, remind after cooldown, and recover once."""
+
+    from datetime import UTC, datetime
+
+    import cyrene_navigator.work.store as work_store_module
+
+    clock = [1_800_000_000_000]
+    monkeypatch.setattr(work_store_module, "_unix_ms", lambda: clock[0])
+    base = BASE.format(workspace="w1")
+    url = base + "/credential-health/snapshots"
+    db_path = tmp_path / "credential-health.sqlite3"
+
+    def snapshot(authorization_state: str, generation: int = 4) -> dict[str, Any]:
+        checked_at = datetime.fromtimestamp(clock[0] / 1000, UTC).isoformat().replace("+00:00", "Z")
+        return {
+            "connectionId": "22222222-2222-4222-8222-222222222222",
+            "provider": "hf",
+            "loginState": "PRESENT",
+            "authorizationState": authorization_state,
+            "checkedAt": checked_at,
+            "expiresAt": "2026-10-26T16:00:00Z",
+            "generation": generation,
+            "capabilities": [
+                {
+                    "capabilityId": "model.read",
+                    "state": authorization_state,
+                    "lastVerifiedAt": checked_at,
+                    "expiresAt": None,
+                    "reasonCode": "TOKEN_REVOKED" if authorization_state != "VALID" else None,
+                }
+            ],
+            "reasonCode": "TOKEN_REVOKED" if authorization_state != "VALID" else None,
+        }
+
+    with _client(db_path) as client:
+        denied_owner = client.post(
+            url,
+            json={
+                "organizationId": "org-a",
+                "connections": [snapshot("REAUTHORIZATION_REQUIRED")],
+            },
+            headers=_headers(),
+        )
+        assert denied_owner.status_code == 403
+        wrong_organization = client.post(
+            url,
+            json={
+                "organizationId": "org-b",
+                "connections": [snapshot("REAUTHORIZATION_REQUIRED")],
+            },
+            headers=_headers("credential-monitor"),
+        )
+        assert wrong_organization.status_code == 403
+
+        def post_snapshots(connections: list[dict[str, Any]]) -> Any:
+            return client.post(
+                url,
+                json={"organizationId": "org-a", "connections": connections},
+                headers=_headers("credential-monitor"),
+            )
+
+        monitor_cannot_create_tasks = client.post(
+            base + "/tasks",
+            json=_task_body("monitor-only-task"),
+            headers=_headers("credential-monitor"),
+        )
+        assert monitor_cannot_create_tasks.status_code == 403
+
+        action = [snapshot("REAUTHORIZATION_REQUIRED")]
+        first = post_snapshots(action)
+        assert first.status_code == 200, first.text
+        assert first.json() == {"processed": 1, "stale": 0, "notificationsQueued": 1}
+        replay = post_snapshots(action)
+        assert replay.status_code == 200
+        assert replay.json()["notificationsQueued"] == 0
+
+        unsupported = client.post(
+            url,
+            json={
+                "organizationId": "org-a",
+                "connections": [
+                    {**snapshot("REAUTHORIZATION_REQUIRED"), "authorizationRef": "secret"}
+                ],
+            },
+            headers=_headers("credential-monitor"),
+        )
+        assert unsupported.status_code == 422
+
+        generic = client.post(
+            base + "/notifications",
+            json={
+                "deduplicationKey": "model-cannot-forge-system-notice",
+                "type": "teams.credential-health",
+                "connectorId": "teams-v1",
+                "recipient": "teams:credential-health",
+                "payload": {"schemaVersion": 1},
+            },
+            headers=_headers(),
+        )
+        assert generic.status_code == 422
+        assert generic.json()["code"] == "WORK_NOTIFICATION_RESERVED_TYPE"
+
+        unknown = [snapshot("UNKNOWN")]
+        assert post_snapshots(unknown).json()["notificationsQueued"] == 0
+        unavailable = [snapshot("UNAVAILABLE")]
+        assert post_snapshots(unavailable).json()["notificationsQueued"] == 0
+        stale_snapshot = snapshot("REAUTHORIZATION_REQUIRED")
+        stale_snapshot["checkedAt"] = "2000-01-01T00:00:00Z"
+        stale_snapshot["capabilities"][0]["lastVerifiedAt"] = "2000-01-01T00:00:00Z"
+        assert post_snapshots([stale_snapshot]).json()["notificationsQueued"] == 0
+        clock[0] += 24 * 60 * 60 * 1_000 + 1
+        reminder = post_snapshots([snapshot("REAUTHORIZATION_REQUIRED", generation=3)])
+        assert reminder.json()["notificationsQueued"] == 1
+        assert (
+            post_snapshots([snapshot("REAUTHORIZATION_REQUIRED")]).json()["notificationsQueued"]
+            == 0
+        )
+
+        recovered = post_snapshots([snapshot("VALID", generation=3)])
+        assert recovered.json()["notificationsQueued"] == 1
+        assert post_snapshots([snapshot("VALID", generation=3)]).json()["notificationsQueued"] == 0
+
+        notices = list(
+            reversed(client.get(base + "/notifications", headers=_headers()).json()["items"])
+        )
+        assert [item["payload"]["event"] for item in notices] == [
+            "action_required",
+            "reminder",
+            "recovered",
+        ]
+        assert all(item["taskId"] is None for item in notices)
+        for item in notices:
+            payload = item["payload"]
+            assert payload["provider"] == "hf"
+            assert "authorizationRef" not in payload
+            assert "token" not in payload
+            assert "route" not in payload
+
+    reopened = WorkStore(db_path)
+    assert reopened.process_credential_health_snapshots(
+        "org-a", "w1", [snapshot("VALID", generation=3)]
+    ) == {"processed": 1, "stale": 0, "notificationsQueued": 0}
 
 
 def test_terminal_task_enqueues_wecom_reply_atomically(tmp_path: Path) -> None:

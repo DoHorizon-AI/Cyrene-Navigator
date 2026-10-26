@@ -18,7 +18,7 @@ import { SessionId, SessionSeq } from '@deepseek-ai/dsh-session';
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
 import type { DynamicPluginManager } from './plugin-manager.js';
 import { WorkStateHttpError } from './work-state-client.js';
-import type { ExecutionStatus, TaskRecord, WorkStateStore } from './work-state-client.js';
+import type { CredentialHealthSnapshot, ExecutionStatus, TaskRecord, WorkStateStore } from './work-state-client.js';
 import type { ExchangeAuthorizationWaitReceipt } from './integrations/exchange-authorization.js';
 import {
   ExchangeConnectorAuthorizationClient,
@@ -190,6 +190,22 @@ export interface TeamsExecutorConfig {
   readonly exchangeConnectionRef: string;
   readonly exchangeProfileRef: string;
   readonly exchangeAuthorization: ExchangeConnectorAuthorizationClient;
+  readonly credentialNotifications?: CredentialNotificationsConfig;
+}
+
+/** Fixed host-owned health selectors and the only Teams route for credential notices. */
+export interface CredentialNotificationsConfig {
+  readonly organizationId: string;
+  readonly workspaceId: string;
+  readonly owner: {
+    readonly issuer: string;
+    readonly subject: string;
+    readonly tenantId: string;
+  };
+  readonly connections: readonly { readonly connectionId: string; readonly provider: CredentialHealthSnapshot['provider'] }[];
+  readonly destination: TeamsMessageRoute;
+  readonly exchangeProfileRef: string;
+  readonly pollIntervalMs: number;
 }
 
 class ExecutorRequestError extends Error {
@@ -374,6 +390,7 @@ export class NavigatorExecutor {
   private drainTimer?: ReturnType<typeof setInterval>;
   private teamsNotificationDrainTimer?: ReturnType<typeof setInterval>;
   private teamsNotificationDrain?: Promise<void>;
+  private lastCredentialHealthSnapshotAt = 0;
   private disposeStreamListener?: () => void;
   private disposeErrorListener?: () => void;
   private disposeSessionListener?: () => void;
@@ -1845,6 +1862,14 @@ export class NavigatorExecutor {
     const config = this.config.teams;
     if (!config) return;
     this.teamsNotificationDrain = (async () => {
+      if (config.credentialNotifications !== undefined) {
+        try {
+          await this.refreshCredentialHealthSnapshots(config, config.credentialNotifications);
+        } catch {
+          this.ctx.logger.warn('credential health snapshot refresh failed; the next bounded check remains scheduled');
+        }
+      }
+      if (this.drainToken !== undefined) return;
       const leases = await this.config.workState.claimNotifications({
         workerId: `navigator-teams-${process.pid}`,
         limit: 10,
@@ -1853,8 +1878,49 @@ export class NavigatorExecutor {
         connectorId: config.connectorId,
       });
       for (const lease of leases) await this.deliverTeamsNotification(lease, config);
+      if (config.credentialNotifications !== undefined && this.drainToken === undefined) {
+        const credentialLeases = await this.config.workState.claimNotifications({
+          workerId: `navigator-credential-notices-${process.pid}`,
+          limit: 10,
+          leaseSeconds: 60,
+          type: 'teams.credential-health',
+          connectorId: config.connectorId,
+          recipient: 'teams:credential-health',
+        });
+        for (const lease of credentialLeases) {
+          await this.deliverCredentialHealthNotification(lease, config, config.credentialNotifications);
+        }
+      }
     })().finally(() => { this.teamsNotificationDrain = undefined; });
     return this.teamsNotificationDrain;
+  }
+
+  /** Consume Exchange's cached projection on the existing durable Teams worker tick. */
+  private async refreshCredentialHealthSnapshots(
+    teams: TeamsExecutorConfig,
+    config: CredentialNotificationsConfig,
+  ): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastCredentialHealthSnapshotAt < config.pollIntervalMs) return;
+    this.lastCredentialHealthSnapshotAt = now;
+    const selectors = new Map(config.connections.map(item => [item.connectionId, item.provider]));
+    const snapshots = await teams.exchangeAuthorization.getAuthorizationHealthSnapshots({
+      requestId: randomUUID(),
+      organizationId: config.organizationId,
+      workspaceId: config.workspaceId,
+      connectionIds: config.connections.map(item => item.connectionId),
+    }, AbortSignal.timeout(10_000));
+    for (const snapshot of snapshots) {
+      if (selectors.get(snapshot.connectionId) !== snapshot.provider) {
+        throw new TypeError('Exchange returned a credential health snapshot outside the host configuration');
+      }
+    }
+    if (snapshots.length > 0) {
+      await this.config.workState.processCredentialHealthSnapshots(
+        config.organizationId,
+        snapshots,
+      );
+    }
   }
 
   private async deliverTeamsNotification(
@@ -1946,6 +2012,133 @@ export class NavigatorExecutor {
         );
       } catch (finishError: unknown) {
         this.ctx.logger.warn(`Teams notification receipt could not be finalized (${safeErrorMessage(finishError)})`);
+      }
+    }
+  }
+
+  /** Deliver one host-owned credential alert through its dedicated fixed Exchange profile. */
+  private async deliverCredentialHealthNotification(
+    lease: Awaited<ReturnType<WorkStateStore['claimNotifications']>>[number],
+    teams: TeamsExecutorConfig,
+    config: CredentialNotificationsConfig,
+  ): Promise<void> {
+    const notification = lease.notification;
+    let started = false;
+    let providerCallStarted = false;
+    try {
+      await this.config.workState.startNotification(notification.id, lease.leaseToken);
+      started = true;
+      if (notification.taskId !== undefined
+        || notification.type !== 'teams.credential-health'
+        || notification.connectorId !== teams.connectorId
+        || notification.recipient !== 'teams:credential-health') {
+        throw new TypeError('Credential health notification has an invalid outbox source');
+      }
+      const retryCountValue = notification.result.retryCount ?? 0;
+      if (typeof retryCountValue !== 'number' || !Number.isSafeInteger(retryCountValue)
+        || retryCountValue < 0) {
+        throw new TypeError('Credential health notification retry counter is invalid');
+      }
+      const requestId = `${notification.id}:attempt:${retryCountValue + 1}`;
+      if (requestId.length > 200) throw new TypeError('Credential health request identifier is too long');
+      const notice = readCredentialHealthNotice(notification.payload);
+      const selectedConnection = config.connections.find(
+        item => item.connectionId === notice.connectionId,
+      );
+      if (selectedConnection === undefined || selectedConnection.provider !== notice.provider) {
+        throw new TypeError('Credential health notice is outside the host connection selectors');
+      }
+      const allowedSubjects = await resolveTeamsTaskActorSubjects(
+        teams, config.workspaceId, config.owner.issuer,
+      );
+      if (!allowedSubjects.includes(config.owner.subject)) {
+        throw new TypeError('Credential notification owner is not currently authorized');
+      }
+      const conversation = config.destination;
+      const text = boundedTeamsMessageText(
+        formatCredentialHealthNotice(notice), 'Credential health notification text', 20_000,
+      );
+      const argumentsValue: ConnectorGrantRequest['arguments'] = {
+        conversation: { ...conversation },
+        text,
+      };
+      const grantRequest: ConnectorGrantRequest = {
+        requestId,
+        workspaceId: config.workspaceId,
+        principalIssuer: config.owner.issuer,
+        principalSubject: config.owner.subject,
+        connectionRef: teams.exchangeConnectionRef,
+        providerId: 'msteams',
+        profileRef: config.exchangeProfileRef,
+        operationId: 'msteams.message.reply',
+        resourceRef: teamsThreadResourceRef(conversation),
+        argumentsDigestSha256: sha256(canonicalJson(argumentsValue)),
+        arguments: argumentsValue,
+      };
+      const grant = await teams.exchangeAuthorization.mintGrant(
+        grantRequest, AbortSignal.timeout(10_000),
+      );
+      if (grant.organizationId !== config.organizationId) {
+        throw new TypeError('Credential notification Exchange grant has a different organization scope');
+      }
+      providerCallStarted = true;
+      const result = await teams.exchangeAuthorization.sendTeamsMessage(
+        { requestId, conversation, text },
+        grant,
+        teams.exchangeConnectionRef,
+        config.exchangeProfileRef,
+        AbortSignal.timeout(15_000),
+      );
+      if (result.outcome === 'rate_limited' && result.retryAfterSeconds !== undefined) {
+        await this.finishTeamsRateLimit(notification.id, lease.leaseToken, result.retryAfterSeconds, {
+          reasonCode: result.reasonCode ?? 'rate_limited',
+        });
+        return;
+      }
+      const outcome = result.outcome === 'accepted'
+        ? 'delivered'
+        : result.outcome === 'uncertain' ? 'uncertain' : 'failed';
+      await this.config.workState.finishNotification(notification.id, lease.leaseToken, outcome, {
+        reasonCode: result.reasonCode ?? null,
+        vendorMessageId: result.vendorMessageId ?? null,
+      });
+    } catch (error: unknown) {
+      if (!started) return;
+      if (!providerCallStarted && error instanceof ExchangeConnectorRequestError
+        && error.status === 429 && error.retryAfterSeconds !== undefined) {
+        await this.finishTeamsRateLimit(notification.id, lease.leaseToken, error.retryAfterSeconds, {
+          code: 'EXCHANGE_GRANT_HTTP_429',
+        }).catch(() => undefined);
+        return;
+      }
+      if (providerCallStarted && error instanceof ExchangeConnectorRequestError
+        && error.status === 429 && error.retryAfterSeconds !== undefined) {
+        await this.finishTeamsRateLimit(notification.id, lease.leaseToken, error.retryAfterSeconds, {
+          code: 'EXCHANGE_HTTP_429',
+        }).catch(() => undefined);
+        return;
+      }
+      if (!providerCallStarted && error instanceof ExchangeConnectorRequestError
+        && (error.status === undefined || error.status >= 500)) {
+        await this.config.workState.finishNotification(
+          notification.id,
+          lease.leaseToken,
+          'retry',
+          { code: safeErrorCode(error) },
+          30,
+        ).catch(() => undefined);
+        return;
+      }
+      const unknown = providerCallStarted && isUncertainConnectorOutcome(error);
+      try {
+        await this.config.workState.finishNotification(
+          notification.id,
+          lease.leaseToken,
+          unknown ? 'uncertain' : 'failed',
+          { code: safeErrorCode(error) },
+        );
+      } catch (finishError: unknown) {
+        this.ctx.logger.warn(`Credential notification receipt could not be finalized (${safeErrorMessage(finishError)})`);
       }
     }
   }
@@ -2693,6 +2886,87 @@ export async function resolveTeamsTaskActorSubjects(
   return subjects;
 }
 
+/** Validate the opt-in private snapshot selectors, owner, and sole notice route. */
+export function parseCredentialNotificationsConfig(
+  value: unknown,
+  workspaceId: string,
+  tenantId: string,
+  allowedTeamIds: readonly string[],
+): CredentialNotificationsConfig {
+  const row = objectValue(value, 'credential notifications configuration');
+  const keys = [
+    'schemaVersion', 'organizationId', 'workspaceId', 'owner', 'connections',
+    'destination', 'exchange',
+  ];
+  if (row.pollIntervalMs !== undefined) keys.push('pollIntervalMs');
+  if (!isExactObjectKeys(row, keys) || row.schemaVersion !== 1 || row.workspaceId !== workspaceId) {
+    throw new TypeError('Credential notifications configuration has invalid scope or schema');
+  }
+  const organizationId = uuidText(row.organizationId, 'credential notification organization id');
+  const owner = objectValue(row.owner, 'credential notification owner');
+  if (!isExactObjectKeys(owner, ['actorAadObjectId', 'issuer', 'subject', 'tenantId'])) {
+    throw new TypeError('Credential notification owner has an invalid shape');
+  }
+  const ownerTenantId = uuidText(owner.tenantId, 'credential notification owner tenant id');
+  const ownerSubject = uuidText(owner.subject, 'credential notification owner subject');
+  const ownerActorId = uuidText(owner.actorAadObjectId, 'credential notification owner actor id');
+  const ownerIssuer = boundedText(owner.issuer, 'credential notification owner issuer', 512);
+  if (ownerSubject !== ownerActorId || ownerTenantId !== tenantId.toLowerCase()
+    || ownerIssuer !== `https://login.microsoftonline.com/${ownerTenantId}/v2.0`) {
+    throw new TypeError('Credential notification owner does not match the configured Teams tenant');
+  }
+  if (!Array.isArray(row.connections) || row.connections.length < 1 || row.connections.length > 100) {
+    throw new TypeError('Credential notification connections must contain 1 to 100 selectors');
+  }
+  const connections = row.connections.map((item, index) => {
+    const selector = objectValue(item, `credential notification connection ${index}`);
+    if (!isExactObjectKeys(selector, ['connectionId', 'provider'])) {
+      throw new TypeError('Credential notification connection selector has an invalid shape');
+    }
+    const connectionId = uuidText(selector.connectionId, `credential notification connection ${index} id`);
+    const provider = selector.provider;
+    if (provider !== 'hf' && provider !== 'runpod' && provider !== 'azure' && provider !== 'gcp') {
+      throw new TypeError('Credential notification connection provider is not supported');
+    }
+    return {
+      connectionId,
+      provider: provider as CredentialHealthSnapshot['provider'],
+    };
+  });
+  if (new Set(connections.map(item => item.connectionId)).size !== connections.length) {
+    throw new TypeError('Credential notification connection selectors must be unique');
+  }
+  const destinationValue = objectValue(row.destination, 'credential notification destination');
+  if (!isExactObjectKeys(destinationValue, [
+    'tenantId', 'teamId', 'channelId', 'conversationId', 'rootThreadId', 'serviceUrl',
+  ])) {
+    throw new TypeError('Credential notification destination has an invalid shape');
+  }
+  const destination = readTeamsNotificationRoute(destinationValue);
+  if (destination.tenantId !== ownerTenantId || !allowedTeamIds.includes(destination.teamId)) {
+    throw new TypeError('Credential notification destination is outside the configured Teams scope');
+  }
+  const exchange = objectValue(row.exchange, 'credential notification Exchange profile');
+  if (!isExactObjectKeys(exchange, ['profileRef'])) {
+    throw new TypeError('Credential notification Exchange profile has an invalid shape');
+  }
+  const exchangeProfileRef = boundedText(exchange.profileRef, 'credential notification Exchange profile', 512);
+  const pollIntervalMs = row.pollIntervalMs ?? 15 * 60_000;
+  if (typeof pollIntervalMs !== 'number' || !Number.isSafeInteger(pollIntervalMs)
+    || pollIntervalMs < 60_000 || pollIntervalMs > 15 * 60_000) {
+    throw new TypeError('Credential notification snapshot interval must be between one and fifteen minutes');
+  }
+  return Object.freeze({
+    organizationId,
+    workspaceId,
+    owner: Object.freeze({ issuer: ownerIssuer, subject: ownerSubject, tenantId: ownerTenantId }),
+    connections: Object.freeze(connections),
+    destination: Object.freeze(destination),
+    exchangeProfileRef,
+    pollIntervalMs,
+  });
+}
+
 function readTeamsCaller(value: unknown): TeamsCaller {
   const row = objectValue(value, 'Teams task caller');
   const tenantId = uuidText(row.tenantId, 'Teams task tenant id');
@@ -2715,6 +2989,150 @@ function readTeamsNotificationRoute(value: Record<string, unknown>): TeamsMessag
     rootThreadId: validateTeamsRootThreadId(value.rootThreadId),
     serviceUrl: validateTeamsServiceUrl(value.serviceUrl, tenantId),
   };
+}
+
+interface CredentialHealthNotice {
+  readonly event: 'action_required' | 'reminder' | 'recovered';
+  readonly incidentId: string;
+  readonly connectionId: string;
+  readonly provider: 'hf' | 'runpod' | 'azure' | 'gcp';
+  readonly generation: number;
+  readonly loginState: 'PRESENT' | 'MISSING' | 'UNKNOWN' | 'UNAVAILABLE';
+  readonly authorizationState: 'VALID' | 'REAUTHORIZATION_REQUIRED' | 'PERMISSION_DENIED' | 'UNKNOWN' | 'UNAVAILABLE';
+  readonly capabilities: readonly {
+    readonly capabilityId: string;
+    readonly state: 'VALID' | 'REAUTHORIZATION_REQUIRED' | 'PERMISSION_DENIED' | 'UNKNOWN' | 'UNAVAILABLE';
+  }[];
+  readonly checkedAt: string | null;
+  readonly expiresAt: string | null;
+  readonly reasonCode: string | null;
+}
+
+/** Parse only the fixed, credential-free payload created by Work's system route. */
+function readCredentialHealthNotice(value: Record<string, unknown>): CredentialHealthNotice {
+  if (!isExactObjectKeys(value, [
+    'schemaVersion', 'event', 'incidentId', 'connectionId', 'provider', 'generation',
+    'loginState', 'authorizationState', 'capabilities', 'checkedAt', 'expiresAt', 'reasonCode',
+  ]) || value.schemaVersion !== 1) {
+    throw new TypeError('Credential health notice has an invalid payload schema');
+  }
+  const event = value.event;
+  if (event !== 'action_required' && event !== 'reminder' && event !== 'recovered') {
+    throw new TypeError('Credential health notice event is not supported');
+  }
+  const incidentId = boundedText(value.incidentId, 'credential incident id', 64);
+  if (!/^[0-9a-f]{32}$/u.test(incidentId)) throw new TypeError('Credential incident id is invalid');
+  const provider = value.provider;
+  if (provider !== 'hf' && provider !== 'runpod' && provider !== 'azure' && provider !== 'gcp') {
+    throw new TypeError('Credential health notice provider is not supported');
+  }
+  if (typeof value.generation !== 'number' || !Number.isSafeInteger(value.generation) || value.generation < 0) {
+    throw new TypeError('Credential health notice generation is invalid');
+  }
+  const loginState = value.loginState;
+  if (loginState !== 'PRESENT' && loginState !== 'MISSING' && loginState !== 'UNKNOWN' && loginState !== 'UNAVAILABLE') {
+    throw new TypeError('Credential health notice login state is invalid');
+  }
+  const authorizationState = value.authorizationState;
+  if (authorizationState !== 'VALID' && authorizationState !== 'REAUTHORIZATION_REQUIRED'
+    && authorizationState !== 'PERMISSION_DENIED' && authorizationState !== 'UNKNOWN'
+    && authorizationState !== 'UNAVAILABLE') {
+    throw new TypeError('Credential health notice authorization state is invalid');
+  }
+  if (!Array.isArray(value.capabilities) || value.capabilities.length > 100) {
+    throw new TypeError('Credential health notice capabilities are invalid');
+  }
+  const capabilities = value.capabilities.map((item, index) => {
+    const capability = objectValue(item, `credential health notice capability ${index}`);
+    if (!isExactObjectKeys(capability, ['capabilityId', 'state'])) {
+      throw new TypeError('Credential health notice capability has an invalid shape');
+    }
+    const state = capability.state;
+    if (state !== 'VALID' && state !== 'REAUTHORIZATION_REQUIRED' && state !== 'PERMISSION_DENIED'
+      && state !== 'UNKNOWN' && state !== 'UNAVAILABLE') {
+      throw new TypeError('Credential health notice capability state is invalid');
+    }
+    return {
+      capabilityId: boundedText(capability.capabilityId, 'credential health capability id', 256),
+      state: state as CredentialHealthNotice['capabilities'][number]['state'],
+    };
+  });
+  if (new Set(capabilities.map(item => item.capabilityId)).size !== capabilities.length) {
+    throw new TypeError('Credential health notice capability ids are duplicated');
+  }
+  const checkedAt = readCredentialTimestamp(value.checkedAt, 'checkedAt');
+  const expiresAt = readCredentialTimestamp(value.expiresAt, 'expiresAt');
+  const reasonCode = readCredentialReasonCode(value.reasonCode);
+  const actionable = authorizationState === 'REAUTHORIZATION_REQUIRED'
+    || authorizationState === 'PERMISSION_DENIED'
+    || capabilities.some(item => item.state === 'REAUTHORIZATION_REQUIRED' || item.state === 'PERMISSION_DENIED');
+  const inconclusive = loginState === 'UNKNOWN' || loginState === 'UNAVAILABLE'
+    || authorizationState === 'UNKNOWN' || authorizationState === 'UNAVAILABLE'
+    || capabilities.some(item => item.state === 'UNKNOWN' || item.state === 'UNAVAILABLE');
+  const healthy = loginState === 'PRESENT' && authorizationState === 'VALID'
+    && capabilities.every(item => item.state === 'VALID');
+  if (inconclusive || (event === 'recovered' && !healthy) || (event !== 'recovered' && !actionable)) {
+    throw new TypeError('Credential health notice event contradicts its authorization state');
+  }
+  return {
+    event,
+    incidentId,
+    connectionId: boundedText(value.connectionId, 'credential connection id', 512),
+    provider,
+    generation: value.generation,
+    loginState,
+    authorizationState,
+    capabilities,
+    checkedAt,
+    expiresAt,
+    reasonCode,
+  };
+}
+
+function readCredentialTimestamp(value: unknown, field: string): string | null {
+  if (value === null) return null;
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/u.test(value)
+    || !Number.isFinite(Date.parse(value))) {
+    throw new TypeError(`Credential health notice ${field} is invalid`);
+  }
+  return value;
+}
+
+function readCredentialReasonCode(value: unknown): string | null {
+  if (value === null) return null;
+  if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/u.test(value)) {
+    throw new TypeError('Credential health notice reason code is invalid');
+  }
+  return value;
+}
+
+/** Format a short provider-owned status message without arbitrary provider text. */
+function formatCredentialHealthNotice(notice: CredentialHealthNotice): string {
+  const labels = { hf: 'Hugging Face', runpod: 'RunPod', azure: 'Azure', gcp: 'Google Cloud' };
+  const headline = notice.event === 'recovered'
+    ? '授权已恢复'
+    : notice.event === 'reminder' ? '授权仍需处理' : '授权需要处理';
+  const lines = [
+    `Cyrene 凭据状态：${headline}`,
+    `平台：${labels[notice.provider]}`,
+    `连接：${notice.connectionId}`,
+    `授权状态：${notice.authorizationState}`,
+  ];
+  const allAffected = notice.capabilities.filter(item =>
+    item.state === 'REAUTHORIZATION_REQUIRED' || item.state === 'PERMISSION_DENIED',
+  );
+  const affected = allAffected.slice(0, 20).map(item => `${item.capabilityId} (${item.state})`);
+  if (affected.length > 0) lines.push(`需要处理的能力：${affected.join(', ')}`);
+  if (allAffected.length > affected.length) {
+    lines.push(`另有 ${allAffected.length - affected.length} 项能力未展开。`);
+  }
+  if (notice.reasonCode !== null) lines.push(`原因代码：${notice.reasonCode}`);
+  if (notice.checkedAt !== null) lines.push(`最近检查：${notice.checkedAt}`);
+  if (notice.expiresAt !== null) lines.push(`凭据过期时间：${notice.expiresAt}`);
+  lines.push(notice.event === 'recovered'
+    ? '最近的 Exchange 检查确认授权已恢复。'
+    : '请检查连接授权或所需权限；确认恢复后会在这里通知。');
+  return lines.join('\n');
 }
 
 function validateTeamsRootThreadId(value: unknown): string {
