@@ -18,6 +18,8 @@ const { values } = parseArgs({
     'single-session-exchange-cli-auth': { type: 'boolean', default: false },
     'test-mode': { type: 'boolean', default: false },
     'test-echo-adapter': { type: 'boolean', default: false },
+    'drain-timeout-ms': { type: 'string', default: process.env.CYRENE_EXECUTOR_DRAIN_TIMEOUT_MS ?? '30000' },
+    'abort-cleanup-timeout-ms': { type: 'string', default: process.env.CYRENE_EXECUTOR_ABORT_CLEANUP_TIMEOUT_MS ?? '5000' },
   },
 });
 
@@ -26,6 +28,35 @@ const host = values.host;
 if (!Number.isSafeInteger(port) || port < 0 || port > 65535) throw new TypeError('Invalid executor port');
 if (values['single-session-exchange-cli-auth'] && !['127.0.0.1', 'localhost'].includes(host)) {
   throw new TypeError('Single-session Exchange CLI auth is limited to a loopback executor');
+}
+const drainTimeoutMs = Number(values['drain-timeout-ms']);
+const abortCleanupTimeoutMs = Number(values['abort-cleanup-timeout-ms']);
+if (!Number.isSafeInteger(drainTimeoutMs) || drainTimeoutMs < 0 || drainTimeoutMs > 900_000) {
+  throw new TypeError('drain-timeout-ms must be between 0 and 900000');
+}
+if (!Number.isSafeInteger(abortCleanupTimeoutMs) || abortCleanupTimeoutMs < 0 || abortCleanupTimeoutMs > 30_000) {
+  throw new TypeError('abort-cleanup-timeout-ms must be between 0 and 30000');
+}
+
+/** Bound post-drain cancellation cleanup so SIGTERM always has a terminal outcome. */
+async function settleWithin(promise, timeoutMs) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise.then(() => true, () => false),
+      new Promise(resolve => { timer = setTimeout(() => resolve(false), timeoutMs); }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** Bound executor and Cordis teardown together, including the fiber disposal deadline. */
+export function disposeWithin(executor, fiber, timeoutMs) {
+  return settleWithin((async () => {
+    await executor.dispose();
+    await fiber.dispose();
+  })(), timeoutMs);
 }
 
 // Run as standalone process if invoked directly
@@ -54,10 +85,69 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const shutdown = async () => {
       if (stopping) return;
       stopping = true;
-      console.log(JSON.stringify({ service: 'cyrene-navigator-executor', status: 'shutting_down' }));
-      await executor.dispose();
-      await ctx.fiber.dispose();
-      process.exit(0);
+      const drain = executor.startShutdownDrain();
+      console.log(JSON.stringify({
+        service: 'cyrene-navigator-executor',
+        status: 'draining',
+        instanceId: drain.instanceId,
+        generation: drain.generation,
+        startedAt: drain.startedAt,
+        timeoutMs: drainTimeoutMs,
+      }));
+      let status;
+      try {
+        status = await executor.waitForIdle(drainTimeoutMs);
+      } catch (error) {
+        console.error(JSON.stringify({
+          service: 'cyrene-navigator-executor',
+          status: 'drain_status_failed',
+          generation: drain.generation,
+          error: error instanceof Error ? error.message : 'Drain status failed',
+        }));
+      }
+      if (status?.activeWorkDrained === true) {
+        const cleanupComplete = await disposeWithin(executor, ctx.fiber, abortCleanupTimeoutMs);
+        if (cleanupComplete) {
+          process.exit(0);
+          return;
+        }
+        console.error(JSON.stringify({
+          service: 'cyrene-navigator-executor',
+          status: 'executor_or_context_disposal_incomplete',
+          generation: drain.generation,
+          cleanupTimeoutMs: abortCleanupTimeoutMs,
+        }));
+        process.exit(1);
+        return;
+      }
+
+      console.error(JSON.stringify({
+        service: 'cyrene-navigator-executor',
+        status: 'drain_deadline_exceeded',
+        generation: drain.generation,
+        countsComplete: status?.countsComplete ?? false,
+        activeTasks: status?.activeTasks ?? null,
+        queuedTasks: status?.queuedTasks ?? null,
+        dispatches: status?.dispatches ?? null,
+        notifications: status?.notifications ?? null,
+      }));
+      const cleanupComplete = await disposeWithin(executor, ctx.fiber, abortCleanupTimeoutMs);
+      if (cleanupComplete) {
+        console.error(JSON.stringify({
+          service: 'cyrene-navigator-executor',
+          status: 'drain_deadline_exceeded_cleanup_completed',
+          generation: drain.generation,
+        }));
+      } else {
+        console.error(JSON.stringify({
+          service: 'cyrene-navigator-executor',
+          status: 'executor_or_context_disposal_incomplete',
+          generation: drain.generation,
+          cleanupTimeoutMs: abortCleanupTimeoutMs,
+          recovery: 'Running task rows are not replayed; started notification leases become uncertain on expiry.',
+        }));
+      }
+      process.exit(1);
     };
 
     process.on('SIGINT', shutdown);
