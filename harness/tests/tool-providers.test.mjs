@@ -5,6 +5,7 @@
 // └─────────────────────────────────────────────────────────────────────┘
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { Context } from '@deepseek-ai/cordis';
 import { ToolCallId } from '@deepseek-ai/dsh-llm';
@@ -17,6 +18,9 @@ const readToolId = 'contacts_search';
 const writeToolId = 'send_message';
 const sessionId = 'navigator-session-42';
 const taskId = 'work-task-42';
+const computerToolCatalog = JSON.parse(readFileSync(
+  new URL('./fixtures/computer-provider-schemas.json', import.meta.url), 'utf8',
+));
 
 const catalog = {
   items: [{ bindingId, capabilityId: 'tool.provider.v1' }],
@@ -390,6 +394,131 @@ test('projects uniqueItems to the host and rejects duplicate values before provi
     assert.equal(fixture.callCount(), 1);
   } finally {
     dispose();
+    await ctx.fiber.dispose();
+  }
+});
+
+test('projects the known UTF-8 byte annotation and enforces it before provider invocation', async () => {
+  const fixture = createBridgeFixture({ toolCatalog: computerToolCatalog });
+  const { ctx, dispose } = await createToolContext(fixture);
+  try {
+    const schemas = ctx.tools.schemas();
+    const rawSchemas = computerToolCatalog.tools.map(tool => structuredClone(tool.inputSchema));
+    assert.equal(schemas.length, 4);
+    for (const name of ['Execute command', 'List directory', 'Read file', 'Write file']) {
+      assert.ok(schemas.some(schema => schema.description.startsWith(`${name} (configured provider ${bindingId})`)));
+    }
+
+    const readSchema = schemas.find(schema =>
+      schema.description.startsWith(`Read file (configured provider ${bindingId})`));
+    assert.ok(readSchema);
+    assert.equal(readSchema.parameters.properties.path.type, 'string');
+    assert.equal(readSchema.parameters.properties.path.maxLength, undefined);
+    assert.equal(readSchema.parameters.properties.path['x-maxUtf8Bytes'], undefined);
+    assert.equal(readSchema.parameters.properties.length.type, 'integer');
+    assert.equal(readSchema.parameters.properties.offset.type, 'integer');
+    assert.deepEqual(computerToolCatalog.tools.map(tool => tool.inputSchema), rawSchemas);
+
+    const invalidPath = await execute(ctx, readSchema.name, {
+      path: '😀'.repeat(1_025),
+      length: 1,
+    }, 'utf8-over-limit', false);
+    assert.equal(invalidPath.isError, true);
+    assert.match(invalidPath.error.message, /UTF-8 byte limit/u);
+    assert.equal(fixture.callCount(), 0);
+
+    const validPath = await execute(ctx, readSchema.name, {
+      path: '文'.repeat(512),
+      length: 1,
+    }, 'utf8-under-limit', false);
+    assert.equal(validPath.isError, false);
+    assert.equal(fixture.callCount(), 1);
+
+    const invalidLength = await execute(ctx, readSchema.name, {
+      path: '文档/说明.txt',
+      length: 65_537,
+    }, 'read-length-over-limit', false);
+    assert.equal(invalidLength.isError, true);
+    assert.match(invalidLength.error.message, /configured bounds/u);
+    assert.equal(fixture.callCount(), 1);
+
+    const invalidOffset = await execute(ctx, readSchema.name, {
+      path: '文档/说明.txt',
+      length: 1,
+      offset: 9_007_199_254_740_992,
+    }, 'offset-over-limit', false);
+    assert.equal(invalidOffset.isError, true);
+    assert.match(invalidOffset.error.message, /configured bounds/u);
+    assert.equal(fixture.callCount(), 1);
+
+    const commandSchema = schemas.find(schema =>
+      schema.description.startsWith(`Execute command (configured provider ${bindingId})`));
+    assert.ok(commandSchema);
+    const invalidTimeout = await execute(ctx, commandSchema.name, {
+      command: 'true',
+      timeout_ms: 600_001,
+    }, 'timeout-over-limit', false);
+    assert.equal(invalidTimeout.isError, true);
+    assert.match(invalidTimeout.error.message, /configured bounds/u);
+    assert.equal(fixture.callCount(), 1);
+
+    const invalidCommand = await execute(ctx, commandSchema.name, {
+      command: '',
+    }, 'command-under-minimum', false);
+    assert.equal(invalidCommand.isError, true);
+    assert.match(invalidCommand.error.message, /configured bounds/u);
+    assert.equal(fixture.callCount(), 1);
+
+    const directorySchema = schemas.find(schema =>
+      schema.description.startsWith(`List directory (configured provider ${bindingId})`));
+    assert.ok(directorySchema);
+    const invalidDepth = await execute(ctx, directorySchema.name, {
+      path: '.',
+      max_depth: 33,
+    }, 'directory-depth-over-limit', false);
+    assert.equal(invalidDepth.isError, true);
+    assert.match(invalidDepth.error.message, /configured bounds/u);
+    assert.equal(fixture.callCount(), 1);
+
+    const invalidDirectoryPath = await execute(ctx, directorySchema.name, {
+      path: 'x'.repeat(1_025),
+    }, 'directory-path-over-limit', false);
+    assert.equal(invalidDirectoryPath.isError, true);
+    assert.match(invalidDirectoryPath.error.message, /configured bounds/u);
+    assert.equal(fixture.callCount(), 1);
+
+    const writeSchema = schemas.find(schema =>
+      schema.description.startsWith(`Write file (configured provider ${bindingId})`));
+    assert.ok(writeSchema);
+    const invalidEncodedContent = await execute(ctx, writeSchema.name, {
+      path: '文档/新文件.bin',
+      content_base64: 'A'.repeat(1_398_105),
+      overwrite: true,
+    }, 'encoded-content-over-limit', false);
+    assert.equal(invalidEncodedContent.isError, true);
+    assert.match(invalidEncodedContent.error.message, /configured bounds/u);
+    assert.equal(fixture.callCount(), 1);
+  } finally {
+    dispose();
+    await ctx.fiber.dispose();
+  }
+});
+
+test('unknown provider schema extensions remain rejected', async () => {
+  const tool = structuredClone(computerToolCatalog.tools[1]);
+  tool.inputSchema.properties.path['x-unrecognizedPolicy'] = 1;
+  const fixture = createBridgeFixture({ toolCatalog: { tools: [tool] } });
+  const ctx = new Context();
+  await ctx.plugin(SystemPrompt);
+  await ctx.plugin(ToolRuntime);
+  try {
+    await assert.rejects(registerToolProviders(ctx, {
+      bridge: fixture.bridge,
+      taskIdForSession: id => id === sessionId ? taskId : undefined,
+    }), /x-unrecognizedPolicy is not a supported keyword/u);
+    assert.equal(ctx.tools.schemas().length, 0);
+    assert.equal(fixture.callCount(), 0);
+  } finally {
     await ctx.fiber.dispose();
   }
 });
