@@ -773,7 +773,9 @@ async function executeTeamsProviderCall(
   }
   execution.signal.removeEventListener('abort', markProviderCallUncertainOnAbort);
   const operationRef = providerResponse.operationRef ?? providerResultOperationRef(result);
-  const effectiveOutcome = effectiveProviderOutcome(providerResponse.outcome, result, operationRef);
+  const effectiveOutcome = effectiveProviderOutcome(
+    providerResponse.outcome, result, toolAuthorization.mutating, operationRef,
+  );
   const knownOutcome = effectiveOutcome === 'verified' || effectiveOutcome === 'failed';
   if (operation) {
     const receiptEvidence: Record<string, unknown> = {
@@ -802,7 +804,9 @@ async function executeTeamsProviderCall(
     }
   }
   if (operationId === 'cloud.operation.status.read'
-    && ['verified', 'failed'].includes(providerResponse.outcome)) {
+    && effectiveOutcome === 'verified'
+    && result.isError !== true
+    && !['UNKNOWN', 'UNKNOWN_RESULT'].includes(providerResultRemoteState(result) ?? '')) {
     await reconcileTerminalOperation(
       options.bridge,
       providerId,
@@ -1165,9 +1169,16 @@ function providerResultOperationRef(result: ProviderToolResult): string | undefi
 function effectiveProviderOutcome(
   envelopeOutcome: 'verified' | 'pending' | 'uncertain' | 'failed',
   result: ProviderToolResult,
+  mutating: boolean,
   operationRef?: string,
 ): 'verified' | 'pending' | 'uncertain' | 'failed' {
-  const state = providerResultState(result);
+  if (envelopeOutcome === 'failed') return 'failed';
+  if (result.isError === true) return 'uncertain';
+  if (envelopeOutcome === 'uncertain') return 'uncertain';
+  // A read-only connector may return business data such as a CI state. Only
+  // mutating calls interpret generic `state` as lifecycle; `remote_state` and
+  // Exchange's envelope outcome remain lifecycle evidence for either effect.
+  const state = mutating ? providerResultState(result) : undefined;
   const remoteState = providerResultRemoteState(result);
   if (state && ['UNKNOWN', 'UNKNOWN_RESULT', 'UNCERTAIN', 'REMOTE_STATE_UNVERIFIED'].includes(state)
     || remoteState === 'UNKNOWN' || remoteState === 'UNKNOWN_RESULT') return 'uncertain';
@@ -1177,7 +1188,6 @@ function effectiveProviderOutcome(
   }
   if (remoteState && ['FAILED', 'REJECTED', 'ERROR'].includes(remoteState)
     || state && ['FAILED', 'REJECTED', 'ERROR'].includes(state)) return 'failed';
-  if (result.isError === true && envelopeOutcome !== 'failed') return 'uncertain';
   return envelopeOutcome;
 }
 

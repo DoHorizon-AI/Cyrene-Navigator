@@ -276,6 +276,202 @@ test('REMOTE_STATE_UNVERIFIED and remote_state UNKNOWN cannot be marked verified
   }
 });
 
+test('verified GitHub CI reads preserve PENDING, RUNNING, and ERROR as business state', async () => {
+  const githubBindingId = 'exchange-github-44444444-4444-4444-8444-444444444444';
+  const githubCiTool = {
+    id: 'github.ci.status',
+    name: 'Read GitHub CI status',
+    description: 'Read the latest status for one commit.',
+    readOnly: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        repository_id: { type: 'string' },
+        repository: { type: 'string' },
+        commit_sha: { type: 'string' },
+      },
+      required: ['repository_id', 'repository', 'commit_sha'],
+      additionalProperties: false,
+    },
+  };
+  const ciStates = ['PENDING', 'RUNNING', 'ERROR'];
+  const fixture = createHarness([
+    ...ciStates.map((state, index) => ({
+      requestId: `github-ci-${index}`,
+      outcome: 'verified',
+      result: {
+        content: [{ type: 'text', text: JSON.stringify({ state }) }],
+        isError: false,
+      },
+    })),
+    {
+      requestId: 'github-ci-error-envelope',
+      outcome: 'verified',
+      result: {
+        content: [{ type: 'text', text: JSON.stringify({ state: 'PENDING' }) }],
+        isError: true,
+      },
+    },
+    {
+      requestId: 'github-ci-unknown-remote-state',
+      outcome: 'verified',
+      result: {
+        content: [{ type: 'text', text: JSON.stringify({ state: 'PENDING', remote_state: 'UNKNOWN' }) }],
+        isError: false,
+      },
+    },
+  ], {
+    providerId: 'github',
+    bindingId: githubBindingId,
+    connectionRef: '44444444-4444-4444-8444-444444444444',
+    profileRef: 'github-profile-test',
+    catalog: { tools: [githubCiTool] },
+    authorizedTools: [{
+      toolId: githubCiTool.id,
+      operationId: 'github.ci.status',
+      resourceProjection: 'profile',
+      mutating: false,
+    }],
+  });
+  const { ctx, dispose } = await setupHarness(fixture);
+  try {
+    const ciName = toolName(ctx, githubCiTool.name, githubBindingId);
+    assert.ok(ciName);
+    const args = {
+      repository_id: 'repository-fixture-1',
+      repository: 'owner/repository',
+      commit_sha: 'a'.repeat(40),
+    };
+
+    for (const [index, state] of ciStates.entries()) {
+      const result = await execute(ctx, ciName, args, `github-ci-${index}`);
+      assert.equal(result.isError, false);
+      assert.equal(result.value.structuredContent.outcome, 'verified');
+      assert.equal(JSON.parse(result.value.content[0].text).state, state);
+    }
+
+    const providerError = await execute(ctx, ciName, args, 'github-ci-error-envelope');
+    assert.equal(providerError.isError, true);
+    assert.match(providerError.error.message, /unknown remote read result/u);
+    const unknownRemoteState = await execute(ctx, ciName, args, 'github-ci-unknown-remote-state');
+    assert.equal(unknownRemoteState.isError, true);
+    assert.match(unknownRemoteState.error.message, /unknown remote read result/u);
+    assert.equal(fixture.client.callCount, 5);
+    assert.equal(fixture.client.mintCount, 5);
+    assert.equal(fixture.receipts.size, 0, 'business states from read-only calls must not create lifecycle receipts');
+  } finally {
+    dispose();
+    await ctx.fiber.dispose();
+  }
+});
+
+test('a mutating RUNNING result with operationRef remains pending under a verified envelope', async () => {
+  const fixture = createHarness([{
+    requestId: 'running-write-call',
+    outcome: 'verified',
+    operationRef: 'azure-operation-44',
+    result: {
+      content: [{ type: 'text', text: JSON.stringify({
+        state: 'RUNNING', operation_ref: 'azure-operation-44',
+      }) }],
+      isError: false,
+    },
+  }]);
+  const { ctx, dispose } = await setupHarness(fixture);
+  try {
+    const stopName = toolName(ctx, 'Stop cloud resource');
+    assert.ok(stopName);
+    const result = await execute(ctx, stopName, {
+      profile_ref: profileRef,
+      target: { resource_id: '/subscriptions/sub-1/resourceGroups/rg-1/providers/Microsoft.Compute/virtualMachines/vm-1' },
+    }, 'running-write-call');
+
+    assert.equal(result.isError, false);
+    assert.equal(result.value.structuredContent.outcome, 'pending');
+    assert.equal(result.value.structuredContent.operationRef, 'azure-operation-44');
+    const receipt = fixture.receipts.get('operation-1');
+    assert.equal(receipt.status, 'uncertain');
+    assert.equal(receipt.evidence.outcome, 'pending');
+    assert.equal(receipt.evidence.operationRef, 'azure-operation-44');
+  } finally {
+    dispose();
+    await ctx.fiber.dispose();
+  }
+});
+
+test('operation status reconciliation requires a verified envelope and known remote state', async () => {
+  const operationRef = 'azure-operation-55';
+  const fixture = createHarness([
+    {
+      requestId: 'uncertain-write-call',
+      outcome: 'uncertain',
+      operationRef,
+      result: {
+        content: [{ type: 'text', text: JSON.stringify({
+          state: 'UNKNOWN_RESULT', remote_state: 'UNKNOWN', operation_ref: operationRef,
+        }) }],
+        isError: false,
+      },
+    },
+    {
+      requestId: 'unknown-status-call',
+      outcome: 'verified',
+      operationRef,
+      result: {
+        content: [{ type: 'text', text: JSON.stringify({
+          state: 'SUCCEEDED', remote_state: 'UNKNOWN', operation_ref: operationRef,
+        }) }],
+        isError: false,
+      },
+    },
+    {
+      requestId: 'failed-status-call',
+      outcome: 'failed',
+      operationRef,
+      result: {
+        content: [{ type: 'text', text: JSON.stringify({
+          state: 'SUCCEEDED', remote_state: 'PENDING', operation_ref: operationRef,
+        }) }],
+        isError: false,
+      },
+    },
+  ]);
+  const { ctx, dispose } = await setupHarness(fixture);
+  try {
+    const stopName = toolName(ctx, 'Stop cloud resource');
+    const statusName = toolName(ctx, 'Read cloud operation status');
+    assert.ok(stopName);
+    assert.ok(statusName);
+    const target = {
+      resource_id: '/subscriptions/sub-1/resourceGroups/rg-1/providers/Microsoft.Compute/virtualMachines/vm-1',
+    };
+
+    const uncertainWrite = await execute(ctx, stopName, { profile_ref: profileRef, target }, 'uncertain-write-call');
+    assert.equal(uncertainWrite.isError, true);
+    const priorReceipt = fixture.receipts.get('operation-1');
+    assert.equal(priorReceipt.status, 'uncertain');
+
+    const unknownRemoteState = await execute(ctx, statusName, {
+      profile_ref: profileRef, operation_ref: operationRef,
+    }, 'unknown-status-call');
+    assert.equal(unknownRemoteState.isError, true);
+    assert.match(unknownRemoteState.error.message, /unknown remote read result/u);
+    assert.equal(priorReceipt.status, 'uncertain');
+    assert.equal(priorReceipt.evidence.reconciledByOperationRef, undefined);
+
+    const failedEnvelope = await execute(ctx, statusName, {
+      profile_ref: profileRef, operation_ref: operationRef,
+    }, 'failed-status-call');
+    assert.equal(failedEnvelope.isError, true);
+    assert.match(failedEnvelope.error.message, /Exchange reports a failed remote operation/u);
+    assert.equal(priorReceipt.status, 'uncertain');
+    assert.equal(priorReceipt.evidence.reconciledByOperationRef, undefined);
+  } finally {
+    dispose();
+    await ctx.fiber.dispose();
+  }
+});
+
 test('connector mode registers only tools present in the launcher-owned grant map', async () => {
   const fixture = createHarness();
   fixture.bindingAuthorization.tools = [fixture.bindingAuthorization.tools[0]];
