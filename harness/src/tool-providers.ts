@@ -225,6 +225,7 @@ interface ProviderInputConstraint {
   readonly maximum?: number;
   readonly minLength?: number;
   readonly maxLength?: number;
+  readonly maxUtf8Bytes?: number;
   readonly minItems?: number;
   readonly maxItems?: number;
   readonly uniqueItems?: boolean;
@@ -1393,7 +1394,7 @@ function parseTools(value: unknown, bindingId: string): ProviderTool[] {
 
 const PROJECTED_PROVIDER_CONSTRAINTS = new Set([
   'pattern', 'minimum', 'maximum', 'minLength', 'maxLength',
-  'minItems', 'maxItems', 'uniqueItems', 'minProperties', 'maxProperties',
+  'minItems', 'maxItems', 'uniqueItems', 'minProperties', 'maxProperties', 'x-maxUtf8Bytes',
 ]);
 
 function collectProviderConstraints(schema: JsonValue): ProviderInputConstraint[] {
@@ -1415,6 +1416,7 @@ function collectProviderConstraints(schema: JsonValue): ProviderInputConstraint[
       maximum?: number;
       minLength?: number;
       maxLength?: number;
+      maxUtf8Bytes?: number;
       minItems?: number;
       maxItems?: number;
       uniqueItems?: boolean;
@@ -1439,6 +1441,10 @@ function collectProviderConstraints(schema: JsonValue): ProviderInputConstraint[
       if (Object.hasOwn(node, 'maxLength')) constraint.maxLength = boundedSchemaInteger(node.maxLength, 'maxLength');
       if (constraint.minLength !== undefined && constraint.maxLength !== undefined
         && constraint.minLength > constraint.maxLength) throw new TypeError('Provider string bounds conflict');
+    }
+    if (Object.hasOwn(node, 'x-maxUtf8Bytes')) {
+      if (node.type !== 'string') throw new TypeError('Provider x-maxUtf8Bytes requires a string schema');
+      constraint.maxUtf8Bytes = boundedSchemaInteger(node['x-maxUtf8Bytes'], 'x-maxUtf8Bytes');
     }
     if (['minimum', 'maximum'].some(key => Object.hasOwn(node, key))) {
       if (node.type !== 'number' && node.type !== 'integer') {
@@ -1585,6 +1591,16 @@ function validateProviderConstraints(
     for (const value of values) {
       if (value === undefined) continue;
       let valid = true;
+      if (constraint.maxUtf8Bytes !== undefined) {
+        // Measure the decoded value's UTF-8 bytes; code-point length is a separate provider constraint.
+        // 这里按解码后的 UTF-8 字节计数，不能用字符数替代。
+        const byteLength = typeof value === 'string' ? Buffer.byteLength(value, 'utf8') : -1;
+        if (byteLength > constraint.maxUtf8Bytes) {
+          const field = constraint.path.filter(segment => segment !== '*').join('.') || 'arguments';
+          throw new TypeError(`Provider argument ${field} exceeds its configured UTF-8 byte limit`);
+        }
+        valid = valid && byteLength >= 0;
+      }
       if (constraint.pattern !== undefined) valid = typeof value === 'string' && constraint.regex!.test(value);
       if (constraint.minLength !== undefined || constraint.maxLength !== undefined) {
         const length = typeof value === 'string' ? [...value].length : -1;

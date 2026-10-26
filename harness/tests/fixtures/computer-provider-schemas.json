@@ -1,0 +1,115 @@
+{
+  "tools": [
+    {
+      "id": "fixture-command",
+      "name": "Execute command",
+      "description": "Execute a bounded command in the configured workspace.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192,
+            "x-maxUtf8Bytes": 32768
+          },
+          "cwd": {
+            "type": "string",
+            "description": "Workspace-relative directory; defaults to the workspace root.",
+            "maxLength": 1024,
+            "x-maxUtf8Bytes": 4096
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 600000
+          }
+        },
+        "required": ["command"],
+        "additionalProperties": false
+      },
+      "readOnly": false
+    },
+    {
+      "id": "fixture-directory-list",
+      "name": "List directory",
+      "description": "List entries in a workspace-relative directory.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Workspace-relative directory path; use '.' for the root.",
+            "minLength": 1,
+            "maxLength": 1024,
+            "x-maxUtf8Bytes": 4096
+          },
+          "max_depth": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 32
+          }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+      },
+      "readOnly": true
+    },
+    {
+      "id": "fixture-file-read",
+      "name": "Read file",
+      "description": "Read a bounded range from a workspace-relative file.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Workspace-relative file path.",
+            "minLength": 1,
+            "maxLength": 1024,
+            "x-maxUtf8Bytes": 4096
+          },
+          "length": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65536
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": ["path", "length"],
+        "additionalProperties": false
+      },
+      "readOnly": true
+    },
+    {
+      "id": "fixture-file-write",
+      "name": "Write file",
+      "description": "Write base64 content to a workspace-relative file.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Workspace-relative file path.",
+            "minLength": 1,
+            "maxLength": 1024,
+            "x-maxUtf8Bytes": 4096
+          },
+          "content_base64": {
+            "type": "string",
+            "description": "File bytes encoded using standard base64.",
+            "maxLength": 1398104
+          },
+          "overwrite": { "type": "boolean" }
+        },
+        "required": ["path", "content_base64", "overwrite"],
+        "additionalProperties": false
+      },
+      "readOnly": false
+    }
+  ]
+}

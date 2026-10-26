@@ -11,6 +11,12 @@ envelope as `cyrene-native-host`, while exposing controlled failure modes for
 cancellation, timeout, protocol version errors, EOF/crash, and bounded output
 checks.
 
+`computer-provider-schemas.json` contains de-identified input-schema fixtures
+for the four computer tools. Its tool IDs and descriptions are synthetic; the
+parameter shapes and bounds exercise Navigator's provider-schema adapter. The
+fixture is used only for registration and validation tests, never to invoke a
+computer provider.
+
 `runNativeRequest` still launches it through the pinned DeepSeek Harness
 `LocalSubprocessRuntime`; the fixture does not replace or wrap that runtime.
 Each test writes its mode and state-file path to a task-local
@@ -57,3 +63,7 @@ host paths when attaching P0-21/P0-23 evidence.
 `runNativeRequest` 仍通过固定版本 DeepSeek Harness 的 `LocalSubprocessRuntime` 启动 fixture；fixture 不会替换或包装该 runtime。每项测试会在子进程工作目录的任务专属 `.cyrene-native-fixture.json` 中写入模式和状态文件路径。fixture 不执行 shell；只有相应负向测试才会向 stderr 输出诊断或向 stdout 输出无效协议字节。
 
 Windows 专属测试在缺少 `native-matrix-host.exe` 时会明确失败，不会退回 `.mjs`，也不会把 POSIX 结果标记为 Windows 通过。`CYRENE_NATIVE_MATRIX_BINARY` 可以指向安装包验证目录中的同一构建产物；`LocalSubprocessRuntime` 仍使用显式 `argv` 和 `shell:false` 启动它，因此含空格的路径也会经过真实 Windows 参数边界。
+
+`computer-provider-schemas.json` 是四个 computer 工具的去标识输入 schema fixture。
+工具 ID 和描述为合成值，参数结构与边界用于覆盖 Navigator 的 provider-schema 适配器；
+fixture 只用于注册与校验测试，不会调用 computer provider。
