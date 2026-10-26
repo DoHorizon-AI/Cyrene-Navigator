@@ -124,7 +124,6 @@ test('credential notification configuration pins the owner and only one allowed 
       serviceUrl: 'https://smba.trafficmanager.net/amer/',
     },
     exchange: {
-      connectionRef: '33333333-3333-4333-8333-333333333333',
       profileRef: 'teams-credential-notifications-20261026',
     },
     pollIntervalMs: 900_000,
@@ -744,7 +743,6 @@ test('NavigatorExecutor: credential notices use cached Exchange health and the f
     owner,
     connections: [{ connectionId: snapshot.connectionId, provider: 'hf' }],
     destination,
-    exchangeConnectionRef: '33333333-3333-4333-8333-333333333333',
     exchangeProfileRef: 'teams-credential-notifications-20261026',
     pollIntervalMs: 900_000,
   };
@@ -844,7 +842,7 @@ test('NavigatorExecutor: credential notices use cached Exchange health and the f
     assert.equal(grantRequests.length, 1);
     assert.equal(grantRequests[0].principalIssuer, owner.issuer);
     assert.equal(grantRequests[0].principalSubject, owner.subject);
-    assert.equal(grantRequests[0].connectionRef, credentialConfig.exchangeConnectionRef);
+    assert.equal(grantRequests[0].connectionRef, 'teams-chat-connection');
     assert.equal(grantRequests[0].profileRef, credentialConfig.exchangeProfileRef);
     assert.equal(grantRequests[0].operationId, 'msteams.message.reply');
     assert.deepEqual(grantRequests[0].arguments.conversation, destination);

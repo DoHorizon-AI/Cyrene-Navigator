@@ -204,7 +204,6 @@ export interface CredentialNotificationsConfig {
   };
   readonly connections: readonly { readonly connectionId: string; readonly provider: CredentialHealthSnapshot['provider'] }[];
   readonly destination: TeamsMessageRoute;
-  readonly exchangeConnectionRef: string;
   readonly exchangeProfileRef: string;
   readonly pollIntervalMs: number;
 }
@@ -2068,7 +2067,7 @@ export class NavigatorExecutor {
         workspaceId: config.workspaceId,
         principalIssuer: config.owner.issuer,
         principalSubject: config.owner.subject,
-        connectionRef: config.exchangeConnectionRef,
+        connectionRef: teams.exchangeConnectionRef,
         providerId: 'msteams',
         profileRef: config.exchangeProfileRef,
         operationId: 'msteams.message.reply',
@@ -2086,7 +2085,7 @@ export class NavigatorExecutor {
       const result = await teams.exchangeAuthorization.sendTeamsMessage(
         { requestId, conversation, text },
         grant,
-        config.exchangeConnectionRef,
+        teams.exchangeConnectionRef,
         config.exchangeProfileRef,
         AbortSignal.timeout(15_000),
       );
@@ -2941,12 +2940,9 @@ export function parseCredentialNotificationsConfig(
     throw new TypeError('Credential notification destination is outside the configured Teams scope');
   }
   const exchange = objectValue(row.exchange, 'credential notification Exchange profile');
-  if (!isExactObjectKeys(exchange, ['connectionRef', 'profileRef'])) {
+  if (!isExactObjectKeys(exchange, ['profileRef'])) {
     throw new TypeError('Credential notification Exchange profile has an invalid shape');
   }
-  const exchangeConnectionRef = uuidText(
-    exchange.connectionRef, 'credential notification Exchange connection',
-  );
   const exchangeProfileRef = boundedText(exchange.profileRef, 'credential notification Exchange profile', 512);
   const pollIntervalMs = row.pollIntervalMs ?? 15 * 60_000;
   if (typeof pollIntervalMs !== 'number' || !Number.isSafeInteger(pollIntervalMs)
@@ -2959,7 +2955,6 @@ export function parseCredentialNotificationsConfig(
     owner: Object.freeze({ issuer: ownerIssuer, subject: ownerSubject, tenantId: ownerTenantId }),
     connections: Object.freeze(connections),
     destination: Object.freeze(destination),
-    exchangeConnectionRef,
     exchangeProfileRef,
     pollIntervalMs,
   });
