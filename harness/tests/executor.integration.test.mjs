@@ -16,6 +16,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { createExecutorApp } from '../dist/serve.js';
 import { parseCredentialNotificationsConfig } from '../dist/executor.js';
 import { InMemoryWorkStateStore, WorkStateClient, WorkStateHttpError } from '../dist/work-state-client.js';
+import { ExchangeConnectorRequestError } from '../dist/connector-authorization.js';
 import { disposeWithin } from '../../scripts/serve-executor.mjs';
 import { LlmAdapter, ToolCallId } from '@deepseek-ai/dsh-llm';
 import { defineTool } from '@deepseek-ai/dsh-tools';
@@ -852,6 +853,104 @@ test('NavigatorExecutor: credential notices use cached Exchange health and the f
     assert.doesNotMatch(sentMessages[0].text, /bearer|token value|authorizationRef/iu);
     assert.deepEqual(finished.map(item => [item.notificationId, item.outcome]), [
       ['credential-notice-1', 'delivered'],
+    ]);
+  } finally {
+    await disposeApp(app);
+  }
+});
+
+test('NavigatorExecutor: credential grant rate limits retry before any Teams provider send', async () => {
+  const store = new InMemoryWorkStateStore();
+  const app = await createTestApp(new TestMockAdapter(), { workStateStore: store, workspaceId: 'health-workspace' });
+  const { executor } = app;
+  const tenantId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const ownerId = '11111111-1111-4111-8111-111111111111';
+  const lease = {
+    notification: {
+      id: 'credential-grant-rate-limit',
+      deduplicationKey: 'credential-health:incident:opened',
+      type: 'teams.credential-health',
+      payload: {
+        schemaVersion: 1,
+        event: 'action_required',
+        incidentId: '0123456789abcdef0123456789abcdef',
+        connectionId: '22222222-2222-4222-8222-222222222222',
+        provider: 'hf',
+        generation: 1,
+        loginState: 'PRESENT',
+        authorizationState: 'REAUTHORIZATION_REQUIRED',
+        capabilities: [],
+        checkedAt: '2026-10-26T15:00:00Z',
+        expiresAt: null,
+        reasonCode: 'TOKEN_EXPIRED',
+      },
+      connectorId: 'teams-v1',
+      recipient: 'teams:credential-health',
+      status: 'leased',
+      result: { retryCount: 0 },
+    },
+    leaseToken: 'credential-grant-rate-limit-lease',
+  };
+  const route = {
+    tenantId,
+    teamId: 'team-1',
+    channelId: '19:notice-channel@thread.tacv2',
+    conversationId: '19:notice-channel@thread.tacv2;messageid=1793027795187',
+    rootThreadId: '1793027795187',
+    serviceUrl: 'https://smba.trafficmanager.net/amer/',
+  };
+  const finishReceipts = [];
+  let providerCalls = 0;
+  let noticePending = true;
+  store.claimNotifications = async input => {
+    if (input.type === 'teams.credential-health' && noticePending) {
+      noticePending = false;
+      return [lease];
+    }
+    return [];
+  };
+  store.startNotification = async () => undefined;
+  store.finishNotification = async (notificationId, leaseToken, outcome, result, retryAfterSeconds) => {
+    finishReceipts.push({ notificationId, leaseToken, outcome, result, retryAfterSeconds });
+  };
+  executor.config.teams = {
+    connectorId: 'teams-v1',
+    tenantId,
+    allowedTeamIds: ['team-1'],
+    botAppId: 'fixture-bot-app',
+    taskActorSubjects: [ownerId],
+    ingressSecretEnv: 'TEAMS_NAVIGATOR_HMAC_KEY',
+    exchangeConnectionRef: 'teams-chat-connection',
+    exchangeProfileRef: 'teams-chat-profile',
+    credentialNotifications: {
+      organizationId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      workspaceId: 'health-workspace',
+      owner: {
+        issuer: `https://login.microsoftonline.com/${tenantId}/v2.0`,
+        subject: ownerId,
+        tenantId,
+      },
+      connections: [{ connectionId: '22222222-2222-4222-8222-222222222222', provider: 'hf' }],
+      destination: route,
+      exchangeProfileRef: 'teams-credential-notifications-20261026',
+      pollIntervalMs: 900_000,
+    },
+    exchangeAuthorization: {
+      async getAuthorizationHealthSnapshots() { return []; },
+      async mintGrant() {
+        throw new ExchangeConnectorRequestError('Exchange grant rate limited', 429, false, undefined, 42);
+      },
+      async sendTeamsMessage() {
+        providerCalls += 1;
+        return { outcome: 'accepted' };
+      },
+    },
+  };
+  try {
+    await executor['drainTeamsNotifications']();
+    assert.equal(providerCalls, 0);
+    assert.deepEqual(finishReceipts.map(receipt => [receipt.outcome, receipt.retryAfterSeconds]), [
+      ['retry', 42],
     ]);
   } finally {
     await disposeApp(app);

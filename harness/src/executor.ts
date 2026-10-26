@@ -2104,6 +2104,13 @@ export class NavigatorExecutor {
       });
     } catch (error: unknown) {
       if (!started) return;
+      if (!providerCallStarted && error instanceof ExchangeConnectorRequestError
+        && error.status === 429 && error.retryAfterSeconds !== undefined) {
+        await this.finishTeamsRateLimit(notification.id, lease.leaseToken, error.retryAfterSeconds, {
+          code: 'EXCHANGE_GRANT_HTTP_429',
+        }).catch(() => undefined);
+        return;
+      }
       if (providerCallStarted && error instanceof ExchangeConnectorRequestError
         && error.status === 429 && error.retryAfterSeconds !== undefined) {
         await this.finishTeamsRateLimit(notification.id, lease.leaseToken, error.retryAfterSeconds, {
