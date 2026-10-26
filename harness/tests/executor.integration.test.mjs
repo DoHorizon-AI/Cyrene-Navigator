@@ -5,6 +5,8 @@
 // └─────────────────────────────────────────────────────────────────────┘
 
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { createServer } from 'node:http';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -13,6 +15,7 @@ import { test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createExecutorApp } from '../dist/serve.js';
 import { InMemoryWorkStateStore, WorkStateClient, WorkStateHttpError } from '../dist/work-state-client.js';
+import { disposeWithin } from '../../scripts/serve-executor.mjs';
 import { LlmAdapter, ToolCallId } from '@deepseek-ai/dsh-llm';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
@@ -485,6 +488,68 @@ test('NavigatorExecutor: drain waits for an existing notification claim and paus
   }
 });
 
+test('NavigatorExecutor: streamed duplicate requests report the existing task status during drain', async () => {
+  const store = new InMemoryWorkStateStore();
+  const adapter = new TestMockAdapter();
+  const app = await createTestApp(adapter, { workStateStore: store });
+  const { executor } = app;
+  const { url, close } = await executor.startServer(0, '127.0.0.1');
+  const headers = { Authorization: `Bearer ${TEST_BEARER}`, 'Content-Type': 'application/json' };
+  try {
+    const running = await store.createTask({
+      id: 'stream-drain-existing-running', sessionId: 'stream-drain-running-session', prompt: 'Existing running work',
+    });
+    await store.claimTask(running.id);
+    executor.startDrain();
+
+    const runningResponse = await fetch(`${url}/api/v1/execute`, {
+      method: 'POST', headers,
+      body: JSON.stringify({
+        taskId: running.id, sessionId: running.sessionId, prompt: running.prompt, stream: true,
+      }),
+    });
+    assert.equal(runningResponse.status, 200);
+    const runningStreamPromise = runningResponse.text();
+    const returnedEarly = await Promise.race([
+      runningStreamPromise.then(() => true),
+      delay(30).then(() => false),
+    ]);
+    assert.equal(returnedEarly, false, 'an existing running task stream must remain open until the task settles');
+    await store.patchTask(running.id, { status: 'completed', output: 'The existing task completed.' });
+    await store.appendEvent(running.id, {
+      type: 'finish', taskId: running.id, status: 'completed',
+      output: 'The existing task completed.', durationMs: 10, timestamp: Date.now(),
+    });
+    const runningStream = await runningStreamPromise;
+    assert.match(runningStream, /"status":"completed"/u);
+    assert.doesNotMatch(runningStream, /"status":"queued"/u);
+
+    const completed = await store.createTask({
+      id: 'stream-drain-existing-completed', sessionId: 'stream-drain-completed-session', prompt: 'Existing completed work',
+    });
+    await store.claimTask(completed.id);
+    await store.patchTask(completed.id, { status: 'completed', output: 'Previously completed.' });
+    await store.appendEvent(completed.id, {
+      type: 'finish', taskId: completed.id, status: 'completed',
+      output: 'Previously completed.', durationMs: 5, timestamp: Date.now(),
+    });
+    const completedResponse = await fetch(`${url}/api/v1/execute`, {
+      method: 'POST', headers,
+      body: JSON.stringify({
+        taskId: completed.id, sessionId: completed.sessionId, prompt: completed.prompt, stream: true,
+      }),
+    });
+    assert.equal(completedResponse.status, 200);
+    const completedStream = await completedResponse.text();
+    assert.match(completedStream, /"status":"completed"/u);
+    assert.doesNotMatch(completedStream, /"status":"queued"/u);
+    assert.equal(adapter.calls, 0, 'drain must not restart or replay an existing task');
+  } finally {
+    await close();
+    await disposeApp(app);
+  }
+});
+
 test('NavigatorExecutor: an admitted task can be cancelled before the dispatcher claims it', async () => {
   const { executor, ctx } = await createTestApp();
   try {
@@ -572,6 +637,60 @@ test('NavigatorExecutor: a shutdown drain cannot be resumed while SIGTERM cleanu
     assert.equal(status.activeWorkDrained, true);
   } finally {
     await disposeApp(app);
+  }
+});
+
+test('serve-executor teardown deadline includes context-fiber disposal', async () => {
+  let fiberDisposalStarted = false;
+  const result = await disposeWithin(
+    { dispose: async () => undefined },
+    { dispose: () => { fiberDisposalStarted = true; return new Promise(() => undefined); } },
+    30,
+  );
+  assert.equal(fiberDisposalStarted, true);
+  assert.equal(result, false, 'a hung Context fiber must not extend the SIGTERM cleanup deadline');
+});
+
+test('serve-executor SIGTERM drain timeout exits nonzero within its cleanup bound', async () => {
+  const child = spawn(process.execPath, [
+    'scripts/serve-executor.mjs', '--port=0', '--host=127.0.0.1', '--test-mode', '--test-echo-adapter',
+    '--drain-timeout-ms=0', '--abort-cleanup-timeout-ms=500',
+  ], {
+    cwd: process.cwd(),
+    env: { ...process.env, CYRENE_EXECUTOR_TOKEN: TEST_BEARER },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', value => { stdout += value; });
+  child.stderr.on('data', value => { stderr += value; });
+  try {
+    const readyDeadline = Date.now() + 10_000;
+    while (!stdout.includes('"status":"ready"') && Date.now() < readyDeadline) {
+      if (child.exitCode !== null) break;
+      await delay(20);
+    }
+    assert.ok(stdout.includes('"status":"ready"'), `executor process did not become ready: ${stderr}`);
+    const exitPromise = once(child, 'exit');
+    const startedAt = performance.now();
+    child.kill('SIGTERM');
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('SIGTERM cleanup exceeded its bounded deadline')), 4_000);
+    });
+    let exit;
+    try {
+      exit = await Promise.race([exitPromise, timeout]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+    assert.equal(exit[0], 1, stderr);
+    assert.ok(performance.now() - startedAt < 4_000, 'drain deadline expiry must remain bounded');
+    assert.match(stderr, /drain_deadline_exceeded_cleanup_completed/u);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
   }
 });
 

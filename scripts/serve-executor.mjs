@@ -51,6 +51,14 @@ async function settleWithin(promise, timeoutMs) {
   }
 }
 
+/** Bound executor and Cordis teardown together, including the fiber disposal deadline. */
+export function disposeWithin(executor, fiber, timeoutMs) {
+  return settleWithin((async () => {
+    await executor.dispose();
+    await fiber.dispose();
+  })(), timeoutMs);
+}
+
 // Run as standalone process if invoked directly
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   createExecutorApp({
@@ -98,9 +106,18 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
         }));
       }
       if (status?.activeWorkDrained === true) {
-        await executor.dispose();
-        await ctx.fiber.dispose();
-        process.exit(0);
+        const cleanupComplete = await disposeWithin(executor, ctx.fiber, abortCleanupTimeoutMs);
+        if (cleanupComplete) {
+          process.exit(0);
+          return;
+        }
+        console.error(JSON.stringify({
+          service: 'cyrene-navigator-executor',
+          status: 'executor_or_context_disposal_incomplete',
+          generation: drain.generation,
+          cleanupTimeoutMs: abortCleanupTimeoutMs,
+        }));
+        process.exit(1);
         return;
       }
 
@@ -114,20 +131,20 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
         dispatches: status?.dispatches ?? null,
         notifications: status?.notifications ?? null,
       }));
-      const cleanup = executor.dispose();
-      const cleanupComplete = await settleWithin(cleanup, abortCleanupTimeoutMs);
+      const cleanupComplete = await disposeWithin(executor, ctx.fiber, abortCleanupTimeoutMs);
       if (cleanupComplete) {
-        await ctx.fiber.dispose();
         console.error(JSON.stringify({
           service: 'cyrene-navigator-executor',
-          status: 'active_work_aborted_after_drain_timeout',
+          status: 'drain_deadline_exceeded_cleanup_completed',
           generation: drain.generation,
         }));
       } else {
         console.error(JSON.stringify({
           service: 'cyrene-navigator-executor',
-          status: 'interrupted_tasks_left_for_startup_recovery',
+          status: 'executor_or_context_disposal_incomplete',
           generation: drain.generation,
+          cleanupTimeoutMs: abortCleanupTimeoutMs,
+          recovery: 'Running task rows are not replayed; started notification leases become uncertain on expiry.',
         }));
       }
       process.exit(1);

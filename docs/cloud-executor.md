@@ -191,7 +191,7 @@ The service-bearer-protected control routes are:
 
 `activeWorkDrained` means this process has no running task, active dispatch, or claimed notification delivery left to finish. `queuedTasks` can remain nonzero by design. The notification fields report whether polling is paused and a claim is in flight; they do not report the durable notification backlog. A new process starts in `accepting` mode with a new instance ID, so a prior process token cannot resume it. Startup recovery runs only never-claimed queued tasks and closes interrupted running tasks without replay. Once SIGTERM/SIGINT cleanup starts, resume is rejected for that process.
 
-If the configured graceful-drain deadline expires, SIGTERM cleanup aborts active work for a second bounded interval and exits nonzero. Any task still recorded as running is left for startup recovery, which records the interruption instead of claiming it again.
+If the configured graceful-drain deadline expires, SIGTERM cleanup aborts active tasks and waits for any claimed notification during a second bounded interval. The same deadline covers executor and Context-fiber teardown; failure to finish any part exits nonzero. Any task still recorded as running is left for startup recovery, which records the interruption instead of claiming it again. A started notification whose delivery cannot be finalized becomes uncertain when its lease expires and is not replayed automatically.
 
 ### 4.3 Running with Docker
 A dedicated production Dockerfile is provided at `Dockerfile.executor`:
@@ -241,4 +241,4 @@ Navigator includes a comprehensive verification suite:
 
 `activeWorkDrained` 表示此进程没有仍在运行的任务、活动 dispatch 或已认领的通知投递。`queuedTasks` 可以继续大于零。通知字段只反映轮询是否暂停及当前是否有在途认领，不表示持久通知队列为空。新进程以新实例 ID 从 `accepting` 启动，旧进程令牌不能用于恢复它。启动恢复只执行从未认领的排队任务，并关闭中断的 running 任务，不会重放它们。SIGTERM/SIGINT 清理开始后，该进程会拒绝 resume。
 
-如果 SIGTERM 排空期限到期，服务再用一个有界时间取消活动工作并以非零状态退出。退出时仍处于 running 的任务留给启动恢复记录为中断，不会再次认领。
+如果 SIGTERM 排空期限到期，服务会在第二个有界时间内取消活动任务并等待已认领的通知收尾。该期限同时覆盖 Executor 和 Context fiber 的清理；任何部分未能完成都会以非零状态退出。退出时仍处于 running 的任务留给启动恢复记录为中断，不会再次认领。已开始但未能记录投递结果的通知会在租约到期后标记为 uncertain，不会自动重放。

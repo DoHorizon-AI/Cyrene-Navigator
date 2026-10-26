@@ -2085,11 +2085,39 @@ export class NavigatorExecutor {
         if (body.stream === true || req.headers.accept?.includes('text/event-stream')) {
           if (this.drainToken !== undefined) {
             const record = await this.startTask(params);
-            this.openEventStream(res, 202);
-            this.writeSseEvent(res, undefined, 'status', {
-              type: 'status', taskId: record.id, sessionId: record.sessionId,
-              status: 'queued', timestamp: Date.now(),
-            });
+            if (record.status === 'queued') {
+              this.openEventStream(res, 202);
+              this.writeSseEvent(res, undefined, 'status', {
+                type: 'status', taskId: record.id, sessionId: record.sessionId,
+                status: 'queued', timestamp: Date.now(),
+              });
+              res.end();
+              return;
+            }
+            this.openEventStream(res);
+            let observedEvent = false;
+            const subscriber = (event: ExecutorStreamEvent) => {
+              observedEvent = true;
+              this.writeSseEvent(res, event.seq, event.type, event);
+            };
+            const outcome = await this.executeTask(params, subscriber);
+            if (outcome.status === 'queued') {
+              this.writeSseEvent(res, undefined, 'status', {
+                type: 'status', taskId: outcome.taskId, sessionId: outcome.sessionId,
+                status: 'queued', timestamp: Date.now(),
+              });
+            } else if (!observedEvent) {
+              this.writeSseEvent(res, undefined, 'status', {
+                type: 'status', taskId: outcome.taskId, sessionId: outcome.sessionId,
+                status: outcome.status, timestamp: Date.now(),
+              });
+              if (TERMINAL_STATUSES.has(outcome.status) || PAUSED_STATUSES.has(outcome.status)) {
+                this.writeSseEvent(res, undefined, 'finish', {
+                  type: 'finish', taskId: outcome.taskId, status: outcome.status,
+                  output: outcome.output, durationMs: outcome.durationMs, timestamp: Date.now(),
+                });
+              }
+            }
             res.end();
             return;
           }
@@ -2415,7 +2443,11 @@ export class NavigatorExecutor {
         task.agent?.cancel({ kind: 'hook', reason: 'navigator_executor_shutdown' });
       }
     }
-    await Promise.allSettled(live.map(task => task.completion).filter((p): p is Promise<TaskOutcome> => p !== undefined));
+    const pendingWork: Promise<unknown>[] = live
+      .map(task => task.completion)
+      .filter((completion): completion is Promise<TaskOutcome> => completion !== undefined);
+    if (this.teamsNotificationDrain !== undefined) pendingWork.push(this.teamsNotificationDrain);
+    await Promise.allSettled(pendingWork);
     if (this.httpServer) {
       const server = this.httpServer;
       this.httpServer = undefined;
