@@ -18,7 +18,13 @@ const MAX_CLOUD_RESOURCES = 500;
 const MAX_ATTRIBUTE_COUNT = 64;
 const MAX_ATTRIBUTE_TEXT_BYTES = 512;
 const AUTHORIZATION_REFERENCE_TTL_MS = 5 * 60_000;
+const HF_DEVICE_HEALTH_MAX_AGE_MS = 20 * 60_000;
 const REAUTHORIZATION_REQUIRED_CODE = 'EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED';
+const HF_DEVICE_VERIFICATION_URLS = new Set([
+  'https://hf.co/oauth/device',
+  'https://huggingface.co/oauth/device',
+]);
+const HF_DEVICE_USER_CODE = /^[A-Z0-9]{4}-[A-Z0-9]{4}$/u;
 const EXCHANGE_OPERATION_STATES = Object.freeze([
   'QUEUED', 'AWAITING_AUTHORITY', 'RUNNING', 'ACCEPTED', 'SUCCEEDED', 'FAILED', 'UNKNOWN',
 ] as const);
@@ -113,7 +119,7 @@ export interface ExchangeAuthorizationHealth {
   readonly reasonCode: string | null;
 }
 
-/** Renewal-session data consumed by Navigator after removing UI-only launch material. */
+/** Renewal-session data consumed by Navigator; HF's bounded device code is user-facing. */
 export interface ExchangeRenewalSession {
   readonly sessionRef: string;
   readonly authorizationRef: string;
@@ -121,6 +127,7 @@ export interface ExchangeRenewalSession {
   readonly createdAt: string;
   readonly expiresAt: string | null;
   readonly authorizationUrl: string | null;
+  readonly userCode: string | null;
   readonly qrAttachmentRef: string | null;
   readonly generation: number;
   readonly reasonCode: string | null;
@@ -379,10 +386,13 @@ export function registerExchangeAuthorizationTools(
   const client = new ExchangeAuthorizationClient(options);
   const healthReferences = new Map<string, Map<string, {
     readonly connectionId: string;
+    readonly provider: ExchangeProvider;
     readonly authorizationState: ExchangeAuthorizationState;
     readonly generation: number;
-    readonly checkedAt: number;
+    readonly sourceCheckedAt: number | null;
+    readonly readAt: number;
   }>>();
+  const renewalProviders = new Map<string, Map<string, ExchangeProvider>>();
   const registrations = [
     ctx.tools.register(defineTool({
       name: 'exchange_connections_list',
@@ -411,12 +421,16 @@ export function registerExchangeAuthorizationTools(
         if (health.authorizationRef !== null) {
           byAuthorization.set(health.authorizationRef, {
             connectionId,
+            provider: health.provider,
             authorizationState: health.authorizationState,
             generation: health.generation,
-            checkedAt: Date.now(),
+            sourceCheckedAt: health.checkedAt === null ? null : Date.parse(health.checkedAt),
+            readAt: Date.now(),
           });
         }
-        if (health.authorizationState === 'REAUTHORIZATION_REQUIRED') {
+        // Let an explicit HF device-code renewal continue in this task; the official HF consent page remains the gate.
+        // 中文：HF 续权保持当前任务继续；最终同意仍由 HF 官方页完成。
+        if (health.authorizationState === 'REAUTHORIZATION_REQUIRED' && health.provider !== 'hf') {
           await options.onAuthorizationRequired(identity.sessionId, {
             callId: String(execution.callId),
             connectionId,
@@ -431,7 +445,7 @@ export function registerExchangeAuthorizationTools(
     })),
     ctx.tools.register(defineTool({
       name: 'exchange_reauthorization_start',
-      description: 'After Navigator human approval, start one Exchange-owned account renewal session.',
+      description: 'Start a scoped account renewal session; HF device-code renewal follows an explicit user request, while other providers require Navigator approval.',
       parameters: {
         authorizationRef: { type: 'string', required: true, description: 'Authorization reference returned by Exchange.' },
       },
@@ -442,25 +456,45 @@ export function registerExchangeAuthorizationTools(
         const authorizationRef = stringArg(args.authorizationRef, 'authorization reference');
         assertIdentifier(authorizationRef, 'authorization reference');
         const knownHealth = healthReferences.get(identity.sessionId)?.get(authorizationRef);
+        const now = Date.now();
+        const sourceHealthAge = knownHealth?.sourceCheckedAt === null || knownHealth?.sourceCheckedAt === undefined
+          ? null
+          : now - knownHealth.sourceCheckedAt;
+        const hfSourceHealthStale = knownHealth?.provider === 'hf'
+          && (sourceHealthAge === null || sourceHealthAge < 0
+            || sourceHealthAge > HF_DEVICE_HEALTH_MAX_AGE_MS);
         if (!knownHealth || knownHealth.authorizationState !== 'REAUTHORIZATION_REQUIRED'
-          || Date.now() - knownHealth.checkedAt > AUTHORIZATION_REFERENCE_TTL_MS) {
+          || now - knownHealth.readAt > AUTHORIZATION_REFERENCE_TTL_MS) {
           throw new Error('Renewal requires a recent authenticated health result for this Navigator session');
         }
-        await options.approvalBridge.requestApproval(
-          identity.sessionId,
-          'exchange.account.authorization.renewal',
-          'Start a user-authorized Exchange account renewal session',
-          { authorizationRef },
-          execution.signal,
-          String(execution.callId),
-        );
+        if (hfSourceHealthStale) {
+          throw new Error('HF renewal requires a current Exchange provider probe; wait for its existing health refresh.');
+        }
+        // HF start only creates its fixed-scope device challenge; consent remains on HF's official page.
+        // 中文：这里只创建固定 scope 的 challenge，实际授权仍由用户在 HF 官方页完成。
+        if (knownHealth.provider !== 'hf') {
+          await options.approvalBridge.requestApproval(
+            identity.sessionId,
+            'exchange.account.authorization.renewal',
+            'Start a user-authorized Exchange account renewal session',
+            { authorizationRef },
+            execution.signal,
+            String(execution.callId),
+          );
+        }
         const session = await client.startRenewalSession(
           authorizationRef,
           idempotencyKey(identity.sessionId, String(execution.callId)),
           identity,
         );
+        let byRenewal = renewalProviders.get(identity.sessionId);
+        if (!byRenewal) {
+          byRenewal = new Map();
+          renewalProviders.set(identity.sessionId, byRenewal);
+        }
+        byRenewal.set(session.sessionRef, knownHealth.provider);
         healthReferences.get(identity.sessionId)?.delete(authorizationRef);
-        return renewalSessionProjection(session);
+        return renewalSessionProjection(session, knownHealth.provider);
       },
     })),
     ctx.tools.register(defineTool({
@@ -474,7 +508,7 @@ export function registerExchangeAuthorizationTools(
         const identity = requestIdentity(execution);
         const sessionRef = stringArg(args.sessionRef, 'renewal session reference');
         const session = await client.getRenewalSession(sessionRef, identity);
-        return renewalSessionProjection(session);
+        return renewalSessionProjection(session, renewalProviders.get(identity.sessionId)?.get(sessionRef));
       },
     })),
     ctx.tools.register(defineTool({
@@ -521,6 +555,7 @@ export function registerExchangeAuthorizationTools(
     if (disposed) return;
     disposed = true;
     healthReferences.clear();
+    renewalProviders.clear();
     for (const unregister of registrations.reverse()) unregister();
   };
   ctx.effect(() => dispose, 'navigator.exchangeAuthorizationTools');
@@ -585,6 +620,8 @@ const renewalSessionOutput = {
       state: { type: 'string', required: true, enum: EXCHANGE_RENEWAL_SESSION_STATES },
       createdAt: { type: 'string', required: true },
       expiresAt: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true },
+      verificationUrl: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true },
+      userCode: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true },
       generation: { type: 'integer', required: true },
       reasonCode: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true },
     },
@@ -651,14 +688,22 @@ function requireActiveTask(options: ExchangeAuthorizationToolOptions, sessionId:
   }
 }
 
-/** Exclude browser launch material from every model-facing renewal result. */
-function renewalSessionProjection(session: ExchangeRenewalSession): Omit<ExchangeRenewalSession, 'authorizationUrl' | 'qrAttachmentRef'> {
+/** Expose HF's fixed device instructions only when health or session ownership proves the provider. */
+function renewalSessionProjection(session: ExchangeRenewalSession, provider: ExchangeProvider | undefined) {
+  const isHfDeviceWait = provider === 'hf'
+    && session.state === 'WAITING_USER'
+    && HF_DEVICE_VERIFICATION_URLS.has(session.authorizationUrl ?? '')
+    && session.expiresAt !== null
+    && Date.parse(session.expiresAt) > Date.now()
+    && session.userCode !== null;
   return {
     sessionRef: session.sessionRef,
     authorizationRef: session.authorizationRef,
     state: session.state,
     createdAt: session.createdAt,
     expiresAt: session.expiresAt,
+    verificationUrl: isHfDeviceWait ? session.authorizationUrl : null,
+    userCode: isHfDeviceWait ? session.userCode : null,
     generation: session.generation,
     reasonCode: session.reasonCode,
   };
@@ -721,6 +766,10 @@ function parseCapabilityHealth(value: unknown): CapabilityAuthorizationHealth {
 function parseRenewalSession(value: unknown): ExchangeRenewalSession {
   const row = objectValue(value, 'Exchange renewal-session response');
   const authorizationUrl = nullableTextField(row.authorizationUrl, 'authorizationUrl', 2_000);
+  const state = enumField(row.state, 'renewal session state', EXCHANGE_RENEWAL_SESSION_STATES);
+  const userCode = row.userCode === undefined
+    ? null
+    : nullableTextField(row.userCode, 'userCode', 9);
   if (authorizationUrl !== null) {
     let url: URL;
     try { url = new URL(authorizationUrl); } catch { throw new TypeError('Exchange authorization URL is invalid'); }
@@ -728,13 +777,21 @@ function parseRenewalSession(value: unknown): ExchangeRenewalSession {
       throw new TypeError('Exchange authorization URL is invalid');
     }
   }
+  const isHfDeviceVerificationUrl = HF_DEVICE_VERIFICATION_URLS.has(authorizationUrl ?? '');
+  if (userCode !== null && (!isHfDeviceVerificationUrl || !HF_DEVICE_USER_CODE.test(userCode))) {
+    throw new TypeError('Exchange HF device user code is invalid');
+  }
+  if (state === 'WAITING_USER' && isHfDeviceVerificationUrl && userCode === null) {
+    throw new TypeError('Exchange HF device renewal is missing its user code');
+  }
   return {
     sessionRef: uuidField(row.sessionRef, 'renewal session reference'),
     authorizationRef: identifierField(row.authorizationRef, 'authorization reference'),
-    state: enumField(row.state, 'renewal session state', EXCHANGE_RENEWAL_SESSION_STATES),
+    state,
     createdAt: utcDateField(row.createdAt, 'renewal createdAt'),
     expiresAt: nullableUtcDateField(row.expiresAt, 'renewal expiresAt'),
     authorizationUrl,
+    userCode,
     qrAttachmentRef: nullableTextField(row.qrAttachmentRef, 'QR attachment reference', 300),
     generation: nonNegativeInteger(row.generation, 'renewal generation'),
     reasonCode: nullableTextField(row.reasonCode, 'renewal reasonCode', 200),

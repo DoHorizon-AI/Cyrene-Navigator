@@ -33,7 +33,7 @@ function authorizationHealth(overrides = {}) {
     authorizationRef,
     loginState: 'PRESENT',
     authorizationState: 'REAUTHORIZATION_REQUIRED',
-    checkedAt: '2026-10-14T13:05:00Z',
+    checkedAt: new Date(Date.now() - 1_000).toISOString(),
     expiresAt: null,
     generation: 7,
     reasonCode: 'provider_token_expired',
@@ -68,7 +68,7 @@ function renewalSession(overrides = {}) {
     authorizationRef,
     state: 'WAITING_USER',
     createdAt: '2026-10-14T13:06:00Z',
-    expiresAt: null,
+    expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
     authorizationUrl: privateLaunchUrl,
     qrAttachmentRef: 'private-attachment-ref',
     generation: 7,
@@ -137,7 +137,7 @@ async function startExchangeFixture(options = {}) {
           return;
         }
         response.writeHead(200, { 'content-type': 'application/json' });
-        response.end(JSON.stringify(authorizationHealth()));
+        response.end(JSON.stringify(authorizationHealth(options.healthOverrides ?? {})));
         return;
       }
 
@@ -149,14 +149,14 @@ async function startExchangeFixture(options = {}) {
           'content-type': 'application/json',
           location: '/api/v1/accounts/renewal-sessions/' + renewalSessionRef,
         });
-        response.end(JSON.stringify(renewalSession()));
+        response.end(JSON.stringify(renewalSession(options.renewalOverrides ?? {})));
         return;
       }
 
       if (request.method === 'GET'
         && request.url === '/api/v1/accounts/renewal-sessions/' + renewalSessionRef) {
         response.writeHead(200, { 'content-type': 'application/json' });
-        response.end(JSON.stringify(renewalSession()));
+        response.end(JSON.stringify(renewalSession(options.renewalOverrides ?? {})));
         return;
       }
 
@@ -276,6 +276,8 @@ test('registers fixed authorization tools, requires approval, and hides renewal 
     const start = await execute(ctx, 'exchange_reauthorization_start', { authorizationRef }, 'renewal-1');
     assert.equal(start.isError, false);
     assert.equal(start.value.state, 'WAITING_USER');
+    assert.equal(start.value.verificationUrl, null);
+    assert.equal(start.value.userCode, null);
     assert.equal(JSON.stringify(start.value).includes('authorizationUrl'), false);
     assert.equal(JSON.stringify(start.value).includes('qrAttachmentRef'), false);
     assert.equal(JSON.stringify(start.value).includes('private-oauth-state'), false);
@@ -303,6 +305,178 @@ test('registers fixed authorization tools, requires approval, and hides renewal 
     dispose();
     await ctx.fiber.dispose();
     await exchange.close();
+  }
+});
+
+test('returns only HF device verification instructions and skips the duplicate Navigator approval', async () => {
+  for (const [index, verificationUrl] of [
+    'https://hf.co/oauth/device',
+    'https://huggingface.co/oauth/device',
+  ].entries()) {
+    const exchange = await startExchangeFixture({
+      healthOverrides: { provider: 'hf' },
+      renewalOverrides: {
+        authorizationUrl: verificationUrl,
+        userCode: 'L94P-HPL8',
+        deviceCode: 'device-code-must-not-escape',
+        accessToken: 'access-token-must-not-escape',
+        refreshToken: 'refresh-token-must-not-escape',
+      },
+    });
+    const { ctx, dispose, events } = await createToolContext(exchange);
+    try {
+      const health = await execute(ctx, 'exchange_authorization_health', { connectionId }, `hf-health-${index}`);
+      assert.equal(health.isError, false);
+      assert.equal(health.value.provider, 'hf');
+
+      const start = await execute(ctx, 'exchange_reauthorization_start', { authorizationRef }, `hf-renewal-${index}`);
+      assert.equal(start.isError, false);
+      assert.equal(start.value.sessionRef, renewalSessionRef);
+      assert.equal(start.value.verificationUrl, verificationUrl);
+      assert.equal(start.value.userCode, 'L94P-HPL8');
+      assert.equal(JSON.stringify(start.value).includes('authorizationUrl'), false);
+      assert.equal(JSON.stringify(start.value).includes('device-code-must-not-escape'), false);
+      assert.equal(JSON.stringify(start.value).includes('access-token-must-not-escape'), false);
+      assert.equal(JSON.stringify(start.value).includes('refresh-token-must-not-escape'), false);
+      assert.equal(events.some(event => event.type === 'approval'), false);
+      assert.equal(events.some(event => event.type === 'authorization-required'), false);
+
+      const status = await execute(ctx, 'exchange_reauthorization_status', {
+        sessionRef: renewalSessionRef,
+      }, `hf-renewal-status-${index}`);
+      assert.equal(status.isError, false);
+      assert.equal(status.value.verificationUrl, verificationUrl);
+      assert.equal(status.value.userCode, 'L94P-HPL8');
+    } finally {
+      dispose();
+      await ctx.fiber.dispose();
+      await exchange.close();
+    }
+  }
+});
+
+test('keeps HF session status readable but hides device code after provider proof is lost', async () => {
+  const exchange = await startExchangeFixture({
+    healthOverrides: { provider: 'hf' },
+    renewalOverrides: {
+      authorizationUrl: 'https://hf.co/oauth/device',
+      userCode: 'L94P-HPL8',
+    },
+  });
+  const first = await createToolContext(exchange);
+  try {
+    await execute(first.ctx, 'exchange_authorization_health', { connectionId }, 'hf-restart-health-1');
+    const start = await execute(first.ctx, 'exchange_reauthorization_start', { authorizationRef }, 'hf-restart-start-1');
+    assert.equal(start.isError, false);
+    assert.equal(start.value.userCode, 'L94P-HPL8');
+  } finally {
+    first.dispose();
+    await first.ctx.fiber.dispose();
+  }
+
+  const restarted = await createToolContext(exchange);
+  try {
+    const status = await execute(restarted.ctx, 'exchange_reauthorization_status', {
+      sessionRef: renewalSessionRef,
+    }, 'hf-restart-status-1');
+    assert.equal(status.isError, false);
+    assert.equal(status.value.sessionRef, renewalSessionRef);
+    assert.equal(status.value.verificationUrl, null);
+    assert.equal(status.value.userCode, null);
+  } finally {
+    restarted.dispose();
+    await restarted.ctx.fiber.dispose();
+    await exchange.close();
+  }
+});
+
+test('rejects HF user codes unless bounded and bound to an exact device verification URL', async () => {
+  for (const [index, renewalOverrides] of [
+    { authorizationUrl: 'https://hf.co/oauth/authorize', userCode: 'L94P-HPL8' },
+    { authorizationUrl: 'https://hf.co.evil/oauth/device', userCode: 'L94P-HPL8' },
+    { authorizationUrl: 'https://user@hf.co/oauth/device', userCode: 'L94P-HPL8' },
+    { authorizationUrl: 'https://hf.co/oauth/device?client_id=unexpected', userCode: 'L94P-HPL8' },
+    { authorizationUrl: 'https://hf.co/oauth/device#unexpected', userCode: 'L94P-HPL8' },
+    { authorizationUrl: 'https://hf.co/oauth/device', userCode: 'access-token' },
+    { authorizationUrl: 'https://hf.co/oauth/device' },
+  ].entries()) {
+    const exchange = await startExchangeFixture({
+      healthOverrides: { provider: 'hf' },
+      renewalOverrides,
+    });
+    const { ctx, dispose } = await createToolContext(exchange);
+    try {
+      await execute(ctx, 'exchange_authorization_health', { connectionId }, `hf-invalid-health-${index}`);
+      const start = await execute(ctx, 'exchange_reauthorization_start', { authorizationRef }, `hf-invalid-${index}`);
+      assert.equal(start.isError, true);
+      assert.equal(JSON.stringify(start).includes('L94P-HPL8'), false);
+      assert.equal(JSON.stringify(start).includes('access-token'), false);
+    } finally {
+      dispose();
+      await ctx.fiber.dispose();
+      await exchange.close();
+    }
+  }
+});
+
+test('does not expose HF device instructions for a non-HF renewal session', async () => {
+  const exchange = await startExchangeFixture({
+    healthOverrides: { provider: 'azure' },
+    renewalOverrides: {
+      authorizationUrl: 'https://hf.co/oauth/device',
+      userCode: 'L94P-HPL8',
+    },
+  });
+  const { ctx, dispose, events } = await createToolContext(exchange);
+  try {
+    await execute(ctx, 'exchange_authorization_health', { connectionId }, 'non-hf-health-1');
+    const start = await execute(ctx, 'exchange_reauthorization_start', { authorizationRef }, 'non-hf-renewal-1');
+    assert.equal(start.isError, false);
+    assert.equal(start.value.verificationUrl, null);
+    assert.equal(start.value.userCode, null);
+    assert.equal(events.some(event => event.type === 'approval'), true);
+
+    const status = await execute(ctx, 'exchange_reauthorization_status', {
+      sessionRef: renewalSessionRef,
+    }, 'non-hf-renewal-status-1');
+    assert.equal(status.isError, false);
+    assert.equal(status.value.verificationUrl, null);
+    assert.equal(status.value.userCode, null);
+  } finally {
+    dispose();
+    await ctx.fiber.dispose();
+    await exchange.close();
+  }
+});
+
+test('requires a recent non-future Exchange probe before starting an HF renewal', async () => {
+  const checkedAtValues = [
+    null,
+    new Date(Date.now() - 21 * 60_000).toISOString(),
+    new Date(Date.now() + 60_000).toISOString(),
+  ];
+  for (const [index, checkedAt] of checkedAtValues.entries()) {
+    const exchange = await startExchangeFixture({
+      healthOverrides: { provider: 'hf', checkedAt },
+      renewalOverrides: {
+        authorizationUrl: 'https://hf.co/oauth/device',
+        userCode: 'L94P-HPL8',
+      },
+    });
+    const { ctx, dispose, events } = await createToolContext(exchange);
+    try {
+      const health = await execute(ctx, 'exchange_authorization_health', { connectionId }, `stale-hf-health-${index}`);
+      assert.equal(health.isError, false);
+      const start = await execute(ctx, 'exchange_reauthorization_start', { authorizationRef }, `stale-hf-start-${index}`);
+      assert.equal(start.isError, true);
+      assert.equal(JSON.stringify(start).includes('existing health refresh'), true);
+      assert.equal(exchange.requests.filter(request => request.method === 'POST').length, 0);
+      assert.equal(events.some(event => event.type === 'approval'), false);
+    } finally {
+      dispose();
+      await ctx.fiber.dispose();
+      await exchange.close();
+    }
   }
 });
 
