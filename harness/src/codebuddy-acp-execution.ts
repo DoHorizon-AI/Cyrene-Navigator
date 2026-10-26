@@ -92,6 +92,18 @@ export interface CodeBuddyAcpExecutionOptions {
   readonly mcpCloseGraceMs?: number;
 }
 
+interface AcpMcpEnvironmentVariable {
+  readonly name: string;
+  readonly value: string;
+}
+
+interface AcpMcpServerStdio {
+  readonly name: string;
+  readonly command: string;
+  readonly args: readonly string[];
+  readonly env: readonly AcpMcpEnvironmentVariable[];
+}
+
 /** Implement a top-level CodeBuddy turn without creating or invoking a DSH Agent. */
 export class CodeBuddyAcpExecutionBackend implements ConversationExecutionBackend {
   readonly name = 'codebuddy-acp' as const
@@ -173,17 +185,15 @@ export class CodeBuddyAcpExecutionBackend implements ConversationExecutionBacken
 
     try {
       const mcpUrl = await mcpHost.listen()
+      const acpMcpServer = createNavigatorAcpMcpServer(this.mcpServerEntrypoint, mcpUrl, mcpHost.token)
       mcpConfigFile = createPrivateMcpConfigFile({
         mcpServers: {
           navigator: {
             type: 'stdio',
-            command: process.execPath,
-            args: [this.mcpServerEntrypoint],
+            command: acpMcpServer.command,
+            args: acpMcpServer.args,
             alwaysLoad: true,
-            env: {
-              NAVIGATOR_ACP_BRIDGE_URL: mcpUrl,
-              NAVIGATOR_ACP_BRIDGE_TOKEN: mcpHost.token,
-            },
+            env: Object.fromEntries(acpMcpServer.env.map(({ name, value }) => [name, value])),
           },
         },
       })
@@ -255,13 +265,13 @@ export class CodeBuddyAcpExecutionBackend implements ConversationExecutionBacken
         await withRunDeadline(peer.request('session/load', {
           sessionId: prior.nativeSessionId,
           cwd: mcpConfigFile.cwd,
-          mcpServers: [],
+          mcpServers: [acpMcpServer],
         }), runController, this.startupTimeoutMs, 'CodeBuddy ACP session load')
         conversationId = prior.nativeSessionId
       } else {
         const createdValue = await withRunDeadline(peer.request('session/new', {
           cwd: mcpConfigFile.cwd,
-          mcpServers: [],
+          mcpServers: [acpMcpServer],
         }), runController, this.startupTimeoutMs, 'CodeBuddy ACP session creation')
         const created = objectResult(createdValue, 'session/new')
         conversationId = requiredIdentifier(created.sessionId, 'session id')
@@ -636,6 +646,23 @@ function safeAcpDiagnostic(error: unknown): string {
   if (error instanceof NativeSubagentFailure) return error.diagnostic
   if (isAuthRequired(error)) return authUnavailableFailure().diagnostic
   return 'NATIVE_PROTOCOL_UNAVAILABLE: ACP turn failed; partial output retained, native details omitted.'
+}
+
+/** Build the ACP v1 stdio descriptor from this run's loopback bridge capability. */
+function createNavigatorAcpMcpServer(
+  entrypoint: string,
+  bridgeUrl: string,
+  bridgeToken: string,
+): AcpMcpServerStdio {
+  return {
+    name: 'navigator',
+    command: process.execPath,
+    args: [entrypoint],
+    env: [
+      { name: 'NAVIGATOR_ACP_BRIDGE_URL', value: bridgeUrl },
+      { name: 'NAVIGATOR_ACP_BRIDGE_TOKEN', value: bridgeToken },
+    ],
+  }
 }
 
 function safeAcpFailure(error: unknown, signal: AbortSignal): Error {

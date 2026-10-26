@@ -11,6 +11,7 @@ import { createInterface } from 'node:readline'
 
 const MAX_FRAME_BYTES = 2_000_000
 const SUPPORTED_PROTOCOLS = new Set(['2024-11-05', '2025-03-26', '2025-06-18'])
+const LATEST_SUPPORTED_PROTOCOL = '2025-06-18'
 const bridgeUrl = process.env.NAVIGATOR_ACP_BRIDGE_URL
 const bridgeToken = process.env.NAVIGATOR_ACP_BRIDGE_TOKEN
 const bridgeSession = randomUUID()
@@ -53,11 +54,14 @@ async function dispatch(request: RpcRequest): Promise<Record<string, unknown>> {
     case 'initialize': {
       const params = isRecord(request.params) ? request.params : {}
       const protocolVersion = params.protocolVersion
-      if (typeof protocolVersion !== 'string' || !SUPPORTED_PROTOCOLS.has(protocolVersion)) {
+      if (!isProtocolDate(protocolVersion)) {
         throw new McpRpcFailure(-32602, 'Unsupported MCP protocol version.')
       }
+      const negotiatedProtocolVersion = SUPPORTED_PROTOCOLS.has(protocolVersion)
+        ? protocolVersion
+        : LATEST_SUPPORTED_PROTOCOL
       return {
-        protocolVersion,
+        protocolVersion: negotiatedProtocolVersion,
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: 'navigator-authorized-tools', version: '1.0.0' },
       }
@@ -135,6 +139,13 @@ function writeFrame(value: Record<string, unknown>): void {
 /** Narrow JSON objects before using their fields as MCP protocol input. */
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+/** Validate the MCP date-version shape before negotiating a supported revision. */
+function isProtocolDate(value: unknown): value is string {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/u.test(value)) return false
+  const parsed = new Date(`${value}T00:00:00.000Z`)
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value
 }
 
 class McpRpcFailure extends Error {

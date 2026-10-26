@@ -78,6 +78,23 @@ extract credentials, or hide an actual `auth_required` response.
 `authMethods` 表示可用认证方式，不代表当前登录状态。使用 CLI 在宿主上的现有登录；不得调用
 `authenticate`、提取凭据或隐藏真实的 `auth_required` 响应。
 
+For CodeBuddy ACP, Navigator supplies the same single `navigator` MCP server
+in both `session/new` and `session/load`. The ACP v1 descriptor uses the
+standard `name`, absolute `command`, `args`, and `env: [{name, value}]` fields;
+the child CLI's private `--mcp-config` file is not treated as a substitute for
+the per-session list. The bridge URL and task-scoped bearer remain in the
+owner-only CLI config and are also supplied in the stdio server environment.
+Navigator does not copy them into prompts, Work events, or fixed diagnostics.
+A CodeBuddy native run remains necessary to verify the vendor's own
+session/transcript handling.
+
+The bundled stdio bridge supports MCP revisions `2024-11-05`, `2025-03-26`,
+and `2025-06-18`. When a client requests a well-formed newer date revision, the
+bridge negotiates its latest supported revision (`2025-06-18`) and keeps the
+same tool catalog and authorization rules. This follows the official
+[MCP version negotiation rule](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle#version-negotiation).
+Malformed version values still fail initialization.
+
 ACP tool-call updates carry fields such as `kind`, `status`, and `toolCallId`
 directly in the update object. Parse the standard flat shape, ignore absent
 optional update fields, and suppress repeated status reports for the same
@@ -86,6 +103,18 @@ not a permission or capability declaration. If `kind` is absent or unknown,
 route the request for explicit host review as unknown; never infer approval
 from a tool name or title. See the official [ACP Tool Calls
 specification](https://agentclientprotocol.com/protocol/v1/tool-calls).
+
+CodeBuddy ACP 的 `session/new` 与 `session/load` 都显式提供唯一的 `navigator` MCP
+server。ACP v1 描述使用标准 `name`、绝对路径 `command`、`args` 和
+`env: [{name, value}]` 字段；CLI 私有 `--mcp-config` 不会替代每个 session 的服务列表。
+bridge URL 与 task 级 bearer 仍保留在 owner-only CLI 配置中，并同时传入 stdio server 环境。
+Navigator 不会把它们复制到提示、Work 事件或固定诊断中。仍需原生 CodeBuddy 验收来确认厂商自身对
+session/transcript 的处理。
+
+内置 stdio bridge 支持 `2024-11-05`、`2025-03-26` 和 `2025-06-18` 版本。客户端请求格式正确但
+更新的日期版本时，bridge 会协商自身最新支持的 `2025-06-18`，工具目录与授权规则保持不变，符合官方
+[MCP 版本协商规则](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle#version-negotiation)。
+格式错误的版本值仍会导致初始化失败。
 
 ACP 工具调用更新会把 `kind`、`status`、`toolCallId` 等字段直接放在 update 对象中。应解析标准平铺
 结构，忽略缺失的可选更新字段，并用有界状态抑制同一 tool-call 标识的重复状态。工具 `name` 只是说明
