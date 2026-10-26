@@ -288,6 +288,203 @@ test('NavigatorExecutor: queued API admissions stay queued until dispatch and al
   }
 });
 
+test('NavigatorExecutor: drain control is bearer-protected and resumes only the exact generation token', async () => {
+  const adapter = new TestMockAdapter();
+  const app = await createTestApp(adapter);
+  const { executor } = app;
+  const { url, close } = await executor.startServer(0, '127.0.0.1');
+  const auth = { Authorization: `Bearer ${TEST_BEARER}`, 'Content-Type': 'application/json' };
+  try {
+    const unauthorized = await fetch(`${url}/internal/v1/executor/drain`);
+    assert.equal(unauthorized.status, 401);
+
+    const initial = await fetch(`${url}/internal/v1/executor/drain`, { headers: auth });
+    assert.equal(initial.status, 200);
+    const initialStatus = await initial.json();
+    assert.equal(initialStatus.mode, 'accepting');
+    assert.equal(initialStatus.generation, 0);
+    assert.equal(initialStatus.token, null);
+    assert.match(initialStatus.instanceId, /^[0-9a-f-]{36}$/u);
+
+    const invalidDrain = await fetch(`${url}/internal/v1/executor/drain`, {
+      method: 'POST', headers: auth, body: JSON.stringify({ force: true }),
+    });
+    assert.equal(invalidDrain.status, 400);
+
+    const started = await fetch(`${url}/internal/v1/executor/drain`, {
+      method: 'POST', headers: auth, body: JSON.stringify({}),
+    });
+    assert.equal(started.status, 200);
+    const draining = await started.json();
+    assert.equal(draining.mode, 'draining');
+    assert.equal(draining.generation, 1);
+    assert.match(draining.token, /^[0-9a-f-]{36}$/u);
+    assert.equal(draining.activeWorkDrained, true);
+
+    const admitted = await fetch(`${url}/api/v1/execute`, {
+      method: 'POST', headers: auth, body: JSON.stringify({ prompt: 'Persist while draining' }),
+    });
+    assert.equal(admitted.status, 202);
+    const queued = await admitted.json();
+    assert.equal(queued.status, 'queued');
+    const statusWhileQueued = await fetch(`${url}/internal/v1/executor/drain`, { headers: auth });
+    const queuedStatus = await statusWhileQueued.json();
+    assert.equal(queuedStatus.queuedTasks, 1);
+    assert.equal(queuedStatus.activeWorkDrained, true, 'durable queued work does not block an idle drain');
+
+    const manualTaskDispatch = await fetch(`${url}/api/v1/tasks/${queued.taskId}/dispatch`, {
+      method: 'POST', headers: auth,
+    });
+    assert.equal(manualTaskDispatch.status, 202);
+    assert.equal((await manualTaskDispatch.json()).status, 'queued');
+    const manualQueueDrain = await fetch(`${url}/api/v1/tasks/dispatch`, {
+      method: 'POST', headers: auth,
+    });
+    assert.equal(manualQueueDrain.status, 200);
+    assert.equal((await manualQueueDrain.json()).started, 0);
+    assert.equal(adapter.calls, 0);
+
+    const staleResume = await fetch(`${url}/internal/v1/executor/drain/resume`, {
+      method: 'POST', headers: auth,
+      body: JSON.stringify({ generation: draining.generation, token: '00000000-0000-4000-8000-000000000000' }),
+    });
+    assert.equal(staleResume.status, 409);
+    const stillDraining = await fetch(`${url}/internal/v1/executor/drain`, { headers: auth });
+    assert.equal((await stillDraining.json()).mode, 'draining');
+
+    const resumed = await fetch(`${url}/internal/v1/executor/drain/resume`, {
+      method: 'POST', headers: auth,
+      body: JSON.stringify({ generation: draining.generation, token: draining.token }),
+    });
+    assert.equal(resumed.status, 200);
+    const resumedStatus = await resumed.json();
+    assert.equal(resumedStatus.mode, 'accepting');
+    assert.equal(resumedStatus.generation, draining.generation);
+    assert.equal(resumedStatus.token, null);
+    await waitForTask(executor, queued.taskId, task => task.status === 'completed');
+    assert.equal(adapter.calls, 1);
+
+    const nextDrainResponse = await fetch(`${url}/internal/v1/executor/drain`, {
+      method: 'POST', headers: auth, body: JSON.stringify({}),
+    });
+    const nextDrain = await nextDrainResponse.json();
+    assert.equal(nextDrain.generation, draining.generation + 1);
+    const oldGenerationResume = await fetch(`${url}/internal/v1/executor/drain/resume`, {
+      method: 'POST', headers: auth,
+      body: JSON.stringify({ generation: draining.generation, token: draining.token }),
+    });
+    assert.equal(oldGenerationResume.status, 409);
+    const currentGenerationStatus = await fetch(`${url}/internal/v1/executor/drain`, { headers: auth });
+    assert.equal((await currentGenerationStatus.json()).generation, nextDrain.generation);
+  } finally {
+    await close();
+    await disposeApp(app);
+  }
+});
+
+test('NavigatorExecutor: drain rejects old limiter waiters, keeps admissions queued, then resumes them once', async () => {
+  const adapter = new TestMockAdapter({ delayMs: 120 });
+  const app = await createTestApp(adapter);
+  const { executor } = app;
+  try {
+    const firstExecution = executor.executeTask({
+      taskId: 'drain-running-task', sessionId: 'drain-running-session', prompt: 'Finish current work',
+    });
+    await waitForTask(executor, 'drain-running-task', task => task.status === 'running');
+
+    const waitingExecution = executor.executeTask({
+      taskId: 'drain-limiter-waiter', sessionId: 'drain-waiter-session', prompt: 'Keep queued during drain',
+    });
+    const sessionTailExecution = executor.executeTask({
+      taskId: 'drain-session-tail', sessionId: 'drain-running-session', prompt: 'Keep session successor queued',
+    });
+    const waitDeadline = performance.now() + 1_000;
+    while (executor.taskLimiter.snapshot().waiting !== 1 && performance.now() < waitDeadline) await delay(5);
+    assert.equal(executor.taskLimiter.snapshot().waiting, 1, 'the second foreground dispatch must be waiting for the existing limiter slot');
+
+    const entered = executor.startDrain();
+    const initial = await executor.getDrainStatus();
+    const drainToken = entered.token;
+    const drainGeneration = entered.generation;
+    assert.equal(initial.activeTasks, 1);
+    assert.equal(initial.dispatches.active, 1);
+    assert.equal(initial.dispatches.waiting, 0, 'entering drain must release the unclaimed limiter waiter');
+    assert.equal(initial.activeWorkDrained, false);
+    const boundedWait = await executor.waitForIdle(0);
+    assert.equal(boundedWait.activeWorkDrained, false);
+    assert.equal(boundedWait.activeTasks, 1);
+
+    const queuedTask = await executor.startTask({ prompt: 'Stay durable while draining' });
+    assert.equal(queuedTask.status, 'queued');
+
+    const manualDispatch = await executor.dispatchTask(queuedTask.id);
+    assert.equal(manualDispatch.status, 'queued');
+    assert.equal(await executor.drainQueuedTasks(), 0);
+
+    const [runningOutcome, waiterOutcome, sessionTailOutcome] = await Promise.all([
+      firstExecution, waitingExecution, sessionTailExecution,
+    ]);
+    assert.equal(runningOutcome.status, 'completed');
+    assert.equal(waiterOutcome.status, 'queued');
+    assert.equal(sessionTailOutcome.status, 'queued');
+    assert.equal(adapter.calls, 1, 'no previously waiting task may claim after drain begins');
+
+    const drained = await executor.waitForIdle(1_000);
+    assert.equal(drained.activeWorkDrained, true);
+    assert.equal(drained.activeTasks, 0);
+    assert.equal(drained.queuedTasks, 3, 'queued work remains durable while active work is drained');
+    assert.equal(drained.notifications.pollingPaused, true);
+
+    executor.resumeFromDrain(drainGeneration, drainToken);
+    await waitForTask(executor, 'drain-limiter-waiter', task => task.status === 'completed');
+    await waitForTask(executor, 'drain-session-tail', task => task.status === 'completed');
+    await waitForTask(executor, queuedTask.id, task => task.status === 'completed');
+    assert.equal(adapter.calls, 4, 'each durable queued task must be claimed once after resume');
+  } finally {
+    await disposeApp(app);
+  }
+});
+
+test('NavigatorExecutor: drain waits for an existing notification claim and pauses later polling', async () => {
+  const app = await createTestApp();
+  const { executor } = app;
+  executor.config.teams = { connectorId: 'notification-drain-fixture' };
+  let claimCount = 0;
+  let releaseClaim;
+  const claimGate = new Promise(resolve => { releaseClaim = resolve; });
+  executor.config.workState.claimNotifications = async () => {
+    claimCount += 1;
+    if (claimCount === 1) await claimGate;
+    return [];
+  };
+  try {
+    const claim = executor.drainTeamsNotifications();
+    assert.equal(claimCount, 1);
+    executor.startDrain();
+
+    const duringClaim = await executor.getDrainStatus();
+    assert.equal(duringClaim.notifications.configured, true);
+    assert.equal(duringClaim.notifications.pollingPaused, true);
+    assert.equal(duringClaim.notifications.inFlight, true);
+    assert.equal(duringClaim.activeWorkDrained, false);
+
+    const deadline = await executor.waitForIdle(0);
+    assert.equal(deadline.activeWorkDrained, false);
+    assert.equal(deadline.notifications.inFlight, true);
+
+    releaseClaim();
+    await claim;
+    const drained = await executor.waitForIdle(1_000);
+    assert.equal(drained.activeWorkDrained, true);
+    assert.equal(drained.notifications.inFlight, false);
+    await executor.drainTeamsNotifications();
+    assert.equal(claimCount, 1, 'drain must prevent a later outbox claim');
+  } finally {
+    releaseClaim();
+    await disposeApp(app);
+  }
+});
+
 test('NavigatorExecutor: an admitted task can be cancelled before the dispatcher claims it', async () => {
   const { executor, ctx } = await createTestApp();
   try {
@@ -329,6 +526,52 @@ test('NavigatorExecutor: recovery adopts safe queued rows and fails uncertain or
     assert.ok(gated.events.some(row => row.event.code === 'EXECUTOR_RESTARTED'));
   } finally {
     await disposeApp({ executor, ctx });
+  }
+});
+
+test('NavigatorExecutor: a new instance starts accepting, reclaims queued work once, and rejects the old drain token', async () => {
+  const store = new InMemoryWorkStateStore();
+  const queued = await store.createTask({ id: 'drain-restart-queued', sessionId: 'drain-restart-session', prompt: 'Run once after restart' });
+  const first = await createTestApp(new TestMockAdapter(), { workStateStore: store });
+  const firstDrain = first.executor.startDrain();
+  await disposeApp(first);
+
+  const adapter = new TestMockAdapter();
+  const second = await createTestApp(adapter, { workStateStore: store });
+  try {
+    const status = await second.executor.getDrainStatus();
+    assert.equal(status.mode, 'accepting');
+    assert.equal(status.generation, 0);
+    assert.notEqual(status.instanceId, firstDrain.instanceId);
+    assert.equal(status.queuedTasks, 1);
+    assert.throws(
+      () => second.executor.resumeFromDrain(firstDrain.generation, firstDrain.token),
+      error => error.code === 'DRAIN_GENERATION_MISMATCH',
+    );
+
+    assert.equal(await second.executor.drainQueuedTasks(), 1);
+    await waitForTask(second.executor, queued.id, task => task.status === 'completed');
+    assert.equal(adapter.calls, 1);
+    assert.equal((await store.getTask(queued.id)).status, 'completed');
+  } finally {
+    await disposeApp(second);
+  }
+});
+
+test('NavigatorExecutor: a shutdown drain cannot be resumed while SIGTERM cleanup is in progress', async () => {
+  const app = await createTestApp();
+  try {
+    const shutdownDrain = app.executor.startShutdownDrain();
+    assert.throws(
+      () => app.executor.resumeFromDrain(shutdownDrain.generation, shutdownDrain.token),
+      error => error.code === 'EXECUTOR_STOPPED',
+    );
+    const status = await app.executor.getDrainStatus();
+    assert.equal(status.mode, 'draining');
+    assert.equal(status.generation, shutdownDrain.generation);
+    assert.equal(status.activeWorkDrained, true);
+  } finally {
+    await disposeApp(app);
   }
 });
 

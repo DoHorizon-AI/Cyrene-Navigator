@@ -176,8 +176,24 @@ CLI Options:
 - `--plugins-dir`: Directory containing dynamic plugins (`.mjs` / `.js`).
 - `--watch-plugins` (default: `true`): Enable live file watching.
 - `--workspace-id` (default: `default`): Workspace tenant context.
+- `--drain-timeout-ms` (default: `30000`, maximum: `900000`): Maximum graceful-drain wait after SIGTERM/SIGINT.
+- `--abort-cleanup-timeout-ms` (default: `5000`, maximum: `30000`): Bounded cleanup wait after the drain deadline expires.
 
-### 4.2 Running with Docker
+### 4.2 Graceful drain for restart or hot update
+
+The service keeps accepting and durably queuing HTTP and Teams work while it drains. It stops task claims and notification polling, rejects unclaimed limiter waiters back to their queued records, and lets already-running tasks and an already-claimed notification batch finish.
+
+The service-bearer-protected control routes are:
+
+- `GET /internal/v1/executor/drain`: Read the process instance, drain generation/token, active and queued task counts (`countsComplete` reports whether the durable Work listing completed), dispatch waiters, notification polling state, and `activeWorkDrained`.
+- `POST /internal/v1/executor/drain` with `{}`: Enter drain. Repeated calls return the same generation and token for this process instance.
+- `POST /internal/v1/executor/drain/resume` with `{"generation": 1, "token": "<token from this instance>"}`: Resume only the matching active drain. A stale token or generation returns `409`.
+
+`activeWorkDrained` means this process has no running task, active dispatch, or claimed notification delivery left to finish. `queuedTasks` can remain nonzero by design. The notification fields report whether polling is paused and a claim is in flight; they do not report the durable notification backlog. A new process starts in `accepting` mode with a new instance ID, so a prior process token cannot resume it. Startup recovery runs only never-claimed queued tasks and closes interrupted running tasks without replay. Once SIGTERM/SIGINT cleanup starts, resume is rejected for that process.
+
+If the configured graceful-drain deadline expires, SIGTERM cleanup aborts active work for a second bounded interval and exits nonzero. Any task still recorded as running is left for startup recovery, which records the interruption instead of claiming it again.
+
+### 4.3 Running with Docker
 A dedicated production Dockerfile is provided at `Dockerfile.executor`:
 
 ```bash
@@ -209,3 +225,20 @@ Navigator includes a comprehensive verification suite:
   ```bash
   python scripts/ci/generate_and_validate_manifest.py
   ```
+
+---
+<!-- Chinese Translation / 中文翻译 -->
+
+## SIGTERM 与热更新前的排空
+
+排空期间服务仍接收 HTTP 与 Teams 请求并将任务持久化为 `queued`，但停止新的任务认领和通知轮询。已开始的任务与已认领的通知批次自然完成；尚未认领的任务继续保存在 Work 队列中。
+
+以下控制路由使用同一服务 Bearer 认证：
+
+- `GET /internal/v1/executor/drain`：读取当前进程实例、排空代次/令牌、活动和排队任务数（`countsComplete` 表示持久 Work 列表是否完整读取）、dispatch 等待数，以及通知轮询状态和 `activeWorkDrained`。
+- `POST /internal/v1/executor/drain`，请求体 `{}`：进入排空。重复请求返回本进程当前代次和令牌。
+- `POST /internal/v1/executor/drain/resume`，请求体 `{"generation": 1, "token": "<本进程返回的令牌>"}`：仅匹配当前排空时恢复；旧令牌或代次返回 `409`。
+
+`activeWorkDrained` 表示此进程没有仍在运行的任务、活动 dispatch 或已认领的通知投递。`queuedTasks` 可以继续大于零。通知字段只反映轮询是否暂停及当前是否有在途认领，不表示持久通知队列为空。新进程以新实例 ID 从 `accepting` 启动，旧进程令牌不能用于恢复它。启动恢复只执行从未认领的排队任务，并关闭中断的 running 任务，不会重放它们。SIGTERM/SIGINT 清理开始后，该进程会拒绝 resume。
+
+如果 SIGTERM 排空期限到期，服务再用一个有界时间取消活动工作并以非零状态退出。退出时仍处于 running 的任务留给启动恢复记录为中断，不会再次认领。

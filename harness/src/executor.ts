@@ -153,6 +153,31 @@ export interface ExecutorConfig {
   ) => Promise<string>;
 }
 
+/** Process-local drain state; durable queued rows remain in the Work service. */
+export interface ExecutorDrainStatus {
+  readonly mode: 'accepting' | 'draining';
+  readonly instanceId: string;
+  readonly generation: number;
+  readonly token: string | null;
+  readonly startedAt: number | null;
+  readonly countsComplete: boolean;
+  /** Durable Work Task rows that have been claimed and remain running. */
+  readonly activeTasks: number;
+  /** Durable Work Task rows that have not been claimed. */
+  readonly queuedTasks: number;
+  readonly dispatches: {
+    readonly active: number;
+    readonly waiting: number;
+  };
+  readonly notifications: {
+    readonly configured: boolean;
+    readonly pollingPaused: boolean;
+    readonly inFlight: boolean;
+  };
+  /** True when this process has no active task/claim or notification delivery to finish. */
+  readonly activeWorkDrained: boolean;
+}
+
 /** Verified transport policy and Exchange route for the built-in Teams bridge. */
 export interface TeamsExecutorConfig {
   readonly connectorId: string;
@@ -174,7 +199,17 @@ class ExecutorRequestError extends Error {
   }
 }
 
+/** Stop an unclaimed dispatch while preserving its durable queued row. */
+class TaskDispatchPausedError extends Error {
+  constructor() {
+    super('Executor is draining; task remains queued');
+    this.name = 'TaskDispatchPausedError';
+  }
+}
+
 const TERMINAL_STATUSES = new Set<TaskStatus>(['completed', 'failed', 'aborted']);
+/** Bound Work-state refresh frequency while waiting for drain completion. */
+const DRAIN_STATUS_POLL_INTERVAL_MS = 500;
 const INTERRUPTED_STATUSES = new Set<TaskStatus>(['running', 'waiting_approval', 'waiting_input']);
 const PAUSED_STATUSES = new Set<TaskStatus>(['waiting_approval', 'waiting_input', 'awaiting_user_authorization']);
 const SAFE_CONTINUATION_TOOLS = new Set([
@@ -207,6 +242,7 @@ class TaskConcurrencyLimiter {
   private active = 0;
   private activeForeground = 0;
   private activeBackground = 0;
+  private draining = false;
   private readonly waiting: TaskWaiter[] = [];
   private readonly foregroundMaximum: number;
   private readonly backgroundMaximum = 1;
@@ -227,8 +263,35 @@ class TaskConcurrencyLimiter {
     }
   }
 
+  /** Stop dispatch and release every unclaimed waiter back to durable queued state. */
+  beginDrain(): void {
+    if (this.draining) return;
+    this.draining = true;
+    for (const waiter of this.waiting.splice(0)) {
+      waiter.signal.removeEventListener('abort', waiter.onAbort);
+      waiter.reject(new TaskDispatchPausedError());
+    }
+  }
+
+  /** Resume existing capacity scheduling after a matching drain token is presented. */
+  resume(): void {
+    if (!this.draining) return;
+    this.draining = false;
+    this.drain();
+  }
+
+  /** Recheck immediately before the durable Work claim, including a pre-drain slot reservation. */
+  assertDispatchAllowed(): void {
+    if (this.draining) throw new TaskDispatchPausedError();
+  }
+
+  snapshot(): { readonly active: number; readonly waiting: number; readonly draining: boolean } {
+    return { active: this.active, waiting: this.waiting.length, draining: this.draining };
+  }
+
   private acquire(executionClass: TaskExecutionClass, signal: AbortSignal): Promise<void> {
     signal.throwIfAborted();
+    if (this.draining) return Promise.reject(new TaskDispatchPausedError());
     if (this.canRun(executionClass)) {
       this.reserve(executionClass);
       return Promise.resolve();
@@ -274,6 +337,7 @@ class TaskConcurrencyLimiter {
   }
 
   private drain(): void {
+    if (this.draining) return;
     for (;;) {
       const index = this.waiting.findIndex(waiter => this.canRun(waiter.executionClass));
       if (index < 0) return;
@@ -299,6 +363,12 @@ export class NavigatorExecutor {
   private readonly agentModelSelections = new WeakMap<Agent, ModelSelectionRef>();
   private readonly sessionTails = new Map<string, Promise<void>>();
   private readonly taskLimiter: TaskConcurrencyLimiter;
+  private readonly instanceId = randomUUID();
+  private drainGeneration = 0;
+  private drainToken?: string;
+  private drainStartedAt?: number;
+  private shutdownRequested = false;
+  private disposePromise?: Promise<void>;
   private readonly defaultTimeoutMs?: number;
   private httpServer?: Server;
   private drainTimer?: ReturnType<typeof setInterval>;
@@ -317,6 +387,172 @@ export class NavigatorExecutor {
     this.taskLimiter = new TaskConcurrencyLimiter(config.maxConcurrentTasks ?? 2);
     this.setupStreamListeners();
     this.ready = this.recoverInterruptedTasks();
+  }
+
+  /** Stop new claims and cancel limiter waiters while leaving durable admission open. */
+  startDrain(): { readonly instanceId: string; readonly generation: number; readonly token: string; readonly startedAt: number } {
+    if (this.shutdownRequested || this.disposePromise !== undefined) {
+      throw new ExecutorRequestError(503, 'EXECUTOR_STOPPED', 'Executor is shutting down.');
+    }
+    this.enterDrain();
+    return this.currentDrainToken();
+  }
+
+  /** Enter a non-resumable drain for SIGTERM/SIGINT shutdown. */
+  startShutdownDrain(): { readonly instanceId: string; readonly generation: number; readonly token: string; readonly startedAt: number } {
+    if (this.disposePromise !== undefined) {
+      throw new ExecutorRequestError(503, 'EXECUTOR_STOPPED', 'Executor is shutting down.');
+    }
+    this.shutdownRequested = true;
+    this.enterDrain();
+    return this.currentDrainToken();
+  }
+
+  private currentDrainToken(): { readonly instanceId: string; readonly generation: number; readonly token: string; readonly startedAt: number } {
+    return {
+      instanceId: this.instanceId,
+      generation: this.drainGeneration,
+      token: this.drainToken!,
+      startedAt: this.drainStartedAt!,
+    };
+  }
+
+  private enterDrain(): void {
+    if (this.drainToken === undefined) {
+      this.drainGeneration += 1;
+      this.drainToken = randomUUID();
+      this.drainStartedAt = Date.now();
+      this.taskLimiter.beginDrain();
+    }
+  }
+
+  /** Resume only the exact drain instance and generation returned by startDrain. */
+  resumeFromDrain(generation: number, token: string): void {
+    if (this.shutdownRequested || this.disposePromise !== undefined) {
+      throw new ExecutorRequestError(409, 'EXECUTOR_STOPPED', 'This executor instance is stopping.');
+    }
+    if (this.drainToken === undefined || generation !== this.drainGeneration || token !== this.drainToken) {
+      throw new ExecutorRequestError(409, 'DRAIN_GENERATION_MISMATCH', 'The drain token does not match this executor instance.');
+    }
+    this.drainToken = undefined;
+    this.drainStartedAt = undefined;
+    this.taskLimiter.resume();
+    setImmediate(() => {
+      void this.drainQueuedTasks().catch(error => {
+        this.ctx.logger.warn(`Queued task dispatch failed after drain resume (${safeErrorMessage(error)})`);
+      });
+      void this.drainTeamsNotifications().catch(error => {
+        this.ctx.logger.warn(`Teams notification dispatch failed after drain resume (${safeErrorMessage(error)})`);
+      });
+    });
+  }
+
+  /** Read process drain state and durable task counts without claiming queued work. */
+  async getDrainStatus(): Promise<ExecutorDrainStatus> {
+    await this.ready;
+    let queuedTasks = 0;
+    let activeTasks = 0;
+    let cursor: string | undefined;
+    const seenCursors = new Set<string>();
+    for (;;) {
+      const page = await this.config.workState.listTasks({ cursor, limit: 100 });
+      for (const task of page.items) {
+        if (task.status === 'queued') queuedTasks += 1;
+        else if (task.status === 'running') activeTasks += 1;
+      }
+      if (!page.nextCursor) break;
+      if (seenCursors.has(page.nextCursor)) throw new Error('Work task listing returned a repeated cursor');
+      seenCursors.add(page.nextCursor);
+      cursor = page.nextCursor;
+    }
+    const dispatches = this.taskLimiter.snapshot();
+    const notificationsInFlight = this.teamsNotificationDrain !== undefined;
+    return {
+      mode: this.drainToken === undefined ? 'accepting' : 'draining',
+      instanceId: this.instanceId,
+      generation: this.drainGeneration,
+      token: this.drainToken ?? null,
+      startedAt: this.drainStartedAt ?? null,
+      countsComplete: true,
+      activeTasks,
+      queuedTasks,
+      dispatches: { active: dispatches.active, waiting: dispatches.waiting },
+      notifications: {
+        configured: this.config.teams !== undefined,
+        pollingPaused: this.drainToken !== undefined,
+        inFlight: notificationsInFlight,
+      },
+      activeWorkDrained: activeTasks === 0
+        && dispatches.active === 0
+        && dispatches.waiting === 0
+        && this.tasks.size === 0
+        && !notificationsInFlight,
+    };
+  }
+
+  /** Return a conservative snapshot when durable Work-state counts are unavailable. */
+  private localDrainStatus(): ExecutorDrainStatus {
+    const dispatches = this.taskLimiter.snapshot();
+    const activeTasks = [...this.tasks.values()].filter(task => task.record.status === 'running').length;
+    const queuedTasks = [...this.tasks.values()].filter(task => task.record.status === 'queued').length;
+    return {
+      mode: this.drainToken === undefined ? 'accepting' : 'draining',
+      instanceId: this.instanceId,
+      generation: this.drainGeneration,
+      token: this.drainToken ?? null,
+      startedAt: this.drainStartedAt ?? null,
+      countsComplete: false,
+      activeTasks,
+      queuedTasks,
+      dispatches: { active: dispatches.active, waiting: dispatches.waiting },
+      notifications: {
+        configured: this.config.teams !== undefined,
+        pollingPaused: this.drainToken !== undefined,
+        inFlight: this.teamsNotificationDrain !== undefined,
+      },
+      activeWorkDrained: false,
+    };
+  }
+
+  /** Wait for current task executions and a claimed notification batch, without waiting for durable queued rows. */
+  async waitForIdle(timeoutMs: number): Promise<ExecutorDrainStatus> {
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 900_000) {
+      throw new TypeError('Drain timeout must be an integer between 0 and 900000 milliseconds');
+    }
+    if (this.drainToken === undefined) {
+      throw new ExecutorRequestError(409, 'EXECUTOR_NOT_DRAINING', 'Start a drain before waiting for idle.');
+    }
+    const deadline = Date.now() + timeoutMs;
+    let status = this.localDrainStatus();
+    for (;;) {
+      const remainingBeforeRead = Math.max(0, deadline - Date.now());
+      if (remainingBeforeRead === 0) return { ...status, activeWorkDrained: false };
+      const read = this.getDrainStatus().then(value => value, () => undefined);
+      let readTimer: ReturnType<typeof setTimeout> | undefined;
+      const readTimeout = new Promise<undefined>(resolve => {
+        readTimer = setTimeout(() => resolve(undefined), remainingBeforeRead);
+      });
+      const refreshed = await Promise.race([read, readTimeout]);
+      if (readTimer !== undefined) clearTimeout(readTimer);
+      if (refreshed === undefined) {
+        if (Date.now() >= deadline) return { ...status, countsComplete: false, activeWorkDrained: false };
+        status = this.localDrainStatus();
+        await delay(Math.min(DRAIN_STATUS_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())));
+        continue;
+      }
+      status = refreshed;
+      if (status.activeWorkDrained || Date.now() >= deadline) return status;
+      const pending: Promise<unknown>[] = [...this.tasks.values()]
+        .map(task => task.completion)
+        .filter((completion): completion is Promise<TaskOutcome> => completion !== undefined);
+      if (this.teamsNotificationDrain !== undefined) pending.push(this.teamsNotificationDrain);
+      const remainingMs = Math.max(0, deadline - Date.now());
+      if (pending.length > 0) {
+        await Promise.race([Promise.allSettled(pending), delay(Math.min(DRAIN_STATUS_POLL_INTERVAL_MS, remainingMs))]);
+      } else {
+        await delay(Math.min(DRAIN_STATUS_POLL_INTERVAL_MS, remainingMs));
+      }
+    }
   }
 
   /** Capture actual upstream failures and tool lifecycle facts for the active task.  中文：捕获上游真实失败和工具生命周期事实。 */
@@ -543,14 +779,17 @@ export class NavigatorExecutor {
   /** Poll durable queued rows and race-safely claim each for execution.  中文：轮询持久排队记录并通过原子认领安全执行。 */
   async drainQueuedTasks(): Promise<number> {
     await this.ready;
+    if (this.drainToken !== undefined) return 0;
     let started = 0;
     let cursor: string | undefined;
     for (;;) {
+      if (this.drainToken !== undefined) return started;
       const page = await this.config.workState.listTasks({ cursor, limit: 100 });
       const queued = page.items.filter(record => record.status === 'queued' && !this.tasks.has(record.id));
       queued.sort((left, right) => Number(recordExecutionClass(right) === 'foreground')
         - Number(recordExecutionClass(left) === 'foreground'));
       for (const record of queued) {
+        if (this.drainToken !== undefined) return started;
         this.adoptQueuedTask(record, {
           taskId: record.id,
           sessionId: record.sessionId,
@@ -599,6 +838,7 @@ export class NavigatorExecutor {
         if (existing.prompt !== params.prompt || (params.sessionId !== undefined && existing.sessionId !== params.sessionId)) {
           throw new Error('Existing queued task does not match this dispatch request');
         }
+        if (dispatchQueued && this.drainToken !== undefined) return stateFromRecord(existing);
         return dispatchQueued
           ? this.adoptQueuedTask(existing, params, subscriber)
           : stateFromRecord(existing);
@@ -637,6 +877,7 @@ export class NavigatorExecutor {
         return active;
       }
       if (raced.status === 'queued') {
+        if (dispatchQueued && this.drainToken !== undefined) return stateFromRecord(raced);
         return dispatchQueued ? this.adoptQueuedTask(raced, params, subscriber) : stateFromRecord(raced);
       }
       return stateFromRecord(raced);
@@ -645,6 +886,7 @@ export class NavigatorExecutor {
     // An API admission remains queued until the dispatcher claims it. This means connector
     // retries and process restarts cannot accidentally start a second model/tool side effect.
     if (!dispatchQueued) return stateFromRecord(record);
+    if (this.drainToken !== undefined) return stateFromRecord(record);
     const concurrent = this.tasks.get(record.id);
     if (concurrent) {
       if (subscriber) concurrent.subscribers.add(subscriber);
@@ -722,6 +964,7 @@ export class NavigatorExecutor {
         () => this.runTaskWithSlot(task, params),
       );
     } catch (error: unknown) {
+      if (error instanceof TaskDispatchPausedError) return outcome(task.record);
       if (!task.abortController.signal.aborted) throw error;
       const latest = await this.config.workState.getTask(task.id).catch(() => undefined);
       return outcome(latest ?? task.record, safeErrorMessage(error), 'aborted');
@@ -740,6 +983,7 @@ export class NavigatorExecutor {
     let claimed = false;
     try {
       task.abortController.signal.throwIfAborted();
+      this.taskLimiter.assertDispatchAllowed();
       const claim = await this.config.workState.claimTask(task.id);
       task.record = claim.task;
       if (!claim.claimed) {
@@ -1597,6 +1841,7 @@ export class NavigatorExecutor {
   /** Deliver durable Teams notifications once; uncertain provider outcomes stay terminal. */
   private async drainTeamsNotifications(): Promise<void> {
     if (this.teamsNotificationDrain) return this.teamsNotificationDrain;
+    if (this.drainToken !== undefined) return;
     const config = this.config.teams;
     if (!config) return;
     this.teamsNotificationDrain = (async () => {
@@ -1788,6 +2033,30 @@ export class NavigatorExecutor {
 
     try {
       await this.ready;
+      if (method === 'GET' && url.pathname === '/internal/v1/executor/drain') {
+        this.sendJson(res, 200, await this.getDrainStatus());
+        return;
+      }
+      if (method === 'POST' && url.pathname === '/internal/v1/executor/drain') {
+        const body = await this.readJsonBody(req);
+        if (!isExactObjectKeys(body, [])) {
+          throw new ExecutorRequestError(400, 'DRAIN_REQUEST_INVALID', 'Drain requests must have an empty JSON object body.');
+        }
+        this.startDrain();
+        this.sendJson(res, 200, await this.getDrainStatus());
+        return;
+      }
+      if (method === 'POST' && url.pathname === '/internal/v1/executor/drain/resume') {
+        const body = await this.readJsonBody(req);
+        if (!isExactObjectKeys(body, ['generation', 'token'])
+          || typeof body.generation !== 'number' || !Number.isSafeInteger(body.generation) || body.generation < 1
+          || typeof body.token !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(body.token)) {
+          throw new ExecutorRequestError(400, 'DRAIN_RESUME_INVALID', 'Resume requires the exact drain generation and token.');
+        }
+        this.resumeFromDrain(body.generation, body.token);
+        this.sendJson(res, 200, await this.getDrainStatus());
+        return;
+      }
       if (method === 'GET' && url.pathname === '/api/v1/tasks') {
         const cursor = url.searchParams.get('cursor') ?? undefined;
         const limitValue = url.searchParams.get('limit');
@@ -1814,13 +2083,30 @@ export class NavigatorExecutor {
         const body = await this.readJsonBody(req);
         const params = taskParams(body);
         if (body.stream === true || req.headers.accept?.includes('text/event-stream')) {
+          if (this.drainToken !== undefined) {
+            const record = await this.startTask(params);
+            this.openEventStream(res, 202);
+            this.writeSseEvent(res, undefined, 'status', {
+              type: 'status', taskId: record.id, sessionId: record.sessionId,
+              status: 'queued', timestamp: Date.now(),
+            });
+            res.end();
+            return;
+          }
           this.openEventStream(res);
           const subscriber = (event: ExecutorStreamEvent) => this.writeSseEvent(res, event.seq, event.type, event);
-          await this.executeTask(params, subscriber);
+          const outcome = await this.executeTask(params, subscriber);
+          if (outcome.status === 'queued' && this.drainToken !== undefined) {
+            this.writeSseEvent(res, undefined, 'status', {
+              type: 'status', taskId: outcome.taskId, sessionId: outcome.sessionId,
+              status: 'queued', timestamp: Date.now(),
+            });
+          }
           if (!res.writableEnded) res.end();
           return;
         }
-        this.sendJson(res, 200, await this.executeTask(params));
+        const outcome = await this.executeTask(params);
+        this.sendJson(res, outcome.status === 'queued' ? 202 : 200, outcome);
         return;
       }
 
@@ -1954,8 +2240,8 @@ export class NavigatorExecutor {
     }
   }
 
-  private openEventStream(res: ServerResponse): void {
-    res.writeHead(200, {
+  private openEventStream(res: ServerResponse, status = 200): void {
+    res.writeHead(status, {
       'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-cache, no-transform',
       Connection: 'keep-alive',
@@ -2107,6 +2393,14 @@ export class NavigatorExecutor {
 
   /** Stop active agent work and release listeners/server resources.  中文：取消活动 Agent 并释放监听器和服务资源。 */
   async dispose(): Promise<void> {
+    if (this.disposePromise !== undefined) return this.disposePromise;
+    this.shutdownRequested = true;
+    this.enterDrain();
+    this.disposePromise = Promise.resolve().then(() => this.disposeImpl());
+    return this.disposePromise;
+  }
+
+  private async disposeImpl(): Promise<void> {
     this.disposeStreamListener?.();
     this.disposeErrorListener?.();
     this.disposeSessionListener?.();
