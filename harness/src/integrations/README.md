@@ -57,7 +57,8 @@ health, and resource reads use the actual DSH
 session's current user Bearer and configured Workspace. Renewal start accepts
 only a recent authorization reference returned by that same session's scoped
 health read. HF device-code renewal starts a fixed-scope challenge after an
-explicit user request; its official verification URL and bounded user code are
+explicit user request only when the source probe is present, non-future, and at
+most 20 minutes old; its official verification URL and bounded user code are
 returned to that session, while HF still requires the user to enter the code and
 consent on its official page. Other providers still wait for Navigator's
 existing human approval before sending an empty typed Product request with
@@ -109,8 +110,7 @@ operation、短暂轮询，并且只在 Exchange 返回 `SUCCEEDED` 后读取缓
 exchange_authorization_health、exchange_reauthorization_start、
 exchange_reauthorization_status 和 exchange_cloud_resources_query。连接列表、健康与资源读取使用当前 DSH Session 的 user Bearer 及宿主配置的
 Workspace。续期启动只接受同一 Session 最近一次受范围保护的健康查询返回的授权引用。HF device-code
-续期在用户明确要求后启动固定 scope 的 challenge，将官方验证地址和有界一次性 code 返回该 Session；HF 仍要求
-用户在其官方页面输入 code 并同意。其他 Provider 在发送无请求体、带 Idempotency-Key 的 Product 请求前
+续期仅在源探测时间非空、非未来且不超过 20 分钟时，才在用户明确要求后启动固定 scope 的 challenge，并将官方验证地址和有界一次性 code 返回该 Session；HF 仍要求用户在其官方页面输入 code 并同意。其他 Provider 在发送无请求体、带 Idempotency-Key 的 Product 请求前
 继续等待 Navigator 现有人工审批。其他浏览器授权 URL 与二维码附件引用不会进入模型结果。资源工具只读取
 Exchange 最新投影。Exchange 负责 provider
 轮询、比较和自动刷新；启用宿主凭据通知后，Navigator 在现有 Teams 通知 tick 中读取缓存快照，并把

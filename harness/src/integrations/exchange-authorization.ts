@@ -18,6 +18,7 @@ const MAX_CLOUD_RESOURCES = 500;
 const MAX_ATTRIBUTE_COUNT = 64;
 const MAX_ATTRIBUTE_TEXT_BYTES = 512;
 const AUTHORIZATION_REFERENCE_TTL_MS = 5 * 60_000;
+const HF_DEVICE_HEALTH_MAX_AGE_MS = 20 * 60_000;
 const REAUTHORIZATION_REQUIRED_CODE = 'EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED';
 const HF_DEVICE_VERIFICATION_URLS = new Set([
   'https://hf.co/oauth/device',
@@ -388,8 +389,10 @@ export function registerExchangeAuthorizationTools(
     readonly provider: ExchangeProvider;
     readonly authorizationState: ExchangeAuthorizationState;
     readonly generation: number;
-    readonly checkedAt: number;
+    readonly sourceCheckedAt: number | null;
+    readonly readAt: number;
   }>>();
+  const renewalProviders = new Map<string, Map<string, ExchangeProvider>>();
   const registrations = [
     ctx.tools.register(defineTool({
       name: 'exchange_connections_list',
@@ -421,7 +424,8 @@ export function registerExchangeAuthorizationTools(
             provider: health.provider,
             authorizationState: health.authorizationState,
             generation: health.generation,
-            checkedAt: Date.now(),
+            sourceCheckedAt: health.checkedAt === null ? null : Date.parse(health.checkedAt),
+            readAt: Date.now(),
           });
         }
         // Let an explicit HF device-code renewal continue in this task; the official HF consent page remains the gate.
@@ -452,9 +456,19 @@ export function registerExchangeAuthorizationTools(
         const authorizationRef = stringArg(args.authorizationRef, 'authorization reference');
         assertIdentifier(authorizationRef, 'authorization reference');
         const knownHealth = healthReferences.get(identity.sessionId)?.get(authorizationRef);
+        const now = Date.now();
+        const sourceHealthAge = knownHealth?.sourceCheckedAt === null || knownHealth?.sourceCheckedAt === undefined
+          ? null
+          : now - knownHealth.sourceCheckedAt;
+        const hfSourceHealthStale = knownHealth?.provider === 'hf'
+          && (sourceHealthAge === null || sourceHealthAge < 0
+            || sourceHealthAge > HF_DEVICE_HEALTH_MAX_AGE_MS);
         if (!knownHealth || knownHealth.authorizationState !== 'REAUTHORIZATION_REQUIRED'
-          || Date.now() - knownHealth.checkedAt > AUTHORIZATION_REFERENCE_TTL_MS) {
+          || now - knownHealth.readAt > AUTHORIZATION_REFERENCE_TTL_MS) {
           throw new Error('Renewal requires a recent authenticated health result for this Navigator session');
+        }
+        if (hfSourceHealthStale) {
+          throw new Error('HF renewal requires a current Exchange provider probe; wait for its existing health refresh.');
         }
         // HF start only creates its fixed-scope device challenge; consent remains on HF's official page.
         // 中文：这里只创建固定 scope 的 challenge，实际授权仍由用户在 HF 官方页完成。
@@ -473,8 +487,14 @@ export function registerExchangeAuthorizationTools(
           idempotencyKey(identity.sessionId, String(execution.callId)),
           identity,
         );
+        let byRenewal = renewalProviders.get(identity.sessionId);
+        if (!byRenewal) {
+          byRenewal = new Map();
+          renewalProviders.set(identity.sessionId, byRenewal);
+        }
+        byRenewal.set(session.sessionRef, knownHealth.provider);
         healthReferences.get(identity.sessionId)?.delete(authorizationRef);
-        return renewalSessionProjection(session);
+        return renewalSessionProjection(session, knownHealth.provider);
       },
     })),
     ctx.tools.register(defineTool({
@@ -488,7 +508,7 @@ export function registerExchangeAuthorizationTools(
         const identity = requestIdentity(execution);
         const sessionRef = stringArg(args.sessionRef, 'renewal session reference');
         const session = await client.getRenewalSession(sessionRef, identity);
-        return renewalSessionProjection(session);
+        return renewalSessionProjection(session, renewalProviders.get(identity.sessionId)?.get(sessionRef));
       },
     })),
     ctx.tools.register(defineTool({
@@ -535,6 +555,7 @@ export function registerExchangeAuthorizationTools(
     if (disposed) return;
     disposed = true;
     healthReferences.clear();
+    renewalProviders.clear();
     for (const unregister of registrations.reverse()) unregister();
   };
   ctx.effect(() => dispose, 'navigator.exchangeAuthorizationTools');
@@ -667,10 +688,13 @@ function requireActiveTask(options: ExchangeAuthorizationToolOptions, sessionId:
   }
 }
 
-/** Expose only HF's fixed device verification instructions; keep other launch material opaque. */
-function renewalSessionProjection(session: ExchangeRenewalSession) {
-  const isHfDeviceWait = session.state === 'WAITING_USER'
+/** Expose HF's fixed device instructions only when health or session ownership proves the provider. */
+function renewalSessionProjection(session: ExchangeRenewalSession, provider: ExchangeProvider | undefined) {
+  const isHfDeviceWait = provider === 'hf'
+    && session.state === 'WAITING_USER'
     && HF_DEVICE_VERIFICATION_URLS.has(session.authorizationUrl ?? '')
+    && session.expiresAt !== null
+    && Date.parse(session.expiresAt) > Date.now()
     && session.userCode !== null;
   return {
     sessionRef: session.sessionRef,
