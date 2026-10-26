@@ -399,6 +399,79 @@ test('a mutating RUNNING result with operationRef remains pending under a verifi
   }
 });
 
+test('operation status reconciliation requires a verified envelope and known remote state', async () => {
+  const operationRef = 'azure-operation-55';
+  const fixture = createHarness([
+    {
+      requestId: 'uncertain-write-call',
+      outcome: 'uncertain',
+      operationRef,
+      result: {
+        content: [{ type: 'text', text: JSON.stringify({
+          state: 'UNKNOWN_RESULT', remote_state: 'UNKNOWN', operation_ref: operationRef,
+        }) }],
+        isError: false,
+      },
+    },
+    {
+      requestId: 'unknown-status-call',
+      outcome: 'verified',
+      operationRef,
+      result: {
+        content: [{ type: 'text', text: JSON.stringify({
+          state: 'SUCCEEDED', remote_state: 'UNKNOWN', operation_ref: operationRef,
+        }) }],
+        isError: false,
+      },
+    },
+    {
+      requestId: 'failed-status-call',
+      outcome: 'failed',
+      operationRef,
+      result: {
+        content: [{ type: 'text', text: JSON.stringify({
+          state: 'SUCCEEDED', remote_state: 'PENDING', operation_ref: operationRef,
+        }) }],
+        isError: false,
+      },
+    },
+  ]);
+  const { ctx, dispose } = await setupHarness(fixture);
+  try {
+    const stopName = toolName(ctx, 'Stop cloud resource');
+    const statusName = toolName(ctx, 'Read cloud operation status');
+    assert.ok(stopName);
+    assert.ok(statusName);
+    const target = {
+      resource_id: '/subscriptions/sub-1/resourceGroups/rg-1/providers/Microsoft.Compute/virtualMachines/vm-1',
+    };
+
+    const uncertainWrite = await execute(ctx, stopName, { profile_ref: profileRef, target }, 'uncertain-write-call');
+    assert.equal(uncertainWrite.isError, true);
+    const priorReceipt = fixture.receipts.get('operation-1');
+    assert.equal(priorReceipt.status, 'uncertain');
+
+    const unknownRemoteState = await execute(ctx, statusName, {
+      profile_ref: profileRef, operation_ref: operationRef,
+    }, 'unknown-status-call');
+    assert.equal(unknownRemoteState.isError, true);
+    assert.match(unknownRemoteState.error.message, /unknown remote read result/u);
+    assert.equal(priorReceipt.status, 'uncertain');
+    assert.equal(priorReceipt.evidence.reconciledByOperationRef, undefined);
+
+    const failedEnvelope = await execute(ctx, statusName, {
+      profile_ref: profileRef, operation_ref: operationRef,
+    }, 'failed-status-call');
+    assert.equal(failedEnvelope.isError, true);
+    assert.match(failedEnvelope.error.message, /Exchange reports a failed remote operation/u);
+    assert.equal(priorReceipt.status, 'uncertain');
+    assert.equal(priorReceipt.evidence.reconciledByOperationRef, undefined);
+  } finally {
+    dispose();
+    await ctx.fiber.dispose();
+  }
+});
+
 test('connector mode registers only tools present in the launcher-owned grant map', async () => {
   const fixture = createHarness();
   fixture.bindingAuthorization.tools = [fixture.bindingAuthorization.tools[0]];

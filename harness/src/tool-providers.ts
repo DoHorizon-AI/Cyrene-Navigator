@@ -804,7 +804,9 @@ async function executeTeamsProviderCall(
     }
   }
   if (operationId === 'cloud.operation.status.read'
-    && ['verified', 'failed'].includes(providerResponse.outcome)) {
+    && effectiveOutcome === 'verified'
+    && result.isError !== true
+    && !['UNKNOWN', 'UNKNOWN_RESULT'].includes(providerResultRemoteState(result) ?? '')) {
     await reconcileTerminalOperation(
       options.bridge,
       providerId,
@@ -1170,6 +1172,9 @@ function effectiveProviderOutcome(
   mutating: boolean,
   operationRef?: string,
 ): 'verified' | 'pending' | 'uncertain' | 'failed' {
+  if (envelopeOutcome === 'failed') return 'failed';
+  if (result.isError === true) return 'uncertain';
+  if (envelopeOutcome === 'uncertain') return 'uncertain';
   // A read-only connector may return business data such as a CI state. Only
   // mutating calls interpret generic `state` as lifecycle; `remote_state` and
   // Exchange's envelope outcome remain lifecycle evidence for either effect.
@@ -1183,7 +1188,6 @@ function effectiveProviderOutcome(
   }
   if (remoteState && ['FAILED', 'REJECTED', 'ERROR'].includes(remoteState)
     || state && ['FAILED', 'REJECTED', 'ERROR'].includes(state)) return 'failed';
-  if (result.isError === true && envelopeOutcome !== 'failed') return 'uncertain';
   return envelopeOutcome;
 }
 
