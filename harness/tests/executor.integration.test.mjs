@@ -651,7 +651,9 @@ test('serve-executor teardown deadline includes context-fiber disposal', async (
   assert.equal(result, false, 'a hung Context fiber must not extend the SIGTERM cleanup deadline');
 });
 
-test('serve-executor SIGTERM drain timeout exits nonzero within its cleanup bound', async () => {
+test('serve-executor SIGTERM drain timeout exits nonzero within its cleanup bound', {
+  skip: process.platform === 'win32' ? 'Windows terminates a child on SIGTERM instead of running the POSIX handler.' : false,
+}, async () => {
   const child = spawn(process.execPath, [
     'scripts/serve-executor.mjs', '--port=0', '--host=127.0.0.1', '--test-mode', '--test-echo-adapter',
     '--drain-timeout-ms=0', '--abort-cleanup-timeout-ms=500',
