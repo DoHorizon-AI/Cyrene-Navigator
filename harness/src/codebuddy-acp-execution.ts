@@ -44,7 +44,11 @@ import {
 import type { WorkStateStore } from './work-state-client.js'
 
 const CODEBUDDY_MODELS = new Set(['glm-5.3-flash', 'deepseek-v4.1-flash'])
-const CODEBUDDY_SETTINGS = JSON.stringify({ disableAllHooks: true, enabledPlugins: {} })
+const CODEBUDDY_SETTINGS = JSON.stringify({
+  disableAllHooks: true,
+  enabledPlugins: {},
+  deferToolLoading: false,
+})
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const MCP_SERVER_ENTRYPOINT = join(__dirname, 'acp-mcp-stdio.js')
 

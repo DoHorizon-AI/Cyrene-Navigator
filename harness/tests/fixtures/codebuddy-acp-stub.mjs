@@ -64,7 +64,10 @@ try {
   assert.ok(process.argv.includes('--agent'));
   assert.equal(valueAfter('--agent'), 'cli');
   assert.equal(valueAfter('--setting-sources'), 'project,local');
-  assert.equal(valueAfter('--settings'), JSON.stringify({ disableAllHooks: true, enabledPlugins: {} }));
+  const settings = JSON.parse(valueAfter('--settings'));
+  assert.deepEqual(settings, { disableAllHooks: true, enabledPlugins: {}, deferToolLoading: false });
+  assert.equal(settings.deferToolLoading, false);
+  assert.equal(valueAfter('--permission-mode'), 'default');
   assert.ok(process.argv.includes('--strict-mcp-config'));
   assert.equal(basename(process.cwd()), 'navigator-acp-workspace');
   assert.equal(dirname(dirname(configPath)), process.cwd());
