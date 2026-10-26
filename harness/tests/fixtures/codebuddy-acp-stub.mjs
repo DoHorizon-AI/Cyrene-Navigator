@@ -17,12 +17,43 @@ const turn = valueAfter('--fixture-turn') ?? 'first';
 const configPath = valueAfter('--mcp-config');
 const configIndex = process.argv.indexOf('--mcp-config');
 const toolFlagIndex = process.argv.indexOf('--tools');
-let navigatorServer;
+let cliNavigatorServer;
+let sessionNavigatorServer;
 let bootstrapStage = 'arguments';
 
 function valueAfter(name) {
   const index = process.argv.indexOf(name);
   return index >= 0 ? process.argv[index + 1] : undefined;
+}
+
+function useSessionMcpServers(value) {
+  assert.ok(Array.isArray(value), 'ACP session setup must provide an MCP server array');
+  assert.equal(value.length, 1, 'the session must expose only the Navigator MCP server');
+  const server = value[0];
+  assert.ok(server && typeof server === 'object' && !Array.isArray(server));
+  assert.equal(Object.keys(server).sort().join(','), 'args,command,env,name',
+    'the session must use only the standard ACP v1 stdio server fields');
+  assert.equal(server.name, 'navigator');
+  assert.equal(server.command, process.execPath);
+  assert.ok(Array.isArray(server.args) && server.args.length === 1);
+  assert.ok(isAbsolute(server.args[0]) && basename(server.args[0]) === 'acp-mcp-stdio.js');
+  assert.ok(Array.isArray(server.env));
+  const environmentNames = server.env.map(entry => entry?.name).sort();
+  assert.deepEqual(environmentNames, ['NAVIGATOR_ACP_BRIDGE_TOKEN', 'NAVIGATOR_ACP_BRIDGE_URL']);
+  const environment = Object.fromEntries(server.env.map(entry => [entry.name, entry.value]));
+  assert.ok(typeof environment.NAVIGATOR_ACP_BRIDGE_URL === 'string'
+    && environment.NAVIGATOR_ACP_BRIDGE_URL.startsWith('http://127.0.0.1:'));
+  assert.ok(typeof environment.NAVIGATOR_ACP_BRIDGE_TOKEN === 'string'
+    && environment.NAVIGATOR_ACP_BRIDGE_TOKEN.length >= 32);
+  assert.ok(environment.NAVIGATOR_ACP_BRIDGE_TOKEN
+    === cliNavigatorServer.env.NAVIGATOR_ACP_BRIDGE_TOKEN,
+  'the ACP session and private CLI config must point at the same task-scoped bridge');
+  assert.ok(environment.NAVIGATOR_ACP_BRIDGE_URL
+    === cliNavigatorServer.env.NAVIGATOR_ACP_BRIDGE_URL,
+  'the ACP session and private CLI config must point at the same task-scoped bridge');
+  assert.equal(process.argv.join(' ').includes(environment.NAVIGATOR_ACP_BRIDGE_TOKEN), false,
+    'the bridge token must not be copied into process arguments');
+  sessionNavigatorServer = server;
 }
 
 try {
@@ -61,11 +92,11 @@ try {
   bootstrapStage = 'MCP config';
   const config = JSON.parse(readFileSync(configPath, 'utf8'));
   assert.deepEqual(Object.keys(config.mcpServers ?? {}), ['navigator']);
-  navigatorServer = config.mcpServers.navigator;
-  assert.equal(navigatorServer.type, 'stdio');
-  assert.equal(navigatorServer.alwaysLoad, true);
-  assert.equal(typeof navigatorServer.env.NAVIGATOR_ACP_BRIDGE_TOKEN, 'string');
-  assert.ok(!process.argv.join(' ').includes(navigatorServer.env.NAVIGATOR_ACP_BRIDGE_TOKEN));
+  cliNavigatorServer = config.mcpServers.navigator;
+  assert.equal(cliNavigatorServer.type, 'stdio');
+  assert.equal(cliNavigatorServer.alwaysLoad, true);
+  assert.equal(typeof cliNavigatorServer.env.NAVIGATOR_ACP_BRIDGE_TOKEN, 'string');
+  assert.ok(!process.argv.join(' ').includes(cliNavigatorServer.env.NAVIGATOR_ACP_BRIDGE_TOKEN));
   bootstrapStage = 'environment';
   assert.equal(process.env.CYRENE_SESSION_TOKEN, undefined);
   assert.equal(process.env.CYRENE_EXCHANGE_TOKEN, undefined);
@@ -131,10 +162,11 @@ async function handleAgentRequest(message) {
       } });
       return;
     case 'session/new':
-      assert.deepEqual(message.params.mcpServers, []);
+      useSessionMcpServers(message.params.mcpServers);
       send({ jsonrpc: '2.0', id: message.id, result: { sessionId: nativeSessionId } });
       return;
     case 'session/load':
+      useSessionMcpServers(message.params.mcpServers);
       loadedSession = message.params.sessionId;
       send({ jsonrpc: '2.0', id: message.id, result: {} });
       return;
@@ -176,7 +208,9 @@ async function handlePrompt(message) {
     return;
   }
   const requestText = message.params.prompt?.[0]?.text ?? '';
-  assert.equal(requestText.includes(navigatorServer.env.NAVIGATOR_ACP_BRIDGE_TOKEN), false);
+  const bridgeToken = sessionNavigatorServer.env.find(item => item.name === 'NAVIGATOR_ACP_BRIDGE_TOKEN')?.value;
+  assert.equal(typeof bridgeToken, 'string');
+  assert.equal(requestText.includes(bridgeToken), false, 'the bridge token must not enter the model prompt');
   if (turn === 'first') {
     assert.match(requestText, /No previous DSH conversation history was imported/u);
   } else {
@@ -261,9 +295,14 @@ async function handlePrompt(message) {
       update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: responseText } },
     } });
   } else {
+    const toolResult = await exerciseMcpClient({ includeComputer: false, includeUnknown: false });
+    assert.equal(toolResult.exchangeDenied, false);
     send({ jsonrpc: '2.0', method: 'session/update', params: {
       sessionId: message.params.sessionId,
-      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `Restored ${loadedSession}` } },
+      update: {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: `Restored ${loadedSession}; ${toolResult.exchangeText}` },
+      },
     } });
   }
   send({ jsonrpc: '2.0', id: promptRequest, result: { stopReason: 'end_turn' } });
@@ -277,9 +316,11 @@ async function exerciseMcpClient({
   includeUnknown = true,
   parallelAuthorizedTools = false,
 } = {}) {
-  const server = spawn(navigatorServer.command, navigatorServer.args, {
+  assert.ok(sessionNavigatorServer, 'tool access must come from the ACP session payload');
+  const mcpEnvironment = Object.fromEntries(sessionNavigatorServer.env.map(({ name, value }) => [name, value]));
+  const server = spawn(sessionNavigatorServer.command, sessionNavigatorServer.args, {
     cwd: process.cwd(),
-    env: { ...process.env, ...navigatorServer.env },
+    env: { ...process.env, ...mcpEnvironment },
     stdio: ['pipe', 'pipe', 'ignore'],
   });
   const lines = createInterface({ input: server.stdout, crlfDelay: Infinity });
@@ -297,9 +338,14 @@ async function exerciseMcpClient({
     pending.set(String(id), { resolve, reject });
     server.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
   });
+  await assert.rejects(call(0, 'initialize', {
+    protocolVersion: '2025-02-31', capabilities: {}, clientInfo: { name: 'fixture', version: '1' },
+  }), /MCP request failed/u, 'malformed MCP date revisions must still fail closed');
   const initialize = await call(1, 'initialize', {
-    protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'fixture', version: '1' },
+    protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'fixture', version: '1' },
   });
+  assert.equal(initialize.protocolVersion, '2025-06-18',
+    'the bridge must negotiate its latest supported revision for a newer valid client revision');
   assert.equal(initialize.serverInfo.name, 'navigator-authorized-tools');
   server.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
   const catalog = await call(2, 'tools/list');

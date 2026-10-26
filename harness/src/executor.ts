@@ -1885,7 +1885,7 @@ export class NavigatorExecutor {
       if (!currentTaskActors.includes(caller.subject)) throw new TypeError('Teams notification actor is no longer authorized');
       const route = readTeamsNotificationRoute(notification.payload);
       if (route.tenantId !== caller.tenantId) throw new TypeError('Teams notification tenant does not match its task actor');
-      const text = boundedText(notification.payload.text, 'Teams notification text', 20_000);
+      const text = boundedTeamsMessageText(notification.payload.text, 'Teams notification text', 20_000);
       const conversation = {
         tenantId: route.tenantId,
         teamId: route.teamId,

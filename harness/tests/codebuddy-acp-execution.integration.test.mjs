@@ -280,6 +280,8 @@ test('CodeBuddy ACP owns the top-level turn, resumes the durable native session,
       const value = previousEnvironment.get(name) ?? process.env[name];
       if (value !== undefined) assert.equal(JSON.stringify(events).includes(value), false);
     }
+    assert.equal(JSON.stringify(events).includes('NAVIGATOR_ACP_BRIDGE_TOKEN'), false);
+    assert.equal(JSON.stringify(events).includes('NAVIGATOR_ACP_BRIDGE_URL'), false);
     const durableEvents = await harness.workState.getEvents(first.taskId);
     assert.ok(durableEvents.events.some(item => item.event.type === 'execution.backend_session'
       && item.event.legacyDshHistoryImported === false));
@@ -295,6 +297,8 @@ test('CodeBuddy ACP owns the top-level turn, resumes the durable native session,
     });
     assert.equal(second.status, 'completed');
     assert.match(second.output, /Restored native-session-1/u);
+    assert.match(second.output, /Exchange query accepted/u,
+      'the loaded ACP session must reconnect to the Navigator MCP server supplied by session/load');
     assert.equal(harness.providerCalls.length, 1, 'restoring context must not replay the previous write');
     assert.deepEqual(acpConfigDirectories(harness.codeBuddyConfigDir), priorConfigDirectories);
     const secondEvents = await harness.workState.getEvents(second.taskId);

@@ -488,6 +488,115 @@ test('NavigatorExecutor: drain waits for an existing notification claim and paus
   }
 });
 
+test('NavigatorExecutor: Teams outbox delivers completed multiline answers byte-for-byte and rejects NUL before send', async () => {
+  const store = new InMemoryWorkStateStore();
+  const app = await createTestApp(new TestMockAdapter(), {
+    workStateStore: store,
+    workspaceId: 'fixture-workspace',
+  });
+  const { executor } = app;
+  const tenantId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const subject = '11111111-1111-4111-8111-111111111111';
+  const caller = {
+    issuer: `https://login.microsoftonline.com/${tenantId}/v2.0`, subject, tenantId,
+  };
+  const taskId = 'teams-outbox-multiline-answer';
+  const queuedLeases = [];
+  const started = [];
+  const finished = [];
+  const sentMessages = [];
+  const grantedTexts = [];
+  const makeLease = (id, text) => ({
+    notification: {
+      id,
+      deduplicationKey: `dedupe-${id}`,
+      type: 'teams.message',
+      payload: {
+        tenantId,
+        teamId: 'team-1',
+        channelId: 'channel-1',
+        conversationId: '19:channel-conversation',
+        rootThreadId: '1698765432100',
+        serviceUrl: 'https://smba.trafficmanager.net/emea/',
+        text,
+      },
+      taskId,
+      connectorId: 'teams-v1',
+      status: 'leased',
+      result: { retryCount: 0 },
+    },
+    leaseToken: `lease-${id}`,
+  });
+  const originalPatchTask = store.patchTask.bind(store);
+  store.patchTask = async (id, patchValue) => {
+    const record = await originalPatchTask(id, patchValue);
+    if (id === taskId && patchValue.status === 'completed') {
+      queuedLeases.push(makeLease('multiline-delivery', record.output));
+      queuedLeases.push(makeLease('nul-delivery', `${record.output}\u0000must-not-send`));
+    }
+    return record;
+  };
+  store.claimNotifications = async input => {
+    assert.equal(input.type, 'teams.message');
+    assert.equal(input.connectorId, 'teams-v1');
+    return queuedLeases.splice(0);
+  };
+  store.startNotification = async (notificationId, leaseToken) => {
+    started.push({ notificationId, leaseToken });
+  };
+  store.finishNotification = async (notificationId, leaseToken, outcomeValue, result) => {
+    finished.push({ notificationId, leaseToken, outcome: outcomeValue, result });
+  };
+  executor.config.teams = {
+    connectorId: 'teams-v1',
+    tenantId,
+    allowedTeamIds: ['team-1'],
+    botAppId: 'fixture-bot-app',
+    taskActorSubjects: [subject],
+    ingressSecretEnv: 'TEAMS_NAVIGATOR_HMAC_KEY',
+    exchangeConnectionRef: 'teams-connection-ref',
+    exchangeProfileRef: 'teams-profile-ref',
+    exchangeAuthorization: {
+      async mintGrant(request) {
+        grantedTexts.push(request.arguments.text);
+        return { token: 'fixture-grant' };
+      },
+      async sendTeamsMessage(message) {
+        sentMessages.push(message);
+        return { outcome: 'accepted', vendorMessageId: 'teams-message-1' };
+      },
+    },
+  };
+
+  try {
+    const answer = await executor.executeTask({
+      taskId,
+      sessionId: 'teams-outbox-session',
+      prompt: 'First paragraph.\n\nSecond paragraph.\tTabbed.\r\nFourth line.',
+      metadata: { teamsCaller: caller },
+    });
+    assert.equal(answer.status, 'completed');
+    assert.ok(answer.output.includes('\n\n'));
+    assert.ok(answer.output.includes('\t'));
+    assert.ok(answer.output.includes('\r\n'));
+    assert.equal((await store.getTask(taskId)).status, 'completed');
+    assert.equal(queuedLeases.length, 2, 'terminal completion should feed the durable outbox fixture');
+
+    await executor.drainTeamsNotifications();
+
+    assert.equal(sentMessages.length, 1, 'the NUL-containing notification must fail before provider invocation');
+    assert.deepEqual(Buffer.from(sentMessages[0].text, 'utf8'), Buffer.from(answer.output, 'utf8'));
+    assert.deepEqual(grantedTexts, [answer.output]);
+    assert.deepEqual(started.map(item => item.notificationId), ['multiline-delivery', 'nul-delivery']);
+    assert.deepEqual(finished.map(item => [item.notificationId, item.outcome]), [
+      ['multiline-delivery', 'delivered'],
+      ['nul-delivery', 'failed'],
+    ]);
+  } finally {
+    await disposeApp(app);
+  }
+});
+
 test('NavigatorExecutor: streamed duplicate requests report the existing task status during drain', async () => {
   const store = new InMemoryWorkStateStore();
   const adapter = new TestMockAdapter();
