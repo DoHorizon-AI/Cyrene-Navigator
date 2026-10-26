@@ -358,7 +358,10 @@ test('returns only HF device verification instructions and skips the duplicate N
 test('rejects HF user codes unless bounded and bound to an exact device verification URL', async () => {
   for (const [index, renewalOverrides] of [
     { authorizationUrl: 'https://hf.co/oauth/authorize', userCode: 'L94P-HPL8' },
+    { authorizationUrl: 'https://hf.co.evil/oauth/device', userCode: 'L94P-HPL8' },
+    { authorizationUrl: 'https://user@hf.co/oauth/device', userCode: 'L94P-HPL8' },
     { authorizationUrl: 'https://hf.co/oauth/device?client_id=unexpected', userCode: 'L94P-HPL8' },
+    { authorizationUrl: 'https://hf.co/oauth/device#unexpected', userCode: 'L94P-HPL8' },
     { authorizationUrl: 'https://hf.co/oauth/device', userCode: 'access-token' },
     { authorizationUrl: 'https://hf.co/oauth/device' },
   ].entries()) {
