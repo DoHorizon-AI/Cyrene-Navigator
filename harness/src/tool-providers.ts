@@ -39,6 +39,7 @@ const MAX_SCHEMA_BYTES = 64_000;
 const MAX_ARGUMENT_BYTES = 1_500_000;
 const MAX_RESULT_BYTES = 2_000_000;
 const MAX_CONTENT_BLOCKS = 512;
+const SAFE_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/u;
 const CODEBUDDY_ACP_EXCHANGE_TOOLS = [
   'exchange_connections_list',
   'exchange_authorization_health',
@@ -80,8 +81,16 @@ export interface ToolProviderRegistrationOptions {
   };
   /** Host-only verifier for persisted background responsibility tasks. */
   readonly backgroundTaskAuthority?: BackgroundTaskAuthorizationResolver;
+  /** Display-only repository labels joined from the host responsibility allowlist. */
+  readonly githubBindingDisplayHints?: ReadonlyMap<string, GithubBindingDisplayHint>;
   /** Private Exchange-exported ListTools snapshot; still intersected with host authorization. */
   readonly connectorToolCatalogSnapshot?: unknown;
+}
+
+/** Human-readable repository context for a host-configured GitHub binding. */
+export interface GithubBindingDisplayHint {
+  readonly label: string;
+  readonly uri: string;
 }
 
 export interface ConnectorToolAuthorization {
@@ -385,9 +394,32 @@ function createDefinition(
   tool: ProviderTool,
   name: string,
 ): ToolDefinition {
+  const trustedBinding = options.connectorAuthorization?.bindings.get(binding.bindingId);
+  const providerId = trustedBinding?.providerId
+    ?? binding.providerId;
+  const candidateRepositoryHint = trustedBinding?.providerId === 'github'
+    ? options.githubBindingDisplayHints?.get(binding.bindingId)
+    : undefined;
+  const repositoryHint = candidateRepositoryHint !== undefined
+    && /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/u.test(candidateRepositoryHint.label)
+    && candidateRepositoryHint.uri === `https://github.com/${candidateRepositoryHint.label}`
+    ? candidateRepositoryHint
+    : undefined;
+  const repositoryDescription = providerId === 'github'
+    ? repositoryHint === undefined
+      ? ' [Host repository mapping unavailable; do not infer the target from this tool name or its arguments.]'
+      : ` [Host-configured GitHub repository: ${repositoryHint.label} (${repositoryHint.uri}). Use this binding for requests about this repository.]`
+    : '';
+  const isCloudProvider = providerId === 'azure' || providerId === 'gcp' || providerId === 'runpod';
+  const cloudProfileRef = isCloudProvider ? trustedBinding?.profileRef : undefined;
+  const cloudProfileDescription = isCloudProvider
+    ? cloudProfileRef !== undefined && SAFE_IDENTIFIER.test(cloudProfileRef)
+      ? ` [Trusted cloud call context: provider ${providerId}; profile_ref "${cloudProfileRef}". Use this exact profile_ref for this binding.]`
+      : ' [Trusted cloud profile hint unavailable; do not guess profile_ref for this binding.]'
+    : '';
   return {
     name,
-    description: `${tool.name} (configured provider ${binding.bindingId}): ${tool.description}`,
+    description: `${tool.name} (configured provider ${binding.bindingId})${repositoryDescription}${cloudProfileDescription}: ${tool.description}`,
     parameters: structuredClone(tool.inputSchema),
     output: {
       schema: OUTPUT_SCHEMA,
@@ -1664,7 +1696,7 @@ function activeSessionId(execution: ToolRunContext): string {
 
 /** Bound identifiers used in backend path segments and durable receipts. */
 function safeIdentifier(value: unknown, label: string): string {
-  if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/u.test(value)) {
+  if (typeof value !== 'string' || !SAFE_IDENTIFIER.test(value)) {
     throw new TypeError(`${label} is invalid`);
   }
   return value;

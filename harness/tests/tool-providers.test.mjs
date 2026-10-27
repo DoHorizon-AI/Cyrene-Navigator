@@ -11,7 +11,7 @@ import { Context } from '@deepseek-ai/cordis';
 import { ToolCallId } from '@deepseek-ai/dsh-llm';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import ToolRuntime, { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools';
-import { registerToolProviders } from '../dist/tool-providers.js';
+import { getCodeBuddyAcpToolCatalog, registerToolProviders } from '../dist/tool-providers.js';
 
 const bindingId = 'wecom-primary';
 const readToolId = 'contacts_search';
@@ -182,6 +182,10 @@ test('host catalog snapshot fixture registers only matching launcher-authorized 
     const dispose = await registerToolProviders(ctx, {
       bridge,
       taskIdForSession: () => undefined,
+      githubBindingDisplayHints: new Map([[githubBindingId, {
+        label: 'DoHorizon-AI/Cyrene-Exchange',
+        uri: 'https://github.com/DoHorizon-AI/Cyrene-Exchange',
+      }]]),
       connectorAuthorization: {
         client: {},
         workspaceId: 'workspace-snapshot-test',
@@ -193,10 +197,35 @@ test('host catalog snapshot fixture registers only matching launcher-authorized 
       const schemas = ctx.tools.schemas();
       assert.equal(schemas.length, 1);
       assert.match(schemas[0].description, /Run GitHub CLI Command/u);
+      assert.match(
+        schemas[0].description,
+        /Host-configured GitHub repository: DoHorizon-AI\/Cyrene-Exchange \(https:\/\/github\.com\/DoHorizon-AI\/Cyrene-Exchange\)/u,
+      );
       assert.deepEqual(schemas[0].parameters.required, ['argv']);
       assert.equal(schemas.some(schema => schema.description.includes('List GitHub Repositories')), false);
+      const acpTool = getCodeBuddyAcpToolCatalog(ctx).find(item => item.name === schemas[0].name);
+      assert.equal(acpTool?.description, schemas[0].description);
     } finally {
       dispose();
+    }
+
+    const disposeWithoutHint = await registerToolProviders(ctx, {
+      bridge,
+      taskIdForSession: () => undefined,
+      connectorAuthorization: {
+        client: {},
+        workspaceId: 'workspace-snapshot-test',
+        bindings: new Map([[githubBindingId, trustedBinding]]),
+      },
+      connectorToolCatalogSnapshot: snapshot,
+    });
+    try {
+      const schema = ctx.tools.schemas()[0];
+      assert.match(schema.description, /Host repository mapping unavailable; do not infer the target/u);
+      const acpTool = getCodeBuddyAcpToolCatalog(ctx).find(item => item.name === schema.name);
+      assert.equal(acpTool?.description, schema.description);
+    } finally {
+      disposeWithoutHint();
     }
 
     await assert.rejects(registerToolProviders(ctx, {
@@ -228,6 +257,231 @@ test('host catalog snapshot fixture registers only matching launcher-authorized 
         }],
       },
     }), /missing or unsupported fields/u);
+  } finally {
+    await ctx.fiber.dispose();
+  }
+});
+
+test('cloud tools show their trusted provider profile without changing required arguments', async () => {
+  const bindingId = 'exchange-azure-primary';
+  const connectionRef = '33333333-3333-4333-8333-333333333333';
+  const profileRef = 'azure-primary';
+  const inputSchema = {
+    type: 'object',
+    properties: {
+      profile_ref: { type: 'string' },
+      target: {
+        type: 'object',
+        properties: { resource_group: { type: 'string' } },
+        required: ['resource_group'],
+        additionalProperties: false,
+      },
+    },
+    required: ['profile_ref', 'target'],
+    additionalProperties: false,
+  };
+  const snapshot = {
+    schemaVersion: 1,
+    items: [{
+      bindingId,
+      capabilityId: 'tool.provider.v1',
+      providerId: 'azure',
+      connectionRef,
+      profileRef,
+      tools: [{
+        id: 'cloud_resources_list',
+        name: 'List Cloud Resources',
+        description: 'List resources in the supplied target.',
+        readOnly: true,
+        inputSchema,
+      }],
+    }],
+  };
+  const trustedBinding = {
+    bindingId,
+    connectionRef,
+    providerId: 'azure',
+    profileRef,
+    tools: [{
+      toolId: 'cloud_resources_list',
+      operationId: 'cloud.resources.list',
+      resourceProjection: 'cloud_target',
+      mutating: false,
+    }],
+  };
+  const bridge = {
+    async request() { throw new Error('Private snapshot registration must not fetch provider metadata.'); },
+    async requestApproval() { throw new Error('Registration must not request approval.'); },
+    async mutate() { throw new Error('Registration must not execute tools.'); },
+  };
+  const ctx = new Context();
+  await ctx.plugin(SystemPrompt);
+  await ctx.plugin(ToolRuntime);
+  try {
+    const dispose = await registerToolProviders(ctx, {
+      bridge,
+      taskIdForSession: () => undefined,
+      connectorAuthorization: {
+        client: {},
+        workspaceId: 'workspace-cloud-profile-hint',
+        bindings: new Map([[bindingId, trustedBinding]]),
+      },
+      connectorToolCatalogSnapshot: snapshot,
+    });
+    try {
+      const schema = ctx.tools.schemas()[0];
+      assert.match(schema.description, /Trusted cloud call context: provider azure; profile_ref "azure-primary"/u);
+      assert.deepEqual(schema.parameters, inputSchema);
+      const acpTool = getCodeBuddyAcpToolCatalog(ctx).find(item => item.name === schema.name);
+      assert.equal(acpTool?.description, schema.description);
+      assert.deepEqual(acpTool?.inputSchema, inputSchema);
+    } finally {
+      dispose();
+    }
+  } finally {
+    await ctx.fiber.dispose();
+  }
+});
+
+test('a provider catalog cannot claim a host repository hint without a trusted GitHub binding', async () => {
+  const bindingId = 'untrusted-github-binding-collision';
+  const bridge = {
+    async request(path) {
+      if (path === '/tool-providers') {
+        return { items: [{ bindingId, capabilityId: 'tool.provider.v1', providerId: 'github' }] };
+      }
+      if (path === `/tool-providers/${bindingId}/tools`) {
+        return { tools: [{
+          id: 'github.issues.search',
+          name: 'Search GitHub Issues',
+          description: 'Search issues in the supplied repository.',
+          readOnly: true,
+          inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+        }] };
+      }
+      throw new Error(`Unexpected provider metadata request: ${path}`);
+    },
+    async requestApproval() { throw new Error('Registration must not request approval.'); },
+    async mutate() { throw new Error('Registration must not execute tools.'); },
+  };
+  const ctx = new Context();
+  await ctx.plugin(SystemPrompt);
+  await ctx.plugin(ToolRuntime);
+  try {
+    const dispose = await registerToolProviders(ctx, {
+      bridge,
+      taskIdForSession: () => undefined,
+      githubBindingDisplayHints: new Map([[bindingId, {
+        label: 'DoHorizon-AI/Cyrene-Exchange',
+        uri: 'https://github.com/DoHorizon-AI/Cyrene-Exchange',
+      }]]),
+    });
+    try {
+      const schema = ctx.tools.schemas()[0];
+      assert.match(schema.description, /Host repository mapping unavailable; do not infer the target/u);
+      assert.doesNotMatch(schema.description, /DoHorizon-AI\/Cyrene-Exchange/u);
+    } finally {
+      dispose();
+    }
+  } finally {
+    await ctx.fiber.dispose();
+  }
+});
+
+test('separate GitHub bindings expose distinct host repository labels in DSH and ACP', async () => {
+  const repositoryBindings = [
+    {
+      bindingId: 'exchange-github-workspace',
+      connectionRef: '11111111-1111-4111-8111-111111111111',
+      profileRef: 'github-workspace-profile',
+      repository: 'DoHorizon-AI/Cyrene-Workspace',
+    },
+    {
+      bindingId: 'exchange-github-exchange',
+      connectionRef: '22222222-2222-4222-8222-222222222222',
+      profileRef: 'github-exchange-profile',
+      repository: 'DoHorizon-AI/Cyrene-Exchange',
+    },
+  ];
+  const inputSchema = {
+    type: 'object',
+    properties: {
+      repository_id: { type: 'string' },
+      repository: { type: 'string' },
+      query: { type: 'string' },
+    },
+    required: ['repository_id', 'repository', 'query'],
+    additionalProperties: false,
+  };
+  const snapshot = {
+    schemaVersion: 1,
+    items: repositoryBindings.map(item => ({
+      bindingId: item.bindingId,
+      capabilityId: 'tool.provider.v1',
+      providerId: 'github',
+      connectionRef: item.connectionRef,
+      profileRef: item.profileRef,
+      tools: [{
+        id: 'github.issues.search',
+        name: 'Search GitHub Issues',
+        description: 'Search issues in the supplied repository.',
+        readOnly: true,
+        inputSchema,
+      }],
+    })),
+  };
+  const connectorBindings = new Map(repositoryBindings.map(item => [item.bindingId, {
+    bindingId: item.bindingId,
+    connectionRef: item.connectionRef,
+    providerId: 'github',
+    profileRef: item.profileRef,
+    tools: [{
+      toolId: 'github.issues.search',
+      operationId: 'github.issues.search',
+      resourceProjection: 'github_repository',
+      mutating: false,
+    }],
+  }]));
+  const bridge = {
+    async request() { throw new Error('Private snapshot registration must not fetch provider metadata.'); },
+    async requestApproval() { throw new Error('Registration must not request approval.'); },
+    async mutate() { throw new Error('Registration must not execute tools.'); },
+  };
+  const ctx = new Context();
+  await ctx.plugin(SystemPrompt);
+  await ctx.plugin(ToolRuntime);
+  try {
+    const dispose = await registerToolProviders(ctx, {
+      bridge,
+      taskIdForSession: () => undefined,
+      connectorAuthorization: {
+        client: {},
+        workspaceId: 'workspace-repository-hints',
+        bindings: connectorBindings,
+      },
+      connectorToolCatalogSnapshot: snapshot,
+      githubBindingDisplayHints: new Map(repositoryBindings.map(item => [item.bindingId, {
+        label: item.repository,
+        uri: `https://github.com/${item.repository}`,
+      }])),
+    });
+    try {
+      const schemas = ctx.tools.schemas().filter(item => item.description.startsWith('Search GitHub Issues'));
+      assert.equal(schemas.length, 2);
+      for (const item of repositoryBindings) {
+        const schema = schemas.find(entry => entry.description.includes(item.repository));
+        assert.ok(schema, `the model-facing schema should name ${item.repository}`);
+        assert.ok(schema.description.includes(`configured provider ${item.bindingId})`));
+        assert.ok(schema.description.includes(`https://github.com/${item.repository}`));
+        assert.deepEqual(schema.parameters, inputSchema);
+        const acpTool = getCodeBuddyAcpToolCatalog(ctx).find(entry => entry.name === schema.name);
+        assert.equal(acpTool?.description, schema.description);
+        assert.deepEqual(acpTool?.inputSchema, inputSchema);
+      }
+      assert.notEqual(schemas[0].name, schemas[1].name);
+    } finally {
+      dispose();
+    }
   } finally {
     await ctx.fiber.dispose();
   }
