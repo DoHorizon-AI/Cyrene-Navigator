@@ -275,6 +275,35 @@ async function handlePrompt(message) {
       ],
     });
     assert.equal(hostPermission.outcome.optionId, 'allow-host');
+    const nativeMcpPermissions = [];
+    for (const kind of [undefined, 'read', 'fetch', 'search', 'other', 'execute']) {
+      const toolCall = {
+        toolCallId: `native-mcp-${kind ?? 'missing-kind'}`,
+        rawInput: { serverName: 'untrusted-argument', toolName: 'shell' },
+        _meta: { 'codebuddy.ai/toolName': `mcp__navigator__${toolResult.toolName}` },
+      };
+      if (kind !== undefined) toolCall.kind = kind;
+      const permission = await request('session/request_permission', {
+        sessionId: message.params.sessionId,
+        toolCall,
+        options: [
+          { kind: 'allow_once', optionId: 'allow-native-mcp' },
+          { kind: 'reject_once', optionId: 'reject-native-mcp' },
+        ],
+      });
+      assert.equal(permission.outcome.optionId, 'allow-native-mcp');
+      nativeMcpPermissions.push(permission);
+    }
+    const nativeMcpWithoutAllowOnce = await request('session/request_permission', {
+      sessionId: message.params.sessionId,
+      toolCall: {
+        toolCallId: 'native-mcp-without-allow-once',
+        rawInput: {},
+        _meta: { 'codebuddy.ai/toolName': `mcp__navigator__${toolResult.toolName}` },
+      },
+      options: [{ kind: 'reject_once', optionId: 'reject-native-mcp-without-allow-once' }],
+    });
+    assert.equal(nativeMcpWithoutAllowOnce.outcome.optionId, 'reject-native-mcp-without-allow-once');
     const unknownMcpPermission = await request('session/request_permission', {
       sessionId: message.params.sessionId,
       toolCall: { kind: 'mcp', rawInput: { serverName: 'navigator', toolName: 'shell' } },
@@ -293,7 +322,99 @@ async function handlePrompt(message) {
       ],
     });
     assert.equal(extraMcpPermission.outcome.optionId, 'reject-extra');
-    const responseText = `MCP result: ${toolResult.text}; ${toolResult.exchangeText}; unknown denied=${toolResult.unknownDenied}; permission denied=${toolResult.permissionDenied}; host MCP allow once=${hostPermission.outcome.optionId === 'allow-host'}; unknown MCP denied=${unknownMcpPermission.outcome.optionId === 'reject-unknown'}; extra MCP denied=${extraMcpPermission.outcome.optionId === 'reject-extra'}`;
+    const spoofedNativePermission = await request('session/request_permission', {
+      sessionId: message.params.sessionId,
+      toolCall: {
+        toolCallId: 'native-mcp-business-arguments-spoof',
+        kind: 'other',
+        rawInput: { serverName: 'navigator', toolName: toolResult.toolName },
+      },
+      options: [
+        { kind: 'allow_once', optionId: 'allow-spoofed-native' },
+        { kind: 'reject_once', optionId: 'reject-spoofed-native' },
+      ],
+    });
+    assert.equal(spoofedNativePermission.outcome.optionId, 'reject-spoofed-native');
+    const foreignServerPermission = await request('session/request_permission', {
+      sessionId: message.params.sessionId,
+      toolCall: {
+        toolCallId: 'native-mcp-foreign-server',
+        kind: 'mcp',
+        rawInput: { serverName: 'navigator', toolName: toolResult.toolName },
+        _meta: { 'codebuddy.ai/toolName': `mcp__personal__${toolResult.toolName}` },
+      },
+      options: [
+        { kind: 'allow_once', optionId: 'allow-foreign-server' },
+        { kind: 'reject_once', optionId: 'reject-foreign-server' },
+      ],
+    });
+    assert.equal(foreignServerPermission.outcome.optionId, 'reject-foreign-server');
+    const unknownNavigatorToolPermission = await request('session/request_permission', {
+      sessionId: message.params.sessionId,
+      toolCall: {
+        toolCallId: 'native-mcp-unknown-tool',
+        kind: 'read',
+        rawInput: {},
+        _meta: { 'codebuddy.ai/toolName': 'mcp__navigator__shell' },
+      },
+      options: [
+        { kind: 'allow_once', optionId: 'allow-unknown-navigator-tool' },
+        { kind: 'reject_once', optionId: 'reject-unknown-navigator-tool' },
+      ],
+    });
+    assert.equal(unknownNavigatorToolPermission.outcome.optionId, 'reject-unknown-navigator-tool');
+    const suffixCollisionPermission = await request('session/request_permission', {
+      sessionId: message.params.sessionId,
+      toolCall: {
+        toolCallId: 'native-mcp-known-tool-suffix-collision',
+        kind: 'search',
+        rawInput: {},
+        _meta: { 'codebuddy.ai/toolName': `mcp__navigator__${toolResult.toolName}__shell` },
+      },
+      options: [
+        { kind: 'allow_once', optionId: 'allow-suffix-collision' },
+        { kind: 'reject_once', optionId: 'reject-suffix-collision' },
+      ],
+    });
+    assert.equal(suffixCollisionPermission.outcome.optionId, 'reject-suffix-collision');
+    const malformedPrefixPermission = await request('session/request_permission', {
+      sessionId: message.params.sessionId,
+      toolCall: {
+        toolCallId: 'native-mcp-malformed-prefix',
+        kind: 'fetch',
+        rawInput: {},
+        _meta: { 'codebuddy.ai/toolName': `mcp__navigator_${toolResult.toolName}` },
+      },
+      options: [
+        { kind: 'allow_once', optionId: 'allow-malformed-prefix' },
+        { kind: 'reject_once', optionId: 'reject-malformed-prefix' },
+      ],
+    });
+    assert.equal(malformedPrefixPermission.outcome.optionId, 'reject-malformed-prefix');
+    const genericExecutePermission = await request('session/request_permission', {
+      sessionId: message.params.sessionId,
+      toolCall: {
+        toolCallId: 'native-generic-execute-with-business-argument-spoof',
+        kind: 'execute',
+        rawInput: { serverName: 'navigator', toolName: toolResult.toolName },
+      },
+      options: [
+        { kind: 'allow_once', optionId: 'allow-generic-execute' },
+        { kind: 'reject_once', optionId: 'reject-generic-execute' },
+      ],
+    });
+    assert.equal(genericExecutePermission.outcome.optionId, 'reject-generic-execute');
+    const missingRejectPermission = await request('session/request_permission', {
+      sessionId: message.params.sessionId,
+      toolCall: {
+        toolCallId: 'native-mcp-untrusted-no-reject-option',
+        kind: 'execute',
+        rawInput: {},
+      },
+      options: [{ kind: 'allow_once', optionId: 'allow-untrusted-native' }],
+    });
+    assert.equal(missingRejectPermission.outcome.outcome, 'cancelled');
+    const responseText = `MCP result: ${toolResult.text}; ${toolResult.exchangeText}; unknown denied=${toolResult.unknownDenied}; permission denied=${toolResult.permissionDenied}; host MCP allow once=${hostPermission.outcome.optionId === 'allow-host'}; native MCP allow once=${nativeMcpPermissions.length === 6}; native MCP without allow once rejected=${nativeMcpWithoutAllowOnce.outcome.optionId === 'reject-native-mcp-without-allow-once'}; business argument spoof denied=${spoofedNativePermission.outcome.optionId === 'reject-spoofed-native'}; foreign server denied=${foreignServerPermission.outcome.optionId === 'reject-foreign-server'}; unknown Navigator tool denied=${unknownNavigatorToolPermission.outcome.optionId === 'reject-unknown-navigator-tool'}; suffix collision denied=${suffixCollisionPermission.outcome.optionId === 'reject-suffix-collision'}; malformed prefix denied=${malformedPrefixPermission.outcome.optionId === 'reject-malformed-prefix'}; generic execute denied=${genericExecutePermission.outcome.optionId === 'reject-generic-execute'}; missing reject cancelled=${missingRejectPermission.outcome.outcome === 'cancelled'}; unknown MCP denied=${unknownMcpPermission.outcome.optionId === 'reject-unknown'}; extra MCP denied=${extraMcpPermission.outcome.optionId === 'reject-extra'}`;
     send({ jsonrpc: '2.0', method: 'session/update', params: {
       sessionId: message.params.sessionId,
       update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: responseText } },

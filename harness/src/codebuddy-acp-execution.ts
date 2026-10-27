@@ -44,6 +44,10 @@ import {
 import type { WorkStateStore } from './work-state-client.js'
 
 const CODEBUDDY_MODELS = new Set(['glm-5.3-flash', 'deepseek-v4.1-flash'])
+const CODEBUDDY_MCP_TOOL_PREFIX = 'mcp__navigator__'
+const ACP_TOOL_KINDS = new Set([
+  'read', 'edit', 'delete', 'move', 'search', 'execute', 'think', 'fetch', 'switch_mode', 'other',
+])
 const CODEBUDDY_SETTINGS = JSON.stringify({
   disableAllHooks: true,
   enabledPlugins: {},
@@ -106,6 +110,35 @@ interface AcpMcpServerStdio {
   readonly command: string;
   readonly args: readonly string[];
   readonly env: readonly AcpMcpEnvironmentVariable[];
+}
+
+type SafeAcpPermissionKind =
+  | 'read' | 'edit' | 'delete' | 'move' | 'search' | 'execute' | 'think' | 'fetch' | 'switch_mode' | 'other'
+  | 'legacy_mcp' | 'unknown' | 'missing'
+
+type PermissionIdentitySource = 'codebuddy_metadata' | 'legacy_mcp_raw_input' | 'none'
+
+interface SafeAcpPermissionDiagnostic {
+  readonly type: 'execution.acp_permission_request'
+  readonly diagnosticVersion: 1
+  readonly method: 'session/request_permission'
+  readonly kind: SafeAcpPermissionKind
+  readonly serverName: 'navigator' | 'other' | 'missing'
+  readonly toolName: 'catalog_match' | 'unknown' | 'missing'
+  readonly identitySource: PermissionIdentitySource
+  readonly catalogAvailable: boolean
+  readonly optionKinds: {
+    readonly allow_once: boolean
+    readonly reject_once: boolean
+    readonly otherCount: number
+  }
+  readonly decision: 'allow_once' | 'reject_once' | 'cancelled'
+}
+
+interface PermissionToolIdentity {
+  readonly serverName: 'navigator' | 'other' | 'missing'
+  readonly toolName: 'catalog_match' | 'unknown' | 'missing'
+  readonly trusted: boolean
 }
 
 /** Implement a top-level CodeBuddy turn without creating or invoking a DSH Agent. */
@@ -186,6 +219,19 @@ export class CodeBuddyAcpExecutionBackend implements ConversationExecutionBacken
     let failure: unknown
     let cleanupFailure: unknown
     let authorizationPaused = false
+    let permissionDiagnosticRecorded = false
+    const recordPermissionDiagnostic = (event: SafeAcpPermissionDiagnostic, codeBuddyMcpCandidate: boolean): void => {
+      if (permissionDiagnosticRecorded || !codeBuddyMcpCandidate) return
+      permissionDiagnosticRecorded = true
+      // Record one native MCP sample without waiting on Work, so telemetry cannot delay ACP permission. | 异步记录一条原生 MCP 样本，不让诊断写入阻塞 ACP 授权。
+      try {
+        void this.options.workState.appendEvent(input.taskId, { ...event }).catch(() => {
+          // Diagnostics must never change the ACP permission decision. | 诊断写入失败不得改变 ACP 授权决定。
+        })
+      } catch {
+        // Work adapters may throw before returning their promise. | Work 适配器可能在返回 Promise 前抛错。
+      }
+    }
 
     try {
       const mcpUrl = await mcpHost.listen()
@@ -237,7 +283,7 @@ export class CodeBuddyAcpExecutionBackend implements ConversationExecutionBacken
           if (method !== 'session/request_permission' || !isJsonObject(params)) {
             throw new Error('Native ACP client request is unsupported')
           }
-          return this.answerPermission(params)
+          return this.answerPermission(params, recordPermissionDiagnostic)
         },
         error => { diagnostic ??= safeAcpDiagnostic(error) },
       )
@@ -427,25 +473,123 @@ export class CodeBuddyAcpExecutionBackend implements ConversationExecutionBacken
     return child
   }
 
-  private async answerPermission(params: Record<string, unknown>): Promise<Record<string, unknown>> {
+  private async answerPermission(
+    params: Record<string, unknown>,
+    recordDiagnostic: (event: SafeAcpPermissionDiagnostic, codeBuddyMcpCandidate: boolean) => void,
+  ): Promise<Record<string, unknown>> {
     const toolCall = isJsonObject(params.toolCall) ? params.toolCall : {}
-    const kind = optionalString(toolCall.kind)
+    const kindValue = optionalString(toolCall.kind)
+    const kind = classifyAcpPermissionKind(kindValue)
     const rawInput = isJsonObject(toolCall.rawInput) ? toolCall.rawInput : {}
-    const serverName = [rawInput.serverName, rawInput.server, rawInput.name]
-      .find(value => typeof value === 'string') as string | undefined
-    const requestedTool = [rawInput.toolName, rawInput.tool]
-      .find(value => typeof value === 'string') as string | undefined
-    const knownTools = new Set(getCodeBuddyAcpToolCatalog(this.options.ctx).map(tool => tool.name))
-    const trustedMcpPermission = kind === 'mcp'
-      && serverName === 'navigator'
-      && requestedTool !== undefined
-      && knownTools.has(requestedTool)
+    const metadata = isJsonObject(toolCall._meta) ? toolCall._meta : {}
+    const codeBuddyToolName = metadata['codebuddy.ai/toolName']
+    const hasCodeBuddyToolName = Object.prototype.hasOwnProperty.call(metadata, 'codebuddy.ai/toolName')
+    let knownTools = new Set<string>()
+    let catalogAvailable = true
+    try {
+      knownTools = new Set(getCodeBuddyAcpToolCatalog(this.options.ctx).map(tool => tool.name))
+    } catch {
+      catalogAvailable = false
+    }
+    const nativeIdentity = codeBuddyMcpToolIdentity(codeBuddyToolName, knownTools)
+    const legacyIdentity = hasCodeBuddyToolName
+      ? { serverName: 'missing' as const, toolName: 'missing' as const, trusted: false }
+      : legacyMcpToolIdentity(kindValue, rawInput, knownTools)
+    const identity = nativeIdentity.trusted
+      ? { ...nativeIdentity, identitySource: 'codebuddy_metadata' as const }
+      : legacyIdentity.trusted
+        ? { ...legacyIdentity, identitySource: 'legacy_mcp_raw_input' as const }
+        : {
+          serverName: hasCodeBuddyToolName ? nativeIdentity.serverName : legacyIdentity.serverName,
+          toolName: hasCodeBuddyToolName ? nativeIdentity.toolName : legacyIdentity.toolName,
+          trusted: false,
+          identitySource: hasCodeBuddyToolName
+            ? 'codebuddy_metadata' as const
+            : kindValue === 'mcp' ? 'legacy_mcp_raw_input' as const : 'none' as const,
+        }
     const options = Array.isArray(params.options) ? params.options.filter(isJsonObject) : []
-    const selection = trustedMcpPermission
-      ? options.find(option => option.kind === 'allow_once' && typeof option.optionId === 'string')
-      : options.find(option => option.kind === 'reject_once' && typeof option.optionId === 'string')
+    const allowOnce = options.find(option => option.kind === 'allow_once' && typeof option.optionId === 'string')
+    const rejectOnce = options.find(option => option.kind === 'reject_once' && typeof option.optionId === 'string')
+    const selection = identity.trusted ? allowOnce ?? rejectOnce : rejectOnce
+    const decision = selection === undefined
+      ? 'cancelled'
+      : identity.trusted && selection === allowOnce ? 'allow_once' : 'reject_once'
+    recordDiagnostic({
+      type: 'execution.acp_permission_request',
+      diagnosticVersion: 1,
+      method: 'session/request_permission',
+      kind,
+      serverName: identity.serverName,
+      toolName: identity.toolName,
+      identitySource: identity.identitySource,
+      catalogAvailable,
+      optionKinds: {
+        allow_once: allowOnce !== undefined,
+        reject_once: rejectOnce !== undefined,
+        otherCount: options.filter(option => option.kind !== 'allow_once' && option.kind !== 'reject_once').length,
+      },
+      decision,
+    }, hasCodeBuddyToolName && typeof codeBuddyToolName === 'string' && codeBuddyToolName.startsWith('mcp__'))
     if (selection !== undefined) return { outcome: { outcome: 'selected', optionId: selection.optionId } }
     return { outcome: { outcome: 'cancelled' } }
+  }
+}
+
+/** Keep ACP tool-kind diagnostics inside the fixed v1 vocabulary. | 仅记录固定 ACP v1 工具类型。 */
+function classifyAcpPermissionKind(value: string | undefined): SafeAcpPermissionKind {
+  if (value === undefined) return 'missing'
+  if (value === 'mcp') return 'legacy_mcp'
+  return ACP_TOOL_KINDS.has(value) ? value as SafeAcpPermissionKind : 'unknown'
+}
+
+/** Trust the CodeBuddy extension name only when it resolves to this session's Navigator catalog. | 仅信任解析到本会话 Navigator 目录的 CodeBuddy 扩展名。 */
+function codeBuddyMcpToolIdentity(value: unknown, knownTools: ReadonlySet<string>): PermissionToolIdentity {
+  if (typeof value !== 'string' || value.length === 0) {
+    return { serverName: 'missing', toolName: 'missing', trusted: false }
+  }
+  if (value.startsWith(CODEBUDDY_MCP_TOOL_PREFIX)) {
+    const requestedTool = value.slice(CODEBUDDY_MCP_TOOL_PREFIX.length)
+    if (requestedTool.length === 0) return { serverName: 'navigator', toolName: 'missing', trusted: false }
+    const catalogMatch = knownTools.has(requestedTool)
+    return {
+      serverName: 'navigator',
+      toolName: catalogMatch ? 'catalog_match' : 'unknown',
+      trusted: catalogMatch,
+    }
+  }
+  if (!value.startsWith('mcp__')) {
+    return { serverName: 'other', toolName: 'unknown', trusted: false }
+  }
+  const separator = value.indexOf('__', 'mcp__'.length)
+  if (separator < 0) return { serverName: 'other', toolName: 'unknown', trusted: false }
+  const serverName = value.slice('mcp__'.length, separator) === 'navigator' ? 'navigator' : 'other'
+  const requestedTool = value.slice(separator + 2)
+  if (requestedTool.length === 0) return { serverName, toolName: 'missing', trusted: false }
+  const catalogMatch = knownTools.has(requestedTool)
+  return {
+    serverName,
+    toolName: catalogMatch ? 'catalog_match' : 'unknown',
+    trusted: serverName === 'navigator' && catalogMatch,
+  }
+}
+
+/** Preserve the pre-metadata custom ACP shape without trusting it for native CodeBuddy requests. | 兼容旧 custom ACP 形状，不用于原生 CodeBuddy 请求。 */
+function legacyMcpToolIdentity(
+  kind: string | undefined,
+  rawInput: Record<string, unknown>,
+  knownTools: ReadonlySet<string>,
+): PermissionToolIdentity {
+  if (kind !== 'mcp') return { serverName: 'missing', toolName: 'missing', trusted: false }
+  const serverValue = [rawInput.serverName, rawInput.server, rawInput.name]
+    .find(value => typeof value === 'string') as string | undefined
+  const toolValue = [rawInput.toolName, rawInput.tool]
+    .find(value => typeof value === 'string') as string | undefined
+  const serverName = serverValue === undefined ? 'missing' : serverValue === 'navigator' ? 'navigator' : 'other'
+  const toolName = toolValue === undefined ? 'missing' : knownTools.has(toolValue) ? 'catalog_match' : 'unknown'
+  return {
+    serverName,
+    toolName,
+    trusted: serverName === 'navigator' && toolName === 'catalog_match',
   }
 }
 

@@ -267,6 +267,15 @@ test('CodeBuddy ACP owns the top-level turn, resumes the durable native session,
     assert.match(first.output, /unknown denied=true/u);
     assert.match(first.output, /permission denied=true/u);
     assert.match(first.output, /host MCP allow once=true/u);
+    assert.match(first.output, /native MCP allow once=true/u);
+    assert.match(first.output, /native MCP without allow once rejected=true/u);
+    assert.match(first.output, /business argument spoof denied=true/u);
+    assert.match(first.output, /foreign server denied=true/u);
+    assert.match(first.output, /unknown Navigator tool denied=true/u);
+    assert.match(first.output, /suffix collision denied=true/u);
+    assert.match(first.output, /malformed prefix denied=true/u);
+    assert.match(first.output, /generic execute denied=true/u);
+    assert.match(first.output, /missing reject cancelled=true/u);
     assert.match(first.output, /unknown MCP denied=true/u);
     assert.match(first.output, /extra MCP denied=true/u);
     assert.equal(harness.providerCalls.length, 1, 'the unknown native MCP tool must not reach Exchange');
@@ -285,6 +294,31 @@ test('CodeBuddy ACP owns the top-level turn, resumes the durable native session,
     const durableEvents = await harness.workState.getEvents(first.taskId);
     assert.ok(durableEvents.events.some(item => item.event.type === 'execution.backend_session'
       && item.event.legacyDshHistoryImported === false));
+    const permissionEvents = durableEvents.events
+      .map(item => item.event)
+      .filter(event => event.type === 'execution.acp_permission_request');
+    assert.equal(permissionEvents.length, 1, 'only one bounded native MCP permission diagnostic is recorded per task');
+    const nativePermission = permissionEvents.find(event => event.identitySource === 'codebuddy_metadata'
+      && event.kind === 'missing');
+    assert.deepEqual(nativePermission, {
+      type: 'execution.acp_permission_request',
+      diagnosticVersion: 1,
+      method: 'session/request_permission',
+      kind: 'missing',
+      serverName: 'navigator',
+      toolName: 'catalog_match',
+      identitySource: 'codebuddy_metadata',
+      catalogAvailable: true,
+      optionKinds: { allow_once: true, reject_once: true, otherCount: 0 },
+      decision: 'allow_once',
+    });
+    const diagnosticJson = JSON.stringify(permissionEvents);
+    assert.equal(diagnosticJson.includes(harness.toolName), false,
+      'permission diagnostics must record only catalog-match classification, not the tool name');
+    for (const secret of ['untrusted-argument', '/workspace/result.txt', 'shell']) {
+      assert.equal(diagnosticJson.includes(secret), false,
+        'permission diagnostics must omit raw arguments and untrusted metadata');
+    }
     assert.deepEqual(acpConfigDirectories(harness.codeBuddyConfigDir), priorConfigDirectories);
 
     await executor.dispose();
@@ -310,6 +344,58 @@ test('CodeBuddy ACP owns the top-level turn, resumes the durable native session,
       if (value === undefined) delete process.env[name];
       else process.env[name] = value;
     }
+  }
+});
+
+test('native MCP permission response and task completion do not wait for diagnostic persistence', async () => {
+  const harness = await createHarness();
+  const originalAppendEvent = harness.workState.appendEvent.bind(harness.workState);
+  let releaseDiagnostic;
+  let signalDiagnosticStarted;
+  let signalDiagnosticPersisted;
+  const diagnosticStarted = new Promise(resolve => { signalDiagnosticStarted = resolve; });
+  const diagnosticPersisted = new Promise(resolve => { signalDiagnosticPersisted = resolve; });
+  harness.workState.appendEvent = async (taskId, event) => {
+    if (event.type === 'execution.acp_permission_request') {
+      signalDiagnosticStarted();
+      await new Promise(resolve => { releaseDiagnostic = resolve; });
+      const receipt = await originalAppendEvent(taskId, event);
+      signalDiagnosticPersisted();
+      return receipt;
+    }
+    return originalAppendEvent(taskId, event);
+  };
+  let execution;
+  let diagnosticStartedDeadline;
+  let completionDeadline;
+  let diagnosticWasStarted = false;
+  try {
+    const executor = harness.createExecutor(harness.createBackend('tool'));
+    execution = executor.executeTask({
+      taskId: 'teams-acp-nonblocking-diagnostic-task',
+      sessionId,
+      prompt: 'Use one permitted Navigator MCP tool.',
+      metadata: { teamsCaller: taskActor },
+    });
+    const started = await Promise.race([
+      diagnosticStarted.then(() => true),
+      new Promise(resolve => { diagnosticStartedDeadline = setTimeout(() => resolve(false), 1_000); }),
+    ]);
+    if (diagnosticStartedDeadline !== undefined) clearTimeout(diagnosticStartedDeadline);
+    assert.equal(started, true, 'the native MCP permission diagnostic should be scheduled');
+    diagnosticWasStarted = true;
+    const outcome = await Promise.race([
+      execution,
+      new Promise(resolve => { completionDeadline = setTimeout(() => resolve(undefined), 1_000); }),
+    ]);
+    assert.ok(outcome, 'the ACP permission and task must complete while diagnostic storage is blocked');
+    assert.equal(outcome.status, 'completed');
+  } finally {
+    if (diagnosticStartedDeadline !== undefined) clearTimeout(diagnosticStartedDeadline);
+    if (completionDeadline !== undefined) clearTimeout(completionDeadline);
+    releaseDiagnostic?.();
+    if (diagnosticWasStarted) await diagnosticPersisted;
+    await disposeHarness(harness);
   }
 });
 
