@@ -656,6 +656,138 @@ def test_credential_health_incident_outbox_is_atomic_deduplicated_and_owner_scop
     ) == {"processed": 1, "stale": 0, "notificationsQueued": 0}
 
 
+def test_credential_health_accepts_scoped_capability_ids_and_keeps_contract_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Opaque provider scopes pass HTTP/store validation without widening IDs. | 验证范围 ID。"""
+
+    from datetime import UTC, datetime
+
+    import cyrene_navigator.work.store as work_store_module
+
+    clock = [1_800_000_000_000]
+    monkeypatch.setattr(work_store_module, "_unix_ms", lambda: clock[0])
+    checked_at = datetime.fromtimestamp(clock[0] / 1000, UTC).isoformat().replace("+00:00", "Z")
+
+    def snapshot(connection_id: str, provider: str, capability_id: str) -> dict[str, Any]:
+        return {
+            "connectionId": connection_id,
+            "provider": provider,
+            "loginState": "PRESENT",
+            "authorizationState": "VALID",
+            "checkedAt": checked_at,
+            "expiresAt": None,
+            "generation": 1,
+            "capabilities": [
+                {
+                    "capabilityId": capability_id,
+                    "state": "VALID",
+                    "lastVerifiedAt": checked_at,
+                    "expiresAt": None,
+                    "reasonCode": None,
+                }
+            ],
+            "reasonCode": None,
+        }
+
+    snapshots = [
+        snapshot("22222222-2222-4222-8222-222222222222", "hf", "model.read"),
+        snapshot(
+            "33333333-3333-4333-8333-333333333333",
+            "azure",
+            "azure:subscription-123/rg-production",
+        ),
+        snapshot(
+            "44444444-4444-4444-8444-444444444444",
+            "gcp",
+            "gcp:project-123/asia-east2-c",
+        ),
+    ]
+    api_db_path = tmp_path / "credential-health-scoped-api.sqlite3"
+    api_base = BASE.format(workspace="w1") + "/credential-health/snapshots"
+
+    with _client(api_db_path) as client:
+        accepted = client.post(
+            api_base,
+            json={"organizationId": "org-a", "connections": snapshots},
+            headers=_headers("credential-monitor"),
+        )
+        assert accepted.status_code == 200, accepted.text
+        assert accepted.json() == {"processed": 3, "stale": 0, "notificationsQueued": 0}
+
+        boundary_id = "a" + ("b" * 254) + "/"
+        assert len(boundary_id) == 256
+        boundary = snapshot("55555555-5555-4555-8555-555555555555", "hf", boundary_id)
+        boundary_response = client.post(
+            api_base,
+            json={"organizationId": "org-a", "connections": [boundary]},
+            headers=_headers("credential-monitor"),
+        )
+        assert boundary_response.status_code == 200, boundary_response.text
+        assert boundary_response.json() == {
+            "processed": 1,
+            "stale": 0,
+            "notificationsQueued": 0,
+        }
+
+        bad_character = snapshot(
+            "66666666-6666-4666-8666-666666666666",
+            "gcp",
+            "gcp:project-123/asia-east2-c?token",
+        )
+        invalid = client.post(
+            api_base,
+            json={"organizationId": "org-a", "connections": [bad_character]},
+            headers=_headers("credential-monitor"),
+        )
+        assert invalid.status_code == 422
+        assert invalid.json()["code"] == "PERSISTENCE_REQUEST_INVALID"
+
+        too_long = snapshot("77777777-7777-4777-8777-777777777777", "hf", boundary_id + "c")
+        oversized = client.post(
+            api_base,
+            json={"organizationId": "org-a", "connections": [too_long]},
+            headers=_headers("credential-monitor"),
+        )
+        assert oversized.status_code == 422
+        assert oversized.json()["code"] == "PERSISTENCE_REQUEST_INVALID"
+
+    with sqlite3.connect(api_db_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT provider, decision
+            FROM work_credential_authorization_health
+            WHERE organization_id = ? AND workspace_id = ?
+            ORDER BY provider, connection_id
+            """,
+            ("org-a", "w1"),
+        ).fetchall()
+    assert rows == [
+        ("azure", "healthy"),
+        ("gcp", "healthy"),
+        ("hf", "healthy"),
+        ("hf", "healthy"),
+    ]
+
+    direct_store = WorkStore(tmp_path / "credential-health-scoped-store.sqlite3")
+    assert direct_store.process_credential_health_snapshots("org-a", "w1", snapshots) == {
+        "processed": 3,
+        "stale": 0,
+        "notificationsQueued": 0,
+    }
+    with pytest.raises(PersistenceError) as error:
+        direct_store.process_credential_health_snapshots("org-a", "w1", [bad_character])
+    assert error.value.code == "WORK_CREDENTIAL_HEALTH_INVALID"
+    assert direct_store.process_credential_health_snapshots("org-a", "w1", [boundary]) == {
+        "processed": 1,
+        "stale": 0,
+        "notificationsQueued": 0,
+    }
+    with pytest.raises(PersistenceError) as error:
+        direct_store.process_credential_health_snapshots("org-a", "w1", [too_long])
+    assert error.value.code == "WORK_CREDENTIAL_HEALTH_INVALID"
+
+
 def test_terminal_task_enqueues_wecom_reply_atomically(tmp_path: Path) -> None:
     """A terminal transition enqueues one adapter reply atomically. | 完成任务原子入通知。"""
 

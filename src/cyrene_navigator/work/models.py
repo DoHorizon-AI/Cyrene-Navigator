@@ -499,7 +499,7 @@ class CredentialCapabilityHealth(WorkModel):
     capability_id: str = Field(
         min_length=1,
         max_length=256,
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$",
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$",
     )
     state: CredentialHealthState
     last_verified_at: str | None = Field(
