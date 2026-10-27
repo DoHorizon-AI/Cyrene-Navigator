@@ -113,6 +113,26 @@ route the request for explicit host review as unknown; never infer approval
 from a tool name or title. See the official [ACP Tool Calls
 specification](https://agentclientprotocol.com/protocol/v1/tool-calls).
 
+The pinned CodeBuddy CLI 2.163.0 permission request omits both `kind` and the
+unstable `name` field. It places business arguments in `rawInput` and identifies
+the requested tool in `_meta["codebuddy.ai/toolName"]` using its
+`mcp__<server>__<tool>` form. Navigator accepts `allow_once` for that
+CodeBuddy-specific shape only when the server component is exactly `navigator`
+and the remaining tool name exactly matches the current task's registered MCP
+catalog. Argument fields never establish server or tool identity. Generic ACP
+requests still require the legacy fixed `mcp` shape or an exact trusted
+CodeBuddy MCP identity; `execute` or `other` alone never grants access.
+Permission diagnostics retain only fixed classifications and option presence,
+not raw metadata, tool names, arguments, titles, request IDs, or credentials.
+
+固定 CodeBuddy CLI 2.163.0 的 ACP 权限请求省略 `kind` 和不稳定的 `name` 字段。业务参数放在
+`rawInput`，工具标识放在 `_meta["codebuddy.ai/toolName"]`，格式为
+`mcp__<server>__<tool>`。Navigator 仅在 server 精确为 `navigator`，且工具名与当前任务已注册的
+MCP 目录完全一致时，才对该 CodeBuddy 专用形状选择 `allow_once`。不得从参数字段推断 server 或工具身份。
+普通 ACP 请求仍须满足旧的固定 `mcp` 形状或精确匹配的 CodeBuddy MCP 身份；单独的 `execute` 或
+`other` 不会授权。权限诊断只保留固定分类和选项是否存在，不记录原始元数据、工具名、参数、标题、请求 ID
+或凭据。
+
 CodeBuddy ACP 的 `session/new` 与 `session/load` 都显式提供唯一的 `navigator` MCP
 server。ACP v1 描述使用标准 `name`、绝对路径 `command`、`args` 和
 `env: [{name, value}]` 字段；CLI 私有 `--mcp-config` 不会替代每个 session 的服务列表。

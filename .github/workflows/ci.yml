@@ -173,6 +173,7 @@ jobs:
             harness/tests/teams-bridge.integration.test.mjs \
             harness/tests/connector-exchange-contract.test.mjs \
             harness/tests/codebuddy-adapter.test.mjs \
+            harness/tests/codebuddy-acp-execution.integration.test.mjs \
             harness/tests/antigravity-adapter.test.mjs \
             harness/tests/subagents.test.mjs \
             harness/tests/subagent-wire.test.mjs \
