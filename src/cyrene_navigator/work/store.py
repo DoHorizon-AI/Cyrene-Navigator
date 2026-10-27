@@ -30,6 +30,7 @@ _CREDENTIAL_HEALTH_NOTIFICATION_TYPE = "teams.credential-health"
 _CREDENTIAL_HEALTH_CONNECTOR_ID = "teams-v1"
 _CREDENTIAL_HEALTH_RECIPIENT = "teams:credential-health"
 _CREDENTIAL_HEALTH_REMINDER_COOLDOWN_MS = 24 * 60 * 60 * 1_000
+_CREDENTIAL_CAPABILITY_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 _TERMINAL_TASK_STATES = frozenset({"completed", "failed", "aborted"})
 _TASK_TRANSITIONS: dict[str, frozenset[str]] = {
     "queued": frozenset({"running", "failed", "aborted", "waiting_approval", "waiting_input"}),
@@ -4466,6 +4467,11 @@ def _credential_health_snapshot(value: object) -> JsonObject:
                 "A capability health snapshot has an unsupported shape.",
             )
         capability_id = _identifier(item.get("capabilityId"), "capabilityId")
+        if _CREDENTIAL_CAPABILITY_ID_PATTERN.fullmatch(capability_id) is None:
+            raise _invalid(
+                "WORK_CREDENTIAL_HEALTH_INVALID",
+                "capabilityId does not match the supported capability identifier contract.",
+            )
         if capability_id in capability_ids:
             raise _invalid("WORK_CREDENTIAL_HEALTH_INVALID", "capability ids must be unique")
         capability_ids.add(capability_id)

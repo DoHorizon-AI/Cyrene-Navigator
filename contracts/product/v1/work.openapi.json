@@ -608,7 +608,7 @@
           "capabilityId": {
             "maxLength": 256,
             "minLength": 1,
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$",
             "title": "Capabilityid",
             "type": "string"
           },
