@@ -38,6 +38,7 @@ import { registerToolProviders } from './tool-providers.js';
 import type {
   ConnectorBindingAuthorization,
   ConnectorResourceProjection,
+  GithubBindingDisplayHint,
 } from './tool-providers.js';
 import type { WorkAssistantBridge } from './work-tools.js';
 import {
@@ -502,6 +503,7 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
       responsibilityTargetsUnavailable = true;
     }
   }
+  const githubBindingDisplayHints = buildGithubBindingDisplayHints(connectorBindings, responsibilityTargets);
 
   let workAssistantBridge: WorkAssistantBridge | undefined;
   if (!teamsChatOnly && persistenceUrl && workspaceId) {
@@ -518,6 +520,7 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
       ...(backgroundTaskAuthority === undefined
         ? {}
         : { backgroundTaskAuthority }),
+      githubBindingDisplayHints,
       ...(teams === undefined ? {} : {
         connectorAuthorization: {
           client: teams.exchangeAuthorization,
@@ -853,6 +856,36 @@ export function validateConnectorBindingMap(value: unknown): Map<string, Connect
     connectionRefs.add(connectionRef.toLowerCase());
   }
   return result;
+}
+
+/** Join host repository labels to trusted GitHub bindings for display only. */
+export function buildGithubBindingDisplayHints(
+  bindings: ReadonlyMap<string, ConnectorBindingAuthorization>,
+  targets: readonly ResponsibilityTargetConfig[] | undefined,
+): ReadonlyMap<string, GithubBindingDisplayHint> {
+  const targetsByBinding = new Map<string, ResponsibilityTargetConfig[]>();
+  for (const target of targets ?? []) {
+    if (bindings.get(target.bindingId)?.providerId !== 'github') continue;
+    const matches = targetsByBinding.get(target.bindingId) ?? [];
+    matches.push(target);
+    targetsByBinding.set(target.bindingId, matches);
+  }
+
+  const hints = new Map<string, GithubBindingDisplayHint>();
+  for (const [bindingId, binding] of bindings) {
+    if (binding.providerId !== 'github') continue;
+    const matches = targetsByBinding.get(bindingId) ?? [];
+    if (matches.length !== 1) continue;
+    const target = matches[0];
+    if (target === undefined || !isSafeGithubRepositoryLabel(target.label)
+      || target.uri !== `https://github.com/${target.label}`) continue;
+    hints.set(bindingId, { label: target.label, uri: target.uri });
+  }
+  return hints;
+}
+
+function isSafeGithubRepositoryLabel(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/u.test(value);
 }
 
 function connectorOperationPolicy(
