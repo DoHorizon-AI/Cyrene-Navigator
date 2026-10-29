@@ -8,7 +8,7 @@
 
 import { constants } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { dirname, isAbsolute, resolve } from 'node:path';
 import type {
   HostObservationAuthority,
   HostObservationTarget,
@@ -149,15 +149,18 @@ export interface PlannerPlanAuthorizationClient {
 
 /** Load one host-authored, bounded JSON profile with a root/private ownership mode. */
 export async function loadAutomationSourceBindings(pathValue: string): Promise<AutomationSourceBindings> {
-  if (!safeText(pathValue, 4096) || !pathValue.startsWith('/') || pathValue.includes('..')) {
+  if (!safeText(pathValue, 4096) || !isAbsolute(pathValue) || pathValue.includes('..')) {
     throw new TypeError('Automation source binding path must be an absolute configured path');
+  }
+  if (process.platform === 'win32') {
+    throw new TypeError('Private automation source bindings are unsupported on Windows until ACL verification is available');
   }
   const path = pathValue;
   try {
     if (await realpath(path) !== path) throw new TypeError('Automation source binding path must not use symlinks');
     const before = await lstat(path);
     const mode = before.mode & 0o7777;
-    const parentPath = path.slice(0, path.lastIndexOf('/')) || '/';
+    const parentPath = dirname(path);
     const parentInfo = await lstat(parentPath);
     const currentGid = typeof process.getgid === 'function' ? process.getgid() : undefined;
     const currentUid = typeof process.getuid === 'function' ? process.getuid() : undefined;

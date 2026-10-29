@@ -7,7 +7,7 @@
 
 import assert from 'node:assert/strict';
 import { chmod, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { test } from 'node:test';
 import {
@@ -85,7 +85,11 @@ test('an empty optional source registry boots without authorizing a Planner targ
   }), undefined);
 });
 
-test('private loader accepts owner-only config and rejects symlinks and permissive files', async () => {
+test('POSIX private loader accepts owner-only config and rejects symlinks and permissive files', {
+  skip: process.platform === 'win32'
+    ? 'Private automation source bindings require POSIX UID/mode checks until Windows ACL verification is implemented.'
+    : false,
+}, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'source-config-'));
   try {
     const privatePath = await writeConfig(directory, config());
@@ -101,6 +105,17 @@ test('private loader accepts owner-only config and rejects symlinks and permissi
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test('Windows refuses a native absolute private source-binding path until ACL verification exists', {
+  skip: process.platform === 'win32' ? false : 'Windows-only private-file guard test.',
+}, async () => {
+  const nativePath = join(tmpdir(), 'navigator-private-source-bindings-not-read.json');
+  assert.equal(isAbsolute(nativePath), true);
+  await assert.rejects(
+    loadAutomationSourceBindings(nativePath),
+    /unsupported on Windows until ACL verification is available/u,
+  );
 });
 
 test('Product authority derives URLs and credentials through Directory ports and asks ACL each poll', async () => {

@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
+import { dirname, isAbsolute } from 'node:path';
 
 export type ExecutionStatus =
   | 'queued'
@@ -911,13 +912,16 @@ export async function loadWorkActorTokenReferences(
   pathValue: string,
   expectedWorkspaceId: string,
 ): Promise<readonly WorkActorTokenReference[]> {
-  if (typeof pathValue !== 'string' || !pathValue.startsWith('/') || pathValue.includes('..')
+  if (typeof pathValue !== 'string' || !isAbsolute(pathValue) || pathValue.includes('..')
     || pathValue.length > 2_000) throw new TypeError('Work actor map path must be absolute and bounded');
+  if (process.platform === 'win32') {
+    throw new TypeError('Private Work actor maps are unsupported on Windows until ACL verification is available');
+  }
   const path = pathValue;
   try {
     if (await realpath(path) !== path) throw new TypeError('Work actor map path must not use symlinks');
     const before = await lstat(path);
-    const parentPath = path.slice(0, path.lastIndexOf('/')) || '/';
+    const parentPath = dirname(path);
     const parent = await lstat(parentPath);
     const currentUid = typeof process.getuid === 'function' ? process.getuid() : undefined;
     const currentGid = typeof process.getgid === 'function' ? process.getgid() : undefined;

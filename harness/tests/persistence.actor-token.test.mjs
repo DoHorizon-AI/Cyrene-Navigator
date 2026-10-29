@@ -7,10 +7,14 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { isAbsolute, join } from 'node:path';
 import { test } from 'node:test';
 import { Context } from '@deepseek-ai/cordis';
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session';
 import CyreneSessionPersistence from '../dist/persistence.js';
+import { loadWorkActorTokenReferences } from '../dist/work-state-client.js';
 
 const DEFAULT_ENV = 'CYRENE_SESSION_TOKEN';
 const OWNER_ENV = 'CYRENE_TEST_OWNER_SESSION_TOKEN';
@@ -263,4 +267,48 @@ test('private Session requests use explicit actor credentials and never fall bac
     await fixture.close();
     restoreEnvironment();
   }
+});
+
+test('POSIX Work actor token map loader accepts the native absolute temp file', {
+  skip: process.platform === 'win32'
+    ? 'Private Work actor maps require POSIX UID/mode checks until Windows ACL verification is implemented.'
+    : false,
+}, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'navigator-work-actor-map-'));
+  const mapPath = join(directory, 'actors.json');
+  await writeFile(mapPath, JSON.stringify({
+    schemaVersion: 1,
+    workspaceId: 'proof',
+    actors: [{
+      actorAadObjectId: '11111111-1111-4111-8111-111111111111',
+      tokenEnv: OWNER_ENV,
+    }],
+  }), { mode: 0o600 });
+  try {
+    assert.equal(isAbsolute(mapPath), true);
+    assert.deepEqual(await loadWorkActorTokenReferences(mapPath, 'proof'), [{
+      actorAadObjectId: '11111111-1111-4111-8111-111111111111',
+      tokenEnv: OWNER_ENV,
+    }]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('Work actor token map still rejects a relative path on every platform', async () => {
+  await assert.rejects(
+    loadWorkActorTokenReferences(join('relative', 'actors.json'), 'proof'),
+    /absolute and bounded/u,
+  );
+});
+
+test('Windows refuses a native absolute private actor-map path until ACL verification exists', {
+  skip: process.platform === 'win32' ? false : 'Windows-only private-file guard test.',
+}, async () => {
+  const nativePath = join(tmpdir(), 'navigator-private-actor-map-not-read.json');
+  assert.equal(isAbsolute(nativePath), true);
+  await assert.rejects(
+    loadWorkActorTokenReferences(nativePath, 'proof'),
+    /unsupported on Windows until ACL verification is available/u,
+  );
 });

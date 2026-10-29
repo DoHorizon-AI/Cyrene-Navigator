@@ -162,7 +162,11 @@ test('ACP backend is explicit, ignores empty legacy model selectors, and does no
   }
 });
 
-test('pilot restart omits a revoked actor credential while the explicit owner model selector stays fail-closed', async () => {
+test('pilot restart omits a revoked actor credential while the explicit owner model selector stays fail-closed', {
+  skip: process.platform === 'win32'
+    ? 'Private actor Work credentials require POSIX UID/mode verification until Windows ACL verification is implemented.'
+    : false,
+}, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'navigator-pilot-revocation-'));
   const actorMapPath = join(directory, 'work-actors.json');
   const actorSubjectsPath = join(directory, 'teams-actors.json');

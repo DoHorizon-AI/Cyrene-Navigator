@@ -169,6 +169,18 @@ enter another actor's operation prompt. The SDK-verified per-activity service
 URL is validated against exact Bot Framework HTTPS hosts and regional paths,
 then kept only in the private thread/outbox route and exact connector grant.
 
+The host actor-token map (`CYRENE_WORK_ACTOR_TOKEN_MAP_FILE`) and private
+automation source-binding file (`CYRENE_AUTOMATION_SOURCE_BINDINGS_FILE`) use
+POSIX UID/mode checks. Use these multi-actor and observation features on a
+POSIX host, including the Linux ARM VM. Native Windows keeps the legacy
+single-user path; private actor maps and source bindings fail closed until a
+Windows ACL verifier is available.
+
+宿主 actor-token map（`CYRENE_WORK_ACTOR_TOKEN_MAP_FILE`）和私有自动化来源绑定文件
+（`CYRENE_AUTOMATION_SOURCE_BINDINGS_FILE`）依赖 POSIX UID/文件模式校验。多成员和主动观察
+能力请运行在 POSIX 宿主，包括 Linux ARM VM。原生 Windows 继续支持旧的单用户路径；在 Windows ACL
+校验器完成前，私有 actor map 和来源绑定会失败关闭。
+
 The outbox dispatcher uses `CYRENE_EXCHANGE_CONNECTOR_INTERNAL_URL`,
 `NAVIGATOR_EXCHANGE_HMAC_KEY_FILE`, `NAVIGATOR_EXCHANGE_HMAC_KEY_ID`, and the
 host-bound `TEAMS_EXCHANGE_CONNECTION_REF` / `TEAMS_EXCHANGE_PROFILE_REF`. It

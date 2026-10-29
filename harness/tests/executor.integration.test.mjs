@@ -820,7 +820,11 @@ test('NavigatorExecutor: actor Work clients claim and deliver only their channel
   }
 });
 
-test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and preserves actor/route certainty', async () => {
+test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and preserves actor/route certainty', {
+  skip: process.platform === 'win32'
+    ? 'Private actor Work credentials require POSIX UID/mode verification until Windows ACL verification is implemented.'
+    : false,
+}, async () => {
   const workspaceId = 'private-boot-workspace';
   const tenantId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
   const ownerId = '11111111-1111-4111-8111-111111111111';
