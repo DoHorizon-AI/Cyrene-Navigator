@@ -888,6 +888,7 @@ function createWorkBridge(source, events, operationReceipts, taskCallers = new M
         if (caller === undefined) throw new Error(`Unknown synthetic Teams task: ${requestedTaskId}`);
         return {
           id: requestedTaskId,
+          createdByActorId: caller.subject,
           metadata: {
             teamsCaller: caller,
           },

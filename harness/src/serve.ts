@@ -5,10 +5,12 @@
 // └─────────────────────────────────────────────────────────────────────┘
 
 import { existsSync, lstatSync, mkdirSync, statSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Context } from '@deepseek-ai/cordis';
+import { ToolCallId } from '@deepseek-ai/dsh-llm/brand';
 import { LocalSubprocessRuntime } from '@deepseek-ai/dsh-subprocess-local';
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session';
 import LlmRuntime, { LlmAdapter } from '@deepseek-ai/dsh-llm';
@@ -26,23 +28,33 @@ import {
   parseCredentialNotificationsConfig,
   resolveTeamsTaskActorSubjects,
 } from './executor.js';
-import type { CredentialNotificationsConfig, TeamsExecutorConfig } from './executor.js';
+import type { CredentialNotificationsConfig, TeamsExecutorConfig, TeamsPersonalMessageSendRequest } from './executor.js';
 import { ExchangeLlmAdapter } from './exchange-adapter.js';
 import { CodeBuddyLlmAdapter } from './codebuddy-adapter.js';
 import { AntigravityLlmAdapter, DEFAULT_ANTIGRAVITY_MODEL } from './antigravity-adapter.js';
-import { ExchangeConnectorAuthorizationClient } from './connector-authorization.js';
-import { InMemoryWorkStateStore, WorkStateClient } from './work-state-client.js';
+import {
+  ExchangeConnectorAuthorizationClient,
+  canonicalJson,
+  sha256,
+  validateTeamsServiceUrl,
+} from './connector-authorization.js';
+import {
+  InMemoryWorkStateStore,
+  WorkActorClientRegistry,
+  WorkStateClient,
+  loadWorkActorTokenReferences,
+} from './work-state-client.js';
 import type { WorkStateStore } from './work-state-client.js';
-import { registerWorkTools } from './work-tools.js';
-import { registerToolProviders } from './tool-providers.js';
+import { WorkAssistantBridge, registerWorkTools } from './work-tools.js';
+import { getConnectorToolCatalog, registerToolProviders } from './tool-providers.js';
 import type {
   ConnectorBindingAuthorization,
   ConnectorResourceProjection,
   GithubBindingDisplayHint,
 } from './tool-providers.js';
-import type { WorkAssistantBridge } from './work-tools.js';
 import {
   createResponsibilityAuthorizationResolver,
+  verifiedTeamsPrincipalForTask,
   verifyActiveTeamsOwnerContext,
   verifyWorkflowOwnerAccess,
 } from './responsibility-authority.js';
@@ -65,6 +77,25 @@ import { CodeBuddyAcpExecutionBackend, validateCodeBuddyModel } from './codebudd
 import type { ConversationExecutionBackend } from './codebuddy-acp-execution.js';
 import { WorkflowsClient } from './workflows/store.js';
 import { registerWorkflowRuntime } from './workflows/runtime.js';
+import { createProductObservationSource } from './workflows/product-observation.js';
+import type { ProductObservationRequest } from './workflows/product-observation.js';
+import { createHostHealthObservationSource } from './workflows/host-observation.js';
+import type { HostObservationRequest } from './workflows/host-observation.js';
+import { createOfficeObservationSource } from './workflows/office-observation.js';
+import {
+  AUTOMATION_SOURCE_BINDINGS_ENV,
+  createHostObservationAuthority,
+  createProductObservationAuthority,
+  loadAutomationSourceBindings,
+} from './workflows/source-config.js';
+import type {
+  AutomationSourceBindings,
+  HostSourceAuthorizationClient,
+  PlannerPlanAuthorizationClient,
+  ProductDirectorySourceClient,
+  ProductSourceCredentialClient,
+} from './workflows/source-config.js';
+import type { WorkflowObservationPageRequest, WorkflowObservationSourceDriver } from './workflows/runtime.js';
 import { registerCloudConnections, validateCloudConnectionConfig } from './integrations/cloud-connections.js';
 import {
   ExchangeAuthorizationClient,
@@ -113,6 +144,13 @@ export interface CreateExecutorAppOptions {
   readonly authTokenEnv?: string;
   readonly allowedOrigins?: readonly string[];
   readonly workStateStore?: WorkStateStore;
+  /** Mandatory server-owned source readers and per-poll ACL clients; absent ports keep those sources disabled. */
+  readonly automationSourceClients?: {
+    readonly productDirectory?: ProductDirectorySourceClient;
+    readonly productCredentials?: ProductSourceCredentialClient;
+    readonly hostAuthorization?: HostSourceAuthorizationClient;
+    readonly plannerAuthorization?: PlannerPlanAuthorizationClient;
+  };
   readonly enableWorkflows?: boolean;
   readonly dshHome?: string;
   readonly cloudConnectionConfigPath?: string;
@@ -148,7 +186,13 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
 
   const persistenceUrl = options.persistenceUrl ?? process.env.CYRENE_PERSISTENCE_URL;
   const workspaceId = options.workspaceId ?? process.env.CYRENE_WORKSPACE_ID;
-  const teams = options.teams ?? await createTeamsExecutorConfig(workspaceId);
+  const configuredTeams = options.teams ?? await createTeamsExecutorConfig(workspaceId);
+  const privateTeamsMessageSender = configuredTeams?.personalChatEnabled === true && workspaceId !== undefined
+    ? createPrivateTeamsMessageSender(configuredTeams, workspaceId)
+    : undefined;
+  const teams = configuredTeams !== undefined && privateTeamsMessageSender !== undefined
+    ? { ...configuredTeams, sendPrivateMessage: privateTeamsMessageSender }
+    : configuredTeams;
   const maxConcurrentTasks = validateTaskConcurrency(
     options.maxConcurrentTasks ?? parseTaskConcurrency(process.env.CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS),
   );
@@ -224,13 +268,74 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
   if (!testMode && !publicToken) throw new Error(`${publicTokenEnv} or CYRENE_SESSION_TOKEN is required for executor API authentication`);
   const workState: WorkStateStore = options.workStateStore
     ?? (persistenceUrl && workspaceId
-      ? new WorkStateClient({ baseUrl: persistenceUrl, workspaceId, tokenEnv: 'CYRENE_SESSION_TOKEN', requestTimeoutMs: 10_000 })
+      ? new WorkStateClient({
+        baseUrl: persistenceUrl,
+        workspaceId,
+        tokenEnv: 'CYRENE_SESSION_TOKEN',
+        privateBridgeTokenEnv: 'CYRENE_PRIVATE_TEAMS_BRIDGE_TOKEN',
+        requestTimeoutMs: 10_000,
+      })
       : testMode ? new InMemoryWorkStateStore() : (() => { throw new Error('Durable work-state configuration is required'); })());
   if (production && (workState instanceof InMemoryWorkStateStore || options.workStateStore === undefined && !persistenceUrl)) {
     throw new Error('Production executor requires the SQLite-backed WorkStateClient');
   }
+  const workActorTokenMapPath = process.env.CYRENE_WORK_ACTOR_TOKEN_MAP_FILE;
+  const configuredWorkActorReferences = workActorTokenMapPath === undefined
+    ? undefined
+    : await loadWorkActorTokenReferences(resolve(configText(workActorTokenMapPath, 'CYRENE_WORK_ACTOR_TOKEN_MAP_FILE', 2_000)), workspaceId!);
+  let workActorReferences = configuredWorkActorReferences;
+  let workActorClients: WorkActorClientRegistry | undefined;
+  if (workActorReferences !== undefined) {
+    const configuredReferences = configuredWorkActorReferences ?? [];
+    if (!persistenceUrl || !workspaceId) throw new Error('A Work actor token map requires durable Workspace configuration');
+    if (teams?.personalChatEnabled === true) {
+      const issuer = `https://login.microsoftonline.com/${teams.tenantId.toLowerCase()}/v2.0`;
+      const currentlyAuthorized = new Set(
+        await resolveTeamsTaskActorSubjects(teams, workspaceId, issuer),
+      );
+      workActorReferences = workActorReferences.filter(reference =>
+        currentlyAuthorized.has(reference.actorAadObjectId.toLowerCase()));
+      const modelActorSubject = teams.modelActorSubject?.toLowerCase();
+      if (modelActorSubject !== undefined
+        && !configuredReferences.some(reference => reference.actorAadObjectId.toLowerCase() === modelActorSubject)) {
+        throw new Error('CYRENE_TEAMS_MODEL_ACTOR_SUBJECT must name a configured actor Work principal');
+      }
+    }
+    const values = workActorReferences.map(reference => process.env[reference.tokenEnv]);
+    if (values.some(value => !value || Buffer.byteLength(value, 'utf8') < 32)
+      || new Set(values).size !== values.length
+      || values.some(value => value === process.env.CYRENE_SESSION_TOKEN
+        || value === process.env.CYRENE_EXECUTOR_TOKEN
+        || value === process.env.CYRENE_PRIVATE_TEAMS_BRIDGE_TOKEN)) {
+      throw new Error('Work actor token environment references must resolve to distinct dedicated credentials');
+    }
+    workActorClients = new WorkActorClientRegistry({ baseUrl: persistenceUrl, workspaceId, requestTimeoutMs: 10_000 }, workActorReferences);
+  }
+  if (teams?.personalChatEnabled === true) {
+    if (workActorReferences === undefined || workActorReferences.length < 1 || workActorReferences.length > 5) {
+      throw new Error('Personal Teams mode requires 1 to 5 dedicated actor Work principals in CYRENE_WORK_ACTOR_TOKEN_MAP_FILE');
+    }
+  }
+  const automationSourceBindingsPath = process.env[AUTOMATION_SOURCE_BINDINGS_ENV];
+  let automationSourceBindings: AutomationSourceBindings | undefined;
+  let automationSourceBindingsUnavailable = false;
+  if (automationSourceBindingsPath !== undefined) {
+    try {
+      automationSourceBindings = await loadAutomationSourceBindings(resolve(configText(
+        automationSourceBindingsPath, AUTOMATION_SOURCE_BINDINGS_ENV, 2_000,
+      )));
+    } catch {
+      automationSourceBindingsUnavailable = true;
+    }
+  }
 
   const ctx = new Context();
+  if (teams?.personalChatEnabled === true && teams.sendPrivateMessage === undefined) {
+    ctx.logger.warn('Teams personal notifications are disabled because the fixed Exchange private sender is unavailable');
+  }
+  if (automationSourceBindingsUnavailable) {
+    ctx.logger.warn('automation source bindings are unavailable or invalid; Product, host-health, and Planner observations are disabled');
+  }
   if (workflowSetupUnavailable) {
     ctx.logger.warn('background workflow runtime is unavailable because durable storage or DSH_HOME is not configured; foreground chat remains online');
   }
@@ -264,6 +369,8 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
       ].join('\n'),
     });
   }
+  let persistenceTokenEnvForSession = (_sessionId: string): string | undefined => undefined;
+  let actorPrivateScopeForSession = (sessionId: string): boolean => sessionId.startsWith('teams-');
   await ctx.plugin(ToolRuntime);
   await ctx.plugin(AgentRegistry);
 
@@ -274,6 +381,8 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
       baseUrl: persistenceUrl,
       workspaceId,
       tokenEnv: 'CYRENE_SESSION_TOKEN',
+      tokenEnvForSession: (sessionId: string) => persistenceTokenEnvForSession(sessionId),
+      actorPrivateScopeForSession: (sessionId: string) => actorPrivateScopeForSession(sessionId),
       clientId: process.env.CYRENE_DEVICE_ID ?? 'navigator-cloud-daemon',
       requestTimeoutMs: 10_000,
       heartbeatMs: 1_000,
@@ -449,6 +558,8 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
     defaultCwd: options.defaultCwd ?? process.cwd(),
     workspaceId: workspaceId ?? 'test-workspace',
     workState,
+    workStateTokenEnv: 'CYRENE_SESSION_TOKEN',
+    ...(workActorClients === undefined ? {} : { workActorClients }),
     authTokenEnv: publicTokenEnv,
     maxConcurrentTasks,
     modelFallbacks,
@@ -461,21 +572,107 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
 
   const executor = ctx.get('executor');
   if (!executor) throw new Error('Navigator executor service was not registered');
+  persistenceTokenEnvForSession = sessionId => executor.workTokenEnvForSession(sessionId);
+  actorPrivateScopeForSession = sessionId => executor.actorPrivateSession(sessionId);
   const pluginManager = ctx.get('pluginManager');
   const workflowStore = workflowsEnabled
     ? new WorkflowsClient({
       baseUrl: persistenceUrl!, workspaceId: workspaceId!, tokenEnv: 'CYRENE_SESSION_TOKEN', requestTimeoutMs: 10_000,
     })
     : undefined;
+  const workflowStoresByActor = new Map<string, WorkflowsClient>();
+  if (workflowsEnabled && workActorClients !== undefined && persistenceUrl && workspaceId) {
+    for (const actorId of workActorClients.actorIds()) {
+      const tokenEnv = workActorClients.tokenEnvForActor(actorId);
+      if (tokenEnv === undefined) continue;
+      workflowStoresByActor.set(actorId, new WorkflowsClient({
+        baseUrl: persistenceUrl, workspaceId, tokenEnv, requestTimeoutMs: 10_000,
+      }));
+    }
+  }
+  const trustedAutomationSourceBindings = automationSourceBindings === undefined
+    ? undefined
+    : {
+      schemaVersion: 1 as const,
+      targets: automationSourceBindings.targets.filter(binding => {
+        if (binding.kind !== 'planner_plan') return true;
+        const graphBinding = connectorBindings.get(binding.bindingId);
+        return graphBinding?.providerId === 'microsoft_graph'
+          && graphBinding.connectionRef.toLowerCase() === binding.connectionRef.toLowerCase()
+          && graphBinding.profileRef === binding.profileRef
+          && graphBinding.tools.some(tool => tool.toolId === 'microsoft_graph.planner.tasks.list'
+            && tool.operationId === 'microsoft_graph.planner.tasks.list'
+            && tool.resourceProjection === 'microsoft_graph_plan' && !tool.mutating)
+          && graphBinding.tools.some(tool => tool.toolId === 'microsoft_graph.planner.plan.get'
+            && tool.operationId === 'microsoft_graph.planner.plan.get'
+            && tool.resourceProjection === 'microsoft_graph_plan' && !tool.mutating);
+      }),
+    };
+  if (automationSourceBindings !== undefined
+    && trustedAutomationSourceBindings?.targets.length !== automationSourceBindings.targets.length) {
+    ctx.logger.warn('one or more Planner source bindings do not match an actor-owned Microsoft Graph connector profile and are disabled');
+  }
+  const workflowSourceDrivers: WorkflowObservationSourceDriver[] = [];
+  const sourceClients = options.automationSourceClients;
+  if (trustedAutomationSourceBindings !== undefined && sourceClients?.productDirectory !== undefined
+    && sourceClients.productCredentials !== undefined) {
+    const authority = createProductObservationAuthority(
+      trustedAutomationSourceBindings, sourceClients.productDirectory, sourceClients.productCredentials,
+    );
+    const adapters = new Map<string, ReturnType<typeof createProductObservationSource>>();
+    const readProduct = (request: WorkflowObservationPageRequest) => {
+      let adapter = adapters.get(request.ownerActorId);
+      if (adapter === undefined) {
+        adapter = createProductObservationSource({ actorId: request.ownerActorId, authority });
+        adapters.set(request.ownerActorId, adapter);
+      }
+      return adapter.read(request as ProductObservationRequest);
+    };
+    workflowSourceDrivers.push(
+      { source: 'product', pollPage: readProduct },
+      { source: 'training', pollPage: readProduct },
+    );
+  }
+  if (trustedAutomationSourceBindings !== undefined && sourceClients?.hostAuthorization !== undefined) {
+    const authority = createHostObservationAuthority(trustedAutomationSourceBindings, sourceClients.hostAuthorization);
+    const adapters = new Map<string, ReturnType<typeof createHostHealthObservationSource>>();
+    workflowSourceDrivers.push({
+      source: 'vm_health',
+      pollPage: request => {
+        let adapter = adapters.get(request.ownerActorId);
+        if (adapter === undefined) {
+          adapter = createHostHealthObservationSource({ actorId: request.ownerActorId, authority });
+          adapters.set(request.ownerActorId, adapter);
+        }
+        return adapter.read(request as HostObservationRequest);
+      },
+    });
+  }
+  if (trustedAutomationSourceBindings?.targets.some(binding => binding.kind === 'planner_plan')) {
+    workflowSourceDrivers.push(createOfficeObservationSource({
+      sourceBindings: trustedAutomationSourceBindings,
+      ...(sourceClients?.plannerAuthorization === undefined ? {} : { authorization: sourceClients.plannerAuthorization }),
+    }));
+  }
+  if (trustedAutomationSourceBindings !== undefined && sourceClients === undefined) {
+    ctx.logger.warn('Product and host source bindings are loaded without their required Directory/ACL clients; those configured reads remain disabled');
+  }
   const responsibilityAuthority: ResponsibilityAuthorityConfig | undefined =
     workflowStore !== undefined && teams !== undefined && workspaceId !== undefined
       ? {
         workspaceId,
         teamsConnectorId: teams.connectorId,
         allowedTenantId: teams.tenantId,
+        allowedBotAppId: teams.botAppId,
         allowedTeamIds: teams.allowedTeamIds,
         workState,
+        workStateForActor: actorId => workActorClients === undefined
+          ? workState
+          : workActorClients.forActor(actorId),
         workflows: workflowStore,
+        workflowsForActor: actorId => workActorClients === undefined
+          ? workflowStore
+          : workflowStoresByActor.get(actorId),
         isDirectoryAuthorized: async (principal, signal) => {
           signal.throwIfAborted();
           if (principal.tenantId !== teams.tenantId.toLowerCase()) return false;
@@ -512,10 +709,25 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
       workspaceId,
       tokenEnv: 'CYRENE_SESSION_TOKEN',
       taskIdForSession: sessionId => executor.activeTaskId(sessionId),
+      tokenEnvForSession: sessionId => {
+        const taskId = executor.activeTaskId(sessionId);
+        return taskId === undefined ? undefined : executor.workTokenEnvForTask(taskId);
+      },
       onTaskDenied: sessionId => ctx.agents.get(SessionId(sessionId))?.cancel({ kind: 'hook', reason: 'work_approval_denied' }),
     });
     await registerToolProviders(ctx, {
       bridge: workAssistantBridge,
+      bridgeForTask: taskId => {
+        const tokenEnv = executor.workTokenEnvForTask(taskId);
+        return tokenEnv === undefined ? workAssistantBridge! : new WorkAssistantBridge({
+          baseUrl: persistenceUrl!,
+          workspaceId: workspaceId!,
+          tokenEnv,
+          taskIdForSession: sessionId => executor.activeTaskId(sessionId),
+          onTaskDenied: sessionId => ctx.agents.get(SessionId(sessionId))?.cancel({ kind: 'hook', reason: 'work_approval_denied' }),
+        });
+      },
+      readBackgroundTask: taskId => executor.readTaskForExecution(taskId),
       taskIdForSession: sessionId => executor.activeTaskId(sessionId),
       ...(backgroundTaskAuthority === undefined
         ? {}
@@ -600,6 +812,52 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
         storageRoot: join(resolve(dshHome!), 'storages'),
         schedulerSessionId: 'navigator-workflow-scheduler-v1',
         executeTask: params => executor.executeTask(params),
+        sourceDrivers: workflowSourceDrivers,
+        executeFixedToolTask: (request, execute, actorAadObjectId, actorWorkState) =>
+          executor.executeFixedToolTask(request, execute, actorAadObjectId, actorWorkState),
+        recordSourcePageReceipt: (taskId, receipt) => executor.recordWorkflowSourcePage(taskId, receipt),
+        resolveWorkflowActor: async ownerTaskId => {
+          const actorTask = await workActorClients?.resolveTask(ownerTaskId);
+          if (actorTask !== undefined) return actorTask.actorAadObjectId;
+          const legacyTask = await workState.getTask(ownerTaskId);
+          return legacyTask?.createdByActorId?.toLowerCase();
+        },
+        authorizeWorkflowActor: async (actorAadObjectId, ownerTaskId) => {
+          if (!teams || !workspaceId || teams.personalChatEnabled !== true) return false;
+          const actorId = actorAadObjectId.toLowerCase();
+          const actorStore = workActorClients === undefined ? undefined : workActorClients.forActor(actorId);
+          if (workActorClients !== undefined && actorStore === undefined) return false;
+          const selectedStore = actorStore ?? workState;
+          const task = await selectedStore.getTask(ownerTaskId);
+          if (task === undefined) return false;
+          const principal = verifiedTeamsPrincipalForTask(task, actorId, teams.tenantId, teams.botAppId);
+          if (principal === undefined) return false;
+          const subjects = await resolveTeamsTaskActorSubjects(teams, workspaceId, principal.issuer);
+          return subjects.includes(actorId);
+        },
+        invokeObservationConnectorTool: async (agent, request) => {
+          const entry = getConnectorToolCatalog(ctx).find(item => item.bindingId === request.bindingId
+            && item.providerId === request.providerId && item.toolId === request.toolId
+            && item.operationId === request.operationId && item.resourceProjection === request.resourceProjection
+            && !item.mutating);
+          if (entry === undefined) throw new Error('Fixed observation connector tool is not configured');
+          const callId = ToolCallId(`workflow-observation-${randomUUID()}`);
+          const result = await ctx.tools.execute({
+            name: entry.name,
+            callId,
+            rootCallId: callId,
+            arguments: request.arguments,
+            signal: request.signal,
+            agent,
+          });
+          return result;
+        },
+        actorStores: [...workflowStoresByActor].map(([actorAadObjectId, store]) => ({
+          actorAadObjectId,
+          store,
+          workState: workActorClients?.forActor(actorAadObjectId),
+          sourceDrivers: workflowSourceDrivers,
+        })),
         readTaskEvents: (taskId, after) => executor.readTaskEvents(taskId, after),
         ...(responsibilityAuthority === undefined
           ? {}
@@ -669,6 +927,15 @@ async function createTeamsExecutorConfig(workspaceId: string | undefined): Promi
   }
   const tenantId = requiredUuidEnvironment('TEAMS_TENANT_ID');
   const botAppId = requiredUuidEnvironment('TEAMS_BOT_APP_ID');
+  const personalChatEnabledValue = process.env.CYRENE_TEAMS_PERSONAL_CHAT_ENABLED;
+  if (personalChatEnabledValue !== undefined && personalChatEnabledValue !== 'true' && personalChatEnabledValue !== 'false') {
+    throw new TypeError('CYRENE_TEAMS_PERSONAL_CHAT_ENABLED must be true or false');
+  }
+  const personalChatEnabled = personalChatEnabledValue === 'true';
+  const modelActorSubjectValue = process.env.CYRENE_TEAMS_MODEL_ACTOR_SUBJECT;
+  const modelActorSubject = modelActorSubjectValue === undefined || modelActorSubjectValue === ''
+    ? undefined
+    : requireUuidValue(modelActorSubjectValue, 'CYRENE_TEAMS_MODEL_ACTOR_SUBJECT');
   const allowedTeamIds = requiredCsvEnvironment('TEAMS_ALLOWED_TEAM_IDS');
   const taskActorSubjectsFile = process.env.TEAMS_TASK_ACTOR_SUBJECTS_FILE === undefined
     ? undefined
@@ -698,6 +965,8 @@ async function createTeamsExecutorConfig(workspaceId: string | undefined): Promi
     allowedTeamIds,
     botAppId,
     taskActorSubjects,
+    personalChatEnabled,
+    ...(modelActorSubject === undefined ? {} : { modelActorSubject }),
     ...(taskActorSubjectsFile === undefined ? {} : { taskActorSubjectsFile }),
     ingressSecretEnv: 'TEAMS_NAVIGATOR_HMAC_KEY',
     exchangeConnectionRef,
@@ -738,6 +1007,83 @@ async function createTeamsExecutorConfig(workspaceId: string | undefined): Promi
     throw new Error('Credential notification owner is not in the configured Teams actor scope');
   }
   return { ...config, credentialNotifications };
+}
+
+/** Bind Work-resolved private targets to the configured Teams Exchange profile and original actor. */
+function createPrivateTeamsMessageSender(
+  config: TeamsExecutorConfig,
+  workspaceId: string,
+): NonNullable<TeamsExecutorConfig['sendPrivateMessage']> | undefined {
+  const client = config.exchangeAuthorization;
+  if (!(client instanceof ExchangeConnectorAuthorizationClient)) return undefined;
+  return async (request: TeamsPersonalMessageSendRequest, signal: AbortSignal) => {
+    if (config.personalChatEnabled !== true || request.target_kind !== 'owner_private'
+      || !exactKeys(request as unknown as Readonly<Record<string, unknown>>, [
+        'requestId', 'conversation', 'tenant_id', 'service_url', 'target_kind', 'actor_aad_object_id', 'text',
+      ])) {
+      throw new TypeError('Private Teams delivery is not enabled or the host request shape is invalid');
+    }
+    const conversationInput = request.conversation as unknown as Record<string, unknown>;
+    if (!exactKeys(conversationInput, ['vendor', 'account_id', 'conversation_id', 'kind'])
+      || conversationInput.vendor !== 'msteams' || conversationInput.kind !== 'private') {
+      throw new TypeError('Private Teams conversation scope is invalid');
+    }
+    const tenantId = requireUuidValue(request.tenant_id, 'private Teams tenant id');
+    const botAppId = requireUuidValue(conversationInput.account_id, 'private Teams bot app id');
+    const actorAadObjectId = requireUuidValue(request.actor_aad_object_id, 'private Teams actor id');
+    if (tenantId !== config.tenantId.toLowerCase() || botAppId !== config.botAppId.toLowerCase()) {
+      throw new TypeError('Private Teams route is outside the configured tenant or bot');
+    }
+    const conversationId = boundedHostText(conversationInput.conversation_id, 'private Teams conversation id', 512);
+    const serviceUrl = validateTeamsServiceUrl(request.service_url, tenantId);
+    const text = boundedHostText(request.text, 'private Teams message text', 20_000);
+    const requestId = boundedHostText(request.requestId, 'private Teams request id', 200);
+    const issuer = `https://login.microsoftonline.com/${tenantId}/v2.0`;
+    const currentSubjects = await resolveTeamsTaskActorSubjects(config, workspaceId, issuer);
+    if (!currentSubjects.includes(actorAadObjectId)) {
+      throw new TypeError('Private Teams route actor is no longer authorized');
+    }
+    const conversation = { tenantId, botAppId, actorAadObjectId, conversationId, serviceUrl };
+    const args = { targetKind: 'owner_private', conversation, text } as const;
+    const grant = await client.mintGrant({
+      requestId,
+      workspaceId,
+      principalIssuer: issuer,
+      principalSubject: actorAadObjectId,
+      connectionRef: config.exchangeConnectionRef,
+      providerId: 'msteams',
+      profileRef: config.exchangeProfileRef,
+      operationId: 'msteams.message.reply',
+      resourceRef: `msteams-personal:${sha256(canonicalJson(conversation))}`,
+      argumentsDigestSha256: sha256(canonicalJson(args)),
+      arguments: args,
+    }, signal);
+    if (grant.request.principalSubject.toLowerCase() !== actorAadObjectId) {
+      throw new TypeError('Exchange private Teams grant actor does not match the Work-resolved owner');
+    }
+    return client.sendPrivateTeamsMessage({ requestId, targetKind: 'owner_private', conversation, text },
+      grant, config.exchangeConnectionRef, config.exchangeProfileRef, signal);
+  };
+}
+
+function exactKeys(value: Readonly<Record<string, unknown>>, fields: readonly string[]): boolean {
+  return Object.keys(value).length === fields.length && fields.every(field => Object.hasOwn(value, field));
+}
+
+function requireUuidValue(value: unknown, label: string): string {
+  const result = boundedHostText(value, label, 36).toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(result)) {
+    throw new TypeError(`Invalid ${label}`);
+  }
+  return result;
+}
+
+function boundedHostText(value: unknown, label: string, maximum: number): string {
+  if (typeof value !== 'string' || value.length < 1 || value.length > maximum
+    || value.trim() !== value || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new TypeError(`Invalid ${label}`);
+  }
+  return value;
 }
 
 function parseTaskConcurrency(value: string | undefined): number {
@@ -803,6 +1149,7 @@ export function validateConnectorBindingMap(value: unknown): Map<string, Connect
     'github_actions_run', 'github_actions_job', 'github_branch', 'github_file', 'github_pull_request_draft',
     'computer_workspace', 'computer_file', 'computer_directory',
     'huggingface_repository', 'cloud_target', 'cloud_operation',
+    'azure_devops_source', 'microsoft_graph_plan', 'microsoft_graph_task',
   ]);
   const result = new Map<string, ConnectorBindingAuthorization>();
   const connectionRefs = new Set<string>();
@@ -815,7 +1162,7 @@ export function validateConnectorBindingMap(value: unknown): Map<string, Connect
       throw new TypeError(`connector binding ${index} connectionRef must be an Exchange UUID`);
     }
     const providerId = configText(row.providerId, 'providerId', 64);
-    if (!['github', 'huggingface', 'azure', 'gcp', 'runpod', 'computer'].includes(providerId)) {
+    if (!['github', 'huggingface', 'azure', 'gcp', 'runpod', 'computer', 'azure_devops', 'microsoft_graph'].includes(providerId)) {
       throw new TypeError(`connector binding ${index} providerId is not supported`);
     }
     const profileRef = configText(row.profileRef, 'profileRef', 512);
@@ -956,6 +1303,18 @@ function connectorOperationPolicy(
     'cloud.operation.logs.read': { toolId: 'cloud_operation_logs', mutating: false, resourceProjection: 'cloud_operation' },
     'cloud.operation.cancel': { toolId: 'cloud_operation_cancel', mutating: true, resourceProjection: 'cloud_operation' },
     'cloud.vendor.cli.execute': { toolId: 'cloud_vendor_cli', mutating: true, resourceProjection: 'profile' },
+    'azure_devops.observations.poll': {
+      toolId: 'azure_devops.observations.poll', mutating: false, resourceProjection: 'azure_devops_source',
+    },
+    'microsoft_graph.planner.plan.get': {
+      toolId: 'microsoft_graph.planner.plan.get', mutating: false, resourceProjection: 'microsoft_graph_plan',
+    },
+    'microsoft_graph.planner.tasks.list': {
+      toolId: 'microsoft_graph.planner.tasks.list', mutating: false, resourceProjection: 'microsoft_graph_plan',
+    },
+    'microsoft_graph.planner.task.get': {
+      toolId: 'microsoft_graph.planner.task.get', mutating: false, resourceProjection: 'microsoft_graph_task',
+    },
   };
   const policy = policies[operationId];
   if (!policy) throw new TypeError(`Connector operation ${operationId} is not in the canonical operation table`);
@@ -965,7 +1324,11 @@ function connectorOperationPolicy(
       ? operationId.startsWith('huggingface.')
       : providerId === 'computer'
         ? operationId.startsWith('computer.')
-        : ['azure', 'gcp', 'runpod'].includes(providerId) && operationId.startsWith('cloud.');
+        : providerId === 'azure_devops'
+          ? operationId.startsWith('azure_devops.')
+          : providerId === 'microsoft_graph'
+            ? operationId.startsWith('microsoft_graph.planner.')
+            : ['azure', 'gcp', 'runpod'].includes(providerId) && operationId.startsWith('cloud.');
   if (!providerAllowed || (operationId === 'cloud.resource.restart' && providerId !== 'runpod')) {
     throw new TypeError(`Connector operation ${operationId} is not valid for provider ${providerId}`);
   }

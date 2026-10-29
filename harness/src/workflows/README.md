@@ -16,6 +16,10 @@ for the profile boundaries and deployment order.
 | `store.ts` | Workflow model, authenticated API client, immutable receipts, notification outbox, and explicit test store / 工作流模型、认证 API 客户端、不可变回执、通知 outbox 与测试存储 |
 | `runtime.ts` | Shared DSH storage bootstrap, scheduler inbox, marker dispatch, and durable transition notifications / DSH 共享存储装配、Scheduler 收件箱、标记派发与持久化状态通知 |
 | `readonly.ts` | Per-occurrence guard for configured observation-only tools / 每次 occurrence 的配置只读工具 guard |
+| `source-config.ts` | Host-selected source references with fresh actor/source authorization ports / 宿主选择的来源引用及即时 actor、来源授权接口 |
+| `product-observation.ts` | Fixed Product resource reads; Yield remains training authority / 固定 Product 资源读取；训练状态仍由 Yield 权威管理 |
+| `host-observation.ts` | Bounded sanitized host snapshots without a host command channel / 有界脱敏宿主状态，不提供宿主命令通道 |
+| `office-observation.ts` | Selected Planner metadata through the registered Graph tool / 通过注册 Graph 工具读取选定 Planner 元数据 |
 | `index.ts` | Public package exports / 包公开导出 |
 
 Call `registerWorkflowRuntime` after session persistence, AgentLoop, and the
@@ -37,3 +41,29 @@ Proactive responsibility definitions use an explicit `definitionVersion=2` Work 
 `workflows-v2.test.mjs` runs the DSH timer hook with the actual registered provider tool catalog for two GitHub repositories. It verifies that a truncated page keeps the watermark, a later run resumes the stored cursor, and the completed repository is retained while the pending page chain resumes.
 
 `workflows-v2.test.mjs` 使用 DSH timer hook 和双仓库 GitHub provider 工具目录 fixture，验证截断分页不推进水位、后续运行续接持久游标，并在恢复分页时保留已完成仓库状态。
+
+V3 is separately negotiated with `definitionVersion=3`; v1 and v2 keep their
+existing contracts. Source collection runs fixed tools or typed read adapters,
+without a model. A source binding selects a target; current Directory and source
+access still need verification on each poll. Missing proof disables that source.
+Incomplete pages keep their prior watermark. Work persists immutable events and
+server-derived notification decisions so retries can resume after either an event
+write or an outbox write. Initial baselines remain quiet.
+
+V3 通过 `definitionVersion=3` 单独协商，v1、v2 保持原有契约。来源采集使用固定工具或
+类型化只读适配器，不调用模型。来源绑定只负责选择目标；每次轮询仍须验证当前 Directory
+和来源访问权，缺少证明时关闭该来源。不完整分页不推进原有水位。Work 持久保存不可变
+事件和服务端生成的通知决定，使事件写入或 outbox 写入后的重试能够继续；首次基线不通知。
+
+The optional pilot uses a dedicated host token for each actor, including the
+owner. Each token must have `actor_private_scope`, Work write and Harness write
+capabilities limited to one organization and Workspace. The shared legacy token
+is not a fallback for this pilot. Personal Teams delivery requires the separate
+bridge principal and a current verified personal installation; model output
+cannot choose a recipient. Product, Graph and Teams local tests do not establish
+live source consent, delivery, capacity admission or a completed observation period.
+
+可选试点为包括 owner 在内的每个 actor 配置独立宿主 token，并限制在单个组织和
+Workspace，启用 `actor_private_scope` 及本人的 Work、Harness 写入能力。试点不会退回
+共享旧 token。Teams 个人通知需要独立 bridge 身份和当前已验证的个人安装；模型输出
+不能选择收件人。本地测试不代表真实来源授权、Teams 送达、容量准入或稳定性观察完成。

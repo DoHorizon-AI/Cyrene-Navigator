@@ -155,8 +155,10 @@ jobs:
         env:
           CYRENE_EXCHANGE_CONTRACT_SOURCE: ${{ github.workspace }}/.ci/exchange-contract
         run: |
-          node --test \
+          node --test --test-timeout=60000 \
             harness/tests/persistence.integration.test.mjs \
+            harness/tests/persistence.actor-token.test.mjs \
+            harness/tests/work-private-claims.integration.test.mjs \
             harness/tests/import-codex.integration.test.mjs \
             harness/tests/input-receipts.integration.test.mjs \
             harness/tests/compaction.test.mjs \
@@ -173,6 +175,7 @@ jobs:
             harness/tests/teams-bridge.integration.test.mjs \
             harness/tests/connector-exchange-contract.test.mjs \
             harness/tests/codebuddy-adapter.test.mjs \
+            harness/tests/codebuddy-acp-config.test.mjs \
             harness/tests/codebuddy-acp-execution.integration.test.mjs \
             harness/tests/antigravity-adapter.test.mjs \
             harness/tests/subagents.test.mjs \
@@ -185,6 +188,11 @@ jobs:
             harness/tests/work-tools.test.mjs \
             harness/tests/workflows.integration.test.mjs \
             harness/tests/workflows-v2.test.mjs \
+            harness/tests/workflows-v3.test.mjs \
+            harness/tests/product-observation.test.mjs \
+            harness/tests/host-observation.test.mjs \
+            harness/tests/source-config.test.mjs \
+            harness/tests/office-observation.test.mjs \
             harness/tests/cloud-connections.integration.test.mjs \
             harness/tests/round1.integration.test.mjs
 

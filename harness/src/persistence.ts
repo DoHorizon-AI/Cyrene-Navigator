@@ -44,6 +44,10 @@ export interface Config extends PersistenceConnection {
   batchDelayMs: number;
   maxPendingEvents: number;
   batchSize: number;
+  /** Resolve a dedicated persistence credential from the trusted session-to-actor map. */
+  tokenEnvForSession?: (sessionId: string) => string | undefined;
+  /** Mark actor-private session ids so a missing token can never fall back to the shared host token. */
+  actorPrivateScopeForSession?: (sessionId: string) => boolean;
 }
 
 /** One provider implements the actual upstream service; it never opens a local database.  中文：一个 Provider 实现实际的上游服务；不会打开本地数据库。 */
@@ -52,6 +56,8 @@ export default class CyreneSessionPersistence extends SessionPersistence {
     baseUrl: z.string().required(),
     workspaceId: z.string().required(),
     tokenEnv: z.string().default('CYRENE_SESSION_TOKEN'),
+    tokenEnvForSession: z.any().default(undefined),
+    actorPrivateScopeForSession: z.any().default(undefined),
     clientId: z.string().default('navigator'),
     requestTimeoutMs: z.number().min(100).max(120000).default(15000),
     heartbeatMs: z.number().min(100).max(60000).default(15000),
@@ -67,9 +73,17 @@ export default class CyreneSessionPersistence extends SessionPersistence {
   private readonly writers = new Map<SessionId, CyreneSessionHandle>();
   private readonly takeovers = new Map<SessionId, CyreneSessionHandle>();
   private readonly takeoverRequests = new Set<SessionId>();
+  private readonly httpByTokenEnv = new Map<string, PersistenceHttp>();
 
   constructor(ctx: Context, readonly config: Config) {
     super(ctx);
+    if (config.tokenEnvForSession !== undefined && typeof config.tokenEnvForSession !== 'function') {
+      throw new TypeError('tokenEnvForSession must be a host callback');
+    }
+    if (config.actorPrivateScopeForSession !== undefined
+      && typeof config.actorPrivateScopeForSession !== 'function') {
+      throw new TypeError('actorPrivateScopeForSession must be a host callback');
+    }
     this.http = new PersistenceHttp(config);
     this.clientId = `${config.clientId}:${randomUUID()}`;
     ctx.on('session/event', (session, event) => { this.writers.get(session.id)?.enqueue(event); });
@@ -107,7 +121,7 @@ export default class CyreneSessionPersistence extends SessionPersistence {
     if ((snapshot.isSeeded && options?.inheritedEventCount === undefined) || (!snapshot.isSeeded && inheritedEventCount !== 0)) {
       throw new TypeError('Session inherited prefix does not match its header');
     }
-    return this.adopt(decodeHandle(await this.http.request('', {
+    return this.adopt(decodeHandle(await this.requestForSession(snapshot.id, '', {
       header: snapshot, inheritedEventCount, clientId: this.clientId,
     }, options?.signal), snapshot.id));
   }
@@ -119,13 +133,18 @@ export default class CyreneSessionPersistence extends SessionPersistence {
       this.takeovers.delete(id);
       return reserved;
     }
-    const value = await this.http.request(`/${encodeURIComponent(id)}/handles`, { access, clientId: this.clientId }, options?.signal);
+    const value = await this.requestForSession(
+      id,
+      `/${encodeURIComponent(id)}/handles`,
+      { access, clientId: this.clientId },
+      options?.signal,
+    );
     return this.adopt(decodeHandle(value, id));
   }
 
   /** Explicit product action; the server checks actor, observed epoch and fencing.  中文：显式 Product 操作；服务端会校验 actor、观测到的 epoch 和 fencing。 */
   async takeover(id: SessionId, expectedEpoch: number, signal?: AbortSignal): Promise<CyreneSessionHandle> {
-    const value = await this.http.request(`/${encodeURIComponent(id)}/handles`, {
+    const value = await this.requestForSession(id, `/${encodeURIComponent(id)}/handles`, {
       access: 'write', clientId: this.clientId,
       takeoverExpectedEpoch: integer(expectedEpoch, 'expectedEpoch'),
     }, signal);
@@ -165,7 +184,12 @@ export default class CyreneSessionPersistence extends SessionPersistence {
 
   override async stat(id: SessionId, options?: SessionPersistenceStatOptions): Promise<SessionPersistenceSnapshot | undefined> {
     try {
-      return decodeSnapshot(await this.http.request(`/${encodeURIComponent(id)}`, undefined, options?.signal));
+      return decodeSnapshot(await this.requestForSession(
+        id,
+        `/${encodeURIComponent(id)}`,
+        undefined,
+        options?.signal,
+      ));
     } catch (error) {
       if (error instanceof SessionPersistenceNotFoundError) return undefined;
       throw error;
@@ -176,6 +200,55 @@ export default class CyreneSessionPersistence extends SessionPersistence {
     const value = record(await this.http.request('', undefined, options?.signal));
     if (!Array.isArray(value.items)) throw new TypeError('Persistence session list is missing');
     return value.items.map(decodeSnapshot);
+  }
+
+  private httpForTokenEnv(tokenEnv: string): PersistenceHttp {
+    if (tokenEnv === this.config.tokenEnv) return this.http;
+    let http = this.httpByTokenEnv.get(tokenEnv);
+    if (http === undefined) {
+      http = new PersistenceHttp({ ...this.config, tokenEnv });
+      this.httpByTokenEnv.set(tokenEnv, http);
+    }
+    return http;
+  }
+
+  /** Route one session request through its trusted actor-specific credential when required. */
+  async requestForSession(
+    id: SessionId,
+    path: string,
+    body?: unknown,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    const sessionId = String(id);
+    const callbackScope = this.config.actorPrivateScopeForSession?.(sessionId);
+    if (callbackScope !== undefined && typeof callbackScope !== 'boolean') {
+      throw new TypeError('actorPrivateScopeForSession must return a boolean');
+    }
+    const actorPrivate = sessionId.startsWith('teams-') || callbackScope === true;
+    const override = this.config.tokenEnvForSession?.(sessionId);
+    if (override !== undefined
+      && (typeof override !== 'string' || !/^[A-Z][A-Z0-9_]{0,127}$/u.test(override))) {
+      throw new TypeError('tokenEnvForSession returned an invalid environment reference');
+    }
+    // The host may explicitly select its one legacy owner credential after
+    // verifying the ingress actor against the immutable Work session owner.
+    // An absent selection is never interpreted as that legacy route.
+    const explicitLegacyOwner = actorPrivate && override === this.config.tokenEnv;
+    if (actorPrivate && (
+      override === undefined
+      || (!explicitLegacyOwner && [
+        'CYRENE_SESSION_TOKEN', 'CYRENE_EXECUTOR_TOKEN', 'CYRENE_PRIVATE_TEAMS_BRIDGE_TOKEN',
+      ].includes(override))
+    )) {
+      throw new Error('Actor-private session requires its dedicated persistence credential');
+    }
+    const tokenEnv = override ?? this.config.tokenEnv;
+    const selectedToken = process.env[tokenEnv];
+    if (actorPrivate && !explicitLegacyOwner && selectedToken !== undefined
+      && selectedToken === process.env[this.config.tokenEnv]) {
+      throw new Error('Actor-private persistence credential is not dedicated');
+    }
+    return this.httpForTokenEnv(tokenEnv).request(path, body, signal);
   }
 
   /** Release only this exact handle; an older handle cannot remove its successor.  中文：只释放这个精确 handle；旧 handle 不能移除它的后继者。 */
@@ -246,7 +319,12 @@ export class CyreneSessionHandle implements SessionHandle {
     let cursor = offset;
     do {
       const count = Math.min(remaining, this.owner.config.batchSize);
-      const response = record(await this.owner.http.request(`${this.path}/events?offset=${cursor}&length=${count}`, undefined, options?.signal));
+      const response = record(await this.owner.requestForSession(
+        this.id,
+        `${this.path}/events?offset=${cursor}&length=${count}`,
+        undefined,
+        options?.signal,
+      ));
       const end = integer(response.nextSeq, 'nextSeq');
       if (end < this.observedLength) throw new Error('Stored Session log shrank');
       this.observedLength = end;
@@ -373,7 +451,7 @@ export class CyreneSessionHandle implements SessionHandle {
   private async mutate(operation: string, body: Record<string, unknown> = {}, signal?: AbortSignal): Promise<unknown> {
     this.assertWriter(operation);
     try {
-      return await this.owner.http.request(`${this.path}/${operation}`, {
+      return await this.owner.requestForSession(this.id, `${this.path}/${operation}`, {
         writerToken: this.remote.writerToken, epoch: this.remote.epoch, ...body,
       }, signal);
     } catch (error) {

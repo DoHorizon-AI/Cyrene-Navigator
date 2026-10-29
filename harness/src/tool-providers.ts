@@ -73,6 +73,10 @@ const OUTPUT_SCHEMA = {
 /** Bridge and active-session mapping already owned by Navigator's task composition. | 使用 Navigator 现有桥接与会话映射。 */
 export interface ToolProviderRegistrationOptions {
   readonly bridge: Pick<WorkAssistantBridge, 'request' | 'requestApproval' | 'mutate'>;
+  /** Select a server-held actor token only from the active Task map, never task metadata. */
+  readonly bridgeForTask?: (taskId: string) => Pick<WorkAssistantBridge, 'request' | 'requestApproval' | 'mutate'>;
+  /** Read the active Task through its host-selected actor Work client. */
+  readonly readBackgroundTask?: (taskId: string, signal: AbortSignal) => Promise<ResponsibilityTaskRecord | undefined>;
   readonly taskIdForSession: (sessionId: string) => string | undefined;
   readonly connectorAuthorization?: {
     readonly client: ExchangeConnectorAuthorizationClient;
@@ -430,23 +434,27 @@ function createDefinition(
       validateProviderConstraints(argumentsValue, tool.constraints);
       const sessionId = execution.agent?.session.id === undefined ? undefined : String(execution.agent.session.id);
       const taskId = sessionId === undefined ? undefined : options.taskIdForSession(sessionId);
+      const taskBridge = taskId === undefined ? options.bridge : options.bridgeForTask?.(taskId) ?? options.bridge;
       if (options.connectorAuthorization !== undefined) {
         if (!taskId) throw new Error('Connector tools require a durable Navigator task');
         const trustedBinding = options.connectorAuthorization.bindings.get(binding.bindingId);
         const trustedTool = trustedBinding?.tools.find(item => item.toolId === tool.id);
         if (!trustedBinding || !trustedTool) throw new Error('Connector tool is outside the launcher-owned binding');
         if (taskId.startsWith('teams-')) {
-          const teamsCaller = await readTeamsCallerForTask(options.bridge, taskId, execution.signal);
+          const teamsCaller = await readTeamsCallerForTask(taskBridge, taskId, execution.signal);
           if (teamsCaller === undefined) throw new Error('Trusted Teams task caller identity is missing');
-          return executeTeamsProviderCall(options, binding, tool, argumentsValue, execution, taskId, teamsCaller);
+          return executeTeamsProviderCall({ ...options, bridge: taskBridge }, binding, tool, argumentsValue, execution, taskId, teamsCaller);
         }
         if (!options.backgroundTaskAuthority) {
           throw new Error('Background connector authorization is unavailable');
         }
-        const task = readBackgroundTaskRecord(
-          await options.bridge.request(`/tasks/${encodeURIComponent(taskId)}`, 'GET', undefined, execution.signal),
-          taskId,
-        );
+        const task = options.readBackgroundTask === undefined
+          ? readBackgroundTaskRecord(
+            await taskBridge.request(`/tasks/${encodeURIComponent(taskId)}`, 'GET', undefined, execution.signal),
+            taskId,
+          )
+          : await options.readBackgroundTask(taskId, execution.signal);
+        if (task === undefined || task.id !== taskId) throw new Error('Active background task is unavailable through its actor Work client');
         const principal = await options.backgroundTaskAuthority({
           taskId,
           task,
@@ -459,7 +467,7 @@ function createDefinition(
           throw new Error('Background task is outside its active responsibility authorization');
         }
         return executeTeamsProviderCall(
-          options, binding, tool, argumentsValue, execution, taskId, principal,
+          { ...options, bridge: taskBridge }, binding, tool, argumentsValue, execution, taskId, principal,
         );
       }
       if (tool.readOnly) {
@@ -561,6 +569,27 @@ async function readTeamsCallerForTask(
   signal: AbortSignal,
 ): Promise<TeamsTaskCaller | undefined> {
   const task = objectValue(await bridge.request(`/tasks/${encodeURIComponent(taskId)}`, 'GET', undefined, signal), 'durable task');
+  const createdByActorId = boundedText(task.createdByActorId, 'Work Task creator actor', 36).toLowerCase();
+  if (!isUuid(createdByActorId)) throw new TypeError('Work Task omitted its server-derived Teams actor.');
+  if (task.origin !== undefined && task.origin !== null) {
+    const origin = objectValue(task.origin, 'immutable Teams task origin');
+    assertExactKeys(origin, ['kind', 'messageId', 'tenantId', 'botAppId', 'actorAadObjectId'], 'private Teams task origin');
+    if (origin.kind !== 'teams_private') throw new TypeError('Work Task has an unsupported immutable Teams origin.');
+    const subject = boundedText(origin.actorAadObjectId, 'private Teams origin actor', 36).toLowerCase();
+    const tenantId = boundedText(origin.tenantId, 'private Teams origin tenant', 36).toLowerCase();
+    const botAppId = boundedText(origin.botAppId, 'private Teams origin bot app', 36).toLowerCase();
+    boundedText(origin.messageId, 'private Teams origin message id', 512);
+    if (!isUuid(subject) || !isUuid(tenantId) || !isUuid(botAppId) || subject !== createdByActorId) {
+      throw new TypeError('Immutable private Teams origin does not match the server-owned Work Task actor.');
+    }
+    if (!taskId.startsWith('teams-private-')) {
+      throw new TypeError('Private Teams origin is attached to an unexpected Task identifier.');
+    }
+    return { issuer: `https://login.microsoftonline.com/${tenantId}/v2.0`, subject, tenantId };
+  }
+  if (taskId.startsWith('teams-private-')) {
+    throw new TypeError('Private Teams Task is missing its immutable server origin.');
+  }
   if (task.metadata === null || typeof task.metadata !== 'object' || Array.isArray(task.metadata)) return undefined;
   const metadata = task.metadata as Record<string, unknown>;
   const value = metadata.teamsCaller;
@@ -571,7 +600,8 @@ async function readTeamsCallerForTask(
   const tenantId = boundedText(row.tenantId, 'Teams caller tenant', 128).toLowerCase();
   if (!isUuid(subject) || !isUuid(tenantId)
     || issuer !== `https://login.microsoftonline.com/${tenantId}/v2.0`
-    || (row.actorAadObjectId !== undefined && row.actorAadObjectId !== subject)) {
+    || (row.actorAadObjectId !== undefined && row.actorAadObjectId !== subject)
+    || subject !== createdByActorId) {
     throw new TypeError('Trusted Teams task caller identity is malformed');
   }
   return { issuer, subject, tenantId };
@@ -605,7 +635,9 @@ async function executeTeamsProviderCall(
   const profileArgument = argumentString(args, 'profile_ref', 'profileRef');
   const profileIsOuterClaim = hostBinding.providerId === 'github'
     || hostBinding.providerId === 'huggingface'
-    || hostBinding.providerId === 'computer';
+    || hostBinding.providerId === 'computer'
+    || hostBinding.providerId === 'azure_devops'
+    || hostBinding.providerId === 'microsoft_graph';
   if (profileIsOuterClaim && (args.profile_ref !== undefined || args.profileRef !== undefined)) {
     throw new Error('This connector provider does not accept a model-supplied profile');
   }
@@ -928,6 +960,13 @@ function connectorTargetProjection(
       return args.target;
     case 'cloud_operation':
       return pickRequiredFields(args, ['operation_ref']);
+    case 'azure_devops_source':
+      if (args.target === undefined) throw new TypeError('Azure DevOps observation requires an exact source target');
+      return { target: args.target };
+    case 'microsoft_graph_plan':
+      return pickRequiredFields(args, ['plan_id']);
+    case 'microsoft_graph_task':
+      return { ...pickRequiredFields(args, ['plan_id']), ...pickRequiredFields(args, ['task_id']) };
     default:
       throw new TypeError('Connector binding has an unsupported resource projection');
   }

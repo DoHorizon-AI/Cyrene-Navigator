@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
+import { createHash, createHmac } from 'node:crypto';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,7 +17,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { createExecutorApp } from '../dist/serve.js';
 import { parseCredentialNotificationsConfig } from '../dist/executor.js';
 import { InMemoryWorkStateStore, WorkStateClient, WorkStateHttpError } from '../dist/work-state-client.js';
-import { ExchangeConnectorRequestError } from '../dist/connector-authorization.js';
+import { ExchangeConnectorAuthorizationClient, ExchangeConnectorRequestError, canonicalJson } from '../dist/connector-authorization.js';
 import { disposeWithin } from '../../scripts/serve-executor.mjs';
 import { LlmAdapter, ToolCallId } from '@deepseek-ai/dsh-llm';
 import { defineTool } from '@deepseek-ai/dsh-tools';
@@ -704,6 +705,547 @@ test('NavigatorExecutor: Teams outbox delivers completed multiline answers byte-
   }
 });
 
+test('NavigatorExecutor: actor Work clients claim and deliver only their channel replies after a live Directory check', async () => {
+  const tenantId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const ownerId = '11111111-1111-4111-8111-111111111111';
+  const otherId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  const issuer = `https://login.microsoftonline.com/${tenantId}/v2.0`;
+  const directoryPath = join(await mkdtemp(join(tmpdir(), 'navigator-teams-directory-')), 'actors.json');
+  await writeFile(directoryPath, JSON.stringify({
+    schemaVersion: 1, workspaceId: 'actor-outbox-workspace', issuer, subjects: [ownerId, otherId],
+  }));
+  const globalStore = new InMemoryWorkStateStore();
+  const ownerStore = new InMemoryWorkStateStore(ownerId);
+  const otherStore = new InMemoryWorkStateStore(otherId);
+  const actorStores = new Map([[ownerId, ownerStore], [otherId, otherStore]]);
+  const ownerTask = {
+    id: 'actor-outbox-task',
+    sessionId: 'teams-owner-thread-session',
+    prompt: 'send the completed answer',
+    status: 'completed',
+    executionClass: 'foreground',
+    createdAt: Date.now(),
+    output: 'completed answer',
+    reasoning: '',
+    durationMs: 1,
+    createdByActorId: ownerId,
+    metadata: { teamsCaller: { issuer, subject: ownerId, actorAadObjectId: ownerId, tenantId } },
+  };
+  const route = {
+    tenantId, teamId: 'team-1', channelId: 'channel-1', conversationId: '19:channel-conversation',
+    rootThreadId: '1698765432100', serviceUrl: 'https://smba.trafficmanager.net/emea/',
+  };
+  const makeLease = id => ({
+    notification: {
+      id, deduplicationKey: `actor-dedupe-${id}`, type: 'teams.message', payload: { ...route, text: 'owner result' },
+      taskId: ownerTask.id, connectorId: 'teams-v1', recipient: 'teams:owner-thread',
+      status: 'leased', result: { retryCount: 0 },
+    },
+    leaseToken: `lease-${id}`,
+  });
+  const claims = [];
+  const started = [];
+  const finished = [];
+  const pending = [makeLease('allowed'), makeLease('revoked')];
+  ownerStore.claimNotifications = async input => {
+    claims.push({ actor: ownerId, ...input });
+    return pending.splice(0, 1);
+  };
+  ownerStore.getTask = async taskId => taskId === ownerTask.id ? ownerTask : undefined;
+  ownerStore.startNotification = async (notificationId, leaseToken) => started.push({ actor: ownerId, notificationId, leaseToken });
+  ownerStore.finishNotification = async (notificationId, leaseToken, outcome, result) => {
+    finished.push({ actor: ownerId, notificationId, leaseToken, outcome, result });
+  };
+  otherStore.claimNotifications = async input => {
+    claims.push({ actor: otherId, ...input });
+    return [];
+  };
+  otherStore.getTask = async () => undefined;
+  let globalClaims = 0;
+  globalStore.claimNotifications = async () => { globalClaims += 1; return []; };
+  const grants = [];
+  const sends = [];
+  const teams = {
+    connectorId: 'teams-v1', tenantId, allowedTeamIds: ['team-1'], botAppId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+    taskActorSubjects: [ownerId, otherId], taskActorSubjectsFile: directoryPath,
+    ingressSecretEnv: 'TEAMS_NAVIGATOR_HMAC_KEY', exchangeConnectionRef: 'teams-connection',
+    exchangeProfileRef: 'teams-profile',
+    exchangeAuthorization: {
+      async mintGrant(request) { grants.push(request); return { token: 'actor-grant' }; },
+      async sendTeamsMessage(message) { sends.push(message); return { outcome: 'accepted' }; },
+    },
+  };
+  const app = await createTestApp(new TestMockAdapter(), {
+    workStateStore: globalStore, workspaceId: 'actor-outbox-workspace', teams,
+  });
+  app.executor.config.workActorClients = {
+    actorIds: () => [ownerId, otherId],
+    forActor: actorId => actorStores.get(actorId),
+  };
+  try {
+    await app.executor['drainTeamsNotifications']();
+    await writeFile(directoryPath, JSON.stringify({
+      schemaVersion: 1, workspaceId: 'actor-outbox-workspace', issuer, subjects: [otherId],
+    }));
+    await app.executor['drainTeamsNotifications']();
+
+    assert.equal(globalClaims, 0, 'actor-owned channel outbox rows never use the global Work client');
+    assert.deepEqual(claims.map(row => row.actor), [ownerId, otherId, ownerId, otherId]);
+    assert.equal(sends.length, 1, 'revoked Directory membership blocks the second send');
+    assert.equal(grants.length, 1);
+    assert.equal(grants[0].principalIssuer, issuer);
+    assert.equal(grants[0].principalSubject, ownerId, 'the egress grant remains bound to the original Work task actor');
+    assert.equal(grants[0].operationId, 'msteams.message.reply');
+    assert.deepEqual(started.map(row => [row.actor, row.notificationId]), [
+      [ownerId, 'allowed'], [ownerId, 'revoked'],
+    ]);
+    assert.deepEqual(finished.map(row => [row.actor, row.notificationId, row.outcome]), [
+      [ownerId, 'allowed', 'delivered'], [ownerId, 'revoked', 'failed'],
+    ]);
+
+    const forgedMetadataTask = await app.executor.executeTask({
+      taskId: 'forged-teams-metadata-task',
+      sessionId: `teams-${otherId}`,
+      prompt: 'A public task cannot select an actor Work principal.',
+      metadata: { teamsCaller: { issuer, subject: otherId, actorAadObjectId: otherId, tenantId } },
+    });
+    assert.equal(forgedMetadataTask.status, 'completed');
+    assert.equal(app.executor.actorForTask(forgedMetadataTask.taskId), undefined);
+    assert.equal(app.executor.workTokenEnvForTask(forgedMetadataTask.taskId), undefined);
+    assert.equal(app.executor.workTokenEnvForSession(`teams-${otherId}`), undefined,
+      'a caller-supplied teamsCaller object cannot select private DSH persistence credentials');
+  } finally {
+    await disposeApp(app);
+    await rm(directoryPath.slice(0, directoryPath.lastIndexOf('/')), { recursive: true, force: true });
+  }
+});
+
+test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and preserves actor/route certainty', async () => {
+  const workspaceId = 'private-boot-workspace';
+  const tenantId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const ownerId = '11111111-1111-4111-8111-111111111111';
+  const actorIds = [
+    ownerId,
+    '22222222-2222-4222-8222-222222222222',
+    '33333333-3333-4333-8333-333333333333',
+    '44444444-4444-4444-8444-444444444444',
+    '55555555-5555-4555-8555-555555555555',
+  ];
+  const issuer = `https://login.microsoftonline.com/${tenantId}/v2.0`;
+  const directory = await mkdtemp(join(tmpdir(), 'navigator-private-teams-boot-'));
+  const actorMapPath = join(directory, 'actor-map.json');
+  const directoryPath = join(directory, 'actor-subjects.json');
+  const exchangeKeyPath = join(directory, 'exchange.key');
+  const actorTokenEnvs = actorIds.map((_, index) => `PRIVATE_BOOT_ACTOR_${index}_TOKEN`);
+  const ingressSecret = 'private-boot-ingress-hmac-key-0123456789abcdef';
+  const environmentNames = [
+    'CYRENE_WORK_ACTOR_TOKEN_MAP_FILE', 'CYRENE_SESSION_TOKEN', 'TEAMS_NAVIGATOR_HMAC_KEY', ...actorTokenEnvs,
+  ];
+  const priorEnvironment = new Map(environmentNames.map(name => [name, process.env[name]]));
+  const tokens = actorTokenEnvs.map((name, index) => `private-boot-work-token-${index}-0123456789abcdef`);
+  const workRequests = [];
+  let privateTaskId = 'private-owner-task';
+  let privateTaskRecord = {
+    id: privateTaskId,
+    workspaceId,
+    createdByActorId: ownerId,
+    sessionId: 'private-owner-session',
+    prompt: 'A previously completed private workflow task.',
+    status: 'completed',
+    executionClass: 'foreground',
+    createdAt: Date.now(),
+    startedAt: Date.now(),
+    endedAt: Date.now(),
+    output: 'Private workflow result for the installing owner.',
+    reasoning: '',
+    error: null,
+    durationMs: 1,
+    sequence: 1,
+    metadata: {},
+    origin: {
+      kind: 'teams_private',
+      messageId: 'previous-private-owner-message',
+      tenantId,
+      botAppId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+      actorAadObjectId: ownerId,
+    },
+  };
+  const workServer = createServer(async (req, res) => {
+    const respond = (status, value) => {
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(value));
+    };
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const bodyText = Buffer.concat(chunks).toString('utf8');
+    const body = bodyText ? JSON.parse(bodyText) : undefined;
+    workRequests.push({ url: req.url, method: req.method, authorization: req.headers.authorization, body });
+    if (req.method === 'GET' && req.url?.endsWith('/work/tool-providers')) {
+      respond(200, { items: [] });
+      return;
+    }
+    if (req.method === 'GET' && req.url?.includes('/work/tasks/owned')) {
+      respond(200, { items: [], nextCursor: null });
+      return;
+    }
+    if (req.method === 'GET' && privateTaskId !== undefined
+      && req.url?.endsWith(`/work/tasks/${privateTaskId}`)) {
+      respond(200, privateTaskRecord);
+      return;
+    }
+    if (req.method === 'POST' && req.url?.endsWith('/work/connectors/teams-v1/events')) {
+      const taskInput = body?.task;
+      const privateMessage = body?.teamsPrivateMessage;
+      if (taskInput === undefined || privateMessage === undefined) {
+        respond(400, { code: 'WORK_CONNECTOR_INVALID_TEAMS_PRIVATE_MESSAGE' });
+        return;
+      }
+      privateTaskId = taskInput.id;
+      privateTaskRecord = {
+        id: taskInput.id,
+        workspaceId,
+        createdByActorId: ownerId,
+        sessionId: taskInput.sessionId,
+        prompt: taskInput.prompt,
+        status: 'completed',
+        executionClass: 'foreground',
+        createdAt: Date.now(),
+        startedAt: Date.now(),
+        endedAt: Date.now(),
+        output: 'Private workflow result for the installing owner.',
+        reasoning: '',
+        error: null,
+        durationMs: 1,
+        sequence: 1,
+        metadata: {},
+        origin: {
+          kind: 'teams_private',
+          messageId: privateMessage.messageId,
+          tenantId,
+          botAppId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+          actorAadObjectId: ownerId,
+        },
+      };
+      respond(200, {
+        eventId: 'private-event-fixture', duplicate: false, receivedAt: Date.now(), task: privateTaskRecord,
+      });
+      return;
+    }
+    if (req.method === 'POST' && req.url?.endsWith('/work/notifications/claim')) {
+      respond(200, { items: [] });
+      return;
+    }
+    respond(404, { code: 'WORK_TASK_NOT_FOUND' });
+  });
+  await new Promise(resolve => workServer.listen(0, '127.0.0.1', resolve));
+
+  await writeFile(exchangeKeyPath, Buffer.alloc(32, 0x4a), { mode: 0o600 });
+  await writeFile(actorMapPath, JSON.stringify({
+    schemaVersion: 1,
+    workspaceId,
+    actors: actorIds.map((actorAadObjectId, index) => ({ actorAadObjectId, tokenEnv: actorTokenEnvs[index] })),
+  }), { mode: 0o600 });
+  await writeFile(directoryPath, JSON.stringify({ schemaVersion: 1, workspaceId, issuer, subjects: actorIds }), { mode: 0o600 });
+  process.env.CYRENE_WORK_ACTOR_TOKEN_MAP_FILE = actorMapPath;
+  process.env.CYRENE_SESSION_TOKEN = 'private-boot-global-session-token';
+  process.env.TEAMS_NAVIGATOR_HMAC_KEY = ingressSecret;
+  actorTokenEnvs.forEach((name, index) => { process.env[name] = tokens[index]; });
+
+  const grantRequests = [];
+  const privateBodies = [];
+  const outcomes = ['accepted', 'uncertain'];
+  const exchangeServer = createServer(async (req, res) => {
+    const respond = (status, value) => {
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(value));
+    };
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    if (req.url === '/internal/v1/connector-operation-grants') {
+      grantRequests.push(body);
+      const { arguments: _arguments, ...claimsWithoutArguments } = body;
+      const now = Math.floor(Date.now() / 1_000);
+      respond(200, {
+        connectorGrantBin: 'AQ==', grantRef: `private-grant-${grantRequests.length}`, audience: 'exchange',
+        issuedAt: now, expiresAt: now + 10, claims: { ...claimsWithoutArguments, organizationId: 'private-org' },
+      });
+      return;
+    }
+    if (req.url === '/internal/v1/teams/messages') {
+      privateBodies.push({ body, grant: req.headers['x-cyrene-connector-grant-bin'] });
+      const status = outcomes.shift() ?? 'accepted';
+      respond(200, {
+        requestId: body.requestId,
+        status,
+        ...(status === 'accepted' ? { vendorMessageId: 'private-delivery-1' } : { reasonCode: 'teams_delivery_outcome_unknown' }),
+      });
+      return;
+    }
+    respond(404, { code: 'EXCHANGE_ROUTE_NOT_FOUND' });
+  });
+  await new Promise(resolve => exchangeServer.listen(0, '127.0.0.1', resolve));
+
+  const leaseFor = (id, actorAadObjectId = ownerId) => ({
+    notification: {
+      id, deduplicationKey: `private-dedupe-${id}`, type: 'teams.message',
+      payload: { text: 'Private workflow update.' }, taskId: 'private-owner-task',
+      connectorId: 'teams-v1', recipient: 'teams:owner-private', status: 'leased', result: { retryCount: 0 },
+    },
+    leaseToken: `private-lease-${id}`,
+    teamsPersonalRoute: {
+        kind: 'teams_personal', tenantId, botAppId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+        actorAadObjectId, conversationId: '19:private-owner-conversation',
+        serviceUrl: 'https://smba.trafficmanager.net/emea/',
+    },
+  });
+  const privateLeases = [
+    leaseFor('accepted'), leaseFor('revoked'), leaseFor('uncertain'), leaseFor('actor-mismatch', actorIds[1]),
+  ];
+  const privateFinished = [];
+  const workStateStore = new InMemoryWorkStateStore();
+  let privateClaimCalls = 0;
+  workStateStore.claimPrivateNotifications = async () => {
+    privateClaimCalls += 1;
+    return privateLeases.splice(0, 1);
+  };
+  workStateStore.startPrivateNotification = async () => {};
+  workStateStore.finishPrivateNotification = async (id, _token, outcome, result) => {
+    privateFinished.push({ id, outcome, result });
+  };
+
+  const exchangeAuthorization = new ExchangeConnectorAuthorizationClient({
+    baseUrl: `http://127.0.0.1:${exchangeServer.address().port}`,
+    hmacKeyFile: exchangeKeyPath,
+    hmacKeyId: 'private-boot-test',
+    audience: 'exchange',
+  });
+  const teams = {
+    connectorId: 'teams-v1', tenantId, allowedTeamIds: ['team-1'],
+    botAppId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+    taskActorSubjects: [], taskActorSubjectsFile: directoryPath, personalChatEnabled: true,
+    ingressSecretEnv: 'TEAMS_NAVIGATOR_HMAC_KEY', exchangeConnectionRef: '66666666-6666-4666-8666-666666666666',
+    exchangeProfileRef: 'teams-private-boot-profile', exchangeAuthorization,
+  };
+  let app;
+  try {
+    app = await createTestApp(new TestMockAdapter(), {
+      workStateStore,
+      workspaceId,
+      persistenceUrl: `http://127.0.0.1:${workServer.address().port}`,
+      teams,
+    });
+    assert.equal(typeof app.executor.config.teams.sendPrivateMessage, 'function',
+      'stock app boot constructs the private sender when personal mode and Exchange client are configured');
+    await app.executor['drainTeamsNotifications']();
+
+    await writeFile(directoryPath, JSON.stringify({ schemaVersion: 1, workspaceId, issuer, subjects: actorIds.slice(1) }));
+    await app.executor['drainTeamsNotifications']();
+
+    await writeFile(directoryPath, JSON.stringify({ schemaVersion: 1, workspaceId, issuer, subjects: actorIds }));
+    await app.executor['drainTeamsNotifications']();
+    await app.executor['drainTeamsNotifications']();
+
+    assert.equal(grantRequests.length, 2, 'revoked and task-owner-mismatched routes fail before grant creation');
+    assert.equal(privateBodies.length, 2);
+    const grant = grantRequests[0];
+    const route = {
+      tenantId,
+      botAppId: teams.botAppId,
+      actorAadObjectId: ownerId,
+      conversationId: '19:private-owner-conversation',
+      serviceUrl: 'https://smba.trafficmanager.net/emea/',
+    };
+    const argumentsValue = { targetKind: 'owner_private', conversation: route, text: 'Private workflow update.' };
+    assert.equal(grant.principalSubject, ownerId, 'fresh Exchange grant uses the original Work Task actor');
+    assert.equal(grant.principalIssuer, issuer);
+    assert.equal(grant.connectionRef, teams.exchangeConnectionRef);
+    assert.equal(grant.profileRef, teams.exchangeProfileRef);
+    assert.equal(grant.providerId, 'msteams');
+    assert.equal(grant.operationId, 'msteams.message.reply');
+    assert.equal(grant.resourceRef, `msteams-personal:${createHash('sha256').update(canonicalJson(route)).digest('hex')}`);
+    assert.deepEqual(grant.arguments, argumentsValue);
+    assert.deepEqual(privateBodies[0].body, {
+      requestId: 'accepted:attempt:1',
+      providerId: 'msteams',
+      targetKind: 'owner_private',
+      conversation: route,
+      text: 'Private workflow update.',
+    });
+    assert.ok(privateBodies.every(item => item.grant === 'AQ=='));
+    assert.deepEqual(privateFinished.map(item => [item.id, item.outcome]), [
+      ['accepted', 'delivered'],
+      ['revoked', 'failed'],
+      ['uncertain', 'uncertain'],
+      ['actor-mismatch', 'failed'],
+    ]);
+    assert.ok(workRequests.some(item => item.url?.endsWith('/work/tasks/private-owner-task')
+      && item.authorization === `Bearer ${tokens[0]}`));
+    assert.ok(workRequests.some(item => item.url?.endsWith('/work/tasks/private-owner-task')
+      && item.authorization === `Bearer ${tokens[1]}`), 'mismatched route is checked through the claimed actor client');
+
+    app.executor.config.teams.sendPrivateMessage = undefined;
+    await app.executor['drainTeamsNotifications']();
+    assert.equal(privateClaimCalls, 4, 'private notices are not claimed if the fixed Exchange sender becomes unavailable');
+  } finally {
+    if (app !== undefined) await disposeApp(app);
+    exchangeServer.closeAllConnections();
+    await new Promise(resolve => exchangeServer.close(resolve));
+    workServer.closeAllConnections();
+    await new Promise(resolve => workServer.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+    for (const [name, value] of priorEnvironment) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+});
+
+test('NavigatorExecutor: a slow channel claim cannot delay a queued private acknowledgement', async () => {
+  const ownerId = '11111111-1111-4111-8111-111111111111';
+  const tenantId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const actorStore = new InMemoryWorkStateStore(ownerId);
+  const ownerTask = await actorStore.createTask({
+    id: 'teams-private-priority-task', sessionId: 'teams-private-priority-session', prompt: 'Private task.',
+  });
+  let releaseChannelClaim;
+  const channelClaimGate = new Promise(resolve => { releaseChannelClaim = resolve; });
+  let signalChannelClaimStarted;
+  const channelClaimStartedPromise = new Promise(resolve => { signalChannelClaimStarted = resolve; });
+  let channelClaimStarted = false;
+  actorStore.claimNotifications = async () => {
+    channelClaimStarted = true;
+    signalChannelClaimStarted();
+    await channelClaimGate;
+    return [];
+  };
+  const workState = new InMemoryWorkStateStore();
+  const privateLease = {
+    notification: {
+      id: 'private-priority-ack', deduplicationKey: 'private-priority-ack', type: 'teams.message',
+      payload: { text: 'Request received. I’m working on it.' }, taskId: ownerTask.id,
+      connectorId: 'teams-v1', recipient: 'teams:owner-private', status: 'leased', result: { retryCount: 0 },
+    },
+    leaseToken: 'private-priority-lease',
+    teamsPersonalRoute: {
+      kind: 'teams_personal', tenantId, botAppId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+      actorAadObjectId: ownerId, conversationId: '19:private-priority-route',
+      serviceUrl: 'https://smba.trafficmanager.net/emea/',
+    },
+  };
+  workState.claimPrivateNotifications = async () => [privateLease];
+  const workActorClients = {
+    actorIds: () => [ownerId],
+    forActor: actorId => actorId === ownerId ? actorStore : undefined,
+  };
+  const app = await createTestApp(new TestMockAdapter(), {
+    workStateStore: workState,
+    workspaceId: 'private-priority-workspace',
+    teams: {
+      connectorId: 'teams-v1', tenantId, allowedTeamIds: ['team-1'],
+      botAppId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', taskActorSubjects: [ownerId],
+      ingressSecretEnv: 'TEAMS_NAVIGATOR_HMAC_KEY', exchangeConnectionRef: '66666666-6666-4666-8666-666666666666',
+      exchangeProfileRef: 'teams-priority-profile', exchangeAuthorization: {},
+    },
+  });
+  const sent = [];
+  let privateSendResolve;
+  const privateSendCompleted = new Promise(resolve => { privateSendResolve = resolve; });
+  app.executor.config.workActorClients = workActorClients;
+  app.executor.config.teams.personalChatEnabled = true;
+  app.executor.config.teams.sendPrivateMessage = async request => {
+    sent.push(request);
+    privateSendResolve();
+    return { outcome: 'accepted' };
+  };
+  try {
+    const draining = app.executor['drainTeamsNotifications']();
+    const sentBeforeChannelGate = await Promise.race([
+      privateSendCompleted.then(() => true),
+      delay(1_000).then(() => false),
+    ]);
+    assert.equal(sentBeforeChannelGate, true, 'owner-private acknowledgement sends before a blocked channel lease');
+    const channelClaimStartedBeforeTimeout = await Promise.race([
+      channelClaimStartedPromise.then(() => true),
+      delay(1_000).then(() => false),
+    ]);
+    assert.equal(channelClaimStartedBeforeTimeout && channelClaimStarted, true,
+      'channel polling may proceed after private delivery starts');
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].target_kind, 'owner_private');
+    assert.equal(sent[0].actor_aad_object_id, ownerId);
+    releaseChannelClaim();
+    await draining;
+  } finally {
+    releaseChannelClaim();
+    await disposeApp(app);
+  }
+});
+
+test('NavigatorExecutor: only a known-safe private 429 is retried with a bounded delay', async () => {
+  const ownerId = '11111111-1111-4111-8111-111111111111';
+  const tenantId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const botAppId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  const actorStore = new InMemoryWorkStateStore(ownerId);
+  await actorStore.createTask({
+    id: 'private-rate-limit-task', sessionId: 'private-rate-limit-session', prompt: 'Private notice source.',
+  });
+  const workState = new InMemoryWorkStateStore();
+  const route = {
+    kind: 'teams_personal', tenantId, botAppId, actorAadObjectId: ownerId,
+    conversationId: '19:private-rate-limit-route', serviceUrl: 'https://smba.trafficmanager.net/emea/',
+  };
+  const leases = ['safe-429', 'unknown-429'].map(id => ({
+    notification: {
+      id, deduplicationKey: `private-rate-limit-${id}`, type: 'teams.message',
+      payload: { text: 'Private retry test.' }, taskId: 'private-rate-limit-task',
+      connectorId: 'teams-v1', recipient: 'teams:owner-private', status: 'leased', result: { retryCount: 0 },
+    },
+    leaseToken: `lease-${id}`,
+    teamsPersonalRoute: route,
+  }));
+  const finished = [];
+  workState.claimPrivateNotifications = async () => leases.splice(0, leases.length);
+  workState.startPrivateNotification = async () => {};
+  workState.finishPrivateNotification = async (id, leaseToken, outcome, result, retryAfterSeconds) => {
+    finished.push({ id, leaseToken, outcome, result, retryAfterSeconds });
+  };
+  const app = await createTestApp(new TestMockAdapter(), {
+    workStateStore: workState,
+    workspaceId: 'private-rate-limit-workspace',
+    teams: {
+      connectorId: 'teams-v1', tenantId, allowedTeamIds: ['team-1'], botAppId,
+      taskActorSubjects: [ownerId], ingressSecretEnv: 'TEAMS_NAVIGATOR_HMAC_KEY',
+      exchangeConnectionRef: 'private-rate-limit-connection',
+      exchangeProfileRef: 'private-rate-limit-profile', exchangeAuthorization: {},
+    },
+  });
+  app.executor.config.workActorClients = {
+    actorIds: () => [ownerId],
+    forActor: actorId => actorId === ownerId ? actorStore : undefined,
+  };
+  app.executor.config.teams.personalChatEnabled = true;
+  const failures = [
+    new ExchangeConnectorRequestError('Confirmed not sent.', 429, false, undefined, 900),
+    new ExchangeConnectorRequestError('Send outcome unknown.', 429, true, undefined, 42),
+  ];
+  app.executor.config.teams.sendPrivateMessage = async () => {
+    const failure = failures.shift();
+    if (failure === undefined) throw new Error('Unexpected private sender call');
+    throw failure;
+  };
+  try {
+    await app.executor['drainTeamsNotifications']();
+    assert.deepEqual(finished.map(item => [item.id, item.outcome, item.retryAfterSeconds]), [
+      ['safe-429', 'retry', 300],
+      ['unknown-429', 'uncertain', undefined],
+    ]);
+    assert.deepEqual(finished.map(item => item.result.code), ['EXCHANGE_HTTP_429', 'EXCHANGE_HTTP_429']);
+  } finally {
+    await disposeApp(app);
+  }
+});
+
 test('NavigatorExecutor: credential notices use cached Exchange health and the fixed taskless Teams route', async () => {
   const store = new InMemoryWorkStateStore();
   const adapter = new TestMockAdapter();
@@ -1239,6 +1781,162 @@ test('WorkStateClient: requests use the configured workspace bearer and decode n
     await new Promise(resolve => server.close(resolve));
     if (previousToken === undefined) delete process.env.CYRENE_SESSION_TOKEN;
     else process.env.CYRENE_SESSION_TOKEN = previousToken;
+  }
+});
+
+test('WorkStateClient: private Teams connector admission sends only message text and decodes immutable route-free origin', async () => {
+  const ownerId = '11111111-1111-4111-8111-111111111111';
+  const tenantId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const botAppId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  const tokenEnv = 'PRIVATE_TEAMS_EVENT_TEST_TOKEN';
+  const priorToken = process.env[tokenEnv];
+  process.env[tokenEnv] = 'private-teams-event-work-token';
+  const seen = [];
+  const server = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    seen.push({
+      url: req.url,
+      method: req.method,
+      authorization: req.headers.authorization,
+      body: JSON.parse(Buffer.concat(chunks).toString('utf8')),
+    });
+    res.writeHead(202, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      eventId: 'private-event-receipt',
+      duplicate: false,
+      receivedAt: 1_798_000_000_000,
+      task: {
+        id: 'teams-private-task-owner-hash', workspaceId: 'acme', createdByActorId: ownerId,
+        sessionId: 'teams-private-session-owner-hash', prompt: 'Private request.', status: 'queued',
+        createdAt: 1_798_000_000_000, startedAt: null, endedAt: null, output: '', reasoning: '',
+        error: null, durationMs: 0, sequence: 1, metadata: {},
+        origin: {
+          kind: 'teams_private', messageId: 'private-activity-1', tenantId, botAppId,
+          actorAadObjectId: ownerId,
+        },
+      },
+    }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const client = new WorkStateClient({
+      baseUrl: `http://127.0.0.1:${server.address().port}`,
+      workspaceId: 'acme',
+      tokenEnv,
+    });
+    await assert.rejects(client.registerConnectorEvent({
+      connectorId: 'teams-v1',
+      messageId: 'private-activity-without-task',
+      type: 'message.received',
+      payload: { provider: 'teams', messageId: 'private-activity-without-task', text: 'Private request.' },
+      teamsPrivateMessage: { messageId: 'private-activity-without-task', text: 'Private request.' },
+    }), /require an actor-owned Task/u);
+    assert.equal(seen.length, 0, 'taskless private events never reach Work');
+    const receipt = await client.registerConnectorEvent({
+      connectorId: 'teams-v1',
+      messageId: 'private-activity-1',
+      type: 'message.received',
+      payload: { provider: 'teams', messageId: 'private-activity-1', text: 'Private request.' },
+      teamsPrivateMessage: { messageId: 'private-activity-1', text: 'Private request.' },
+      task: {
+        id: 'teams-private-task-owner-hash',
+        sessionId: 'teams-private-session-owner-hash',
+        prompt: 'Private request.',
+        metadata: {},
+      },
+    });
+    assert.equal(receipt.task.createdByActorId, ownerId);
+    assert.deepEqual(receipt.task.origin, {
+      kind: 'teams_private',
+      messageId: 'private-activity-1',
+      tenantId,
+      botAppId,
+      actorAadObjectId: ownerId,
+    });
+    assert.deepEqual(seen[0], {
+      url: '/api/v1/workspaces/acme/work/connectors/teams-v1/events',
+      method: 'POST',
+      authorization: 'Bearer private-teams-event-work-token',
+      body: {
+        messageId: 'private-activity-1',
+        type: 'message.received',
+        payload: { provider: 'teams', messageId: 'private-activity-1', text: 'Private request.' },
+        teamsPrivateMessage: { messageId: 'private-activity-1', text: 'Private request.' },
+        task: {
+          id: 'teams-private-task-owner-hash',
+          sessionId: 'teams-private-session-owner-hash',
+          prompt: 'Private request.',
+          metadata: {},
+        },
+      },
+    });
+    assert.equal(JSON.stringify(seen[0].body).includes('conversationId'), false);
+    assert.equal(JSON.stringify(seen[0].body).includes('serviceUrl'), false);
+    assert.equal(JSON.stringify(seen[0].body).includes('actorAadObjectId'), false);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+    if (priorToken === undefined) delete process.env[tokenEnv];
+    else process.env[tokenEnv] = priorToken;
+  }
+});
+
+test('WorkStateClient: private claim decodes the Work route from the lease envelope', async () => {
+  const tenantId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const ownerId = '11111111-1111-4111-8111-111111111111';
+  const botAppId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  const actorTokenEnv = 'PRIVATE_ROUTE_ACTOR_TOKEN';
+  const bridgeTokenEnv = 'PRIVATE_ROUTE_BRIDGE_TOKEN';
+  const previousValues = new Map([[actorTokenEnv, process.env[actorTokenEnv]], [bridgeTokenEnv, process.env[bridgeTokenEnv]]]);
+  process.env[actorTokenEnv] = 'private-route-actor-work-token';
+  process.env[bridgeTokenEnv] = 'private-route-bridge-token';
+  const seen = [];
+  const server = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    seen.push({ url: req.url, method: req.method, authorization: req.headers.authorization });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ items: [{
+      notification: {
+        id: 'private-notice-1', deduplicationKey: 'private-dedupe-1', type: 'teams.message',
+        payload: { text: 'Private result.' }, taskId: 'teams-private-task', connectorId: 'teams-v1',
+        recipient: 'teams:owner-private', status: 'leased', result: { retryCount: 0 },
+      },
+      leaseToken: 'private-lease-1', leaseExpiresAt: Date.now() + 30_000,
+      teamsPersonalRoute: {
+        kind: 'teams_personal', tenantId, botAppId, actorAadObjectId: ownerId,
+        conversationId: '19:private-owner-route', serviceUrl: 'https://smba.trafficmanager.net/emea/',
+      },
+    }] }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const client = new WorkStateClient({
+      baseUrl: `http://127.0.0.1:${server.address().port}`,
+      workspaceId: 'acme',
+      tokenEnv: actorTokenEnv,
+      privateBridgeTokenEnv: bridgeTokenEnv,
+    });
+    const leases = await client.claimPrivateNotifications({
+      workerId: 'navigator-private-test', limit: 1, leaseSeconds: 60, type: 'teams.message', connectorId: 'teams-v1',
+    });
+    assert.equal(leases.length, 1);
+    assert.deepEqual(leases[0].teamsPersonalRoute, {
+      kind: 'teams_personal', tenantId, botAppId, actorAadObjectId: ownerId,
+      conversationId: '19:private-owner-route', serviceUrl: 'https://smba.trafficmanager.net/emea/',
+    });
+    assert.equal(leases[0].notification.teamsPersonalRoute, undefined);
+    assert.deepEqual(seen, [{
+      url: '/api/v1/workspaces/acme/work/private-notifications/claim',
+      method: 'POST',
+      authorization: `Bearer ${process.env[bridgeTokenEnv]}`,
+    }]);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+    for (const [name, value] of previousValues) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
   }
 });
 

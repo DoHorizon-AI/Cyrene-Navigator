@@ -16,6 +16,7 @@ import {
   ExchangeConnectorRequestError,
   canonicalJson,
   sha256,
+  teamsPrivateResourceRef,
   teamsThreadResourceRef,
   validateTeamsServiceUrl,
 } from '../dist/connector-authorization.js';
@@ -29,6 +30,14 @@ const route = {
   conversationId: '19:channel-conversation',
   rootThreadId: '1698765432101',
   serviceUrl: 'https://smba.trafficmanager.net/emea/',
+};
+const privateActorId = '22222222-2222-4222-8222-222222222222';
+const privateConversation = {
+  tenantId: route.tenantId,
+  botAppId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+  actorAadObjectId: privateActorId,
+  conversationId: '19:owner-private-conversation',
+  serviceUrl: route.serviceUrl,
 };
 
 function grantFor(input) {
@@ -49,6 +58,32 @@ function grantFor(input) {
   const now = Math.floor(Date.now() / 1000);
   return {
     connectorGrantBin: 'AQ==', grantRef: 'sha256:fixture', audience: 'exchange',
+    organizationId: 'org-1', issuedAt: now, expiresAt: now + 15, request,
+  };
+}
+
+function privateGrantFor(input, principalSubject = privateActorId) {
+  const argumentsValue = {
+    targetKind: 'owner_private',
+    conversation: privateConversation,
+    text: 'Private owner status.',
+  };
+  const request = {
+    requestId: input.requestId,
+    workspaceId: 'workspace-1',
+    principalIssuer: `https://login.microsoftonline.com/${route.tenantId}/v2.0`,
+    principalSubject,
+    connectionRef,
+    providerId: 'msteams',
+    profileRef,
+    operationId: 'msteams.message.reply',
+    resourceRef: teamsPrivateResourceRef(privateConversation),
+    argumentsDigestSha256: sha256(canonicalJson(argumentsValue)),
+    arguments: argumentsValue,
+  };
+  const now = Math.floor(Date.now() / 1000);
+  return {
+    connectorGrantBin: 'AQ==', grantRef: 'sha256:private-fixture', audience: 'exchange',
     organizationId: 'org-1', issuedAt: now, expiresAt: now + 15, request,
   };
 }
@@ -107,6 +142,76 @@ test('accepts Exchange UNKNOWN tombstones as terminal uncertain delivery', async
         text: input.text,
       },
     });
+  });
+});
+
+test('sends only the Work-resolved owner-private route through the existing Teams reply grant', async () => {
+  const input = {
+    requestId: 'private-notification-1:attempt:1',
+    targetKind: 'owner_private',
+    conversation: privateConversation,
+    text: 'Private owner status.',
+  };
+  await withHttpResponse(200, {}, {
+    requestId: input.requestId, status: 'accepted', vendorMessageId: 'private-message-1',
+  }, async (client, received) => {
+    const result = await client.sendPrivateTeamsMessage(
+      input, privateGrantFor(input), connectionRef, profileRef, new AbortController().signal,
+    );
+    assert.deepEqual(result, { outcome: 'accepted', vendorMessageId: 'private-message-1' });
+    assert.equal(received[0].url, '/internal/v1/teams/messages');
+    assert.equal(received[0].grant, 'AQ==');
+    assert.deepEqual(received[0].body, {
+      requestId: input.requestId,
+      providerId: 'msteams',
+      targetKind: 'owner_private',
+      conversation: privateConversation,
+      text: input.text,
+    });
+  });
+});
+
+test('owner-private send rejects actor or grant route mismatch before Exchange invocation', async () => {
+  const input = {
+    requestId: 'private-notification-mismatch:attempt:1',
+    targetKind: 'owner_private',
+    conversation: privateConversation,
+    text: 'Private owner status.',
+  };
+  await withHttpResponse(200, {}, { requestId: input.requestId, status: 'accepted' }, async (client, received) => {
+    await assert.rejects(client.sendPrivateTeamsMessage(
+      input,
+      privateGrantFor(input, '33333333-3333-4333-8333-333333333333'),
+      connectionRef,
+      profileRef,
+      new AbortController().signal,
+    ), /grant actor does not match/u);
+    await assert.rejects(client.sendPrivateTeamsMessage(
+      { ...input, conversation: { ...privateConversation, serviceUrl: 'https://smba.trafficmanager.net/amer/' } },
+      privateGrantFor(input),
+      connectionRef,
+      profileRef,
+      new AbortController().signal,
+    ), /does not match the exact provider call/u);
+    assert.equal(received.length, 0);
+  });
+});
+
+test('owner-private send preserves Exchange uncertain receipts without treating them as retryable', async () => {
+  const input = {
+    requestId: 'private-notification-uncertain:attempt:1',
+    targetKind: 'owner_private',
+    conversation: privateConversation,
+    text: 'Private owner status.',
+  };
+  await withHttpResponse(200, {}, {
+    requestId: input.requestId, status: 'uncertain', reasonCode: 'teams_delivery_outcome_unknown',
+  }, async (client, received) => {
+    const result = await client.sendPrivateTeamsMessage(
+      input, privateGrantFor(input), connectionRef, profileRef, new AbortController().signal,
+    );
+    assert.deepEqual(result, { outcome: 'uncertain', reasonCode: 'teams_delivery_outcome_unknown' });
+    assert.equal(received.length, 1);
   });
 });
 

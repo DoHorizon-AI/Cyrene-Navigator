@@ -6,6 +6,8 @@
 
 import { randomUUID } from 'node:crypto';
 import { createHash } from 'node:crypto';
+import { constants } from 'node:fs';
+import { lstat, open, realpath } from 'node:fs/promises';
 
 export type ExecutionStatus =
   | 'queued'
@@ -34,10 +36,22 @@ export interface TaskRecord {
   readonly error?: string;
   readonly durationMs: number;
   readonly workspaceId?: string;
+  /** Server-derived Work principal actor; never accepted from Task creation metadata. */
+  readonly createdByActorId?: string;
   readonly sequence?: number;
   readonly continuationOfTaskId?: string | null;
   readonly continuationMode?: 'read_only' | null;
+  /** Immutable, server-derived Teams private ingress proof; contains no reply route. */
+  readonly origin?: TeamsPrivateTaskOrigin;
   readonly metadata?: Readonly<Record<string, unknown>>;
+}
+
+export interface TeamsPrivateTaskOrigin {
+  readonly kind: 'teams_private';
+  readonly messageId: string;
+  readonly tenantId: string;
+  readonly botAppId: string;
+  readonly actorAadObjectId: string;
 }
 
 /** Native process identity stored by the existing Workspace-scoped Work service. */
@@ -57,6 +71,10 @@ export interface ConnectorEventInput {
   readonly conversationId?: string;
   readonly senderId?: string;
   readonly payload: Readonly<Record<string, unknown>>;
+  readonly teamsPrivateMessage?: {
+    readonly messageId: string;
+    readonly text: string;
+  };
   readonly teamsThreadMessage?: {
     readonly threadId: string;
     readonly messageId: string;
@@ -121,6 +139,47 @@ export interface NotificationLease {
     readonly result: Readonly<Record<string, unknown>>;
   };
   readonly leaseToken: string;
+  /** Work-resolved personal route, available only on the private notification lease. */
+  readonly teamsPersonalRoute?: TeamsPersonalNotificationRoute;
+}
+
+/** Private conversation binding returned only inside a trusted Work notification lease. */
+export interface TeamsPersonalNotificationRoute {
+  readonly kind: 'teams_personal';
+  readonly tenantId: string;
+  readonly botAppId: string;
+  readonly actorAadObjectId: string;
+  readonly conversationId: string;
+  readonly serviceUrl: string;
+}
+
+/** Verified personal-install activity forwarded from the authenticated Teams adapter. */
+export interface TeamsPrivateInstallationEvent {
+  readonly eventType: 'personal_installation';
+  readonly payload: { readonly action: 'add' | 'remove' };
+  readonly trust: {
+    readonly version: 1;
+    readonly provider: 'teams';
+    readonly conversationKind: 'private';
+    readonly installationAction: 'add' | 'remove';
+    readonly tenantId: string;
+    readonly actorAadObjectId: string;
+    readonly botAppId: string;
+    readonly conversationId: string;
+    readonly activityId: string;
+    readonly activityOccurredAt: string;
+    readonly serviceUrl: string;
+  };
+}
+
+export interface TeamsPrivateInstallationReceipt {
+  readonly action: 'add' | 'remove';
+  readonly active: boolean;
+  /** Whether this event changed the currently applied installation state. */
+  readonly applied: boolean;
+  readonly revision: number;
+  readonly updatedAt: number;
+  readonly duplicate: boolean;
 }
 
 /** Credential-free authorization health returned by Exchange's fixed snapshot projection. */
@@ -188,9 +247,10 @@ export interface WorkStateStore {
   getBackendSession(taskId: string): Promise<BackendSessionRecord | undefined>;
   bindBackendSession(taskId: string, nativeSessionId: string): Promise<BackendSessionRecord>;
   listTasks(options?: { cursor?: string; limit?: number }): Promise<TaskPage>;
+  listOwnedTasks?(options?: { cursor?: string; limit?: number }): Promise<TaskPage>;
   claimTask(taskId: string): Promise<{ claimed: boolean; task: TaskRecord }>;
   patchTask(taskId: string, patch: Partial<Omit<TaskRecord, 'id' | 'workspaceId' | 'sequence'>>): Promise<TaskRecord>;
-  appendEvent(taskId: string, event: Record<string, unknown>): Promise<DurableTaskEvent>;
+  appendEvent(taskId: string, event: Record<string, unknown>, messageId?: string): Promise<DurableTaskEvent>;
   getEvents(taskId: string, after?: number): Promise<TaskEventPage>;
   listUnresolvedOperations(options?: { target?: string; limit?: number }): Promise<readonly UnresolvedOperationSummary[]>;
   registerConnectorEvent(input: ConnectorEventInput): Promise<ConnectorEventReceipt>;
@@ -203,6 +263,22 @@ export interface WorkStateStore {
     connectorId: string;
     recipient?: string;
   }): Promise<readonly NotificationLease[]>;
+  claimPrivateNotifications?(input: {
+    workerId: string;
+    limit: number;
+    leaseSeconds: number;
+    type: string;
+    connectorId: string;
+  }): Promise<readonly NotificationLease[]>;
+  startPrivateNotification?(notificationId: string, leaseToken: string): Promise<void>;
+  finishPrivateNotification?(
+    notificationId: string,
+    leaseToken: string,
+    outcome: 'delivered' | 'failed' | 'uncertain' | 'retry',
+    result?: Readonly<Record<string, unknown>>,
+    retryAfterSeconds?: number,
+  ): Promise<void>;
+  registerTeamsPrivateInstallation?(event: TeamsPrivateInstallationEvent): Promise<TeamsPrivateInstallationReceipt>;
   processCredentialHealthSnapshots(
     organizationId: string,
     connections: readonly CredentialHealthSnapshot[],
@@ -225,6 +301,8 @@ export interface WorkStateConnection {
   readonly baseUrl: string;
   readonly workspaceId: string;
   readonly tokenEnv?: string;
+  /** Separate Work principal scoped to Teams private installation/notification bridge operations. */
+  readonly privateBridgeTokenEnv?: string;
   readonly requestTimeoutMs?: number;
 }
 
@@ -283,6 +361,8 @@ function decodeTask(value: unknown): TaskRecord {
   const endedAt = timeField(row.endedAt, 'endedAt', true);
   const error = row.error === undefined || row.error === null ? undefined : stringField(row.error, 'error', true);
   const workspaceId = row.workspaceId === undefined ? undefined : stringField(row.workspaceId, 'workspaceId');
+  const createdByActorId = row.createdByActorId === undefined
+    ? undefined : stringField(row.createdByActorId, 'createdByActorId');
   const sequence = row.sequence === undefined ? undefined : timeField(row.sequence, 'sequence');
   const continuationOfTaskId = row.continuationOfTaskId === undefined
     ? undefined
@@ -290,8 +370,10 @@ function decodeTask(value: unknown): TaskRecord {
   const continuationMode = row.continuationMode === undefined
     ? undefined
     : row.continuationMode === null ? null
-      : row.continuationMode === 'read_only' ? 'read_only'
+        : row.continuationMode === 'read_only' ? 'read_only'
         : (() => { throw new TypeError('Invalid Work Task continuationMode'); })();
+  const origin = row.origin === undefined || row.origin === null
+    ? undefined : decodeTeamsPrivateTaskOrigin(row.origin);
   const metadata = row.metadata === undefined ? undefined : object(row.metadata, 'Work Task metadata');
   return {
     ...task,
@@ -299,10 +381,33 @@ function decodeTask(value: unknown): TaskRecord {
     ...(endedAt === undefined ? {} : { endedAt }),
     ...(error === undefined ? {} : { error }),
     ...(workspaceId === undefined ? {} : { workspaceId }),
+    ...(createdByActorId === undefined ? {} : { createdByActorId }),
     ...(sequence === undefined ? {} : { sequence }),
     ...(continuationOfTaskId === undefined ? {} : { continuationOfTaskId }),
     ...(continuationMode === undefined ? {} : { continuationMode }),
+    ...(origin === undefined ? {} : { origin }),
     ...(metadata === undefined ? {} : { metadata }),
+  };
+}
+
+function decodeTeamsPrivateTaskOrigin(value: unknown): TeamsPrivateTaskOrigin {
+  const row = object(value, 'Work private Teams task origin');
+  if (Object.keys(row).sort().join(',') !== 'actorAadObjectId,botAppId,kind,messageId,tenantId'
+    || row.kind !== 'teams_private') {
+    throw new TypeError('Invalid Work private Teams task origin');
+  }
+  const actorAadObjectId = boundedString(row.actorAadObjectId, 'private Teams origin actor', 36).toLowerCase();
+  const tenantId = boundedString(row.tenantId, 'private Teams origin tenant', 36).toLowerCase();
+  const botAppId = boundedString(row.botAppId, 'private Teams origin bot app', 36).toLowerCase();
+  if (!isUuid(actorAadObjectId) || !isUuid(tenantId) || !isUuid(botAppId)) {
+    throw new TypeError('Invalid Work private Teams task origin identity');
+  }
+  return {
+    kind: 'teams_private',
+    messageId: boundedString(row.messageId, 'private Teams origin message id', 512),
+    tenantId,
+    botAppId,
+    actorAadObjectId,
   };
 }
 
@@ -452,6 +557,22 @@ export class WorkStateClient implements WorkStateStore {
     return { items: row.items.map(decodeTask), nextCursor: (row.nextCursor as string | null | undefined) ?? null };
   }
 
+  /** List tasks owned by this actor principal, independent of broader workspace list behavior. */
+  async listOwnedTasks(options: { cursor?: string; limit?: number } = {}): Promise<TaskPage> {
+    const query = new URLSearchParams();
+    if (options.cursor) query.set('cursor', options.cursor);
+    if (options.limit !== undefined) query.set('limit', String(Math.min(options.limit, 50)));
+    const suffix = query.size > 0 ? `?${query.toString()}` : '';
+    const row = object(await this.requestAt(`${this.tasksUrl}/owned${suffix}`, 'GET'), 'Owned Work Task page');
+    if (!Array.isArray(row.items)) throw new TypeError('Invalid owned Work Task page items');
+    if (row.nextCursor !== null && row.nextCursor !== undefined && typeof row.nextCursor !== 'string') {
+      throw new TypeError('Invalid owned Work Task cursor');
+    }
+    const items = row.items.map(decodeTask);
+    if (items.some(item => item.createdByActorId === undefined)) throw new TypeError('Owned Task page omitted the server actor identity');
+    return { items, nextCursor: (row.nextCursor as string | null | undefined) ?? null };
+  }
+
   /** Atomically claim a queued task so only one executor process can run it.  中文：原子认领排队任务，确保只有一个执行器进程启动它。 */
   async claimTask(taskId: string): Promise<{ claimed: boolean; task: TaskRecord }> {
     const row = object(await this.request(`/${encodeURIComponent(taskId)}/claim`, 'POST', {}), 'Work Task claim');
@@ -468,8 +589,8 @@ export class WorkStateClient implements WorkStateStore {
   }
 
   /** Append one idempotent event to the durable task timeline.  中文：向持久任务时间线追加一条幂等事件。 */
-  async appendEvent(taskId: string, event: Record<string, unknown>): Promise<DurableTaskEvent> {
-    const messageId = randomUUID();
+  async appendEvent(taskId: string, event: Record<string, unknown>, messageId = randomUUID()): Promise<DurableTaskEvent> {
+    boundedString(messageId, 'messageId', 512);
     const payload = { event, messageId };
     let lastError: unknown;
     for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -509,6 +630,9 @@ export class WorkStateClient implements WorkStateStore {
 
   /** Deduplicate an inbound event and persist its task admission atomically. */
   async registerConnectorEvent(input: ConnectorEventInput): Promise<ConnectorEventReceipt> {
+    if (input.teamsPrivateMessage !== undefined && input.task === undefined) {
+      throw new TypeError('Private Teams events require an actor-owned Task in the same admission.');
+    }
     const row = object(await this.requestAt(
       `${this.workUrl}/connectors/${encodeURIComponent(safeIdentifier(input.connectorId, 'connectorId'))}/events`,
       'POST',
@@ -520,6 +644,12 @@ export class WorkStateClient implements WorkStateStore {
         ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
         ...(input.senderId === undefined ? {} : { senderId: input.senderId }),
         payload: input.payload,
+        ...(input.teamsPrivateMessage === undefined ? {} : {
+          teamsPrivateMessage: {
+            messageId: boundedString(input.teamsPrivateMessage.messageId, 'private Teams message id', 512),
+            text: boundedThreadMessageText(input.teamsPrivateMessage.text, 'private Teams message text', 20_000),
+          },
+        }),
         ...(input.teamsThreadMessage === undefined ? {} : { teamsThreadMessage: input.teamsThreadMessage }),
         ...(input.task === undefined ? {} : { task: input.task }),
       },
@@ -611,6 +741,59 @@ export class WorkStateClient implements WorkStateStore {
     });
   }
 
+  /** Lease only owner-private notices under the dedicated private bridge capability. */
+  async claimPrivateNotifications(input: {
+    workerId: string; limit: number; leaseSeconds: number; type: string; connectorId: string;
+  }): Promise<readonly NotificationLease[]> {
+    const row = object(await this.requestPrivate('/private-notifications/claim', 'POST', input), 'Private notification claim');
+    if (!Array.isArray(row.items)) throw new TypeError('Invalid private notification claim response');
+    return row.items.map(item => {
+      const lease = object(item, 'Private notification lease');
+      const notice = object(lease.notification, 'Private notification');
+      const route = decodeTeamsPersonalNotificationRoute(lease.teamsPersonalRoute);
+      const status = notice.status;
+      if (!['queued', 'leased', 'started', 'uncertain', 'delivered', 'failed'].includes(String(status))) {
+        throw new TypeError('Invalid private notification state');
+      }
+      if (notice.type !== input.type || notice.connectorId !== input.connectorId) {
+        throw new TypeError('Work returned a private notification outside the requested connector scope');
+      }
+      return {
+        notification: {
+          id: boundedString(notice.id, 'private notification id', 512),
+          deduplicationKey: boundedString(notice.deduplicationKey, 'private notification deduplication key', 512),
+          type: String(notice.type),
+          payload: object(notice.payload, 'private notification payload'),
+          ...(typeof notice.taskId === 'string' ? { taskId: notice.taskId } : {}),
+          ...(typeof notice.connectorId === 'string' ? { connectorId: notice.connectorId } : {}),
+          ...(typeof notice.recipient === 'string' ? { recipient: notice.recipient } : {}),
+          status: status as NotificationLease['notification']['status'],
+          result: notice.result === undefined ? {} : object(notice.result, 'private notification result'),
+        },
+        leaseToken: boundedString(lease.leaseToken, 'private notification lease token', 512),
+        teamsPersonalRoute: route,
+      };
+    });
+  }
+
+  /** Persist a verified personal-install event using the separately scoped Work bridge bearer. */
+  async registerTeamsPrivateInstallation(event: TeamsPrivateInstallationEvent): Promise<TeamsPrivateInstallationReceipt> {
+    validateTeamsPrivateInstallationEvent(event);
+    const row = object(await this.requestPrivate('/private-installations/events', 'POST', event), 'Private installation receipt');
+    if ((row.action !== 'add' && row.action !== 'remove') || typeof row.active !== 'boolean'
+      || typeof row.applied !== 'boolean' || typeof row.duplicate !== 'boolean') {
+      throw new TypeError('Invalid private installation receipt');
+    }
+    return {
+      action: row.action,
+      active: row.active,
+      applied: row.applied,
+      revision: countField(row.revision, 'private installation revision'),
+      updatedAt: timeField(row.updatedAt, 'private installation updatedAt')!,
+      duplicate: row.duplicate,
+    };
+  }
+
   /** Atomically checkpoint Exchange health and enqueue its incident transitions. */
   async processCredentialHealthSnapshots(
     organizationId: string,
@@ -647,6 +830,30 @@ export class WorkStateClient implements WorkStateStore {
     });
   }
 
+  async startPrivateNotification(notificationId: string, leaseToken: string): Promise<void> {
+    await this.requestPrivate(`/notifications/${encodeURIComponent(notificationId)}/start`, 'POST', { leaseToken });
+  }
+
+  async finishPrivateNotification(
+    notificationId: string,
+    leaseToken: string,
+    outcome: 'delivered' | 'failed' | 'uncertain' | 'retry',
+    result: Readonly<Record<string, unknown>> = {},
+    retryAfterSeconds?: number,
+  ): Promise<void> {
+    await this.requestPrivate(`/notifications/${encodeURIComponent(notificationId)}/finish`, 'POST', {
+      leaseToken,
+      outcome,
+      ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }),
+      result,
+    });
+  }
+
+  private async requestPrivate(path: string, method: string, body?: unknown): Promise<unknown> {
+    return this.requestAt(`${this.workUrl}${path}`, method, body, undefined, {},
+      this.connection.privateBridgeTokenEnv ?? 'CYRENE_PRIVATE_TEAMS_BRIDGE_TOKEN');
+  }
+
   private async request(
     path: string,
     method: string,
@@ -663,8 +870,9 @@ export class WorkStateClient implements WorkStateStore {
     body?: unknown,
     timeoutMs?: number,
     extraHeaders: Readonly<Record<string, string>> = {},
+    tokenEnvOverride?: string,
   ): Promise<unknown> {
-    const tokenEnv = this.connection.tokenEnv ?? 'CYRENE_SESSION_TOKEN';
+    const tokenEnv = tokenEnvOverride ?? this.connection.tokenEnv ?? 'CYRENE_SESSION_TOKEN';
     const token = process.env[tokenEnv];
     if (!token) throw new Error(`Missing persistence credential in ${tokenEnv}`);
     const requestTimeoutMs = timeoutMs ?? this.connection.requestTimeoutMs ?? 10_000;
@@ -692,6 +900,163 @@ export class WorkStateClient implements WorkStateStore {
   }
 }
 
+/** Host-private reference from one verified Teams actor to its server-issued Work bearer env. */
+export interface WorkActorTokenReference {
+  readonly actorAadObjectId: string;
+  readonly tokenEnv: string;
+}
+
+/** Load a root-owned or owner-private map of actor ids to dedicated Work token environment names. */
+export async function loadWorkActorTokenReferences(
+  pathValue: string,
+  expectedWorkspaceId: string,
+): Promise<readonly WorkActorTokenReference[]> {
+  if (typeof pathValue !== 'string' || !pathValue.startsWith('/') || pathValue.includes('..')
+    || pathValue.length > 2_000) throw new TypeError('Work actor map path must be absolute and bounded');
+  const path = pathValue;
+  try {
+    if (await realpath(path) !== path) throw new TypeError('Work actor map path must not use symlinks');
+    const before = await lstat(path);
+    const parentPath = path.slice(0, path.lastIndexOf('/')) || '/';
+    const parent = await lstat(parentPath);
+    const currentUid = typeof process.getuid === 'function' ? process.getuid() : undefined;
+    const currentGid = typeof process.getgid === 'function' ? process.getgid() : undefined;
+    const mode = before.mode & 0o7777;
+    const rootReadable = before.uid === 0 && mode === 0o640 && currentGid !== undefined && before.gid === currentGid;
+    const ownerPrivate = currentUid !== undefined && before.uid === currentUid && mode === 0o600;
+    if (!before.isFile() || before.isSymbolicLink() || before.size < 2 || before.size > 64_000
+      || (!rootReadable && !ownerPrivate) || !parent.isDirectory() || parent.isSymbolicLink()
+      || parent.uid !== before.uid || (parent.mode & 0o022) !== 0 || await realpath(parentPath) !== parentPath) {
+      throw new TypeError('Work actor map must be a bounded root-readable private file');
+    }
+    const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    let raw: Uint8Array;
+    try {
+      const after = await handle.stat();
+      if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino
+        || after.uid !== before.uid || after.gid !== before.gid || (after.mode & 0o7777) !== mode
+        || after.size !== before.size) throw new TypeError('Work actor map changed while opening');
+      raw = await handle.readFile();
+    } finally {
+      await handle.close();
+    }
+    if (raw.byteLength !== before.size || raw.byteLength > 64_000) throw new TypeError('Work actor map exceeds its size limit');
+    let value: unknown;
+    try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw)) as unknown; }
+    catch { throw new TypeError('Work actor map must be valid UTF-8 JSON'); }
+    return decodeWorkActorTokenReferences(value, expectedWorkspaceId);
+  } catch (error: unknown) {
+    if (error instanceof TypeError) throw error;
+    throw new TypeError('Work actor map is unavailable');
+  }
+}
+
+export function decodeWorkActorTokenReferences(
+  value: unknown,
+  expectedWorkspaceId: string,
+): readonly WorkActorTokenReference[] {
+  const root = object(value, 'Work actor map');
+  if (Object.keys(root).sort().join(',') !== 'actors,schemaVersion,workspaceId'
+    || root.schemaVersion !== 1 || root.workspaceId !== expectedWorkspaceId
+    || !Array.isArray(root.actors) || root.actors.length < 1 || root.actors.length > 5) {
+    throw new TypeError('Work actor map must use the selected workspace and five-person schema version 1');
+  }
+  const actorIds = new Set<string>();
+  const tokenEnvs = new Set<string>();
+  return root.actors.map((value, index) => {
+    const row = object(value, `Work actor map entry ${index}`);
+    if (Object.keys(row).sort().join(',') !== 'actorAadObjectId,tokenEnv') {
+      throw new TypeError(`Work actor map entry ${index} contains unsupported fields`);
+    }
+    const actorAadObjectId = boundedString(row.actorAadObjectId, 'Work actor AAD id', 36).toLowerCase();
+    const tokenEnv = boundedString(row.tokenEnv, 'Work actor token environment reference', 128);
+    if (!isUuid(actorAadObjectId) || !/^[A-Z][A-Z0-9_]{0,127}$/u.test(tokenEnv)
+      || ['CYRENE_SESSION_TOKEN', 'CYRENE_EXECUTOR_TOKEN', 'CYRENE_PRIVATE_TEAMS_BRIDGE_TOKEN'].includes(tokenEnv)
+      || actorIds.has(actorAadObjectId) || tokenEnvs.has(tokenEnv)) {
+      throw new TypeError(`Work actor map entry ${index} is invalid or reused`);
+    }
+    actorIds.add(actorAadObjectId);
+    tokenEnvs.add(tokenEnv);
+    return { actorAadObjectId, tokenEnv };
+  });
+}
+
+/** Prebuilt Work clients for only the actors in the root-owned provisioned token map. */
+export class WorkActorClientRegistry {
+  private readonly clientsByActor = new Map<string, WorkStateClient>();
+  private readonly tokenEnvsByActor = new Map<string, string>();
+
+  constructor(
+    connection: Omit<WorkStateConnection, 'tokenEnv' | 'privateBridgeTokenEnv'>,
+    references: readonly WorkActorTokenReference[],
+  ) {
+    if (references.length > 5) throw new TypeError('Work actor token map exceeds the five-person pilot bound');
+    const tokenEnvs = new Set<string>();
+    for (const reference of references) {
+      const actorAadObjectId = boundedString(reference.actorAadObjectId, 'Work actor AAD subject', 36).toLowerCase();
+      if (!isUuid(actorAadObjectId) || this.clientsByActor.has(actorAadObjectId)) {
+        throw new TypeError('Work actor token map contains an invalid or duplicate actor');
+      }
+      const tokenEnv = boundedString(reference.tokenEnv, 'Work actor token env reference', 128);
+      if (!/^[A-Z][A-Z0-9_]{0,127}$/u.test(tokenEnv)
+        || ['CYRENE_SESSION_TOKEN', 'CYRENE_EXECUTOR_TOKEN', 'CYRENE_PRIVATE_TEAMS_BRIDGE_TOKEN'].includes(tokenEnv)
+        || tokenEnvs.has(tokenEnv)) {
+        throw new TypeError('Work actor token references must be unique dedicated environment names');
+      }
+      tokenEnvs.add(tokenEnv);
+      this.clientsByActor.set(actorAadObjectId, new WorkStateClient({ ...connection, tokenEnv }));
+      this.tokenEnvsByActor.set(actorAadObjectId, tokenEnv);
+    }
+  }
+
+  /** Resolve only an actor already present in the trusted host registry. */
+  forActor(actorAadObjectId: string): WorkStateClient | undefined {
+    return this.clientsByActor.get(actorAadObjectId.toLowerCase());
+  }
+
+  /** Resolve only the host-private environment reference for a verified configured actor. */
+  tokenEnvForActor(actorAadObjectId: string): string | undefined {
+    return this.tokenEnvsByActor.get(actorAadObjectId.toLowerCase());
+  }
+
+  /** Enumerate configured actor ids without returning token references or values. */
+  actorIds(): readonly string[] {
+    return [...this.clientsByActor.keys()];
+  }
+
+  /** Read a Task through actor-filtered clients and verify the server-owned creator field. */
+  async resolveTask(taskId: string): Promise<{ readonly actorAadObjectId: string; readonly store: WorkStateClient; readonly task: TaskRecord } | undefined> {
+    for (const [actorAadObjectId, store] of this.clientsByActor) {
+      const task = await store.getTask(taskId);
+      if (task === undefined) continue;
+      if (task.createdByActorId?.toLowerCase() !== actorAadObjectId) {
+        throw new Error('Work Task creator does not match its actor-scoped Work token.');
+      }
+      return { actorAadObjectId, store, task };
+    }
+    return undefined;
+  }
+
+  /** List each actor's own tasks for host recovery without asking Work for another actor ID. */
+  async listOwnedTasks(): Promise<readonly { readonly actorAadObjectId: string; readonly store: WorkStateClient; readonly task: TaskRecord }[]> {
+    const rows: { actorAadObjectId: string; store: WorkStateClient; task: TaskRecord }[] = [];
+    for (const [actorAadObjectId, store] of this.clientsByActor) {
+      let cursor: string | undefined;
+      do {
+        const page = await store.listOwnedTasks({ ...(cursor === undefined ? {} : { cursor }), limit: 50 });
+        for (const task of page.items) {
+          if (task.createdByActorId?.toLowerCase() !== actorAadObjectId) {
+            throw new Error('Owned Work Task page contains a different creator.');
+          }
+          rows.push({ actorAadObjectId, store, task });
+        }
+        cursor = page.nextCursor ?? undefined;
+      } while (cursor !== undefined);
+    }
+    return rows;
+  }
+}
+
 function errorCode(value: unknown): string {
   try {
     const row = object(value, 'Work API error');
@@ -699,6 +1064,60 @@ function errorCode(value: unknown): string {
   } catch {
     return 'HTTP_ERROR';
   }
+}
+
+function decodeTeamsPersonalNotificationRoute(value: unknown): TeamsPersonalNotificationRoute {
+  const row = object(value, 'Work private notification route');
+  if (row.kind !== 'teams_personal') throw new TypeError('Invalid Work private notification route kind');
+  const tenantId = boundedString(row.tenantId, 'private notification tenant id', 128).toLowerCase();
+  const botAppId = boundedString(row.botAppId, 'private notification bot app id', 128).toLowerCase();
+  const actorAadObjectId = boundedString(row.actorAadObjectId, 'private notification actor id', 128).toLowerCase();
+  const conversationId = boundedString(row.conversationId, 'private notification conversation id', 512);
+  const serviceUrl = boundedString(row.serviceUrl, 'private notification service URL', 512);
+  if (!isUuid(tenantId) || !isUuid(botAppId) || !isUuid(actorAadObjectId)
+    || !/^https:\/\/(?:smba\.trafficmanager\.net|smba\.infra\.teams\.microsoft\.com)(?::443)?\//iu.test(serviceUrl)) {
+    throw new TypeError('Invalid Work private notification route fields');
+  }
+  return { kind: 'teams_personal', tenantId, botAppId, actorAadObjectId, conversationId, serviceUrl };
+}
+
+function validateTeamsPrivateInstallationEvent(event: TeamsPrivateInstallationEvent): void {
+  if (Object.keys(event as unknown as Record<string, unknown>).sort().join(',') !== 'eventType,payload,trust'
+    || event.eventType !== 'personal_installation'
+    || !['add', 'remove'].includes(event.payload.action)
+    || event.trust.version !== 1 || event.trust.provider !== 'teams'
+    || event.trust.conversationKind !== 'private'
+    || event.trust.installationAction !== event.payload.action
+    || !isUuid(event.trust.tenantId) || !isUuid(event.trust.actorAadObjectId) || !isUuid(event.trust.botAppId)) {
+    throw new TypeError('Invalid Teams private-installation event');
+  }
+  const timestamp = boundedString(event.trust.activityOccurredAt, 'private installation activity timestamp', 32);
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/u.test(timestamp)
+    || !Number.isFinite(Date.parse(timestamp))) {
+    throw new TypeError('Invalid private installation activity timestamp');
+  }
+  boundedString(event.trust.conversationId, 'private installation conversation id', 512);
+  boundedString(event.trust.activityId, 'private installation activity id', 512);
+  const serviceUrl = boundedString(event.trust.serviceUrl, 'private installation service URL', 512);
+  if (!/^https:\/\/(?:smba\.trafficmanager\.net|smba\.infra\.teams\.microsoft\.com)(?::443)?\//iu.test(serviceUrl)) {
+    throw new TypeError('Invalid Teams private-installation service URL');
+  }
+}
+
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value);
+}
+
+function canonicalTaskJson(value: unknown): string {
+  const normalize = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(normalize);
+    if (item !== null && typeof item === 'object') {
+      return Object.fromEntries(Object.entries(item).sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, child]) => [key, normalize(child)]));
+    }
+    return item;
+  };
+  return JSON.stringify(normalize(value));
 }
 
 function safeIdentifier(value: unknown, label: string): string {
@@ -743,6 +1162,35 @@ export class InMemoryWorkStateStore implements WorkStateStore {
   private readonly connectorThreadRoutes = new Map<string, Omit<ConnectorThreadRecord, 'sessionId' | 'messages'>>();
   private readonly connectorThreadMessages = new Map<string, ConnectorThreadRecord['messages'][number][]>();
   private readonly credentialHealth = new Map<string, CredentialHealthSnapshot>();
+  private readonly privateInstallations: Map<string, {
+    readonly active: boolean;
+    readonly revision: number;
+    readonly updatedAt: number;
+    readonly lastActivityOccurredAt?: number;
+    readonly events: Map<string, {
+      readonly digest: string;
+      readonly receipt: Omit<TeamsPrivateInstallationReceipt, 'duplicate'>;
+    }>;
+  }>;
+
+  constructor(
+    private readonly actorAadObjectId?: string,
+    privateInstallations?: Map<string, {
+      readonly active: boolean;
+      readonly revision: number;
+      readonly updatedAt: number;
+      readonly lastActivityOccurredAt?: number;
+      readonly events: Map<string, {
+        readonly digest: string;
+        readonly receipt: Omit<TeamsPrivateInstallationReceipt, 'duplicate'>;
+      }>;
+    }>,
+  ) {
+    if (actorAadObjectId !== undefined && !isUuid(actorAadObjectId)) {
+      throw new TypeError('In-memory actor scope must be a UUID');
+    }
+    this.privateInstallations = privateInstallations ?? new Map();
+  }
 
   async createTask(input: {
     id?: string;
@@ -758,6 +1206,7 @@ export class InMemoryWorkStateStore implements WorkStateStore {
       id, sessionId: input.sessionId, prompt: input.prompt, status: 'queued',
       executionClass: input.executionClass ?? 'foreground',
       createdAt: now, output: '', reasoning: '', durationMs: 0,
+      ...(this.actorAadObjectId === undefined ? {} : { createdByActorId: this.actorAadObjectId.toLowerCase() }),
       ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
     };
     this.records.set(id, row);
@@ -858,7 +1307,6 @@ export class InMemoryWorkStateStore implements WorkStateStore {
     const old = this.records.get(taskId);
     if (!old) throw new WorkStateHttpError(404, 'TASK_NOT_FOUND');
     if (old.status !== 'queued') return { claimed: false, task: old };
-    const now = Date.now();
     const task = await this.patchTask(taskId, { status: 'running' });
     return { claimed: true, task };
   }
@@ -880,10 +1328,17 @@ export class InMemoryWorkStateStore implements WorkStateStore {
     return next;
   }
 
-  async appendEvent(taskId: string, event: Record<string, unknown>): Promise<DurableTaskEvent> {
+  async appendEvent(taskId: string, event: Record<string, unknown>, messageId = randomUUID()): Promise<DurableTaskEvent> {
     if (!this.records.has(taskId)) throw new WorkStateHttpError(404, 'TASK_NOT_FOUND');
     const events = this.events.get(taskId)!;
-    const row = { seq: events.length + 1, event, createdAt: Date.now() };
+    const prior = events.find(item => item.messageId === messageId);
+    if (prior !== undefined) {
+      if (canonicalTaskJson(prior.event) !== canonicalTaskJson(event)) {
+        throw new WorkStateHttpError(409, 'TASK_EVENT_CONFLICT');
+      }
+      return prior;
+    }
+    const row = { seq: events.length + 1, event: structuredClone(event), createdAt: Date.now(), messageId };
     events.push(row);
     return row;
   }
@@ -897,8 +1352,44 @@ export class InMemoryWorkStateStore implements WorkStateStore {
   async listUnresolvedOperations(): Promise<readonly UnresolvedOperationSummary[]> { return []; }
 
   async registerConnectorEvent(input: ConnectorEventInput): Promise<ConnectorEventReceipt> {
-    const key = `${input.connectorId}\0${input.messageId}`;
+    const teamsPrivateMessage = input.teamsPrivateMessage;
     const teamsThreadMessage = input.teamsThreadMessage;
+    if (teamsPrivateMessage !== undefined && teamsThreadMessage !== undefined) {
+      throw new WorkStateHttpError(400, 'WORK_CONNECTOR_INVALID_TEAMS_ORIGIN');
+    }
+    let privateOrigin: TeamsPrivateTaskOrigin | undefined;
+    let key = `${input.connectorId}\0${input.messageId}`;
+    if (teamsPrivateMessage !== undefined) {
+      if (input.task === undefined) {
+        throw new WorkStateHttpError(400, 'WORK_CONNECTOR_INVALID_TEAMS_PRIVATE_MESSAGE');
+      }
+      const actorAadObjectId = this.actorAadObjectId?.toLowerCase();
+      if (actorAadObjectId === undefined || input.accountId !== undefined || input.conversationId !== undefined
+        || input.senderId !== undefined || input.messageId !== teamsPrivateMessage.messageId
+        || input.payload.messageId !== teamsPrivateMessage.messageId
+        || input.payload.text !== teamsPrivateMessage.text) {
+        throw new WorkStateHttpError(403, 'WORK_TEAMS_PRIVATE_MESSAGE_FORBIDDEN');
+      }
+      const activeInstallation = [...this.privateInstallations.entries()].find(([identity, value]) => {
+        const [tenantId, actorId, botAppId] = identity.split('\0');
+        return actorId === actorAadObjectId && value.active && tenantId !== undefined && botAppId !== undefined;
+      });
+      if (activeInstallation === undefined) {
+        throw new WorkStateHttpError(403, 'WORK_TEAMS_PRIVATE_INSTALLATION_NOT_FOUND');
+      }
+      const [tenantId, , botAppId] = activeInstallation[0].split('\0');
+      if (tenantId === undefined || botAppId === undefined) {
+        throw new WorkStateHttpError(403, 'WORK_TEAMS_PRIVATE_INSTALLATION_NOT_FOUND');
+      }
+      privateOrigin = {
+        kind: 'teams_private',
+        messageId: teamsPrivateMessage.messageId,
+        tenantId,
+        botAppId,
+        actorAadObjectId,
+      };
+      key = `${input.connectorId}\0teams-private\0${actorAadObjectId}\0${input.messageId}`;
+    }
     if (teamsThreadMessage !== undefined && input.payload.messageId !== teamsThreadMessage.messageId) {
       throw new TypeError('Teams thread message ID does not match its canonical event payload');
     }
@@ -923,7 +1414,11 @@ export class InMemoryWorkStateStore implements WorkStateStore {
     }
     if (teamsThreadMessage?.sessionId) {
       const threadKey = `${input.connectorId}\0${teamsThreadMessage.threadId}`;
-      const mapped = this.connectorThreads.get(threadKey);
+      if (this.actorAadObjectId !== undefined
+        && teamsThreadMessage.actorSubject.toLowerCase() !== this.actorAadObjectId.toLowerCase()) {
+        throw new WorkStateHttpError(403, 'WORK_CONNECTOR_TEAMS_ACTOR_MISMATCH');
+      }
+      const mapped = this.connectorThreads.get(this.scopedConnectorThreadKey(threadKey));
       if (mapped && (mapped.sessionId !== teamsThreadMessage.sessionId
         || mapped.tenantId !== teamsThreadMessage.tenantId || mapped.teamId !== teamsThreadMessage.teamId
         || mapped.channelId !== teamsThreadMessage.channelId || mapped.conversationId !== teamsThreadMessage.conversationId
@@ -931,7 +1426,22 @@ export class InMemoryWorkStateStore implements WorkStateStore {
         throw new WorkStateHttpError(409, 'CONNECTOR_THREAD_CONFLICT');
       }
     }
-    const task = input.task ? await this.createTask(input.task) : undefined;
+    const taskInput = input.task === undefined || teamsPrivateMessage === undefined
+      ? input.task
+      : {
+        ...input.task,
+        metadata: Object.fromEntries(Object.entries(input.task.metadata ?? {}).filter(([field]) =>
+          !['notification', 'teamsCaller', 'teamsThread', 'teamsPrivate'].includes(field))),
+      };
+    let task = taskInput ? await this.createTask(taskInput) : undefined;
+    if (task !== undefined && teamsThreadMessage !== undefined) {
+      task = { ...task, createdByActorId: teamsThreadMessage.actorSubject.toLowerCase() };
+      this.records.set(task.id, task);
+    }
+    if (task !== undefined && privateOrigin !== undefined) {
+      task = { ...task, createdByActorId: privateOrigin.actorAadObjectId, origin: privateOrigin };
+      this.records.set(task.id, task);
+    }
     if (teamsThreadMessage) {
       const threadKey = `${input.connectorId}\0${teamsThreadMessage.threadId}`;
       this.connectorThreadRoutes.set(threadKey, {
@@ -944,7 +1454,7 @@ export class InMemoryWorkStateStore implements WorkStateStore {
         serviceUrl: teamsThreadMessage.serviceUrl,
       });
       if (teamsThreadMessage.sessionId) {
-        this.connectorThreads.set(threadKey, {
+        this.connectorThreads.set(this.scopedConnectorThreadKey(threadKey), {
           threadId: teamsThreadMessage.threadId,
           tenantId: teamsThreadMessage.tenantId,
           teamId: teamsThreadMessage.teamId,
@@ -983,17 +1493,89 @@ export class InMemoryWorkStateStore implements WorkStateStore {
     const key = `${connectorId}\0${threadId}`;
     const route = this.connectorThreadRoutes.get(key);
     if (!route) throw new WorkStateHttpError(404, 'WORK_CONNECTOR_THREAD_NOT_FOUND');
-    const record = this.connectorThreads.get(key);
+    const record = this.connectorThreads.get(this.scopedConnectorThreadKey(key));
     return {
       ...route,
       ...(record === undefined ? {} : { sessionId: record.sessionId }),
       messages: (this.connectorThreadMessages.get(key) ?? [])
+        .filter(message => this.actorAadObjectId === undefined
+          || message.actorSubject.toLowerCase() === this.actorAadObjectId.toLowerCase())
         .filter(message => message.messageId !== excludeMessageId)
         .slice(-messageLimit),
     };
   }
 
+  private scopedConnectorThreadKey(threadKey: string): string {
+    return this.actorAadObjectId === undefined
+      ? threadKey
+      : `${threadKey}\0${this.actorAadObjectId.toLowerCase()}`;
+  }
+
   async claimNotifications(): Promise<readonly NotificationLease[]> { return []; }
+
+  async claimPrivateNotifications(): Promise<readonly NotificationLease[]> { return []; }
+
+  async startPrivateNotification(): Promise<void> {}
+
+  async finishPrivateNotification(): Promise<void> {}
+
+  async registerTeamsPrivateInstallation(event: TeamsPrivateInstallationEvent): Promise<TeamsPrivateInstallationReceipt> {
+    validateTeamsPrivateInstallationEvent(event);
+    const actorId = event.trust.actorAadObjectId.toLowerCase();
+    if (this.actorAadObjectId !== undefined && actorId !== this.actorAadObjectId.toLowerCase()) {
+      throw new WorkStateHttpError(403, 'WORK_TEAMS_PRIVATE_INSTALLATION_FORBIDDEN');
+    }
+    const tenantId = event.trust.tenantId.toLowerCase();
+    const botAppId = event.trust.botAppId.toLowerCase();
+    const identity = `${tenantId}\0${actorId}\0${botAppId}`;
+    const eventDigest = canonicalTaskJson(event);
+    const prior = this.privateInstallations.get(identity);
+    const priorEvent = prior?.events.get(event.trust.activityId);
+    if (priorEvent !== undefined) {
+      if (priorEvent.digest !== eventDigest) throw new WorkStateHttpError(409, 'PRIVATE_INSTALLATION_EVENT_CONFLICT');
+      return { ...priorEvent.receipt, duplicate: true };
+    }
+    const events = new Map(prior?.events);
+    const activityOccurredAt = Date.parse(event.trust.activityOccurredAt);
+    const currentTimestamp = prior?.lastActivityOccurredAt;
+    const ignored = prior !== undefined && (
+      (currentTimestamp === undefined && event.payload.action === 'add')
+      || (currentTimestamp !== undefined && activityOccurredAt < currentTimestamp)
+      || (currentTimestamp !== undefined && activityOccurredAt === currentTimestamp
+        && (event.payload.action === 'add' || !prior.active))
+    );
+    if (ignored && prior !== undefined) {
+      const receipt = {
+        action: event.payload.action,
+        active: prior.active,
+        applied: false,
+        revision: prior.revision,
+        updatedAt: prior.updatedAt,
+      } satisfies Omit<TeamsPrivateInstallationReceipt, 'duplicate'>;
+      events.set(event.trust.activityId, { digest: eventDigest, receipt });
+      this.privateInstallations.set(identity, { ...prior, events });
+      return { ...receipt, duplicate: false };
+    }
+    const updatedAt = Date.now();
+    const active = event.payload.action === 'add';
+    const receipt = {
+      action: event.payload.action,
+      active,
+      applied: true,
+      revision: (prior?.revision ?? 0) + 1,
+      updatedAt,
+    } satisfies Omit<TeamsPrivateInstallationReceipt, 'duplicate'>;
+    events.set(event.trust.activityId, { digest: eventDigest, receipt });
+    const next = {
+      active,
+      revision: receipt.revision,
+      updatedAt,
+      lastActivityOccurredAt: activityOccurredAt,
+      events,
+    };
+    this.privateInstallations.set(identity, next);
+    return { ...receipt, duplicate: false };
+  }
   async processCredentialHealthSnapshots(
     _organizationId: string,
     connections: readonly CredentialHealthSnapshot[],

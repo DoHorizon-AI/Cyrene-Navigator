@@ -124,6 +124,13 @@ SBOM，因此上述步骤是发布 gate，而不是声称当前
 
 ## No bundled proprietary data / 不包含私有数据
 
+The first-party Exchange consumer snapshot is pinned to merge
+`2264a5392f5f188b958e660052f55e087922cefa` in its contract lock. This contract-only
+update adds no third-party implementation or runtime dependency.
+
+第一方 Exchange 消费者契约快照已在契约锁文件中固定到合并提交
+`2264a5392f5f188b958e660052f55e087922cefa`。此次契约更新未增加第三方实现或运行依赖。
+
 No customer credentials, personal profiles, or private service endpoints are
 part of the intended distribution. Demo fixtures use reserved `example.invalid`
 domains and neutral identities. If a generated screenshot contains a real

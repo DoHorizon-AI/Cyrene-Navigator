@@ -150,7 +150,53 @@ export interface WorkflowV2Record {
 }
 
 export type WorkflowV2Write = Omit<WorkflowV2Record, 'updatedAt'>;
-export type WorkflowDefinition = WorkflowRecord | WorkflowV2Record;
+
+/** Canonical provider classes supported by deterministic source polling. */
+export type WorkflowObservationSource = 'github' | 'azure_devops' | 'vm_health' | 'training' | 'product' | 'office_graph';
+
+/** One source poll scheduled by the sole DSH Schedule domain. */
+export interface WorkflowV3Trigger {
+  readonly id: string;
+  readonly kind: 'source_poll';
+  readonly source: WorkflowObservationSource;
+  readonly schedule: WorkflowSchedule;
+  readonly targetIds: readonly string[];
+  readonly initialBaseline: 'record_without_notification';
+  readonly pageSize: number;
+  readonly maxPages: number;
+}
+
+/** Host-verified notification destination. Private conversation data is resolved by Work. */
+export type WorkflowV3Destination =
+  | { readonly kind: 'responsibility_thread' }
+  | { readonly kind: 'owner_private' };
+
+/** Owner-task proof used to resolve channel or personal notification routes. */
+export type WorkflowV3Authorization =
+  | { readonly kind: 'teams_thread'; readonly threadBindingId: string; readonly ownerTaskId: string }
+  | { readonly kind: 'owner_private'; readonly ownerTaskId: string };
+
+/** Notification policy for deterministic source events, negotiated only as definitionVersion=3. */
+export interface WorkflowV3Notifications extends Omit<WorkflowV2Notifications, 'destination'> {
+  readonly destination: WorkflowV3Destination;
+}
+
+/** Opt-in deterministic event workflow. It contains no model or action policy. */
+export interface WorkflowV3Record {
+  readonly id: string;
+  readonly version: 3;
+  readonly title: string;
+  readonly description: string;
+  readonly targets: readonly WorkflowTarget[];
+  readonly triggers: readonly WorkflowV3Trigger[];
+  readonly authorization: WorkflowV3Authorization;
+  readonly notifications: WorkflowV3Notifications;
+  readonly enabled: boolean;
+  readonly updatedAt?: string;
+}
+
+export type WorkflowV3Write = Omit<WorkflowV3Record, 'updatedAt'>;
+export type WorkflowDefinition = WorkflowRecord | WorkflowV2Record | WorkflowV3Record;
 
 /** One immutable state fact for a single DSH timer occurrence. */
 export interface WorkflowScheduleEvent {
@@ -171,7 +217,7 @@ export interface WorkflowScheduleEvent {
   readonly operationIds?: readonly string[];
   readonly actionTaskIds?: readonly string[];
   readonly actionResults?: readonly WorkflowActionReceipt[];
-  readonly checkpoint?: WorkflowCheckpoint;
+  readonly checkpoint?: WorkflowEventCheckpoint;
   readonly attentionKind?: WorkflowAttentionKind;
   readonly createdAt: string;
 }
@@ -202,6 +248,153 @@ export interface WorkflowCheckpoint {
   readonly complete: boolean;
   readonly repositories: readonly WorkflowRepositoryCursor[];
 }
+
+/** Source-neutral bounded poll cursor. Watermarks advance only after complete page chains. */
+export interface WorkflowSourceCheckpoint {
+  readonly kind: 'source_poll';
+  readonly windowStart: string | null;
+  readonly windowEnd: string;
+  readonly complete: boolean;
+  readonly sources: readonly WorkflowSourceCursor[];
+}
+
+export interface WorkflowSourceCursor {
+  readonly source: WorkflowObservationSource;
+  readonly targetId: string;
+  readonly pageCursor: string | null;
+  /** Opaque cursor after a completed window, used to start the next window (for example Yield sequence). */
+  readonly resumeCursor?: string | null;
+  readonly watermark: string | null;
+  readonly complete: boolean;
+  readonly pagesCollected: number;
+  readonly seenEventIds?: readonly string[];
+  readonly states?: readonly WorkflowSourceState[];
+}
+
+export interface WorkflowSourceState {
+  readonly resourceKey: string;
+  readonly fingerprint: string;
+  readonly state: 'healthy' | 'incident' | 'neutral';
+}
+
+export type WorkflowEventCheckpoint = WorkflowCheckpoint | WorkflowSourceCheckpoint;
+
+/** Reference-only metadata pointer carried by an immutable source observation. */
+export interface WorkflowMetadataReference {
+  readonly kind: string;
+  readonly resourceUri: string;
+  readonly resourceVersion?: number | string;
+}
+
+/** Identity-free event write accepted from a fixed source adapter. */
+export interface WorkflowAutomationEventWrite {
+  readonly source: WorkflowObservationSource;
+  readonly sourceEventId: string;
+  readonly resourceUri: string;
+  readonly sourceVersion: number | string;
+  readonly eventType: string;
+  readonly occurredAt: number;
+  readonly title?: string;
+  readonly summary?: string;
+  readonly severity?: 'info' | 'warning' | 'critical';
+  readonly correlationId?: string;
+  readonly experimentId?: string;
+  readonly metadataReferences?: readonly WorkflowMetadataReference[];
+  readonly semanticFingerprint?: string;
+  readonly stateClass?: 'healthy' | 'incident' | 'neutral';
+}
+
+/** Normalized poll item; semantic fields drive transitions but remain source event data, not routing. */
+export type WorkflowSourceObservation = WorkflowAutomationEventWrite & {
+  readonly semanticFingerprint: string;
+  readonly stateClass: 'healthy' | 'incident' | 'neutral';
+};
+
+/** Server-owned event projection. Actor and visibility always come from Work auth. */
+export interface WorkflowAutomationEvent extends WorkflowAutomationEventWrite {
+  readonly id: string;
+  readonly observedAt: number;
+  readonly actorId: string;
+  readonly organizationId: string;
+  readonly workspaceId: string;
+  readonly revision: number;
+  readonly visibility: 'owner';
+}
+
+export interface WorkflowAutomationEventReceipt {
+  readonly event: WorkflowAutomationEvent;
+  readonly duplicate: boolean;
+}
+
+export interface WorkflowAutomationEventPage {
+  readonly items: readonly WorkflowAutomationEvent[];
+  readonly nextCursor: string | null;
+}
+
+/** Route-free request to durably classify one source event for one owner workflow trigger. */
+export interface WorkflowAutomationEventNoticeRequest {
+  readonly eventId: string;
+  readonly workflowId: string;
+  readonly triggerId: string;
+  readonly occurrenceId: string;
+  readonly scheduledAt: string;
+  readonly taskId: string;
+}
+
+export interface WorkflowAutomationEventNoticeReceipt {
+  readonly eventId: string;
+  readonly workflowId: string;
+  readonly triggerId: string;
+  readonly occurrenceId: string;
+  readonly decision: 'initial_baseline' | 'unchanged' | 'stale' | 'change' | 'failure' | 'recovery' | 'blocker' | 'quiet';
+  readonly notificationId: string | null;
+  readonly duplicate: boolean;
+}
+
+/** Route-free v3 weekday digest request; Work derives changed events and the private destination. */
+export interface WorkflowV3DigestNoticeRequest {
+  readonly occurrenceId: string;
+  readonly triggerId: 'daily-digest';
+  readonly scheduledAt: string;
+  readonly taskId: string;
+}
+
+/** Task-bound evidence for one completed source page; contains IDs/cursors but no event body or route. */
+export interface WorkflowSourcePageReceipt {
+  readonly workflowId: string;
+  readonly triggerId: string;
+  readonly occurrenceId: string;
+  readonly scheduledAt: string;
+  readonly source: WorkflowObservationSource;
+  readonly targetId: string;
+  readonly pageCursor: string | null;
+  readonly nextCursor: string | null;
+  readonly windowStart: string | null;
+  readonly windowEnd: string;
+  readonly automationEventIds: readonly string[];
+  readonly sourceEventIds: readonly string[];
+  readonly observedAt: number;
+}
+
+/** A bounded adapter failure receipt; it proves failure state without claiming page completion. */
+export interface WorkflowSourceErrorReceipt {
+  readonly workflowId: string;
+  readonly triggerId: string;
+  readonly occurrenceId: string;
+  readonly scheduledAt: string;
+  readonly source: WorkflowObservationSource;
+  readonly targetId: string;
+  readonly windowStart: string | null;
+  readonly windowEnd: string;
+  readonly outcome: 'failed';
+  readonly reasonCode: WorkflowObservationErrorCode;
+  readonly observedAt: string;
+}
+
+export type WorkflowSourceTaskReceipt = WorkflowSourcePageReceipt | WorkflowSourceErrorReceipt;
+
+export type WorkflowObservationErrorCode =
+  | 'not_configured' | 'forbidden' | 'unavailable' | 'timeout' | 'invalid' | 'partial';
 
 export interface WorkflowRepositoryCursor {
   readonly targetId: string;
@@ -251,9 +444,15 @@ export interface WorkflowStore {
   listWorkflows(): Promise<readonly WorkflowRecord[]>;
   listWorkflows(definitionVersion: 1): Promise<readonly WorkflowRecord[]>;
   listWorkflows(definitionVersion: 2): Promise<readonly WorkflowV2Record[]>;
+  listWorkflows(definitionVersion: 3): Promise<readonly WorkflowV3Record[]>;
   putWorkflow(workflow: WorkflowWrite): Promise<WorkflowRecord>;
   putWorkflow(workflow: WorkflowV2Write): Promise<WorkflowV2Record>;
+  putWorkflow(workflow: WorkflowV3Write): Promise<WorkflowV3Record>;
   appendScheduleEvent(event: WorkflowScheduleEvent): Promise<WorkflowScheduleEvent>;
+  appendAutomationEvent(event: WorkflowAutomationEventWrite): Promise<WorkflowAutomationEventReceipt>;
+  listAutomationEvents(options?: { readonly limit?: number; readonly cursor?: string }): Promise<WorkflowAutomationEventPage>;
+  enqueueAutomationEventNotice(request: WorkflowAutomationEventNoticeRequest): Promise<WorkflowAutomationEventNoticeReceipt>;
+  enqueueV3DigestNotice(workflowId: string, request: WorkflowV3DigestNoticeRequest): Promise<WorkflowOutboxReceipt>;
   enqueueNotification(request: WorkflowOutboxRequest): Promise<WorkflowOutboxReceipt>;
   enqueueTeamsNotification(workflowId: string, request: WorkflowTeamsNoticeRequest): Promise<WorkflowOutboxReceipt>;
   getOperation?(operationId: string): Promise<WorkflowOperationState>;
@@ -307,6 +506,7 @@ export class WorkflowsClient implements WorkflowStore {
   private readonly workflowsUrl: string;
   private readonly workUrl: string;
   private readonly eventsUrl: string;
+  private readonly automationEventsUrl: string;
   private readonly notificationsUrl: string;
   private readonly tokenEnv: string;
   private readonly requestTimeoutMs: number;
@@ -322,6 +522,7 @@ export class WorkflowsClient implements WorkflowStore {
     this.workUrl = prefix;
     this.workflowsUrl = `${prefix}/workflows`;
     this.eventsUrl = `${prefix}/schedule-events`;
+    this.automationEventsUrl = `${prefix}/automation-events`;
     this.notificationsUrl = `${prefix}/notifications`;
     this.tokenEnv = connection.tokenEnv ?? 'CYRENE_SESSION_TOKEN';
     this.requestTimeoutMs = connection.requestTimeoutMs ?? 10_000;
@@ -331,7 +532,8 @@ export class WorkflowsClient implements WorkflowStore {
   listWorkflows(): Promise<readonly WorkflowRecord[]>;
   listWorkflows(definitionVersion: 1): Promise<readonly WorkflowRecord[]>;
   listWorkflows(definitionVersion: 2): Promise<readonly WorkflowV2Record[]>;
-  async listWorkflows(definitionVersion: 1 | 2 = 1): Promise<readonly WorkflowDefinition[]> {
+  listWorkflows(definitionVersion: 3): Promise<readonly WorkflowV3Record[]>;
+  async listWorkflows(definitionVersion: 1 | 2 | 3 = 1): Promise<readonly WorkflowDefinition[]> {
     const url = `${this.workflowsUrl}?definitionVersion=${definitionVersion}`;
     const row = object(await this.request(url, 'GET'), 'Workflow page');
     if (!Array.isArray(row.items)) throw new TypeError('Workflow page is missing items');
@@ -341,7 +543,8 @@ export class WorkflowsClient implements WorkflowStore {
   /** Create or replace one negotiated workflow definition. */
   putWorkflow(workflow: WorkflowWrite): Promise<WorkflowRecord>;
   putWorkflow(workflow: WorkflowV2Write): Promise<WorkflowV2Record>;
-  async putWorkflow(workflow: WorkflowWrite | WorkflowV2Write): Promise<WorkflowDefinition> {
+  putWorkflow(workflow: WorkflowV3Write): Promise<WorkflowV3Record>;
+  async putWorkflow(workflow: WorkflowWrite | WorkflowV2Write | WorkflowV3Write): Promise<WorkflowDefinition> {
     validateWorkflowWrite(workflow);
     return decodeWorkflowDefinition(
       await this.request(
@@ -357,6 +560,71 @@ export class WorkflowsClient implements WorkflowStore {
   async appendScheduleEvent(event: WorkflowScheduleEvent): Promise<WorkflowScheduleEvent> {
     validateScheduleEvent(event);
     return decodeScheduleEvent(await this.request(this.eventsUrl, 'POST', event));
+  }
+
+  /** Append one identity-free source observation through the actor-scoped Work API route. */
+  async appendAutomationEvent(event: WorkflowAutomationEventWrite): Promise<WorkflowAutomationEventReceipt> {
+    validateWorkflowAutomationEvent(event);
+    const row = object(await this.request(this.automationEventsUrl, 'POST', event), 'Automation event receipt');
+    if (typeof row.duplicate !== 'boolean') throw new TypeError('Automation event receipt is missing duplicate');
+    return { event: decodeWorkflowAutomationEvent(row), duplicate: row.duplicate };
+  }
+
+  /** Read bounded actor-scoped automation events without widening existing Work read permissions. */
+  async listAutomationEvents(options: { readonly limit?: number; readonly cursor?: string } = {}): Promise<WorkflowAutomationEventPage> {
+    const query = new URLSearchParams();
+    if (options.limit !== undefined) query.set('limit', String(options.limit));
+    if (options.cursor !== undefined) query.set('cursor', options.cursor);
+    const suffix = query.size > 0 ? `?${query.toString()}` : '';
+    const row = object(await this.request(`${this.automationEventsUrl}${suffix}`, 'GET'), 'Automation event page');
+    if (!Array.isArray(row.items)) throw new TypeError('Automation event page is missing items');
+    if (row.nextCursor !== null && row.nextCursor !== undefined && typeof row.nextCursor !== 'string') {
+      throw new TypeError('Invalid automation event cursor');
+    }
+    return {
+      items: row.items.map(decodeWorkflowAutomationEvent),
+      nextCursor: typeof row.nextCursor === 'string' ? row.nextCursor : null,
+    };
+  }
+
+  /** Atomically record/replay one owner-scoped event transition intent through the Work outbox. */
+  async enqueueAutomationEventNotice(
+    request: WorkflowAutomationEventNoticeRequest,
+  ): Promise<WorkflowAutomationEventNoticeReceipt> {
+    validateWorkflowAutomationEventNoticeRequest(request);
+    const row = object(await this.request(
+      `${this.automationEventsUrl}/${encodeURIComponent(request.eventId)}/notices`, 'POST', request,
+    ), 'Automation event notice receipt');
+    const decisions: WorkflowAutomationEventNoticeReceipt['decision'][] = [
+      'initial_baseline', 'unchanged', 'stale', 'change', 'failure', 'recovery', 'blocker', 'quiet',
+    ];
+    if (!decisions.includes(row.decision as WorkflowAutomationEventNoticeReceipt['decision'])
+      || typeof row.duplicate !== 'boolean'
+      || row.notificationId !== null && typeof row.notificationId !== 'string') {
+      throw new TypeError('Invalid automation event notice receipt');
+    }
+    return {
+      eventId: text(row.eventId, 'notice.eventId'),
+      workflowId: text(row.workflowId, 'notice.workflowId'),
+      triggerId: text(row.triggerId, 'notice.triggerId'),
+      occurrenceId: text(row.occurrenceId, 'notice.occurrenceId'),
+      decision: row.decision as WorkflowAutomationEventNoticeReceipt['decision'],
+      notificationId: row.notificationId as string | null,
+      duplicate: row.duplicate,
+    };
+  }
+
+  async enqueueV3DigestNotice(
+    workflowId: string,
+    request: WorkflowV3DigestNoticeRequest,
+  ): Promise<WorkflowOutboxReceipt> {
+    validateWorkflowV3DigestNoticeRequest(workflowId, request);
+    const row = object(await this.request(
+      `${this.workflowsUrl}/${encodeURIComponent(workflowId)}/notices`, 'POST', request,
+    ), 'V3 digest notice receipt');
+    const notification = object(row.notification, 'V3 digest notification');
+    if (typeof row.duplicate !== 'boolean') throw new TypeError('V3 digest receipt is missing duplicate');
+    return { notification, duplicate: row.duplicate };
   }
 
   /** Read one immutable schedule receipt without scanning a responsibility's full event history. */
@@ -475,27 +743,39 @@ export async function loadDefaultWorkflowTemplates(): Promise<readonly WorkflowW
 export class InMemoryWorkflowStore implements WorkflowStore {
   private readonly workflows = new Map<string, WorkflowRecord>();
   private readonly workflowsV2 = new Map<string, WorkflowV2Record>();
+  private readonly workflowsV3 = new Map<string, WorkflowV3Record>();
   private readonly events = new Map<string, WorkflowScheduleEvent>();
+  private readonly automationEvents = new Map<string, WorkflowAutomationEvent>();
+  private readonly automationEventKeys = new Map<string, string>();
+  private readonly automationEventNotices = new Map<string, WorkflowAutomationEventNoticeReceipt>();
+  private readonly automationEventStates = new Map<string, { readonly fingerprint: string; readonly state: WorkflowSourceState['state'] }>();
   private readonly notifications = new Map<string, WorkflowOutboxRequest | { readonly workflowId: string; readonly notice: WorkflowTeamsNoticeRequest }>();
 
   listWorkflows(): Promise<readonly WorkflowRecord[]>;
   listWorkflows(definitionVersion: 1): Promise<readonly WorkflowRecord[]>;
   listWorkflows(definitionVersion: 2): Promise<readonly WorkflowV2Record[]>;
-  async listWorkflows(definitionVersion: 1 | 2 = 1): Promise<readonly WorkflowDefinition[]> {
-    const rows = definitionVersion === 1 ? this.workflows.values() : this.workflowsV2.values();
+  listWorkflows(definitionVersion: 3): Promise<readonly WorkflowV3Record[]>;
+  async listWorkflows(definitionVersion: 1 | 2 | 3 = 1): Promise<readonly WorkflowDefinition[]> {
+    const rows = definitionVersion === 1 ? this.workflows.values()
+      : definitionVersion === 2 ? this.workflowsV2.values() : this.workflowsV3.values();
     return [...rows].map(value => structuredClone(value));
   }
 
   putWorkflow(workflow: WorkflowWrite): Promise<WorkflowRecord>;
   putWorkflow(workflow: WorkflowV2Write): Promise<WorkflowV2Record>;
-  async putWorkflow(workflow: WorkflowWrite | WorkflowV2Write): Promise<WorkflowDefinition> {
+  putWorkflow(workflow: WorkflowV3Write): Promise<WorkflowV3Record>;
+  async putWorkflow(workflow: WorkflowWrite | WorkflowV2Write | WorkflowV3Write): Promise<WorkflowDefinition> {
     validateWorkflowWrite(workflow);
     const row = { ...structuredClone(workflow), updatedAt: new Date().toISOString() };
     if (row.version === 1) {
       this.workflows.set(row.id, row);
       return structuredClone(row);
     }
-    this.workflowsV2.set(row.id, row);
+    if (row.version === 2) {
+      this.workflowsV2.set(row.id, row);
+      return structuredClone(row);
+    }
+    this.workflowsV3.set(row.id, row);
     return structuredClone(row);
   }
 
@@ -516,6 +796,162 @@ export class InMemoryWorkflowStore implements WorkflowStore {
     return structuredClone(event);
   }
 
+  async appendAutomationEvent(event: WorkflowAutomationEventWrite): Promise<WorkflowAutomationEventReceipt> {
+    validateWorkflowAutomationEvent(event);
+    const key = `fixture-org\0fixture-workspace\0${event.source}\0${event.sourceEventId}`;
+    const existingId = this.automationEventKeys.get(key);
+    if (existingId !== undefined) {
+      const existing = this.automationEvents.get(existingId)!;
+      const { id: _id, observedAt: _observedAt, actorId: _actorId, organizationId: _organizationId,
+        workspaceId: _workspaceId, revision: _revision, visibility: _visibility, ...storedInput } = existing;
+      if (canonicalEventJson(storedInput) !== canonicalEventJson(event)) {
+        throw new WorkflowStoreHttpError(409, 'WORK_AUTOMATION_EVENT_CONFLICT');
+      }
+      return { event: structuredClone(existing), duplicate: true };
+    }
+    const id = `event-${digestAutomationEventKey(key).slice(0, 40)}`;
+    const stored: WorkflowAutomationEvent = {
+      ...structuredClone(event), id, observedAt: Date.now(), actorId: 'fixture-owner',
+      organizationId: 'fixture-org', workspaceId: 'fixture-workspace', revision: 1, visibility: 'owner',
+    };
+    this.automationEvents.set(id, stored);
+    this.automationEventKeys.set(key, id);
+    return { event: structuredClone(stored), duplicate: false };
+  }
+
+  async listAutomationEvents(options: { readonly limit?: number; readonly cursor?: string } = {}): Promise<WorkflowAutomationEventPage> {
+    const all = [...this.automationEvents.values()];
+    const start = options.cursor === undefined ? 0 : Number(options.cursor);
+    if (!Number.isSafeInteger(start) || start < 0) throw new WorkflowStoreHttpError(400, 'INVALID_CURSOR');
+    const limit = Math.min(Math.max(options.limit ?? 100, 1), 100);
+    return {
+      items: structuredClone(all.slice(start, start + limit)),
+      nextCursor: start + limit < all.length ? String(start + limit) : null,
+    };
+  }
+
+  async enqueueAutomationEventNotice(
+    request: WorkflowAutomationEventNoticeRequest,
+  ): Promise<WorkflowAutomationEventNoticeReceipt> {
+    validateWorkflowAutomationEventNoticeRequest(request);
+    const event = this.automationEvents.get(request.eventId);
+    const workflow = this.workflowsV3.get(request.workflowId);
+    if (event === undefined || workflow === undefined || !workflow.enabled) {
+      throw new WorkflowStoreHttpError(404, 'WORK_AUTOMATION_EVENT_OR_WORKFLOW_NOT_FOUND');
+    }
+    const trigger = workflow.triggers.find(item => item.id === request.triggerId && item.source === event.source);
+    const running = [...this.events.values()].find(item => item.workflowId === request.workflowId
+      && item.triggerId === request.triggerId && item.scheduledAt === request.scheduledAt
+      && item.taskId === request.taskId && item.status === 'running');
+    if (trigger === undefined || running?.status !== 'running' || running.taskId !== request.taskId) {
+      throw new WorkflowStoreHttpError(409, 'WORK_AUTOMATION_EVENT_NOTICE_NOT_ACTIVE');
+    }
+    const noticeKey = `${request.workflowId}\0${request.triggerId}\0${request.eventId}`;
+    const previousNotice = this.automationEventNotices.get(noticeKey);
+    if (previousNotice !== undefined) return { ...structuredClone(previousNotice), duplicate: true };
+
+    const stateKey = `${request.workflowId}\0${request.triggerId}\0${event.resourceUri}`;
+    const previous = this.automationEventStates.get(stateKey);
+    const fingerprint = event.semanticFingerprint ?? digestAutomationEventKey(canonicalEventJson({
+      eventType: event.eventType, sourceVersion: event.sourceVersion, severity: event.severity ?? null,
+      title: event.title ?? null, summary: event.summary ?? null,
+    }));
+    const state = event.stateClass ?? inferWorkflowEventState(event);
+    let decision: WorkflowAutomationEventNoticeReceipt['decision'];
+    if (event.eventType === 'source.poll.failure') {
+      decision = previous?.state === 'incident' && previous.fingerprint === fingerprint ? 'unchanged' : 'failure';
+    } else if (event.eventType === 'source.poll.recovery') {
+      if (previous?.state !== 'incident') {
+        throw new WorkflowStoreHttpError(409, 'WORK_AUTOMATION_EVENT_RECOVERY_WITHOUT_INCIDENT');
+      }
+      decision = 'recovery';
+    } else if (running.baseline === true) decision = 'initial_baseline';
+    else if (previous?.fingerprint === fingerprint) decision = 'unchanged';
+    else if (state === 'incident') decision = 'failure';
+    else if (previous?.state === 'incident' && state === 'healthy') decision = 'recovery';
+    else decision = 'change';
+
+    const scheduledAt = request.scheduledAt;
+    const occurrenceId = request.occurrenceId;
+    const shouldQueue = decision === 'failure' ? workflow.notifications.onFailure
+      : decision === 'recovery' ? workflow.notifications.onRecovery
+        : decision === 'change' ? workflow.notifications.onChange && !isWorkflowQuietTime(scheduledAt, workflow.notifications.quietHours)
+          : false;
+    let notificationId: string | null = null;
+    if (shouldQueue) {
+      const type: WorkflowOutboxType = decision === 'change' ? 'workflow.change'
+        : decision === 'failure' ? 'workflow.failure' : 'workflow.recovery';
+      const deduplicationKey = `workflow:${request.workflowId}:source:${request.eventId}:${decision}`;
+      await this.enqueueNotification({
+        deduplicationKey,
+        type,
+        payload: {
+          workflowId: request.workflowId,
+          occurrenceId,
+          triggerId: request.triggerId,
+          summary: redactAutomationSummary(event.summary ?? event.title ?? `${event.source} ${event.eventType}`),
+          taskId: request.taskId,
+        },
+      });
+      notificationId = deduplicationKey;
+    } else if (decision === 'failure' && workflow.notifications.immediateOn.includes('service_or_auth_outage')) {
+      const deduplicationKey = `workflow:${request.workflowId}:source:${request.eventId}:blocker`;
+      await this.enqueueNotification({
+        deduplicationKey,
+        type: 'workflow.blocker',
+        payload: {
+          workflowId: request.workflowId,
+          occurrenceId,
+          triggerId: request.triggerId,
+          summary: redactAutomationSummary(event.summary ?? event.title ?? `${event.source} ${event.eventType}`),
+          taskId: request.taskId,
+        },
+      });
+      notificationId = deduplicationKey;
+      decision = 'blocker';
+    } else if (decision === 'change' && workflow.notifications.onChange && isWorkflowQuietTime(scheduledAt, workflow.notifications.quietHours)) {
+      decision = 'quiet';
+    }
+    this.automationEventStates.set(stateKey, { fingerprint, state });
+    const receipt: WorkflowAutomationEventNoticeReceipt = {
+      eventId: request.eventId,
+      workflowId: request.workflowId,
+      triggerId: request.triggerId,
+      occurrenceId,
+      decision,
+      notificationId,
+      duplicate: false,
+    };
+    this.automationEventNotices.set(noticeKey, receipt);
+    return structuredClone(receipt);
+  }
+
+  async enqueueV3DigestNotice(
+    workflowId: string,
+    request: WorkflowV3DigestNoticeRequest,
+  ): Promise<WorkflowOutboxReceipt> {
+    validateWorkflowV3DigestNoticeRequest(workflowId, request);
+    const workflow = this.workflowsV3.get(workflowId);
+    if (workflow === undefined || !workflow.enabled) throw new WorkflowStoreHttpError(404, 'WORK_WORKFLOW_NOT_FOUND');
+    const event = [...this.events.values()].find(item => item.workflowId === workflowId
+      && item.triggerId === 'daily-digest' && item.scheduledAt === request.scheduledAt
+      && item.taskId === request.taskId && item.status === 'succeeded');
+    if (event === undefined) throw new WorkflowStoreHttpError(409, 'WORK_WORKFLOW_DIGEST_NOT_ACTIVE');
+    const changed = [...this.automationEventNotices.values()].some(receipt => receipt.workflowId === workflowId
+      && ['change', 'failure', 'recovery', 'blocker'].includes(receipt.decision));
+    return this.enqueueNotification({
+      deduplicationKey: `workflow:${workflowId}:digest:${request.occurrenceId}`,
+      type: 'workflow.digest',
+      payload: {
+        workflowId,
+        occurrenceId: request.occurrenceId,
+        triggerId: request.triggerId,
+        summary: changed ? 'Daily review includes changed source events.' : 'No material source changes since the previous digest.',
+        taskId: request.taskId,
+      },
+    });
+  }
+
   async enqueueNotification(request: WorkflowOutboxRequest): Promise<WorkflowOutboxReceipt> {
     validateWorkflowOutboxRequest(request);
     const existing = this.notifications.get(request.deduplicationKey);
@@ -529,7 +965,9 @@ export class InMemoryWorkflowStore implements WorkflowStore {
 
   async enqueueTeamsNotification(workflowId: string, request: WorkflowTeamsNoticeRequest): Promise<WorkflowOutboxReceipt> {
     validateWorkflowTeamsNoticeRequest(workflowId, request);
-    if (!this.workflowsV2.has(workflowId)) throw new WorkflowStoreHttpError(404, 'WORK_WORKFLOW_NOT_FOUND');
+    if (!this.workflowsV2.has(workflowId) && !this.workflowsV3.has(workflowId)) {
+      throw new WorkflowStoreHttpError(404, 'WORK_WORKFLOW_NOT_FOUND');
+    }
     const terminal = [...this.events.values()].find(event => event.workflowId === workflowId
       && event.triggerId === request.triggerId && event.scheduledAt === request.scheduledAt
       && (event.status === 'succeeded' || event.status === 'failed'));
@@ -564,7 +1002,11 @@ export class InMemoryWorkflowStore implements WorkflowStore {
 }
 
 /** Validate one write before crossing the authenticated API boundary. */
-export function validateWorkflowWrite(value: WorkflowWrite | WorkflowV2Write): void {
+export function validateWorkflowWrite(value: WorkflowWrite | WorkflowV2Write | WorkflowV3Write): void {
+  if (value.version === 3) {
+    validateWorkflowV3Write(value);
+    return;
+  }
   if (value.version === 2) {
     validateWorkflowV2Write(value);
     return;
@@ -720,11 +1162,125 @@ function validateWorkflowV2Write(value: WorkflowV2Write): void {
     if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time)) throw new TypeError('Quiet hours must use HH:MM');
   }
   validateTimeZone(value.notifications.quietHours.timeZone);
+  if (value.notifications.quietHours.start !== '22:00' || value.notifications.quietHours.end !== '08:00'
+    || value.notifications.quietHours.timeZone !== 'America/New_York') {
+    throw new TypeError('Workflow v3 quiet hours are fixed to 22:00–08:00 America/New_York');
+  }
   validateSchedule(value.notifications.digest.schedule);
   const allowedImmediate = new Set(['blocked_goal', 'user_decision', 'service_or_auth_outage']);
   if (new Set(value.notifications.immediateOn).size !== value.notifications.immediateOn.length
     || value.notifications.immediateOn.some(item => !allowedImmediate.has(item))) {
     throw new TypeError('Workflow immediate notification policy is invalid');
+  }
+}
+
+/** Validate the deterministic source-poll contract without reinterpreting v1/v2 fields. */
+function validateWorkflowV3Write(value: WorkflowV3Write): void {
+  const allowedFields = new Set([
+    'id', 'version', 'title', 'description', 'targets', 'triggers', 'authorization', 'notifications', 'enabled',
+  ]);
+  if (Object.keys(value as unknown as Record<string, unknown>).some(key => !allowedFields.has(key))) {
+    throw new TypeError('Workflow v3 contains unsupported fields');
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/u.test(value.id) || value.version !== 3
+    || !value.title.trim() || !value.description.trim() || typeof value.enabled !== 'boolean') {
+    throw new TypeError('Invalid workflow v3 identity or description');
+  }
+  if (value.targets.length < 1 || value.targets.length > 100) throw new TypeError('Workflow v3 requires bounded targets');
+  const targets = new Map<string, WorkflowTarget>();
+  for (const target of value.targets) {
+    if (!target.id.trim() || !target.label.trim() || !target.kind.trim() || targets.has(target.id)) {
+      throw new TypeError('Workflow v3 target ids must be unique and complete');
+    }
+    if (!target.bindingId?.trim()) throw new TypeError('Workflow v3 targets must be bound to an activated source');
+    if (target.kind === 'github_repository') {
+      if (!/^[1-9]\d{0,18}$/u.test(target.id) || !/^[^/\s]+\/[^/\s]+$/u.test(target.label)
+        || target.uri !== `https://github.com/${target.label}`) {
+        throw new TypeError('GitHub source targets require a canonical repository identity');
+      }
+    } else if (target.uri !== undefined) {
+      throw new TypeError('Non-GitHub source targets cannot configure a URL');
+    }
+    if (target.uri !== undefined) {
+      const uri = new URL(target.uri);
+      if (uri.protocol !== 'https:' || uri.username || uri.password || uri.search || uri.hash) {
+        throw new TypeError('Workflow v3 target URLs must be canonical HTTPS without credentials or query values');
+      }
+    }
+    targets.set(target.id, target);
+  }
+
+  if (value.triggers.length < 1 || value.triggers.length > 100) throw new TypeError('Workflow v3 requires a bounded trigger list');
+  const triggerIds = new Set<string>();
+  for (const trigger of value.triggers) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(trigger.id) || triggerIds.has(trigger.id)
+      || trigger.kind !== 'source_poll' || trigger.initialBaseline !== 'record_without_notification') {
+      throw new TypeError('Invalid workflow v3 source trigger identity or baseline policy');
+    }
+    triggerIds.add(trigger.id);
+    validateSchedule(trigger.schedule);
+    const expectedExpression = trigger.source === 'github' || trigger.source === 'azure_devops' || trigger.source === 'office_graph'
+      ? '*/5 * * * *' : '* * * * *';
+    if (trigger.schedule.expression !== expectedExpression || trigger.schedule.timeZone !== 'UTC') {
+      throw new TypeError('Workflow v3 source cadence is fixed by source type');
+    }
+    if (!Number.isSafeInteger(trigger.pageSize) || trigger.pageSize < 1 || trigger.pageSize > 50
+      || !Number.isSafeInteger(trigger.maxPages) || trigger.maxPages < 1 || trigger.maxPages > 20) {
+      throw new TypeError('Workflow v3 source bounds exceed the supported page budget');
+    }
+    if (trigger.pageSize * trigger.maxPages > 1_000) throw new TypeError('Workflow v3 page budget exceeds 1,000 records');
+    if (trigger.targetIds.length < 1 || trigger.targetIds.length > 20
+      || new Set(trigger.targetIds).size !== trigger.targetIds.length
+      || trigger.targetIds.some(targetId => {
+        const target = targets.get(targetId);
+        return target === undefined || !isTargetKindForSource(trigger.source, target.kind);
+      })) throw new TypeError('Workflow v3 trigger targets must match its source kind');
+  }
+
+  if (value.authorization.ownerTaskId.trim().length === 0) throw new TypeError('Workflow v3 requires a verified owner task');
+  if (value.authorization.kind === 'teams_thread') {
+    if (!/^[a-f0-9]{64}$/u.test(value.authorization.threadBindingId)) {
+      throw new TypeError('Workflow v3 channel authorization requires an opaque thread binding');
+    }
+    if (value.notifications.destination.kind !== 'responsibility_thread') {
+      throw new TypeError('Workflow v3 channel authorization requires a channel destination');
+    }
+  } else if (value.authorization.kind === 'owner_private') {
+    if (value.notifications.destination.kind !== 'owner_private') {
+      throw new TypeError('Workflow v3 private authorization requires a private destination');
+    }
+  } else {
+    throw new TypeError('Invalid workflow v3 authorization kind');
+  }
+  if (value.notifications.quietWhenUnchanged !== true || value.notifications.digest.maxPerDay !== 1
+    || value.notifications.destination.kind !== 'responsibility_thread'
+      && value.notifications.destination.kind !== 'owner_private') {
+    throw new TypeError('Workflow v3 notification policy is invalid');
+  }
+  for (const time of [value.notifications.quietHours.start, value.notifications.quietHours.end]) {
+    if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/u.test(time)) throw new TypeError('Quiet hours must use HH:MM');
+  }
+  validateTimeZone(value.notifications.quietHours.timeZone);
+  validateSchedule(value.notifications.digest.schedule);
+  if (value.notifications.digest.schedule.expression !== '0 9 * * 1-5'
+    || value.notifications.digest.schedule.timeZone !== 'America/New_York') {
+    throw new TypeError('Workflow v3 digest cadence is fixed to weekday 09:00 America/New_York');
+  }
+  const allowedImmediate = new Set(['blocked_goal', 'user_decision', 'service_or_auth_outage']);
+  if (new Set(value.notifications.immediateOn).size !== value.notifications.immediateOn.length
+    || value.notifications.immediateOn.some(item => !allowedImmediate.has(item))) {
+    throw new TypeError('Workflow v3 immediate notification policy is invalid');
+  }
+}
+
+function isTargetKindForSource(source: WorkflowObservationSource, kind: string): boolean {
+  switch (source) {
+    case 'github': return kind === 'github_repository';
+    case 'azure_devops': return kind === 'pipeline_runs' || kind === 'release_deployments';
+    case 'vm_health': return kind === 'host_health';
+    case 'training': return kind === 'training_run';
+    case 'product': return kind === 'product_resource';
+    case 'office_graph': return kind === 'planner_plan';
   }
 }
 
@@ -763,6 +1319,225 @@ export function validateScheduleEvent(event: WorkflowScheduleEvent): void {
   if (event.actionResults !== undefined) decodeActionReceipts(event.actionResults);
   if (event.checkpoint !== undefined) decodeWorkflowCheckpoint(event.checkpoint);
   if (event.attentionKind !== undefined) decodeAttentionKind(event.attentionKind);
+}
+
+/** Validate one fixed-adapter event before storing it through the actor-scoped Work API. */
+export function validateWorkflowAutomationEvent(event: WorkflowAutomationEventWrite): void {
+  const allowed = new Set([
+    'source', 'sourceEventId', 'resourceUri', 'sourceVersion', 'eventType', 'occurredAt', 'title', 'summary',
+    'severity', 'correlationId', 'experimentId', 'metadataReferences', 'semanticFingerprint', 'stateClass',
+  ]);
+  if (Object.keys(event as unknown as Record<string, unknown>).some(key => !allowed.has(key))) {
+    throw new TypeError('Automation event contains server-owned or unsupported fields');
+  }
+  if (!isWorkflowObservationSource(event.source)) throw new TypeError('Unsupported automation event source');
+  boundedEventText(event.sourceEventId, 'sourceEventId', 512);
+  boundedEventText(event.eventType, 'eventType', 256);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/u.test(event.eventType)) throw new TypeError('Invalid automation event type');
+  validateSafeResourceUri(event.resourceUri, 'resourceUri');
+  if (typeof event.sourceVersion === 'number') {
+    if (!Number.isSafeInteger(event.sourceVersion) || event.sourceVersion < 0) throw new TypeError('Invalid automation sourceVersion');
+  } else boundedEventText(event.sourceVersion, 'sourceVersion', 512);
+  if (!Number.isSafeInteger(event.occurredAt) || event.occurredAt < 0) throw new TypeError('Invalid automation occurredAt');
+  if (event.title !== undefined) boundedEventText(event.title, 'title', 512, true);
+  if (event.summary !== undefined) boundedEventText(event.summary, 'summary', 2_000, true);
+  if (event.severity !== undefined && !['info', 'warning', 'critical'].includes(event.severity)) {
+    throw new TypeError('Invalid automation event severity');
+  }
+  if (event.correlationId !== undefined) boundedEventText(event.correlationId, 'correlationId', 128);
+  if (event.experimentId !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(event.experimentId)) {
+    throw new TypeError('Invalid automation experimentId');
+  }
+  if (event.metadataReferences !== undefined) decodeWorkflowMetadataReferences(event.metadataReferences);
+  if (event.semanticFingerprint !== undefined && !/^[a-f0-9]{64}$/u.test(event.semanticFingerprint)) {
+    throw new TypeError('Invalid automation semanticFingerprint');
+  }
+  if (event.stateClass !== undefined && !['healthy', 'incident', 'neutral'].includes(event.stateClass)) {
+    throw new TypeError('Invalid automation stateClass');
+  }
+}
+
+export function validateWorkflowAutomationEventNoticeRequest(
+  request: WorkflowAutomationEventNoticeRequest,
+): void {
+  const allowed = new Set(['eventId', 'workflowId', 'triggerId', 'occurrenceId', 'scheduledAt', 'taskId']);
+  if (Object.keys(request as unknown as Record<string, unknown>).some(key => !allowed.has(key))) {
+    throw new TypeError('Automation event notice cannot contain routing or summary fields');
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,511}$/u.test(request.eventId)
+    || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/u.test(request.workflowId)
+    || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(request.triggerId)
+    || !/^occ-[a-f0-9]{40}$/u.test(request.occurrenceId)
+    || !Number.isFinite(Date.parse(request.scheduledAt))
+    || request.taskId !== `workflow-${request.occurrenceId.slice(4)}`) {
+    throw new TypeError('Invalid automation event notice identity');
+  }
+}
+
+export function validateWorkflowV3DigestNoticeRequest(
+  workflowId: string,
+  request: WorkflowV3DigestNoticeRequest,
+): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/u.test(workflowId)
+    || request.triggerId !== 'daily-digest'
+    || !/^occ-[a-f0-9]{40}$/u.test(request.occurrenceId)
+    || !Number.isFinite(Date.parse(request.scheduledAt))
+    || request.taskId !== `workflow-${request.occurrenceId.slice(4)}`) {
+    throw new TypeError('Invalid v3 digest notice identity');
+  }
+}
+
+function decodeWorkflowAutomationEvent(value: unknown): WorkflowAutomationEvent {
+  const row = object(value, 'Automation event');
+  if (!isWorkflowObservationSource(row.source)) throw new TypeError('Invalid automation event source');
+  if (row.visibility !== 'owner') throw new TypeError('Automation event visibility must be owner-only');
+  const event: WorkflowAutomationEvent = {
+    source: row.source,
+    sourceEventId: boundedEventText(row.sourceEventId, 'sourceEventId', 512),
+    resourceUri: validateSafeResourceUri(row.resourceUri, 'resourceUri'),
+    sourceVersion: decodeSourceVersion(row.sourceVersion),
+    eventType: boundedEventText(row.eventType, 'eventType', 256),
+    occurredAt: eventTimestamp(row.occurredAt, 'occurredAt'),
+    ...(row.title === undefined ? {} : { title: boundedEventText(row.title, 'title', 512, true) }),
+    ...(row.summary === undefined ? {} : { summary: boundedEventText(row.summary, 'summary', 2_000, true) }),
+    ...(row.severity === undefined ? {} : { severity: decodeEventSeverity(row.severity) }),
+    ...(row.correlationId === undefined ? {} : { correlationId: boundedEventText(row.correlationId, 'correlationId', 128) }),
+    ...(row.experimentId === undefined ? {} : { experimentId: boundedEventText(row.experimentId, 'experimentId', 36) }),
+    ...(row.metadataReferences === undefined ? {} : { metadataReferences: decodeWorkflowMetadataReferences(row.metadataReferences) }),
+    ...(row.semanticFingerprint === undefined ? {} : { semanticFingerprint: boundedEventText(row.semanticFingerprint, 'semanticFingerprint', 64) }),
+    ...(row.stateClass === undefined ? {} : { stateClass: decodeWorkflowStateClass(row.stateClass) }),
+    id: boundedEventText(row.id, 'event.id', 512),
+    observedAt: eventTimestamp(row.observedAt, 'observedAt'),
+    actorId: boundedEventText(row.actorId, 'actorId', 256),
+    organizationId: boundedEventText(row.organizationId, 'organizationId', 256),
+    workspaceId: boundedEventText(row.workspaceId, 'workspaceId', 256),
+    revision: eventCount(row.revision, 'revision'),
+    visibility: 'owner',
+  };
+  validateWorkflowAutomationEvent({
+    source: event.source,
+    sourceEventId: event.sourceEventId,
+    resourceUri: event.resourceUri,
+    sourceVersion: event.sourceVersion,
+    eventType: event.eventType,
+    occurredAt: event.occurredAt,
+    ...(event.title === undefined ? {} : { title: event.title }),
+    ...(event.summary === undefined ? {} : { summary: event.summary }),
+    ...(event.severity === undefined ? {} : { severity: event.severity }),
+    ...(event.correlationId === undefined ? {} : { correlationId: event.correlationId }),
+    ...(event.experimentId === undefined ? {} : { experimentId: event.experimentId }),
+    ...(event.metadataReferences === undefined ? {} : { metadataReferences: event.metadataReferences }),
+    ...(event.semanticFingerprint === undefined ? {} : { semanticFingerprint: event.semanticFingerprint }),
+    ...(event.stateClass === undefined ? {} : { stateClass: event.stateClass }),
+  });
+  return event;
+}
+
+function decodeWorkflowMetadataReferences(value: unknown): readonly WorkflowMetadataReference[] {
+  if (!Array.isArray(value) || value.length > 32) throw new TypeError('Invalid automation metadata references');
+  return value.map(item => {
+    const row = object(item, 'Automation metadata reference');
+    const reference: WorkflowMetadataReference = {
+      kind: boundedEventText(row.kind, 'metadataReference.kind', 128),
+      resourceUri: validateSafeResourceUri(row.resourceUri, 'metadataReference.resourceUri'),
+      ...(row.resourceVersion === undefined ? {} : { resourceVersion: decodeSourceVersion(row.resourceVersion) }),
+    };
+    return reference;
+  });
+}
+
+function decodeSourceVersion(value: unknown): number | string {
+  if (typeof value === 'number') {
+    if (!Number.isSafeInteger(value) || value < 0) throw new TypeError('Invalid automation resource version');
+    return value;
+  }
+  return boundedEventText(value, 'resourceVersion', 512);
+}
+
+function decodeEventSeverity(value: unknown): NonNullable<WorkflowAutomationEvent['severity']> {
+  if (value !== 'info' && value !== 'warning' && value !== 'critical') throw new TypeError('Invalid automation event severity');
+  return value;
+}
+
+function decodeWorkflowStateClass(value: unknown): NonNullable<WorkflowAutomationEvent['stateClass']> {
+  if (value !== 'healthy' && value !== 'incident' && value !== 'neutral') throw new TypeError('Invalid automation stateClass');
+  return value;
+}
+
+function eventTimestamp(value: unknown, label: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new TypeError(`Invalid automation ${label}`);
+  return value;
+}
+
+function eventCount(value: unknown, label: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new TypeError(`Invalid automation ${label}`);
+  return value;
+}
+
+function boundedEventText(value: unknown, label: string, maximum: number, allowEmpty = false): string {
+  if (typeof value !== 'string' || value.length > maximum || (!allowEmpty && value.trim().length === 0)
+    || /[\u0000-\u001f\u007f]/u.test(value)) throw new TypeError(`Invalid automation ${label}`);
+  return value;
+}
+
+function validateSafeResourceUri(value: unknown, label: string): string {
+  const textValue = boundedEventText(value, label, 2_000);
+  let uri: URL;
+  try { uri = new URL(textValue); } catch { throw new TypeError(`Invalid automation ${label}`); }
+  const scheme = uri.protocol.slice(0, -1).toLowerCase();
+  if (!/^[a-z][a-z0-9+.-]{0,31}$/u.test(scheme)
+    || ['data', 'file', 'javascript', 'vbscript'].includes(scheme)
+    || uri.username || uri.password || uri.search || uri.hash
+    || (scheme === 'http' || scheme === 'https') && !uri.hostname
+    || scheme !== 'http' && scheme !== 'https' && !uri.host && !uri.pathname) {
+    throw new TypeError(`Automation ${label} must be an absolute safe URI without credentials, query, or fragment`);
+  }
+  return textValue;
+}
+
+function canonicalEventJson(value: unknown): string {
+  const normalize = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(normalize);
+    if (item !== null && typeof item === 'object') {
+      return Object.fromEntries(Object.entries(item).sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, child]) => [key, normalize(child)]));
+    }
+    return item;
+  };
+  return JSON.stringify(normalize(value));
+}
+
+function digestAutomationEventKey(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+function inferWorkflowEventState(event: WorkflowAutomationEvent): WorkflowSourceState['state'] {
+  const type = event.eventType.toLowerCase();
+  if (event.severity === 'critical' || event.severity === 'warning'
+    || /(?:fail|error|unhealthy|incident|blocked|denied|outage)/u.test(type)) return 'incident';
+  if (/(?:healthy|success|succeed|complete|ready|recovered)/u.test(type)) return 'healthy';
+  return 'neutral';
+}
+
+function isWorkflowQuietTime(timestamp: string, quietHours: WorkflowV3Notifications['quietHours']): boolean {
+  const date = new Date(timestamp);
+  if (!Number.isFinite(date.getTime())) return false;
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: quietHours.timeZone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).formatToParts(date);
+  const hour = Number(parts.find(part => part.type === 'hour')?.value);
+  const minute = Number(parts.find(part => part.type === 'minute')?.value);
+  const [startHour, startMinute] = quietHours.start.split(':').map(Number);
+  const [endHour, endMinute] = quietHours.end.split(':').map(Number);
+  const current = hour * 60 + minute;
+  const start = startHour! * 60 + startMinute!;
+  const end = endHour! * 60 + endMinute!;
+  return start > end ? current >= start || current < end : current >= start && current < end;
+}
+
+function redactAutomationSummary(value: string): string {
+  return value.replace(/\b(authorization|api[_ -]?key|password|secret|token)\b\s*[:=]\s*\S+/giu, '$1=[redacted]')
+    .replace(/\s+/gu, ' ').trim().slice(0, 400);
 }
 
 /** Validate the deliberately small safe workflow outbox contract. */
@@ -816,10 +1591,11 @@ function workflowOccurrenceId(workflowId: string, triggerId: string, scheduledAt
   return `occ-${createHash('sha256').update(`${workflowId}\0${triggerId}\0${scheduledAt}`).digest('hex').slice(0, 40)}`;
 }
 
-function decodeWorkflowDefinition(value: unknown, definitionVersion: 1 | 2): WorkflowDefinition {
+function decodeWorkflowDefinition(value: unknown, definitionVersion: 1 | 2 | 3): WorkflowDefinition {
   const row = object(value, 'Workflow record');
   if (row.version !== definitionVersion) throw new TypeError('Workflow record version does not match definitionVersion negotiation');
-  return definitionVersion === 1 ? decodeWorkflow(value) : decodeWorkflowV2(value);
+  return definitionVersion === 1 ? decodeWorkflow(value)
+    : definitionVersion === 2 ? decodeWorkflowV2(value) : decodeWorkflowV3(value);
 }
 
 function decodeWorkflow(value: unknown): WorkflowRecord {
@@ -932,6 +1708,108 @@ function decodeWorkflowV2(value: unknown): WorkflowV2Record {
     enabled: result.enabled,
   });
   return result;
+}
+
+function decodeWorkflowV3(value: unknown): WorkflowV3Record {
+  const row = object(value, 'Workflow v3 record');
+  if (row.version !== 3 || !Array.isArray(row.targets) || !Array.isArray(row.triggers)) {
+    throw new TypeError('Invalid workflow v3 record');
+  }
+  const targets = row.targets.map(item => {
+    const target = object(item, 'Workflow v3 target');
+    return {
+      id: text(target.id, 'target.id'),
+      label: text(target.label, 'target.label'),
+      kind: text(target.kind, 'target.kind'),
+      ...(target.bindingId === undefined ? {} : { bindingId: text(target.bindingId, 'target.bindingId') }),
+      ...(target.uri === undefined ? {} : { uri: text(target.uri, 'target.uri') }),
+    };
+  });
+  const triggers = row.triggers.map(item => {
+    const trigger = object(item, 'Workflow v3 trigger');
+    if (trigger.kind !== 'source_poll' || !isWorkflowObservationSource(trigger.source)
+      || trigger.initialBaseline !== 'record_without_notification' || !Array.isArray(trigger.targetIds)) {
+      throw new TypeError('Invalid workflow v3 source trigger');
+    }
+    if (typeof trigger.pageSize !== 'number' || typeof trigger.maxPages !== 'number'
+      || !Number.isSafeInteger(trigger.pageSize) || !Number.isSafeInteger(trigger.maxPages)) {
+      throw new TypeError('Invalid workflow v3 page bounds');
+    }
+    return {
+      id: text(trigger.id, 'trigger.id'),
+      kind: 'source_poll' as const,
+      source: trigger.source,
+      schedule: decodeSchedule(trigger.schedule),
+      targetIds: trigger.targetIds.map(targetId => text(targetId, 'trigger.targetId')),
+      initialBaseline: 'record_without_notification' as const,
+      pageSize: trigger.pageSize,
+      maxPages: trigger.maxPages,
+    };
+  });
+  const authorizationRow = object(row.authorization, 'Workflow v3 authorization');
+  let authorization: WorkflowV3Authorization;
+  if (authorizationRow.kind === 'teams_thread') {
+    authorization = {
+      kind: 'teams_thread',
+      threadBindingId: text(authorizationRow.threadBindingId, 'authorization.threadBindingId'),
+      ownerTaskId: text(authorizationRow.ownerTaskId, 'authorization.ownerTaskId'),
+    };
+  } else if (authorizationRow.kind === 'owner_private') {
+    authorization = { kind: 'owner_private', ownerTaskId: text(authorizationRow.ownerTaskId, 'authorization.ownerTaskId') };
+  } else {
+    throw new TypeError('Invalid workflow v3 authorization kind');
+  }
+  const result: WorkflowV3Record = {
+    id: text(row.id, 'workflow.id'),
+    version: 3,
+    title: text(row.title, 'workflow.title'),
+    description: text(row.description, 'workflow.description'),
+    targets,
+    triggers,
+    authorization,
+    notifications: decodeNotificationsV3(row.notifications),
+    enabled: bool(row.enabled, 'workflow.enabled'),
+    ...(row.updatedAt === undefined ? {} : { updatedAt: text(row.updatedAt, 'workflow.updatedAt') }),
+  };
+  validateWorkflowWrite({
+    id: result.id, version: result.version, title: result.title, description: result.description,
+    targets: result.targets, triggers: result.triggers, authorization: result.authorization,
+    notifications: result.notifications, enabled: result.enabled,
+  });
+  return result;
+}
+
+function decodeNotificationsV3(value: unknown): WorkflowV3Notifications {
+  const row = object(value, 'Workflow v3 notification policy');
+  if (row.quietWhenUnchanged !== true || !Array.isArray(row.immediateOn)) {
+    throw new TypeError('Invalid workflow v3 notification policy');
+  }
+  const quietHours = object(row.quietHours, 'Workflow v3 quiet hours');
+  const digest = object(row.digest, 'Workflow v3 digest policy');
+  const destination = object(row.destination, 'Workflow v3 destination');
+  if (destination.kind !== 'responsibility_thread' && destination.kind !== 'owner_private') {
+    throw new TypeError('Invalid workflow v3 notification destination');
+  }
+  if (digest.maxPerDay !== 1 || typeof digest.enabled !== 'boolean') throw new TypeError('Invalid workflow v3 digest policy');
+  return {
+    onChange: bool(row.onChange, 'notifications.onChange'),
+    onFailure: bool(row.onFailure, 'notifications.onFailure'),
+    onRecovery: bool(row.onRecovery, 'notifications.onRecovery'),
+    quietWhenUnchanged: true,
+    quietHours: {
+      start: text(quietHours.start, 'quietHours.start'),
+      end: text(quietHours.end, 'quietHours.end'),
+      timeZone: text(quietHours.timeZone, 'quietHours.timeZone'),
+    },
+    digest: { enabled: digest.enabled, schedule: decodeSchedule(digest.schedule), maxPerDay: 1 },
+    destination: { kind: destination.kind },
+    immediateOn: row.immediateOn.map(item => text(item, 'notifications.immediateOn') as WorkflowV3Notifications['immediateOn'][number]),
+  };
+}
+
+function isWorkflowObservationSource(value: unknown): value is WorkflowObservationSource {
+  return value === 'github' || value === 'azure_devops' || value === 'vm_health'
+    || value === 'training' || value === 'product' || value === 'office_graph';
 }
 
 function decodeActionPolicy(value: unknown): WorkflowV2Record['actionPolicy'] {
@@ -1115,7 +1993,13 @@ function decodeTextArray(value: unknown, label: string): readonly string[] {
   return value.map(item => text(item, label));
 }
 
-function decodeWorkflowCheckpoint(value: unknown): WorkflowCheckpoint {
+function decodeWorkflowCheckpoint(value: unknown): WorkflowEventCheckpoint {
+  const row = object(value, 'Workflow checkpoint');
+  if (row.kind === 'source_poll') return decodeWorkflowSourceCheckpoint(row);
+  return decodeWorkflowGitHubCheckpoint(row);
+}
+
+function decodeWorkflowGitHubCheckpoint(value: unknown): WorkflowCheckpoint {
   const row = object(value, 'Workflow checkpoint');
   if (row.kind !== 'github_issues_search' || typeof row.complete !== 'boolean' || !Array.isArray(row.repositories)) {
     throw new TypeError('Invalid workflow checkpoint');
@@ -1165,6 +2049,91 @@ function decodeWorkflowCheckpoint(value: unknown): WorkflowCheckpoint {
     complete: row.complete,
     repositories,
   };
+}
+
+function decodeWorkflowSourceCheckpoint(value: Record<string, unknown>): WorkflowSourceCheckpoint {
+  if (value.kind !== 'source_poll' || typeof value.complete !== 'boolean' || !Array.isArray(value.sources)
+    || value.sources.length < 1 || value.sources.length > 100) {
+    throw new TypeError('Invalid workflow source checkpoint');
+  }
+  const windowStart = value.windowStart === null ? null : text(value.windowStart, 'checkpoint.windowStart');
+  if (windowStart !== null && !Number.isFinite(Date.parse(windowStart))) throw new TypeError('Invalid source checkpoint windowStart');
+  const windowEnd = text(value.windowEnd, 'checkpoint.windowEnd');
+  if (!Number.isFinite(Date.parse(windowEnd)) || windowStart !== null && Date.parse(windowStart) > Date.parse(windowEnd)) {
+    throw new TypeError('Invalid source checkpoint time window');
+  }
+  const sources: WorkflowSourceCursor[] = value.sources.map(item => {
+    const cursor = object(item, 'Workflow source cursor');
+    if (!isWorkflowObservationSource(cursor.source) || typeof cursor.complete !== 'boolean'
+      || !Number.isSafeInteger(cursor.pagesCollected) || Number(cursor.pagesCollected) < 0 || Number(cursor.pagesCollected) > 20) {
+      throw new TypeError('Invalid workflow source cursor');
+    }
+    const pageCursor = cursor.pageCursor === null ? null : text(cursor.pageCursor, 'sourceCursor.pageCursor');
+    const resumeCursor = cursor.resumeCursor === undefined ? undefined
+      : cursor.resumeCursor === null ? null : text(cursor.resumeCursor, 'sourceCursor.resumeCursor');
+    const watermark = cursor.watermark === null ? null : text(cursor.watermark, 'sourceCursor.watermark');
+    if (pageCursor !== null && pageCursor.length > 2_000 || resumeCursor !== undefined && resumeCursor !== null && resumeCursor.length > 2_000
+      || watermark !== null && watermark.length > 512) {
+      throw new TypeError('Invalid source cursor size');
+    }
+    if (cursor.complete && pageCursor !== null
+      || !cursor.complete && (pageCursor === null || resumeCursor !== undefined && resumeCursor !== null)) {
+      throw new TypeError('Source page and resume cursors are invalid for the completion state');
+    }
+    const seenEventIds = cursor.seenEventIds === undefined ? undefined : decodeTextArrayBounded(cursor.seenEventIds, 'sourceCursor.seenEventIds', 1_000, 512);
+    if (seenEventIds !== undefined && new Set(seenEventIds).size !== seenEventIds.length) {
+      throw new TypeError('Source cursor event IDs must be unique');
+    }
+    const states = cursor.states === undefined ? undefined : decodeWorkflowSourceStates(cursor.states);
+    return {
+      source: cursor.source,
+      targetId: text(cursor.targetId, 'sourceCursor.targetId'),
+      pageCursor,
+      ...(resumeCursor === undefined ? {} : { resumeCursor }),
+      watermark,
+      complete: cursor.complete,
+      pagesCollected: Number(cursor.pagesCollected),
+      ...(seenEventIds === undefined ? {} : { seenEventIds }),
+      ...(states === undefined ? {} : { states }),
+    };
+  });
+  if (new Set(sources.map(item => `${item.source}\0${item.targetId}`)).size !== sources.length) {
+    throw new TypeError('Workflow source checkpoint contains duplicate targets');
+  }
+  if (sources.reduce((total, item) => total + item.pagesCollected, 0) > 20) {
+    throw new TypeError('Workflow source checkpoint exceeds its occurrence-wide page budget');
+  }
+  if (value.complete && sources.some(item => !item.complete || item.watermark !== windowEnd)
+    || !value.complete && sources.every(item => item.complete)) {
+    throw new TypeError('Workflow source checkpoint completeness does not match its cursors');
+  }
+  return { kind: 'source_poll', windowStart, windowEnd, complete: value.complete, sources };
+}
+
+function decodeWorkflowSourceStates(value: unknown): readonly WorkflowSourceState[] {
+  if (!Array.isArray(value) || value.length > 1_000) throw new TypeError('Invalid workflow source states');
+  const states = value.map(item => {
+    const row = object(item, 'Workflow source state');
+    if (row.state !== 'healthy' && row.state !== 'incident' && row.state !== 'neutral') {
+      throw new TypeError('Invalid workflow source state class');
+    }
+    const resourceKey = text(row.resourceKey, 'sourceState.resourceKey');
+    const fingerprint = text(row.fingerprint, 'sourceState.fingerprint');
+    if (!/^[a-f0-9]{64}$/u.test(resourceKey) || !/^[a-f0-9]{64}$/u.test(fingerprint)) {
+      throw new TypeError('Workflow source state hashes are invalid');
+    }
+    const state = row.state as WorkflowSourceState['state'];
+    return { resourceKey, fingerprint, state };
+  });
+  if (new Set(states.map(item => item.resourceKey)).size !== states.length) {
+    throw new TypeError('Workflow source state resources must be unique');
+  }
+  return states;
+}
+
+function decodeTextArrayBounded(value: unknown, label: string, maximumItems: number, maximumLength: number): readonly string[] {
+  if (!Array.isArray(value) || value.length > maximumItems) throw new TypeError(`Invalid ${label}`);
+  return value.map(item => boundedEventText(item, label, maximumLength));
 }
 
 function decodeAttentionKind(value: unknown): WorkflowAttentionKind {

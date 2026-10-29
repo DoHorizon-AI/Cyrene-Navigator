@@ -32,10 +32,10 @@ import { registerWorkTools } from '../dist/work-tools.js';
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const python = process.env.CYRENE_TEST_PYTHON ?? join(repository, '.venv/bin/python');
 
-async function startService(directory, token, port = 0, { leaseSeconds = 30, canTakeover = false } = {}) {
+async function startService(directory, token, port = 0, { leaseSeconds = 30, canTakeover = false, actorId = 'test-owner' } = {}) {
   const config = join(directory, 'principals.json');
   await writeFile(config, JSON.stringify({ principals: [{
-    token_env: 'CYRENE_TEST_SESSION_TOKEN', actor_id: 'test-owner', workspace_ids: ['proof'], can_takeover: canTakeover,
+    token_env: 'CYRENE_TEST_SESSION_TOKEN', actor_id: actorId, workspace_ids: ['proof'], can_takeover: canTakeover,
   }] }));
   const child = spawn(python, [join(repository, 'scripts/serve-persistence.py'),
     '--database', join(directory, 'sessions.sqlite'), '--principal-config', config,
@@ -421,10 +421,10 @@ test('production projection uses real Python Work SQL with synthetic provider re
   let ctx;
   let disposeProviders;
   try {
-    service = await startService(directory, token, 0, { canTakeover: true });
+    const ownerId = '11111111-1111-4111-8111-111111111111';
+    service = await startService(directory, token, 0, { canTakeover: true, actorId: ownerId });
     const taskId = `teams-task-${randomUUID()}`;
     const sessionId = `teams-session-${randomUUID()}`;
-    const ownerId = '11111111-1111-4111-8111-111111111111';
     const tenantId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
     const issuer = `https://login.microsoftonline.com/${tenantId}/v2.0`;
     const apiRoot = `${service.baseUrl}/api/v1/workspaces/proof/work`;
