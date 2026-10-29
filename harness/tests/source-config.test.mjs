@@ -24,6 +24,7 @@ const bindingId = '10cf334d-6f8a-4fea-83df-fef89f8eb523';
 const resourceId = '1b6ce5fd-0b0f-4a6a-a661-c092bc091f2e';
 const organizationId = 'synthetic-organization';
 const workspaceId = 'synthetic-workspace';
+const vmHealthMount = '/run/synthetic-health';
 
 function config(overrides = {}) {
   return {
@@ -40,7 +41,7 @@ function config(overrides = {}) {
       },
       {
         actorId, targetId: 'vm-health-lookup', kind: 'host_health', bindingId: '30cf334d-6f8a-4fea-83df-fef89f8eb523',
-        hostRef: 'synthetic-host', mountDirectory: '/run/synthetic-health', mountGid: 2000,
+        hostRef: 'synthetic-host', mountDirectory: vmHealthMount, mountGid: 2000,
         maxAgeSeconds: 90, maxClockSkewSeconds: 15,
       },
       {
@@ -163,7 +164,7 @@ test('host authority maps a fixed mount and requires per-actor ACL proof', async
   const target = { id: 'vm-health-lookup', kind: 'host_health', bindingId: '30cf334d-6f8a-4fea-83df-fef89f8eb523' };
   const signal = new AbortController().signal;
   const profile = await authority.resolveTarget(actorId, target, signal);
-  assert.equal(profile?.mountDirectory, '/run/synthetic-health');
+  assert.equal(profile?.mountDirectory, vmHealthMount);
   assert.equal(profile?.hostRef, 'synthetic-host');
   assert.equal(await authority.authorizeRead(actorId, target, profile, signal), 'forbidden');
   assert.equal(calls.length, 1);

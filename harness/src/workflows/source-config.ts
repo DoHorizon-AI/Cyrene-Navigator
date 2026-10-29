@@ -8,7 +8,7 @@
 
 import { constants } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
-import { dirname, isAbsolute, resolve } from 'node:path';
+import { dirname, isAbsolute, posix } from 'node:path';
 import type {
   HostObservationAuthority,
   HostObservationTarget,
@@ -387,7 +387,9 @@ function decodeTargetBinding(value: unknown, index: number): AutomationSourceTar
     const mountGid = row.mountGid;
     const maxAgeSeconds = row.maxAgeSeconds;
     const maxClockSkewSeconds = row.maxClockSkewSeconds;
-    if (!mountDirectory.startsWith('/') || mountDirectory.includes('..') || resolve(mountDirectory) !== mountDirectory
+    // Linux VM mount metadata retains POSIX semantics when decoded by a Windows client.
+    // 中文：挂载元数据描述 Linux VM，不使用客户端操作系统的路径规则。
+    if (!mountDirectory.startsWith('/') || mountDirectory.includes('..') || posix.resolve(mountDirectory) !== mountDirectory
       || !safeInteger(mountGid, 0)
       || !safeInteger(maxAgeSeconds, 1) || maxAgeSeconds > 600
       || !safeInteger(maxClockSkewSeconds, 0) || maxClockSkewSeconds > 120) {
