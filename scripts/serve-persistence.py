@@ -21,12 +21,12 @@ from typing import Any, Literal, cast
 
 import uvicorn
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from cyrene_navigator import Product
 from cyrene_navigator import create_app as create_product_api_app
 from cyrene_navigator.persistence import PersistencePrincipal, create_persistence_app
-from cyrene_navigator.work.api import ConnectorBridge
+from cyrene_navigator.work.api import ConnectorBridge, TeamsPrivateConversationPolicy
 
 PERSISTENCE_TLS_CERT_FILE_ENV = "CYRENE_PERSISTENCE_TLS_CERT_FILE"
 PERSISTENCE_TLS_KEY_FILE_ENV = "CYRENE_PERSISTENCE_TLS_KEY_FILE"
@@ -48,6 +48,40 @@ class PrincipalConfig(BaseModel):
     can_takeover: bool = False
     can_write_harness: bool = False
     can_publish_credential_health: bool = False
+    can_bind_teams_private_conversations: bool = False
+    actor_private_scope: bool = False
+
+    @model_validator(mode="after")
+    def private_bridge_is_narrow(self) -> PrincipalConfig:
+        """Keep the Teams route binder separate from normal Work owner credentials."""
+
+        if self.can_bind_teams_private_conversations and (
+            self.can_takeover
+            or self.can_write_harness
+            or self.can_publish_credential_health
+            or self.actor_private_scope
+            or self.organization_id is None
+            or len(self.workspace_ids) != 1
+        ):
+            raise ValueError(
+                "private Teams bridge principals must have one scope and no other grants"
+            )
+        if self.actor_private_scope and (
+            self.organization_id is None or len(self.workspace_ids) != 1
+        ):
+            raise ValueError("actor-private principals must have one organization-scoped Workspace")
+        return self
+
+
+class TeamsPrivateConversationConfig(BaseModel):
+    """Pinned owner projection source and identity for private Teams delivery."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    actor_subjects_file_env: str = Field(default="TEAMS_TASK_ACTOR_SUBJECTS_FILE", min_length=1)
+    workspace_id: str = Field(min_length=1, max_length=512)
+    issuer: str = Field(min_length=1, max_length=512)
+    tenant_id: str = Field(min_length=36, max_length=36)
+    bot_app_id: str = Field(min_length=36, max_length=36)
 
 
 class ProductDirectoryConfig(BaseModel):
@@ -95,6 +129,7 @@ class ServiceConfig(BaseModel):
     product_directory: list[ProductDirectoryConfig] = Field(default_factory=list)
     product_service_credentials: list[ProductServiceCredentialConfig] = Field(default_factory=list)
     work_connectors: list[WorkConnectorConfig] = Field(default_factory=list)
+    teams_private_conversations: TeamsPrivateConversationConfig | None = None
 
 
 def main() -> None:
@@ -138,6 +173,8 @@ def main() -> None:
             organization_id=row.organization_id,
             can_write_harness=row.can_write_harness,
             can_publish_credential_health=row.can_publish_credential_health,
+            can_bind_teams_private_conversations=row.can_bind_teams_private_conversations,
+            actor_private_scope=row.actor_private_scope,
         )
     product_directory = _load_product_directory(config.product_directory)
     product_service_credentials = _load_product_service_credentials(
@@ -148,6 +185,9 @@ def main() -> None:
             config, product_directory, product_service_credentials
         )
     args.database.parent.mkdir(parents=True, exist_ok=True)
+    private_policy = _teams_private_conversation_policy(
+        config.teams_private_conversations, os.environ
+    )
     app = create_persistence_app(
         args.database,
         principals,
@@ -155,6 +195,7 @@ def main() -> None:
         artifact_root=args.artifact_root,
         echo_url=args.echo_url,
         work_connector_bridges=_load_work_connectors(config.work_connectors, principals),
+        private_conversation_policy=private_policy,
     )
 
     @app.get("/healthz", include_in_schema=False)
@@ -250,6 +291,26 @@ def _persistence_tls_files(environment: Mapping[str, str]) -> tuple[Path, Path] 
             "Navigator persistence TLS certificate and key files are invalid or unreadable"
         ) from None
     return certificate, private_key
+
+
+def _teams_private_conversation_policy(
+    config: TeamsPrivateConversationConfig | None,
+    environment: Mapping[str, str],
+) -> TeamsPrivateConversationPolicy | None:
+    """Build the host-pinned owner policy, or leave private delivery disabled."""
+
+    if config is None:
+        return None
+    path_value = environment.get(config.actor_subjects_file_env)
+    if not path_value:
+        return None
+    return TeamsPrivateConversationPolicy(
+        actor_subjects_path=Path(path_value),
+        workspace_id=config.workspace_id,
+        issuer=config.issuer,
+        tenant_id=config.tenant_id,
+        bot_app_id=config.bot_app_id,
+    )
 
 
 def _load_work_connectors(

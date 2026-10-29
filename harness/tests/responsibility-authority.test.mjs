@@ -31,6 +31,7 @@ const CONNECTION_REF = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const PROFILE_REF = 'github-owner-profile';
 const TENANT_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const OWNER_ID = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+const MEMBER_ID = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
 const OWNER_ISSUER = `https://login.microsoftonline.com/${TENANT_ID}/v2.0`;
 const REPOSITORY_ID = '12345';
 const REPOSITORY = 'DoHorizon-AI/Cyrene-Workspace';
@@ -60,6 +61,150 @@ const DRAFT_OPERATIONS = Object.freeze([
 function hash(value) {
   return createHash('sha256').update(value).digest('hex');
 }
+
+test('V3 private source polling authenticates immutable private origin and preserves verified channel-owner migration', async () => {
+  const actorId = OWNER_ID;
+  const botAppId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+  const workflowId = 'private-source-poll';
+  const triggerId = 'github-poll';
+  const scheduledAt = '2026-10-27T14:00:00.000Z';
+  const actorSalt = hash(actorId).slice(0, 16);
+  const occurrenceId = `occ-${hash(`${workflowId}\0${triggerId}\0${scheduledAt}\0${actorSalt}`).slice(0, 40)}`;
+  const taskId = `workflow-${occurrenceId.slice(4)}`;
+  const taskMetadata = {
+    source: 'workflow', workflowId, triggerId, occurrenceId, scheduledAt,
+    authorizationRef: { kind: 'owner_private', ownerTaskId: OWNER_TASK_ID },
+  };
+  const workflow = {
+    id: workflowId,
+    version: 3,
+    title: 'Private GitHub poll',
+    description: 'Observe one selected repository.',
+    targets: [{
+      id: '12345', label: 'owner/repository', kind: 'github_repository',
+      uri: 'https://github.com/owner/repository', bindingId: BINDING_ID,
+    }],
+    triggers: [{
+      id: triggerId, kind: 'source_poll', source: 'github',
+      schedule: { kind: 'cron', expression: '*/5 * * * *', timeZone: 'UTC' },
+      targetIds: ['12345'], initialBaseline: 'record_without_notification', pageSize: 10, maxPages: 2,
+    }],
+    authorization: { kind: 'owner_private', ownerTaskId: OWNER_TASK_ID },
+    notifications: {
+      onChange: true, onFailure: true, onRecovery: true, quietWhenUnchanged: true,
+      quietHours: { start: '22:00', end: '08:00', timeZone: 'America/New_York' },
+      digest: { enabled: true, schedule: { kind: 'cron', expression: '0 9 * * 1-5', timeZone: 'America/New_York' }, maxPerDay: 1 },
+      destination: { kind: 'owner_private' }, immediateOn: ['blocked_goal', 'user_decision', 'service_or_auth_outage'],
+    },
+    enabled: true,
+  };
+  const makeTask = ({ createdByActorId = OWNER_ID, origin, metadata = {} } = {}) => ({
+    id: OWNER_TASK_ID, workspaceId: WORKSPACE_ID, createdByActorId, sessionId: 'teams-private-owner-session',
+    prompt: 'Create the private poll.', status: 'completed', executionClass: 'foreground',
+    createdAt: 1_792_840_000_000, output: '', reasoning: '', durationMs: 0, metadata,
+    ...(origin === undefined ? {} : { origin }),
+  });
+  const ownerOrigin = {
+    kind: 'teams_private', messageId: 'private-activity-1', tenantId: TENANT_ID,
+    botAppId, actorAadObjectId: OWNER_ID,
+  };
+  const makeResolver = (ownerTask, {
+    expectedTenantId = TENANT_ID,
+    expectedBotAppId = botAppId,
+    directoryAuthorized = true,
+  } = {}) => {
+    const task = {
+      id: taskId, workspaceId: WORKSPACE_ID, createdByActorId: actorId,
+      sessionId: 'workflow-private-session', prompt: 'Observe the repository.', status: 'running',
+      executionClass: 'background', createdAt: 1_792_840_000_000, output: '', reasoning: '',
+      durationMs: 0, metadata: taskMetadata,
+    };
+    const workState = {
+      async getTask(id) { return id === taskId ? task : id === OWNER_TASK_ID ? ownerTask : undefined; },
+    };
+    const workflows = {
+      async listWorkflows(version) { return version === 3 ? [workflow] : []; },
+      async listScheduleEvents() {
+        return { items: [{
+          id: 'private-running-occurrence', workflowId, triggerId, scheduledAt,
+          taskId, status: 'running', sessionId: task.sessionId,
+        }], nextCursor: null };
+      },
+    };
+    const config = {
+      workspaceId: WORKSPACE_ID,
+      teamsConnectorId: CONNECTOR_ID,
+      allowedTenantId: expectedTenantId,
+      allowedBotAppId: expectedBotAppId,
+      allowedTeamIds: [],
+      workState,
+      workStateForActor: () => workState,
+      workflows,
+      workflowsForActor: () => workflows,
+      async isDirectoryAuthorized(principal) {
+        return directoryAuthorized && principal.subject === OWNER_ID && principal.tenantId === expectedTenantId;
+      },
+    };
+    const binding = {
+      bindingId: BINDING_ID,
+      connectionRef: CONNECTION_REF,
+      providerId: 'github',
+      profileRef: PROFILE_REF,
+      tools: [{ toolId: 'github.issues.search', operationId: 'github.issues.search', resourceProjection: 'github_repository', mutating: false }],
+    };
+    return createResponsibilityAuthorizationResolver(config)({
+      taskId,
+      task,
+      binding,
+      tool: { toolId: 'github.issues.search', operationId: 'github.issues.search', resourceProjection: 'github_repository', mutating: false },
+      arguments: { repository_id: 12345, repository: 'owner/repository', query: 'is:open' },
+      signal: new AbortController().signal,
+    });
+  };
+
+  assert.deepEqual(await makeResolver(makeTask({ origin: ownerOrigin })), {
+    issuer: OWNER_ISSUER, subject: OWNER_ID, tenantId: TENANT_ID,
+  });
+  assert.deepEqual(await makeResolver(makeTask({
+    metadata: {
+      teamsCaller: { issuer: OWNER_ISSUER, subject: OWNER_ID, tenantId: TENANT_ID },
+    },
+  })), {
+    issuer: OWNER_ISSUER, subject: OWNER_ID, tenantId: TENANT_ID,
+  }, 'the existing authenticated owner channel task remains a valid workflow owner');
+  assert.equal(await makeResolver(makeTask({ origin: { ...ownerOrigin, botAppId: MEMBER_ID } })), undefined,
+    'a private task origin from another configured Teams bot is rejected');
+  assert.equal(await makeResolver(makeTask({ origin: { ...ownerOrigin, tenantId: MEMBER_ID } })), undefined,
+    'a private task origin from another tenant is rejected');
+  assert.equal(await makeResolver(makeTask({
+    metadata: { teamsCaller: { issuer: OWNER_ISSUER, subject: OWNER_ID, tenantId: TENANT_ID } },
+  }), { expectedBotAppId: 'invalid-bot-id' }), undefined,
+  'a legacy channel owner requires an explicitly configured Teams bot as well as its authenticated actor');
+  const foreignTenantId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  assert.equal(await makeResolver(makeTask({ metadata: {
+    teamsCaller: {
+      issuer: `https://login.microsoftonline.com/${foreignTenantId}/v2.0`,
+      subject: OWNER_ID,
+      tenantId: foreignTenantId,
+    },
+  } })), undefined, 'a legacy channel caller from another tenant is rejected');
+  const callerWithoutCreator = makeTask({
+    metadata: { teamsCaller: { issuer: OWNER_ISSUER, subject: OWNER_ID, tenantId: TENANT_ID } },
+  });
+  delete callerWithoutCreator.createdByActorId;
+  assert.equal(await makeResolver(callerWithoutCreator), undefined,
+    'authenticated Teams metadata cannot stand in for the server-owned task creator');
+  assert.equal(await makeResolver(makeTask({ origin: ownerOrigin }), { directoryAuthorized: false }), undefined,
+    'the live Directory projection is checked for a private owner before source access');
+  assert.equal(await makeResolver(makeTask({
+    createdByActorId: MEMBER_ID,
+    metadata: { teamsCaller: { issuer: OWNER_ISSUER, subject: OWNER_ID, tenantId: TENANT_ID } },
+  })), undefined, 'a member Task cannot borrow the owner through caller-supplied teamsCaller metadata');
+  assert.equal(await makeResolver(makeTask({
+    createdByActorId: MEMBER_ID,
+    origin: ownerOrigin,
+  })), undefined, 'a private origin cannot borrow the owner actor from another Work principal');
+});
 
 function baseTask(id, metadata, overrides = {}) {
   return {

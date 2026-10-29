@@ -258,6 +258,814 @@
         "title": "AttachmentRecord",
         "type": "object"
       },
+      "AutomationArtifactRef": {
+        "additionalProperties": false,
+        "description": "Canonical Platform ArtifactRef metadata without artifact bytes.\n\n\u4e2d\u6587\uff1a\u6807\u51c6 ArtifactRef \u5143\u6570\u636e\u3002",
+        "properties": {
+          "digest": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "kind": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Kind",
+            "type": "string"
+          },
+          "manifest_digest": {
+            "anyOf": [
+              {
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Manifest Digest"
+          },
+          "size_bytes": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Size Bytes",
+            "type": "integer"
+          },
+          "uri": {
+            "pattern": "^artifact://sha256/[0-9a-f]{64}$",
+            "title": "Uri",
+            "type": "string"
+          }
+        },
+        "required": [
+          "uri",
+          "digest",
+          "size_bytes",
+          "kind"
+        ],
+        "title": "AutomationArtifactRef",
+        "type": "object"
+      },
+      "AutomationCommitReference": {
+        "additionalProperties": false,
+        "description": "Reference one immutable repository commit. | \u5f15\u7528\u4e00\u4e2a\u4e0d\u53ef\u53d8\u4ed3\u5e93\u63d0\u4ea4\u3002",
+        "properties": {
+          "repositoryUri": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Repositoryuri",
+            "type": "string"
+          },
+          "sha": {
+            "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+            "title": "Sha",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repositoryUri",
+          "sha"
+        ],
+        "title": "AutomationCommitReference",
+        "type": "object"
+      },
+      "AutomationEvent": {
+        "additionalProperties": false,
+        "description": "Immutable stored observation with server-derived provenance. | \u542b\u670d\u52a1\u7aef\u6765\u6e90\u7684\u4e8b\u4ef6\u3002",
+        "properties": {
+          "actorId": {
+            "title": "Actorid",
+            "type": "string"
+          },
+          "correlationId": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Correlationid"
+          },
+          "eventType": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$",
+            "title": "Eventtype",
+            "type": "string"
+          },
+          "experimentId": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Experimentid"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "metadataReferences": {
+            "items": {
+              "$ref": "#/components/schemas/AutomationResourceReference"
+            },
+            "maxItems": 32,
+            "title": "Metadatareferences",
+            "type": "array"
+          },
+          "observedAt": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Observedat",
+            "type": "integer"
+          },
+          "occurredAt": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Occurredat",
+            "type": "integer"
+          },
+          "organizationId": {
+            "title": "Organizationid",
+            "type": "string"
+          },
+          "resourceUri": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Resourceuri",
+            "type": "string"
+          },
+          "revision": {
+            "const": 1,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "semanticFingerprint": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Semanticfingerprint"
+          },
+          "severity": {
+            "anyOf": [
+              {
+                "enum": [
+                  "info",
+                  "warning",
+                  "critical"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Severity"
+          },
+          "source": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$",
+            "title": "Source",
+            "type": "string"
+          },
+          "sourceEventId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Sourceeventid",
+            "type": "string"
+          },
+          "sourceVersion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              }
+            ],
+            "title": "Sourceversion"
+          },
+          "stateClass": {
+            "anyOf": [
+              {
+                "enum": [
+                  "healthy",
+                  "incident",
+                  "neutral"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stateclass"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Summary"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "visibility": {
+            "const": "owner",
+            "title": "Visibility",
+            "type": "string"
+          },
+          "workspaceId": {
+            "title": "Workspaceid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "sourceEventId",
+          "resourceUri",
+          "sourceVersion",
+          "eventType",
+          "occurredAt",
+          "id",
+          "observedAt",
+          "actorId",
+          "organizationId",
+          "workspaceId",
+          "revision",
+          "visibility"
+        ],
+        "title": "AutomationEvent",
+        "type": "object"
+      },
+      "AutomationEventCreate": {
+        "additionalProperties": false,
+        "description": "Submit one bounded source observation without client-owned identity. | \u63d0\u4ea4\u6709\u754c\u6765\u6e90\u89c2\u5bdf\u3002",
+        "properties": {
+          "correlationId": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Correlationid"
+          },
+          "eventType": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$",
+            "title": "Eventtype",
+            "type": "string"
+          },
+          "experimentId": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Experimentid"
+          },
+          "metadataReferences": {
+            "items": {
+              "$ref": "#/components/schemas/AutomationResourceReference"
+            },
+            "maxItems": 32,
+            "title": "Metadatareferences",
+            "type": "array"
+          },
+          "occurredAt": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Occurredat",
+            "type": "integer"
+          },
+          "resourceUri": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Resourceuri",
+            "type": "string"
+          },
+          "semanticFingerprint": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Semanticfingerprint"
+          },
+          "severity": {
+            "anyOf": [
+              {
+                "enum": [
+                  "info",
+                  "warning",
+                  "critical"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Severity"
+          },
+          "source": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$",
+            "title": "Source",
+            "type": "string"
+          },
+          "sourceEventId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Sourceeventid",
+            "type": "string"
+          },
+          "sourceVersion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              }
+            ],
+            "title": "Sourceversion"
+          },
+          "stateClass": {
+            "anyOf": [
+              {
+                "enum": [
+                  "healthy",
+                  "incident",
+                  "neutral"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stateclass"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Summary"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "required": [
+          "source",
+          "sourceEventId",
+          "resourceUri",
+          "sourceVersion",
+          "eventType",
+          "occurredAt"
+        ],
+        "title": "AutomationEventCreate",
+        "type": "object"
+      },
+      "AutomationEventList": {
+        "additionalProperties": false,
+        "description": "Actor-owned observations with an opaque stable cursor. | \u6309 actor \u5206\u9875\u8bfb\u53d6\u4e8b\u4ef6\u3002",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AutomationEvent"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "nextCursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nextcursor"
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ],
+        "title": "AutomationEventList",
+        "type": "object"
+      },
+      "AutomationEventNoticeIntentCreate": {
+        "additionalProperties": false,
+        "description": "Link one immutable event to its exact running workflow occurrence. | \u4e8b\u4ef6\u901a\u77e5\u610f\u56fe\u3002",
+        "properties": {
+          "occurrenceId": {
+            "pattern": "^occ-[0-9a-f]{40}$",
+            "title": "Occurrenceid",
+            "type": "string"
+          },
+          "scheduledAt": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Scheduledat",
+            "type": "string"
+          },
+          "taskId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Taskid",
+            "type": "string"
+          },
+          "triggerId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Triggerid",
+            "type": "string"
+          },
+          "workflowId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Workflowid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workflowId",
+          "triggerId",
+          "occurrenceId",
+          "scheduledAt",
+          "taskId"
+        ],
+        "title": "AutomationEventNoticeIntentCreate",
+        "type": "object"
+      },
+      "AutomationEventNoticeIntentReceipt": {
+        "additionalProperties": false,
+        "description": "Server-derived event decision and its stable retry result. | \u4e8b\u4ef6\u901a\u77e5\u51b3\u7b56\u56de\u6267\u3002",
+        "properties": {
+          "decision": {
+            "enum": [
+              "initial_baseline",
+              "unchanged",
+              "stale",
+              "change",
+              "failure",
+              "recovery",
+              "blocker",
+              "quiet"
+            ],
+            "title": "Decision",
+            "type": "string"
+          },
+          "duplicate": {
+            "title": "Duplicate",
+            "type": "boolean"
+          },
+          "eventId": {
+            "title": "Eventid",
+            "type": "string"
+          },
+          "notificationId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Notificationid"
+          },
+          "occurrenceId": {
+            "title": "Occurrenceid",
+            "type": "string"
+          },
+          "triggerId": {
+            "title": "Triggerid",
+            "type": "string"
+          },
+          "workflowId": {
+            "title": "Workflowid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "eventId",
+          "workflowId",
+          "triggerId",
+          "occurrenceId",
+          "decision",
+          "duplicate"
+        ],
+        "title": "AutomationEventNoticeIntentReceipt",
+        "type": "object"
+      },
+      "AutomationEventReceipt": {
+        "additionalProperties": false,
+        "description": "POST acknowledgement indicating whether the receipt was replayed. | \u4e8b\u4ef6\u5199\u5165\u56de\u6267\u3002",
+        "properties": {
+          "actorId": {
+            "title": "Actorid",
+            "type": "string"
+          },
+          "correlationId": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Correlationid"
+          },
+          "duplicate": {
+            "title": "Duplicate",
+            "type": "boolean"
+          },
+          "eventType": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$",
+            "title": "Eventtype",
+            "type": "string"
+          },
+          "experimentId": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Experimentid"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "metadataReferences": {
+            "items": {
+              "$ref": "#/components/schemas/AutomationResourceReference"
+            },
+            "maxItems": 32,
+            "title": "Metadatareferences",
+            "type": "array"
+          },
+          "observedAt": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Observedat",
+            "type": "integer"
+          },
+          "occurredAt": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Occurredat",
+            "type": "integer"
+          },
+          "organizationId": {
+            "title": "Organizationid",
+            "type": "string"
+          },
+          "resourceUri": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Resourceuri",
+            "type": "string"
+          },
+          "revision": {
+            "const": 1,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "semanticFingerprint": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Semanticfingerprint"
+          },
+          "severity": {
+            "anyOf": [
+              {
+                "enum": [
+                  "info",
+                  "warning",
+                  "critical"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Severity"
+          },
+          "source": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$",
+            "title": "Source",
+            "type": "string"
+          },
+          "sourceEventId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Sourceeventid",
+            "type": "string"
+          },
+          "sourceVersion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              }
+            ],
+            "title": "Sourceversion"
+          },
+          "stateClass": {
+            "anyOf": [
+              {
+                "enum": [
+                  "healthy",
+                  "incident",
+                  "neutral"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stateclass"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Summary"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "visibility": {
+            "const": "owner",
+            "title": "Visibility",
+            "type": "string"
+          },
+          "workspaceId": {
+            "title": "Workspaceid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "sourceEventId",
+          "resourceUri",
+          "sourceVersion",
+          "eventType",
+          "occurredAt",
+          "id",
+          "observedAt",
+          "actorId",
+          "organizationId",
+          "workspaceId",
+          "revision",
+          "visibility",
+          "duplicate"
+        ],
+        "title": "AutomationEventReceipt",
+        "type": "object"
+      },
+      "AutomationResourceReference": {
+        "additionalProperties": false,
+        "description": "Typed opaque reference to a Product resource. | \u4ea7\u54c1\u8d44\u6e90\u7684\u6709\u7c7b\u578b\u5f15\u7528\u3002",
+        "properties": {
+          "kind": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+            "title": "Kind",
+            "type": "string"
+          },
+          "resourceUri": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Resourceuri",
+            "type": "string"
+          },
+          "resourceVersion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resourceversion"
+          }
+        },
+        "required": [
+          "kind",
+          "resourceUri"
+        ],
+        "title": "AutomationResourceReference",
+        "type": "object"
+      },
       "BackendSessionBind": {
         "additionalProperties": false,
         "description": "Bind one Work Task's session to a native execution session. | \u7ed1\u5b9a\u539f\u751f\u6267\u884c\u4f1a\u8bdd\u3002",
@@ -374,6 +1182,16 @@
             "anyOf": [
               {
                 "$ref": "#/components/schemas/TaskCreate"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "teamsPrivateMessage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TeamsPrivateMessageCreate"
               },
               {
                 "type": "null"
@@ -829,6 +1647,234 @@
           "notificationsQueued"
         ],
         "title": "CredentialHealthSnapshotReceipt",
+        "type": "object"
+      },
+      "ExperimentPut": {
+        "additionalProperties": false,
+        "description": "Replace reference-only experiment lineage at an expected revision. | \u66f4\u65b0\u5b9e\u9a8c\u5f15\u7528\u7d22\u5f15\u3002",
+        "properties": {
+          "checkpointArtifactRef": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AutomationArtifactRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "commit": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AutomationCommitReference"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "datasetVersion": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AutomationResourceReference"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "deployment": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AutomationResourceReference"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "evaluationRun": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AutomationResourceReference"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expectedRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Expectedrevision",
+            "type": "integer"
+          },
+          "modelVersion": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AutomationResourceReference"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "trainingAttempt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AutomationResourceReference"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "trainingRun": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AutomationResourceReference"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "expectedRevision"
+        ],
+        "title": "ExperimentPut",
+        "type": "object"
+      },
+      "ExperimentRecord": {
+        "additionalProperties": false,
+        "description": "Actor-owned index of Product references, never Product lifecycle state. | \u5b9e\u9a8c\u5f15\u7528\u7d22\u5f15\u3002",
+        "properties": {
+          "actorId": {
+            "title": "Actorid",
+            "type": "string"
+          },
+          "checkpointArtifactRef": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AutomationArtifactRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "commit": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AutomationCommitReference"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "datasetVersion": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AutomationResourceReference"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "deployment": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AutomationResourceReference"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "evaluationRun": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AutomationResourceReference"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "experimentId": {
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "title": "Experimentid",
+            "type": "string"
+          },
+          "modelVersion": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AutomationResourceReference"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "organizationId": {
+            "title": "Organizationid",
+            "type": "string"
+          },
+          "revision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "trainingAttempt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AutomationResourceReference"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "trainingRun": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AutomationResourceReference"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "updatedAt": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Updatedat",
+            "type": "integer"
+          },
+          "visibility": {
+            "const": "owner",
+            "title": "Visibility",
+            "type": "string"
+          },
+          "workspaceId": {
+            "title": "Workspaceid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "experimentId",
+          "actorId",
+          "organizationId",
+          "workspaceId",
+          "revision",
+          "updatedAt",
+          "visibility"
+        ],
+        "title": "ExperimentRecord",
         "type": "object"
       },
       "HTTPValidationError": {
@@ -1936,6 +2982,229 @@
         "title": "OperationVerify",
         "type": "object"
       },
+      "PrivateInstallationEvent": {
+        "additionalProperties": false,
+        "description": "Trusted package event relayed after DSH verifies its HMAC envelope. | \u53ef\u4fe1\u5b89\u88c5\u4e8b\u4ef6\u3002",
+        "properties": {
+          "eventType": {
+            "const": "personal_installation",
+            "title": "Eventtype",
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/PrivateInstallationPayload"
+          },
+          "trust": {
+            "$ref": "#/components/schemas/PrivateInstallationTrust"
+          }
+        },
+        "required": [
+          "eventType",
+          "payload",
+          "trust"
+        ],
+        "title": "PrivateInstallationEvent",
+        "type": "object"
+      },
+      "PrivateInstallationPayload": {
+        "additionalProperties": false,
+        "description": "Minimal add/remove intent from the authenticated Teams bridge. | \u5b89\u88c5\u64cd\u4f5c\u610f\u56fe\u3002",
+        "properties": {
+          "action": {
+            "enum": [
+              "add",
+              "remove"
+            ],
+            "title": "Action",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "PrivateInstallationPayload",
+        "type": "object"
+      },
+      "PrivateInstallationReceipt": {
+        "additionalProperties": false,
+        "description": "Route-free acknowledgement of one private installation update. | \u79c1\u6709\u5b89\u88c5\u56de\u6267\u3002",
+        "properties": {
+          "action": {
+            "enum": [
+              "add",
+              "remove"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "active": {
+            "title": "Active",
+            "type": "boolean"
+          },
+          "applied": {
+            "title": "Applied",
+            "type": "boolean"
+          },
+          "duplicate": {
+            "title": "Duplicate",
+            "type": "boolean"
+          },
+          "revision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "updatedAt": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Updatedat",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "action",
+          "active",
+          "applied",
+          "revision",
+          "updatedAt",
+          "duplicate"
+        ],
+        "title": "PrivateInstallationReceipt",
+        "type": "object"
+      },
+      "PrivateInstallationTrust": {
+        "additionalProperties": false,
+        "description": "Host-verified Teams private-install identity, never client/model supplied.\n\n\u4e2d\u6587\uff1a\u53ef\u4fe1\u5b89\u88c5\u8eab\u4efd\u3002",
+        "properties": {
+          "activityId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Activityid",
+            "type": "string"
+          },
+          "activityOccurredAt": {
+            "maxLength": 64,
+            "minLength": 20,
+            "title": "Activityoccurredat",
+            "type": "string"
+          },
+          "actorAadObjectId": {
+            "maxLength": 36,
+            "minLength": 36,
+            "title": "Actoraadobjectid",
+            "type": "string"
+          },
+          "botAppId": {
+            "maxLength": 36,
+            "minLength": 36,
+            "title": "Botappid",
+            "type": "string"
+          },
+          "conversationId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Conversationid",
+            "type": "string"
+          },
+          "conversationKind": {
+            "const": "private",
+            "title": "Conversationkind",
+            "type": "string"
+          },
+          "installationAction": {
+            "enum": [
+              "add",
+              "remove"
+            ],
+            "title": "Installationaction",
+            "type": "string"
+          },
+          "provider": {
+            "const": "teams",
+            "title": "Provider",
+            "type": "string"
+          },
+          "serviceUrl": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Serviceurl",
+            "type": "string"
+          },
+          "tenantId": {
+            "maxLength": 36,
+            "minLength": 36,
+            "title": "Tenantid",
+            "type": "string"
+          },
+          "version": {
+            "const": 1,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "provider",
+          "conversationKind",
+          "installationAction",
+          "tenantId",
+          "actorAadObjectId",
+          "botAppId",
+          "conversationId",
+          "activityId",
+          "activityOccurredAt",
+          "serviceUrl"
+        ],
+        "title": "PrivateInstallationTrust",
+        "type": "object"
+      },
+      "PrivateNotificationClaimResult": {
+        "additionalProperties": false,
+        "description": "Lease response containing private routing only for the Teams bridge. | Teams \u79c1\u804a\u79df\u7ea6\u3002",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/PrivateNotificationLease"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "PrivateNotificationClaimResult",
+        "type": "object"
+      },
+      "PrivateNotificationLease": {
+        "additionalProperties": false,
+        "description": "Private route materialized only for the dedicated trusted delivery lease. | \u79c1\u6709\u79df\u7ea6\u3002",
+        "properties": {
+          "leaseExpiresAt": {
+            "title": "Leaseexpiresat",
+            "type": "integer"
+          },
+          "leaseToken": {
+            "title": "Leasetoken",
+            "type": "string"
+          },
+          "notification": {
+            "$ref": "#/components/schemas/NotificationRecord"
+          },
+          "teamsPersonalRoute": {
+            "$ref": "#/components/schemas/TeamsPersonalRoute"
+          }
+        },
+        "required": [
+          "notification",
+          "leaseToken",
+          "leaseExpiresAt",
+          "teamsPersonalRoute"
+        ],
+        "title": "PrivateNotificationLease",
+        "type": "object"
+      },
       "SourceFactInput": {
         "additionalProperties": false,
         "description": "One fact from a paginated source inventory. | \u5206\u9875\u6765\u6e90\u6e05\u5355\u4e2d\u7684\u4e00\u9879\u4e8b\u5b9e\u3002",
@@ -2582,6 +3851,17 @@
             "title": "Createdat",
             "type": "integer"
           },
+          "createdByActorId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Createdbyactorid"
+          },
           "description": {
             "anyOf": [
               {
@@ -2636,6 +3916,16 @@
             "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TeamsPrivateTaskOrigin"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "output": {
             "title": "Output",
@@ -2712,6 +4002,107 @@
           "metadata"
         ],
         "title": "TaskRecord",
+        "type": "object"
+      },
+      "TeamsPersonalRoute": {
+        "additionalProperties": false,
+        "description": "Private host-only delivery route materialized only on a trusted lease. | \u79c1\u6709\u6295\u9012\u8def\u7531\u3002",
+        "properties": {
+          "actorAadObjectId": {
+            "title": "Actoraadobjectid",
+            "type": "string"
+          },
+          "botAppId": {
+            "title": "Botappid",
+            "type": "string"
+          },
+          "conversationId": {
+            "title": "Conversationid",
+            "type": "string"
+          },
+          "kind": {
+            "const": "teams_personal",
+            "title": "Kind",
+            "type": "string"
+          },
+          "serviceUrl": {
+            "title": "Serviceurl",
+            "type": "string"
+          },
+          "tenantId": {
+            "title": "Tenantid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "tenantId",
+          "botAppId",
+          "actorAadObjectId",
+          "conversationId",
+          "serviceUrl"
+        ],
+        "title": "TeamsPersonalRoute",
+        "type": "object"
+      },
+      "TeamsPrivateMessageCreate": {
+        "additionalProperties": false,
+        "description": "Private ingress identity without recipient or model-controlled route fields.\n\nThe actor, tenant, bot app, and active installation are resolved from the\nauthenticated principal and server-pinned Teams policy. \u4e2d\u6587\uff1a\u79c1\u804a\u5165\u53e3\u53ea\u4f20\u6d88\u606f\u6b63\u6587\u3002\n\u4e2d\u6587\uff1a\u79c1\u804a\u5165\u53e3\u53ea\u4f20\u6d88\u606f\u4e0e\u5b89\u88c5\u5339\u914d\u503c\uff0c\u4e0d\u63a5\u53d7\u6536\u4ef6\u8def\u7531\u8eab\u4efd\u3002",
+        "properties": {
+          "messageId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Messageid",
+            "type": "string"
+          },
+          "text": {
+            "maxLength": 20000,
+            "minLength": 1,
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "messageId",
+          "text"
+        ],
+        "title": "TeamsPrivateMessageCreate",
+        "type": "object"
+      },
+      "TeamsPrivateTaskOrigin": {
+        "additionalProperties": false,
+        "description": "Server-derived proof that a task came from verified private Teams ingress.",
+        "properties": {
+          "actorAadObjectId": {
+            "title": "Actoraadobjectid",
+            "type": "string"
+          },
+          "botAppId": {
+            "title": "Botappid",
+            "type": "string"
+          },
+          "kind": {
+            "const": "teams_private",
+            "title": "Kind",
+            "type": "string"
+          },
+          "messageId": {
+            "title": "Messageid",
+            "type": "string"
+          },
+          "tenantId": {
+            "title": "Tenantid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "messageId",
+          "tenantId",
+          "botAppId",
+          "actorAadObjectId"
+        ],
+        "title": "TeamsPrivateTaskOrigin",
         "type": "object"
       },
       "TeamsThreadMessage": {
@@ -3363,7 +4754,8 @@
               "discriminator": {
                 "mapping": {
                   "1": "#/components/schemas/WorkflowRecord",
-                  "2": "#/components/schemas/WorkflowV2Record"
+                  "2": "#/components/schemas/WorkflowV2Record",
+                  "3": "#/components/schemas/WorkflowV3Record"
                 },
                 "propertyName": "version"
               },
@@ -3373,6 +4765,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/WorkflowV2Record"
+                },
+                {
+                  "$ref": "#/components/schemas/WorkflowV3Record"
                 }
               ]
             },
@@ -3419,7 +4814,7 @@
       },
       "WorkflowNoticeCreate": {
         "additionalProperties": false,
-        "description": "Project a terminal v2 receipt to its owner Teams thread. | \u6295\u5f71\u5de5\u4f5c\u6d41\u7ec8\u6001\u901a\u77e5\u3002",
+        "description": "Submit either a v2 notice or route-free V3 digest identity. | \u5de5\u4f5c\u6d41\u901a\u77e5\u8bf7\u6c42\u3002",
         "properties": {
           "attentionKind": {
             "anyOf": [
@@ -3438,15 +4833,22 @@
             "title": "Attentionkind"
           },
           "kind": {
-            "enum": [
-              "change",
-              "failure",
-              "recovery",
-              "digest",
-              "blocker"
+            "anyOf": [
+              {
+                "enum": [
+                  "change",
+                  "failure",
+                  "recovery",
+                  "digest",
+                  "blocker"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
             ],
-            "title": "Kind",
-            "type": "string"
+            "title": "Kind"
           },
           "occurrenceId": {
             "maxLength": 128,
@@ -3461,10 +4863,30 @@
             "type": "string"
           },
           "summary": {
-            "maxLength": 400,
-            "minLength": 1,
-            "title": "Summary",
-            "type": "string"
+            "anyOf": [
+              {
+                "maxLength": 400,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Summary"
+          },
+          "taskId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Taskid"
           },
           "triggerId": {
             "maxLength": 128,
@@ -3476,9 +4898,7 @@
         "required": [
           "occurrenceId",
           "triggerId",
-          "scheduledAt",
-          "kind",
-          "summary"
+          "scheduledAt"
         ],
         "title": "WorkflowNoticeCreate",
         "type": "object"
@@ -3578,6 +4998,56 @@
           }
         },
         "title": "WorkflowNotificationsV2",
+        "type": "object"
+      },
+      "WorkflowNotificationsV3": {
+        "additionalProperties": false,
+        "description": "Quiet-by-default V3 notices with a server-resolved destination. | v3 \u901a\u77e5\u7b56\u7565\u3002",
+        "properties": {
+          "destination": {
+            "$ref": "#/components/schemas/WorkflowV3Destination"
+          },
+          "digest": {
+            "$ref": "#/components/schemas/WorkflowV3DigestPolicy"
+          },
+          "immediateOn": {
+            "items": {
+              "enum": [
+                "blocked_goal",
+                "user_decision",
+                "service_or_auth_outage"
+              ],
+              "type": "string"
+            },
+            "title": "Immediateon",
+            "type": "array"
+          },
+          "onChange": {
+            "default": true,
+            "title": "Onchange",
+            "type": "boolean"
+          },
+          "onFailure": {
+            "default": true,
+            "title": "Onfailure",
+            "type": "boolean"
+          },
+          "onRecovery": {
+            "default": true,
+            "title": "Onrecovery",
+            "type": "boolean"
+          },
+          "quietHours": {
+            "$ref": "#/components/schemas/WorkflowQuietHours"
+          },
+          "quietWhenUnchanged": {
+            "const": true,
+            "default": true,
+            "title": "Quietwhenunchanged",
+            "type": "boolean"
+          }
+        },
+        "title": "WorkflowNotificationsV3",
         "type": "object"
       },
       "WorkflowQuietHours": {
@@ -3857,12 +5327,27 @@
           "checkpoint": {
             "anyOf": [
               {
-                "$ref": "#/components/schemas/WorkflowCheckpoint"
+                "discriminator": {
+                  "mapping": {
+                    "github_issues_search": "#/components/schemas/WorkflowCheckpoint",
+                    "source_poll": "#/components/schemas/WorkflowSourcePollCheckpoint"
+                  },
+                  "propertyName": "kind"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/WorkflowCheckpoint"
+                  },
+                  {
+                    "$ref": "#/components/schemas/WorkflowSourcePollCheckpoint"
+                  }
+                ]
               },
               {
                 "type": "null"
               }
-            ]
+            ],
+            "title": "Checkpoint"
           },
           "createdAt": {
             "maxLength": 128,
@@ -4037,6 +5522,182 @@
           "nextCursor"
         ],
         "title": "WorkflowScheduleEventList",
+        "type": "object"
+      },
+      "WorkflowSourcePollCheckpoint": {
+        "additionalProperties": false,
+        "description": "Typed DSH source-poll checkpoint for restart and partial-page recovery. | \u8f6e\u8be2\u68c0\u67e5\u70b9\u3002",
+        "properties": {
+          "complete": {
+            "title": "Complete",
+            "type": "boolean"
+          },
+          "kind": {
+            "const": "source_poll",
+            "title": "Kind",
+            "type": "string"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowSourcePollCursor"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "title": "Sources",
+            "type": "array"
+          },
+          "windowEnd": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Windowend",
+            "type": "string"
+          },
+          "windowStart": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Windowstart"
+          }
+        },
+        "required": [
+          "kind",
+          "windowEnd",
+          "complete",
+          "sources"
+        ],
+        "title": "WorkflowSourcePollCheckpoint",
+        "type": "object"
+      },
+      "WorkflowSourcePollCursor": {
+        "additionalProperties": false,
+        "description": "One target's resumable page cursor and last complete source watermark. | \u6765\u6e90\u5206\u9875\u72b6\u6001\u3002",
+        "properties": {
+          "complete": {
+            "title": "Complete",
+            "type": "boolean"
+          },
+          "pageCursor": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pagecursor"
+          },
+          "pagesCollected": {
+            "maximum": 20.0,
+            "minimum": 0.0,
+            "title": "Pagescollected",
+            "type": "integer"
+          },
+          "resumeCursor": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resumecursor"
+          },
+          "seenEventIds": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 1000,
+            "title": "Seeneventids",
+            "type": "array"
+          },
+          "source": {
+            "enum": [
+              "github",
+              "azure_devops",
+              "office_graph",
+              "vm_health",
+              "training",
+              "product"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "states": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowSourceStateFingerprint"
+            },
+            "maxItems": 1000,
+            "title": "States",
+            "type": "array"
+          },
+          "targetId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Targetid",
+            "type": "string"
+          },
+          "watermark": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Watermark"
+          }
+        },
+        "required": [
+          "source",
+          "targetId",
+          "complete",
+          "pagesCollected"
+        ],
+        "title": "WorkflowSourcePollCursor",
+        "type": "object"
+      },
+      "WorkflowSourceStateFingerprint": {
+        "additionalProperties": false,
+        "description": "Compact semantic state used to detect changes and recovery. | \u8bed\u4e49\u72b6\u6001\u6307\u7eb9\u3002",
+        "properties": {
+          "fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Fingerprint",
+            "type": "string"
+          },
+          "resourceKey": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Resourcekey",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "healthy",
+              "incident",
+              "neutral"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "resourceKey",
+          "fingerprint",
+          "state"
+        ],
+        "title": "WorkflowSourceStateFingerprint",
         "type": "object"
       },
       "WorkflowTarget": {
@@ -4245,6 +5906,291 @@
           "schedule"
         ],
         "title": "WorkflowV2Trigger",
+        "type": "object"
+      },
+      "WorkflowV3Destination": {
+        "additionalProperties": false,
+        "description": "No model-selected route; Work resolves the configured owner destination. | \u5bbf\u4e3b\u89e3\u6790\u8def\u7531\u3002",
+        "properties": {
+          "kind": {
+            "enum": [
+              "responsibility_thread",
+              "owner_private"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "WorkflowV3Destination",
+        "type": "object"
+      },
+      "WorkflowV3DigestPolicy": {
+        "additionalProperties": false,
+        "description": "At most one weekday digest using the approved owner timezone. | \u5de5\u4f5c\u65e5\u6458\u8981\u7b56\u7565\u3002",
+        "properties": {
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "maxPerDay": {
+            "const": 1,
+            "default": 1,
+            "title": "Maxperday",
+            "type": "integer"
+          },
+          "schedule": {
+            "$ref": "#/components/schemas/WorkflowSchedule"
+          }
+        },
+        "title": "WorkflowV3DigestPolicy",
+        "type": "object"
+      },
+      "WorkflowV3OwnerPrivateAuthorization": {
+        "additionalProperties": false,
+        "description": "Resolve a private Teams route from the original verified owner task. | \u79c1\u804a\u6388\u6743\u5f15\u7528\u3002",
+        "properties": {
+          "kind": {
+            "const": "owner_private",
+            "title": "Kind",
+            "type": "string"
+          },
+          "ownerTaskId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Ownertaskid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "ownerTaskId"
+        ],
+        "title": "WorkflowV3OwnerPrivateAuthorization",
+        "type": "object"
+      },
+      "WorkflowV3Record": {
+        "additionalProperties": false,
+        "description": "Actor-owned source-poll definition using DSH Schedule only. | actor \u79c1\u6709\u8f6e\u8be2\u5b9a\u4e49\u3002",
+        "properties": {
+          "authorization": {
+            "discriminator": {
+              "mapping": {
+                "owner_private": "#/components/schemas/WorkflowV3OwnerPrivateAuthorization",
+                "teams_thread": "#/components/schemas/WorkflowAuthorizationReference"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowAuthorizationReference"
+              },
+              {
+                "$ref": "#/components/schemas/WorkflowV3OwnerPrivateAuthorization"
+              }
+            ],
+            "title": "Authorization"
+          },
+          "description": {
+            "maxLength": 20000,
+            "title": "Description",
+            "type": "string"
+          },
+          "enabled": {
+            "default": false,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "notifications": {
+            "$ref": "#/components/schemas/WorkflowNotificationsV3"
+          },
+          "targets": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowV3Target"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "title": "Targets",
+            "type": "array"
+          },
+          "title": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Title",
+            "type": "string"
+          },
+          "triggers": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowV3Trigger"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "title": "Triggers",
+            "type": "array"
+          },
+          "updatedAt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updatedat"
+          },
+          "version": {
+            "const": 3,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "version",
+          "title",
+          "description",
+          "targets",
+          "triggers",
+          "authorization"
+        ],
+        "title": "WorkflowV3Record",
+        "type": "object"
+      },
+      "WorkflowV3Target": {
+        "additionalProperties": false,
+        "description": "Host-bound target selector with no arbitrary network destination. | \u5bbf\u4e3b\u7ed1\u5b9a\u76ee\u6807\u3002",
+        "properties": {
+          "bindingId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Bindingid",
+            "type": "string"
+          },
+          "id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "github_repository",
+              "pipeline_runs",
+              "release_deployments",
+              "planner_plan",
+              "host_health",
+              "training_run",
+              "product_resource"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "label": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          },
+          "uri": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Uri"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "kind",
+          "bindingId"
+        ],
+        "title": "WorkflowV3Target",
+        "type": "object"
+      },
+      "WorkflowV3Trigger": {
+        "additionalProperties": false,
+        "description": "Typed source polling trigger with bounded page work. | \u6709\u754c\u6765\u6e90\u8f6e\u8be2\u89e6\u53d1\u5668\u3002",
+        "properties": {
+          "id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "initialBaseline": {
+            "const": "record_without_notification",
+            "default": "record_without_notification",
+            "title": "Initialbaseline",
+            "type": "string"
+          },
+          "kind": {
+            "const": "source_poll",
+            "title": "Kind",
+            "type": "string"
+          },
+          "maxPages": {
+            "default": 20,
+            "maximum": 20.0,
+            "minimum": 1.0,
+            "title": "Maxpages",
+            "type": "integer"
+          },
+          "pageSize": {
+            "default": 50,
+            "maximum": 50.0,
+            "minimum": 1.0,
+            "title": "Pagesize",
+            "type": "integer"
+          },
+          "schedule": {
+            "$ref": "#/components/schemas/WorkflowSchedule"
+          },
+          "source": {
+            "enum": [
+              "github",
+              "azure_devops",
+              "office_graph",
+              "vm_health",
+              "training",
+              "product"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "targetIds": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "title": "Targetids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "source",
+          "targetIds",
+          "schedule"
+        ],
+        "title": "WorkflowV3Trigger",
         "type": "object"
       }
     },
@@ -4531,6 +6477,182 @@
           }
         },
         "summary": "Download Attachment"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/automation-events": {
+      "get": {
+        "description": "List only observations owned by the authenticated actor. | \u53ea\u8bfb\u53d6\u672c\u4eba\u4e8b\u4ef6\u3002",
+        "operationId": "list_automation_events_api_v1_workspaces__workspace_id__work_automation_events_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 2000,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutomationEventList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Automation Events"
+      },
+      "post": {
+        "description": "Append one immutable source observation for the authenticated owner actor.\n\n\u4e2d\u6587\uff1aactor\u3001\u7ec4\u7ec7\u3001\u5de5\u4f5c\u533a\u548c\u53ef\u89c1\u6027\u5747\u7531\u5df2\u8ba4\u8bc1 owner \u8eab\u4efd\u6d3e\u751f\u3002",
+        "operationId": "append_automation_event_api_v1_workspaces__workspace_id__work_automation_events_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AutomationEventCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutomationEventReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Append Automation Event"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/automation-events/{event_id}/notices": {
+      "post": {
+        "description": "Persist one actor-owned event decision and any eligible outbox item atomically.",
+        "operationId": "decide_automation_event_notice_api_v1_workspaces__workspace_id__work_automation_events__event_id__notices_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "event_id",
+            "required": true,
+            "schema": {
+              "title": "Event Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AutomationEventNoticeIntentCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutomationEventNoticeIntentReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Decide Automation Event Notice"
       }
     },
     "/api/v1/workspaces/{workspace_id}/work/connectors": {
@@ -5046,6 +7168,112 @@
           }
         },
         "summary": "Process Credential Health Snapshots"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/experiments/{experiment_id}": {
+      "get": {
+        "description": "Read one owner-scoped reference-only experiment index. | \u8bfb\u53d6\u672c\u4eba\u5b9e\u9a8c\u5f15\u7528\u7d22\u5f15\u3002",
+        "operationId": "get_experiment_api_v1_workspaces__workspace_id__work_experiments__experiment_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "experiment_id",
+            "required": true,
+            "schema": {
+              "title": "Experiment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExperimentRecord"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Experiment"
+      },
+      "put": {
+        "description": "Replace Product reference links using an expected-revision check. | \u66f4\u65b0\u5f15\u7528\u7d22\u5f15\u3002",
+        "operationId": "put_experiment_api_v1_workspaces__workspace_id__work_experiments__experiment_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "experiment_id",
+            "required": true,
+            "schema": {
+              "title": "Experiment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExperimentPut"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExperimentRecord"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Experiment"
       }
     },
     "/api/v1/workspaces/{workspace_id}/work/inputs": {
@@ -5895,6 +8123,106 @@
         "summary": "Update Operation"
       }
     },
+    "/api/v1/workspaces/{workspace_id}/work/private-installations/events": {
+      "post": {
+        "description": "Record or revoke a Teams route from the separately authenticated bridge.\n\n\u4e2d\u6587\uff1a\u4ec5\u63a5\u53d7 DSH \u6821\u9a8c HMAC/SDK \u540e\uff0c\u7531\u4e13\u7528 bridge Bearer \u8f6c\u53d1\u7684\u8def\u7531\u4e8b\u5b9e\u3002",
+        "operationId": "register_private_installation_event_api_v1_workspaces__workspace_id__work_private_installations_events_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PrivateInstallationEvent"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrivateInstallationReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Register Private Installation Event"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/private-notifications/claim": {
+      "post": {
+        "description": "Lease private Teams messages only to the configured installation bridge.",
+        "operationId": "claim_private_notifications_api_v1_workspaces__workspace_id__work_private_notifications_claim_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NotificationClaim"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrivateNotificationClaimResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Claim Private Notifications"
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/work/schedule-events": {
       "get": {
         "operationId": "list_schedule_events_api_v1_workspaces__workspace_id__work_schedule_events_get",
@@ -6357,6 +8685,75 @@
           }
         },
         "summary": "Create Task"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/tasks/owned": {
+      "get": {
+        "description": "List recovery tasks only for the server-derived Work actor. | \u6309 actor \u6062\u590d\u4efb\u52a1\u3002",
+        "operationId": "list_owned_tasks_api_v1_workspaces__workspace_id__work_tasks_owned_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 2000,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Owned Tasks"
       }
     },
     "/api/v1/workspaces/{workspace_id}/work/tasks/{task_id}": {
@@ -7171,7 +9568,7 @@
             "required": false,
             "schema": {
               "default": 1,
-              "maximum": 2,
+              "maximum": 3,
               "minimum": 1,
               "title": "Definitionversion",
               "type": "integer"
@@ -7231,7 +9628,7 @@
             "required": false,
             "schema": {
               "default": 1,
-              "maximum": 2,
+              "maximum": 3,
               "minimum": 1,
               "title": "Definitionversion",
               "type": "integer"
@@ -7245,7 +9642,8 @@
                 "discriminator": {
                   "mapping": {
                     "1": "#/components/schemas/WorkflowRecord",
-                    "2": "#/components/schemas/WorkflowV2Record"
+                    "2": "#/components/schemas/WorkflowV2Record",
+                    "3": "#/components/schemas/WorkflowV3Record"
                   },
                   "propertyName": "version"
                 },
@@ -7255,6 +9653,9 @@
                   },
                   {
                     "$ref": "#/components/schemas/WorkflowV2Record"
+                  },
+                  {
+                    "$ref": "#/components/schemas/WorkflowV3Record"
                   }
                 ],
                 "title": "Body"
@@ -7271,7 +9672,8 @@
                   "discriminator": {
                     "mapping": {
                       "1": "#/components/schemas/WorkflowRecord",
-                      "2": "#/components/schemas/WorkflowV2Record"
+                      "2": "#/components/schemas/WorkflowV2Record",
+                      "3": "#/components/schemas/WorkflowV3Record"
                     },
                     "propertyName": "version"
                   },
@@ -7281,6 +9683,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/WorkflowV2Record"
+                    },
+                    {
+                      "$ref": "#/components/schemas/WorkflowV3Record"
                     }
                   ],
                   "title": "Response Put Workflow Api V1 Workspaces  Workspace Id  Work Workflows  Workflow Id  Put"

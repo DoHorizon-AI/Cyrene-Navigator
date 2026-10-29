@@ -26,6 +26,15 @@ requires its explicit `can_publish_credential_health` service grant. QQ login
 routes also require the configured owner authority.
 An object from a different organization or Workspace is returned as not found.
 
+Host-managed per-actor principals may set `actor_private_scope:true`. This
+capability requires exactly one organization-scoped Workspace. New tasks,
+memory facts, and attachments written by that principal receive immutable
+server-side actor ownership; reads are filtered by the authenticated principal,
+and unknown legacy owners are hidden. Existing shared tasks, curated memory
+facts, and attachments remain visible to ordinary principals with the default
+`actor_private_scope:false`. Verified Teams connector events and task records
+are actor-filtered for every Work principal, including workspace owners.
+
 所有路由都需要已配置的 bearer 凭据。现有 persistence authenticator 必须授权路径中的
 `{workspaceId}`。读取受 Workspace 限制；普通写入沿用当前 persistence writer 权限
 （`can_takeover`），凭据健康快照路由单独要求 `can_publish_credential_health` service grant。QQ 登录路由还需要已配置的 owner 权限。其他组织或 Workspace
@@ -56,12 +65,15 @@ Base path: `/api/v1/workspaces/{workspaceId}/work`.
 | `GET /tasks/{taskId}/events?after=0&limit=1000` | Read events after the exclusive sequence cursor. |
 | `POST /tasks/{taskId}/events` | Append an event, optionally deduplicated by `messageId`. |
 
-The executor record preserves these camelCase fields:
+The executor record preserves these camelCase fields, including the
+server-derived `createdByActorId` used by host actor clients to recover their
+own tasks after restart:
 
 ```json
 {
   "id": "task-123",
   "workspaceId": "workspace-1",
+  "createdByActorId": "<authenticated-principal-actor>",
   "sessionId": "session-123",
   "prompt": "Summarize the report",
   "status": "queued",
@@ -286,8 +298,8 @@ this deterministic job.
 | `GET /connectors` | Read persisted connector state. Configured bindings are seeded with `configured:true,status:"unknown"`; live health must be probed separately. |
 | `POST /connectors/{connectorId}/status` | Update typed local connection status. |
 | `POST /connectors/{connectorId}/events` | Idempotently record an inbound event and, optionally, a nested `task` in the same transaction. |
-| `GET /connectors/{connectorId}/events?after=0` | Read connector event history. |
-| `GET /connectors/{connectorId}/threads/{threadId}?exclude_message_id=...` | Read the exact Teams route (including its private validated Bot Framework `serviceUrl`) and latest context, excluding the original current activity ID; an unmapped thread returns `sessionId:null`. |
+| `GET /connectors/{connectorId}/events?after=0` | Read connector event history; Teams-origin events are filtered by verified actor. |
+| `GET /connectors/{connectorId}/threads/{threadId}?exclude_message_id=...` | Read the caller's actor-specific Teams route/session and only that actor's messages, excluding the original current activity ID; an unmapped actor/thread pair returns `sessionId:null`. |
 | `GET /connectors/{bindingId}/health` | Probe the launcher-configured QQ bridge; no bridge returns `503 QQ_HOST_NOT_CONFIGURED`. |
 | `POST /connectors/{bindingId}/login/qr` | Request a QR from that trusted bridge; request body is empty. |
 | `POST /connectors/{bindingId}/login/poll` | Poll `{ "loginId":"..." }`; account and host are taken from trusted launcher configuration. |
@@ -297,21 +309,127 @@ this deterministic job.
 | `GET /workflows` / `PUT /workflows/{workflowId}` | Read or replace versioned workflow memory, including optional UTC/IANA cron metadata. |
 | `POST /schedule-events` / `GET /schedule-events` | Append/read safe workflow execution history. DSH owns all timer scheduling. |
 
-Connector intake uses `{ "messageId":"msg-1", "type":"message.received", "accountId":"acct-1", "conversationId":"room-1", "senderId":"user-1", "payload":{}, "teamsThreadMessage":{"threadId":"<sha256>","messageId":"original-activity-id","serviceUrl":"https://smba.trafficmanager.net/emea/","tenantId":"...","teamId":"...","channelId":"...","conversationId":"...","rootThreadId":"...","actorIssuer":"...","actorSubject":"...","text":"...","sessionId":"session-1"}, "task":{"id":"stable-task-id","sessionId":"session-1","prompt":"...","metadata":{}} }`.
+Channel connector intake uses `{ "messageId":"msg-1", "type":"message.received", "accountId":"acct-1", "conversationId":"room-1", "senderId":"user-1", "payload":{}, "teamsThreadMessage":{"threadId":"<sha256>","messageId":"original-activity-id","serviceUrl":"https://smba.trafficmanager.net/emea/","tenantId":"...","teamId":"...","channelId":"...","conversationId":"...","rootThreadId":"...","actorIssuer":"...","actorSubject":"...","text":"...","sessionId":"session-1"}, "task":{"id":"stable-task-id","sessionId":"session-1","prompt":"...","metadata":{}} }`. Actor-private personal ingress uses the same event route with only `teamsPrivateMessage:{"messageId":"...","text":"..."}` plus an optional task. Work derives actor, tenant, and bot app from the actor-scoped bearer and fixed Teams policy, and requires a current owner-directory entry and active private installation. The private message body does not carry a recipient or route; Work stores an opaque origin key and excludes conversation ID and service URL from Task metadata. When a private Task is admitted, Work atomically queues a fixed generic owner-private acknowledgement; it contains no source text or client-selected recipient.
 The response is `{ "eventId":"<uuid>", "duplicate":false, "receivedAt":1791050400000, "task":<TaskRecord> }`.
-The `(organization, workspace, connector, messageId)` key deduplicates retries;
-the event and nested task admission are atomic. A duplicate with changed content
-returns `409`.
+Verified Teams event retries use `(organization, workspace, connector, actor,
+messageId)`; unscoped connector events retain one Workspace-wide key. The event
+and nested task admission are atomic. An exact same-actor retry returns its
+original receipt; changed content returns `409`. Two actors may receive the same
+vendor activity ID without sharing a receipt or Task.
 
 Teams activity text and stable route identifiers are committed with the event. A verified participant message can be stored without a task; a later authorized request may establish the DSH Session mapping in the same transaction as its task. The mapping key is a host-derived SHA-256 over tenant, team, channel, and root-thread IDs. Context lookup is Workspace-scoped, returns no display names, and accepts an `exclude_message_id` query so retries reproduce the original task prompt.
 
-Teams terminal replies use the existing notification outbox with `type="teams.message"`, a configured connector binding, and route payload `{ "tenantId":"...", "teamId":"...", "channelId":"...", "conversationId":"...", "rootThreadId":"...", "serviceUrl":"https://smba.trafficmanager.net/emea/" }`. Navigator validates and keeps the service URL private; it never enters the task prompt. The same Navigator runtime dispatches the fixed `teams.credential-health` type through its separately configured owner identity and dedicated single-thread Exchange profile; neither its route nor its health status is model-selectable. It claims and starts the durable lease, obtains an exact Exchange connector grant, invokes Exchange, and records `delivered`, `failed`, or `uncertain`. Only a known HTTP 429 rate-limit outcome is retried; an uncertain Bot Framework send is never automatically replayed.
+Teams intake uses a dedicated per-actor Work writer: the verified
+`teamsThreadMessage.actorSubject` must equal the authenticated principal actor.
+Work replaces `teamsCaller`, `teamsThread`, and notification route metadata from
+the accepted envelope and records immutable origin provenance separately from
+mutable task metadata. Task list/get/event and native session routes hide another
+actor's Teams-origin records, including from `can_takeover` principals.
+
+Legacy shared Tasks retain their Teams channel reply route. Tasks created with an immutable actor-private owner marker and verified Teams origin always enqueue terminal output through the owner-private outbox, ignoring mutable channel notification metadata. Ordinary channel claims cannot lease those rows. A missing private policy or active installation leaves the result queued with a durable `deliveryHoldCode`; the Task remains completed and Work never falls back to the source channel. `POST /notifications` cannot create a shared Teams message from an actor-private principal. Private claims resolve the actor's current installation immediately before delivery, so revocation stops a queued send. The same Navigator runtime dispatches the fixed `teams.credential-health` type through its separately configured owner identity and dedicated single-thread Exchange profile; neither its route nor its health status is model-selectable. It claims and starts the durable lease, obtains an exact Exchange connector grant, invokes Exchange, and records `delivered`, `failed`, or `uncertain`. Only a known HTTP 429 rate-limit outcome is retried; an uncertain Bot Framework send is never automatically replayed.
 
 QQ bridge health/login calls use only the launcher-installed bridge keyed by
 organization, Workspace, and binding. Browser inputs cannot select a host or account. QR payloads
 are returned directly and are not stored in public memory.
 
-连接器接纳请求可包含一个嵌套任务；事件与任务在同一事务写入。Teams 可额外提交经验证的参与者消息；普通参与者消息只保存为后续上下文，不建立任务。精确查询会排除当前活动，确保重试生成相同任务。
-键 `(organization, workspace, connector, messageId)` 用于重试去重；相同 id 内容改变会返回 `409`。Teams 任务的 prompt 与会话由首次持久接纳确定，重试返回原任务，不重新构造。
-Teams 完成结果进入持久 outbox，由 Navigator 用任务中保存的调用者身份向 Exchange 申请短期精确 grant 后发送；系统凭据通知使用独立固定 owner identity 与单线程 Exchange profile，模型不能选择状态或目标。发送结果未知时进入 `uncertain` 并禁止自动重放。QQ 健康状态与登录只调用启动器按 Workspace 和 binding 安装的桥接器，浏览器不能
+连接器接纳请求可包含一个嵌套任务；事件与任务在同一事务写入。Teams channel 上的参与者消息继续作为线程上下文。actor-private 私聊只提交 `teamsPrivateMessage:{messageId,text}`；Work 从 actor token、当前 Directory 投影和 active installation 派生身份，不保存 conversation ID 或 service URL 到 Task metadata。Task 接纳后会原子加入固定的 owner-private 通用确认消息，不包含私聊正文或客户端收件人。
+已验证的 Teams 事件按 `(organization, workspace, connector, actor, messageId)` 去重；无 actor 的通用连接事件仍使用 Workspace 范围键。相同 actor 的精确重试返回原回执；不同 actor 即使 vendor activity ID 相同也会分开保存。内容改变返回 `409`。
+带不可变 actor-private owner 和 Teams origin 的任务结果只进入 owner-private outbox；channel notification metadata 不能改变目标。缺少 policy 或 active installation 时，投递保持 queued 并留下 `deliveryHoldCode`，不回退到来源 channel，也不撤销已完成的 Task。actor-private principal 的通用通知 API 不能创建 Teams channel 消息。旧的共享 Task 仍按原配置回复 channel。系统凭据通知使用独立固定 owner identity 与单线程 Exchange profile，模型不能选择状态或目标。发送结果未知时进入 `uncertain` 并禁止自动重放。QQ 健康状态与登录只调用启动器按 Workspace 和 binding 安装的桥接器，浏览器不能
 指定 host 或 account。QR 内容直接返回且不写入公共记忆。
+
+## Automation events, experiments, and source-poll V3 / 自动化事件、实验索引与 V3
+
+`POST /automation-events` accepts a strict bounded event projection; actor,
+organization, Workspace, visibility, event ID, observation time, and revision
+are server-owned. `source`, `sourceEventId`, `resourceUri`, `sourceVersion`,
+`eventType`, and integer `occurredAt` are required. Optional fields are bounded
+title/summary/severity/correlation/experiment identifiers, semantic state, and
+typed metadata references. Payloads contain references only; Work does not
+resolve them or claim Product lifecycle authority. An identical
+`(organization, workspace, actor, source, sourceEventId)` retry returns the
+stored event with `duplicate:true`; changed content for that actor returns
+`409`. Different actors may store the same provider `sourceEventId` in their
+separate private streams. `GET
+/automation-events?limit=50&cursor=...` lists only the authenticated actor's
+events.
+
+`POST /automation-events/{eventId}/notices` accepts only
+`{workflowId,triggerId,occurrenceId,scheduledAt,taskId}`. Work verifies the
+actor-owned event, V3 workflow, running ScheduleEvent, and immutable Task page
+or source-error receipt before recording one durable event intent. It derives
+the decision and text from stored event/state data. Failure, recovery, and
+blocker notifications use the active private Teams installation; baselines and
+unchanged events stay silent. Replaying an already-consumed event in a later
+occurrence returns the original decision without creating another outbox item.
+
+`GET /experiments/{experimentId}` and
+`PUT /experiments/{experimentId}` expose an actor-owned Product lineage index,
+not a lifecycle API. The body contains only typed references to dataset
+versions, training runs/attempts, checkpoint artifacts, evaluation runs, model
+versions, deployments, and Git commits, plus `expectedRevision`. Revision zero
+creates; a changed write must match the current revision; stale writes return
+`409`. Work never activates, deploys, promotes, or otherwise changes Product
+lifecycle state.
+
+`definitionVersion=3` negotiates typed, bounded `source_poll` workflows while
+V1/V2 behavior remains unchanged. Sources are `github`, `azure_devops`,
+`office_graph`, `vm_health`, `training`, and `product`; GitHub, Azure DevOps,
+and Office Graph poll at five-minute UTC intervals, while VM health, training,
+and Product poll at one-minute UTC intervals. The VM-health source uses the
+host-bound `host_health` target kind. Targets are host-bound, page and
+cursor-state sets have explicit limits. Incomplete pages retain `pageCursor`
+and cannot advance watermarks or produce successful poll receipts; completed
+windows clear `pageCursor` and may retain an opaque `resumeCursor` for the next
+provider window. V3 source data requires
+`authorization.kind="owner_private"` and
+`notifications.destination.kind="owner_private"` because no per-source share
+grant is configured.
+
+The DSH scheduler owns polling and the weekday digest timer. The digest notice
+route `POST /workflows/{workflowId}/notices` accepts only
+`{occurrenceId,triggerId:"daily-digest",scheduledAt,taskId}`. Work verifies the
+actor-salted occurrence and terminal Task/ScheduleEvent, then derives digest
+text from complete changed V3 schedule receipts since the previous digest;
+client-supplied summary text is not authoritative.
+
+### Teams personal route binding / Teams 私聊路由绑定
+
+Private installation events are accepted only on
+`POST /private-installations/events` from a separate principal configured with
+`can_bind_teams_private_conversations:true`. This principal cannot carry the
+other persistence grants. Its token is referenced by
+`CYRENE_PRIVATE_TEAMS_BRIDGE_TOKEN`. Work re-reads the host-configured owner
+projection (`TEAMS_TASK_ACTOR_SUBJECTS_FILE`) on each bind, revoke, and route
+resolution and pins Workspace, issuer, tenant, and bot application ID. Missing
+or changed owner membership fails closed. The conversation ID and service URL
+stay in private Work state; workflow JSON and event metadata cannot set a
+private recipient. A dedicated private-notification claim returns the active
+owner route only to that bridge. Each event must include the verified
+Bot Framework `Activity.timestamp` as `trust.activityOccurredAt` in UTC; Work
+stores its normalized millisecond value and rejects missing, malformed, or more
+than five minutes future timestamps. Older add/remove events are recorded as
+no-ops, and remove wins equal-timestamp ties. A verified remove is scoped by
+actor, tenant, and bot app rather than conversation or service URL, so route
+changes cannot prevent revocation. Existing installations without trusted event
+time are disabled during migration; a timestamped remove followed by a newer
+timestamped add establishes a fresh ordered binding. This registration route
+does not enable personal message ingestion.
+
+`actor_private_scope:true` is configured on per-actor host principals and
+requires `can_takeover:true`, one organization, and one Workspace to use the
+actor-owned automation and experiment routes. If the same principal writes
+actor-private Harness sessions, it also requires the separate
+`can_write_harness:true` grant. The private Teams bridge uses its own stable
+non-human actor identity and separate token; it never receives `can_takeover`,
+`can_write_harness`, or `actor_private_scope`.
+
+私聊 installation 事件只接受 `/private-installations/events` 上由独立 principal 提交的事实。
+该身份单独配置 `can_bind_teams_private_conversations:true`，不能同时拥有其他持久化 grant；其令牌来自
+`CYRENE_PRIVATE_TEAMS_BRIDGE_TOKEN`。Work 每次绑定、撤销和路由解析都会重新读取
+`TEAMS_TASK_ACTOR_SUBJECTS_FILE`，并固定 Workspace、issuer、tenant 和 bot app。缺少 owner 投影或成员变更时失败关闭。
+conversation ID 与 service URL 只保存在私有 Work 状态；工作流和事件 metadata 不能指定私聊收件人。
+专用 private-notification claim 只向该 bridge 返回 active owner 路由。每个事件都必须携带经验证的 Bot Framework
+`Activity.timestamp`，对应 `trust.activityOccurredAt` UTC 字段；Work 以毫秒保存，缺失、无效或超前超过五分钟的时间戳都会被拒绝。
+较早的 add/remove 会被记录为 no-op；时间相同时 remove 优先。remove 按 actor、tenant 和 bot app 撤销，不依赖 conversation 或 service URL
+与旧值相同，因此路由变化不会阻止撤销。迁移时会停用缺少可信事件时间的旧安装；收到带时间戳的 remove 后，再收到更新的 add，才能建立新的有序绑定。
+此注册路由本身不启用私聊消息接收。

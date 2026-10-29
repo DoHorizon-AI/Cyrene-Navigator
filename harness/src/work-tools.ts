@@ -16,6 +16,7 @@ export interface WorkToolsConfig {
   readonly workspaceId: string;
   readonly tokenEnv?: string;
   readonly taskIdForSession: (sessionId: string) => string | undefined;
+  readonly tokenEnvForSession?: (sessionId: string) => string | undefined;
   readonly onTaskDenied?: (sessionId: string) => void;
 }
 
@@ -35,8 +36,14 @@ export class WorkAssistantBridge {
   }
 
   /** Bound requests cannot choose another host or workspace. | 请求只能到固定宿主与空间。 */
-  async request(path: string, method: string, body: unknown, signal: AbortSignal): Promise<Record<string, JsonValue>> {
-    const token = process.env[this.config.tokenEnv ?? 'CYRENE_SESSION_TOKEN'];
+  async request(
+    path: string,
+    method: string,
+    body: unknown,
+    signal: AbortSignal,
+    tokenEnvOverride?: string,
+  ): Promise<Record<string, JsonValue>> {
+    const token = process.env[tokenEnvOverride ?? this.config.tokenEnv ?? 'CYRENE_SESSION_TOKEN'];
     if (!token) throw new Error('Work service credential is unavailable');
     const response = await fetch(`${this.root}${path}`, {
       method,
@@ -49,17 +56,30 @@ export class WorkAssistantBridge {
     return asRecord(await response.json());
   }
 
+  /** Route a model-visible Work request through its already trusted active task actor. */
+  async requestForSession(
+    sessionId: string,
+    path: string,
+    method: string,
+    body: unknown,
+    signal: AbortSignal,
+  ): Promise<Record<string, JsonValue>> {
+    const tokenEnv = this.config.tokenEnvForSession?.(sessionId);
+    return this.request(path, method, body, signal, tokenEnv);
+  }
+
   /** Correlate model mutations to their live, human-authorized task. | 关联仍获授权的活动任务。 */
   async mutate(exec: ToolRunContext, path: string, method: string, body: Record<string, unknown>, taskLinked = false): Promise<Record<string, JsonValue>> {
     const id = sessionId(exec);
     const taskId = this.config.taskIdForSession(id);
     if (!taskId) throw new Error('Work mutation requires an active durable Navigator task');
-    const task = await this.request(`/tasks/${encodeURIComponent(taskId)}`, 'GET', undefined, exec.signal);
+    const tokenEnv = this.config.tokenEnvForSession?.(id);
+    const task = await this.request(`/tasks/${encodeURIComponent(taskId)}`, 'GET', undefined, exec.signal, tokenEnv);
     if (task.status !== 'running') {
       this.config.onTaskDenied?.(id);
       throw new Error('This task is paused or closed; further mutations are denied');
     }
-    return this.request(path, method, taskLinked ? { ...body, taskId } : body, exec.signal);
+    return this.request(path, method, taskLinked ? { ...body, taskId } : body, exec.signal, tokenEnv);
   }
 
   /** Read a minimal operation receipt owned by the active durable task. | 读取当前任务的最小回执。 */
@@ -79,7 +99,8 @@ export class WorkAssistantBridge {
   ): Promise<{ taskId: string; operation: Record<string, JsonValue> }> {
     const taskId = this.config.taskIdForSession(sessionId);
     if (!taskId) throw new Error('Operation receipt reads require an active durable Navigator task');
-    const response = await this.request(`/operations/${encodeURIComponent(operationId)}`, 'GET', undefined, signal);
+    const tokenEnv = this.config.tokenEnvForSession?.(sessionId);
+    const response = await this.request(`/operations/${encodeURIComponent(operationId)}`, 'GET', undefined, signal, tokenEnv);
     const operation = asRecord(response.operation ?? response);
     if (operation.id !== operationId || operation.taskId !== taskId) {
       throw new Error('Operation receipt does not belong to the active durable task');
@@ -177,15 +198,16 @@ export class WorkAssistantBridge {
   ): Promise<Record<string, JsonValue>> {
     const taskId = this.config.taskIdForSession(sessionId);
     if (!taskId) throw new Error('Approval requires an active durable Navigator task');
+    const tokenEnv = this.config.tokenEnvForSession?.(sessionId);
     const receipt = await this.request(`/tasks/${encodeURIComponent(taskId)}/approvals`, 'POST', {
       kind, summary, details, ...(messageId === undefined ? {} : { messageId }),
-    }, signal);
+    }, signal, tokenEnv);
     let approval = asRecord(receipt.approval ?? receipt);
     if (typeof approval.id !== 'string') throw new Error('Invalid approval receipt');
     const id = approval.id;
     while (approval.status === 'pending') {
       await delay(500, undefined, { signal });
-      const result = await this.request(`/approvals/${encodeURIComponent(id)}`, 'GET', undefined, signal);
+      const result = await this.request(`/approvals/${encodeURIComponent(id)}`, 'GET', undefined, signal, tokenEnv);
       approval = asRecord(result.approval ?? result);
     }
     if (approval.status !== 'approved') {
@@ -202,15 +224,16 @@ export class WorkAssistantBridge {
   ): Promise<Record<string, JsonValue>> {
     const taskId = this.config.taskIdForSession(sessionId);
     if (!taskId) throw new Error('Input requires an active durable Navigator task');
+    const tokenEnv = this.config.tokenEnvForSession?.(sessionId);
     const receipt = await this.request(`/tasks/${encodeURIComponent(taskId)}/inputs`, 'POST', {
       summary, details, ...(messageId === undefined ? {} : { messageId }),
-    }, signal);
+    }, signal, tokenEnv);
     let input = asRecord(receipt.input ?? receipt);
     if (typeof input.id !== 'string') throw new Error('Invalid input receipt');
     const id = input.id;
     while (input.status === 'pending') {
       await delay(500, undefined, { signal });
-      const result = await this.request(`/inputs/${encodeURIComponent(id)}`, 'GET', undefined, signal);
+      const result = await this.request(`/inputs/${encodeURIComponent(id)}`, 'GET', undefined, signal, tokenEnv);
       input = asRecord(result.input ?? result);
     }
     if (input.status !== 'answered') throw new Error('The human input was closed without an answer');
@@ -243,7 +266,7 @@ export function registerWorkTools(ctx: Context, config: WorkToolsConfig): WorkAs
       query: { type: 'string', required: true },
       includeStale: { type: 'boolean' },
     }, output,
-    execute: (args, exec) => bridge.request('/memory/query', 'POST', {
+    execute: (args, exec) => bridge.requestForSession(sessionId(exec), '/memory/query', 'POST', {
       query: args.query, includeStale: args.includeStale ?? false,
     }, exec.signal),
   }));
@@ -261,7 +284,7 @@ export function registerWorkTools(ctx: Context, config: WorkToolsConfig): WorkAs
     name: 'work_sources',
     description: 'List source inventory health. A failed or incomplete inventory does not prove an item was removed.',
     parameters: {}, output,
-    execute: (_args, exec) => bridge.request('/sources', 'GET', undefined, exec.signal),
+    execute: (_args, exec) => bridge.requestForSession(sessionId(exec), '/sources', 'GET', undefined, exec.signal),
   }));
   ctx.tools.register(defineTool({
     name: 'work_request_approval',

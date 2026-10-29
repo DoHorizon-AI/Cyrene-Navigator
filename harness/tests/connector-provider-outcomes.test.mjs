@@ -192,7 +192,10 @@ function createHarness(providerResponses = [
       }
       if (path === `/tool-providers/${encodeURIComponent(configuredBindingId)}/tools` && method === 'GET') return catalog;
       if (path === `/tasks/${taskId}` && method === 'GET') {
-        return { metadata: { teamsCaller: { issuer, subject: ownerId, tenantId } } };
+        return {
+          createdByActorId: ownerId,
+          metadata: { teamsCaller: { issuer, subject: ownerId, tenantId } },
+        };
       }
       if (path.startsWith('/operations/unresolved') && method === 'GET') {
         const target = new URLSearchParams(path.split('?')[1] ?? '').get('target');
@@ -827,6 +830,7 @@ test('unknown GitHub CLI write can be reconciled only from a same-task read rece
     if (path === `${workRoot}/tasks/${githubTask}` && request.method === 'GET') {
       return send({
         id: githubTask,
+        createdByActorId: ownerId,
         status: 'running',
         metadata: { teamsCaller: { issuer, subject: ownerId, tenantId } },
       });

@@ -13,6 +13,7 @@ import type { CredentialHealthSnapshot } from './work-state-client.js';
 const GRANT_TTL_MAX_SECONDS = 15;
 const REQUEST_TIMEOUT_MS = 10_000;
 const MAX_RESPONSE_BYTES = 2_000_000;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
 export interface ConnectorGrantRequest {
   readonly requestId: string;
@@ -52,6 +53,29 @@ export interface TeamsMessageSend {
   readonly requestId: string;
   readonly conversation: TeamsMessageRoute;
   readonly text: string;
+}
+
+/** Work-resolved Teams owner-private route; every field is server supplied. */
+export interface TeamsPrivateConversationRoute {
+  readonly tenantId: string;
+  readonly botAppId: string;
+  readonly actorAadObjectId: string;
+  readonly conversationId: string;
+  readonly serviceUrl: string;
+}
+
+export interface TeamsPrivateMessageSend {
+  readonly requestId: string;
+  readonly targetKind: 'owner_private';
+  readonly conversation: TeamsPrivateConversationRoute;
+  readonly text: string;
+}
+
+export interface TeamsMessageDeliveryOutcome {
+  readonly outcome: 'accepted' | 'rejected' | 'rate_limited' | 'uncertain';
+  readonly vendorMessageId?: string;
+  readonly reasonCode?: string;
+  readonly retryAfterSeconds?: number;
 }
 
 export interface ProviderOperationCall {
@@ -221,6 +245,94 @@ export class ExchangeConnectorAuthorizationClient {
       if (outcome !== 'rate_limited' || retryAfterSeconds === undefined) {
         throw new ExchangeConnectorRequestError(
           'Exchange returned a 429 without a confirmed Teams rate-limit outcome',
+          429,
+          false,
+        );
+      }
+      return {
+        outcome,
+        ...(typeof row.reasonCode === 'string' ? { reasonCode: row.reasonCode } : {}),
+        retryAfterSeconds,
+      };
+    }
+    if (outcome === 'rate_limited') {
+      throw new TypeError('Exchange returned rate_limited without an HTTP 429 response');
+    }
+    if (outcome === 'uncertain') {
+      return {
+        outcome,
+        ...(typeof row.reasonCode === 'string' ? { reasonCode: row.reasonCode } : {}),
+      };
+    }
+    return {
+      outcome,
+      ...(typeof row.vendorMessageId === 'string' ? { vendorMessageId: row.vendorMessageId } : {}),
+      ...(typeof row.reasonCode === 'string' ? { reasonCode: row.reasonCode } : {}),
+      ...(boundedRetryAfter(row.retryAfterSeconds) === undefined
+        ? {} : { retryAfterSeconds: boundedRetryAfter(row.retryAfterSeconds) }),
+    };
+  }
+
+  /** Deliver one Work-resolved owner-private Teams message through the same fixed bot binding. */
+  async sendPrivateTeamsMessage(
+    input: TeamsPrivateMessageSend,
+    grant: ConnectorGrant,
+    connectionRef: string,
+    profileRef: string,
+    signal: AbortSignal,
+  ): Promise<TeamsMessageDeliveryOutcome> {
+    const conversation = validateTeamsPrivateConversation(input.conversation);
+    const requestId = safeText(input.requestId, 'private Teams request id', 200);
+    if (input.targetKind !== 'owner_private') throw new TypeError('Invalid private Teams target kind');
+    const text = safeText(input.text, 'private Teams message text', 24_000);
+    if (grant.request.principalSubject.toLowerCase() !== conversation.actorAadObjectId
+      || grant.request.principalIssuer !== `https://login.microsoftonline.com/${conversation.tenantId}/v2.0`) {
+      throw new TypeError('Private Teams grant actor does not match the Work-resolved route');
+    }
+    const argumentsValue: Readonly<Record<string, JsonValue>> = {
+      targetKind: 'owner_private',
+      conversation: {
+        tenantId: conversation.tenantId,
+        botAppId: conversation.botAppId,
+        actorAadObjectId: conversation.actorAadObjectId,
+        conversationId: conversation.conversationId,
+        serviceUrl: conversation.serviceUrl,
+      },
+      text,
+    };
+    const resourceRef = teamsPrivateResourceRef(conversation);
+    assertGrantBinding(grant, {
+      requestId,
+      connectionRef,
+      profileRef,
+      providerId: 'msteams',
+      operationId: 'msteams.message.reply',
+      resourceRef,
+      arguments: argumentsValue,
+    });
+    assertGrantFresh(grant);
+    const body = JSON.stringify({
+      requestId,
+      providerId: 'msteams',
+      targetKind: 'owner_private',
+      conversation,
+      text,
+    });
+    const response = await this.postGrantedResponse('/internal/v1/teams/messages', body, grant, signal, true);
+    const row = object(await readJson(response), 'Exchange private Teams message result');
+    if (row.requestId !== requestId) {
+      throw new TypeError('Exchange returned a private Teams result for a different notification');
+    }
+    const outcome = row.status;
+    if (outcome !== 'accepted' && outcome !== 'rejected'
+      && outcome !== 'rate_limited' && outcome !== 'uncertain') {
+      throw new TypeError('Exchange returned an unknown private Teams message result');
+    }
+    if (response.status === 429) {
+      const retryAfterSeconds = boundedRetryAfter(response.headers.get('retry-after'));
+      if (outcome !== 'rate_limited' || retryAfterSeconds === undefined) {
+        throw new ExchangeConnectorRequestError(
+          'Exchange returned a 429 without a confirmed private Teams rate-limit outcome',
           429,
           false,
         );
@@ -448,6 +560,30 @@ export function sha256(value: string): string {
 
 export function teamsThreadResourceRef(route: TeamsMessageRoute): string {
   return `sha256:${sha256(canonicalJson(route))}`;
+}
+
+/** Work's owner-private bot route uses the existing reply operation with a disjoint resource identity. */
+export function teamsPrivateResourceRef(route: TeamsPrivateConversationRoute): string {
+  return `msteams-personal:${sha256(canonicalJson(validateTeamsPrivateConversation(route)))}`;
+}
+
+function validateTeamsPrivateConversation(value: unknown): TeamsPrivateConversationRoute {
+  const row = object(value, 'private Teams conversation');
+  if (!exactObjectKeys(row, ['tenantId', 'botAppId', 'actorAadObjectId', 'conversationId', 'serviceUrl'])) {
+    throw new TypeError('Private Teams conversation contains unsupported or missing fields');
+  }
+  const tenantId = safeUuid(row.tenantId, 'private Teams tenant id');
+  const botAppId = safeUuid(row.botAppId, 'private Teams bot app id');
+  const actorAadObjectId = safeUuid(row.actorAadObjectId, 'private Teams actor id');
+  const conversationId = safeText(row.conversationId, 'private Teams conversation id', 512);
+  const serviceUrl = validateTeamsServiceUrl(row.serviceUrl, tenantId);
+  return { tenantId, botAppId, actorAadObjectId, conversationId, serviceUrl };
+}
+
+function safeUuid(value: unknown, label: string): string {
+  const normalized = safeText(value, label, 36).toLowerCase();
+  if (!UUID_PATTERN.test(normalized)) throw new TypeError(`Invalid ${label}`);
+  return normalized;
 }
 
 /** Validate the host-only Bot Framework endpoint copied from the signed activity envelope. */

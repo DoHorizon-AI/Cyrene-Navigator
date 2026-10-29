@@ -14,7 +14,9 @@ import type {
   WorkflowOperation,
   WorkflowScheduleEvent,
   WorkflowTarget,
+  WorkflowObservationSource,
   WorkflowV2Record,
+  WorkflowV3Record,
 } from './workflows/store.ts';
 
 export type ConnectorResourceProjection =
@@ -35,7 +37,10 @@ export type ConnectorResourceProjection =
   | 'computer_directory'
   | 'huggingface_repository'
   | 'cloud_target'
-  | 'cloud_operation';
+  | 'cloud_operation'
+  | 'azure_devops_source'
+  | 'microsoft_graph_plan'
+  | 'microsoft_graph_task';
 
 /** Stable Teams principal resolved from authenticated task state and current Directory policy. */
 export interface ResponsibilityPrincipal {
@@ -84,7 +89,12 @@ export type BackgroundTaskAuthorizationResolver = (
 /** Narrow canonical v2 definition access needed for independent task verification. */
 export interface ResponsibilityWorkflowStore {
   listWorkflows(definitionVersion: 2): Promise<readonly WorkflowV2Record[]>;
+  listWorkflows(definitionVersion: 3): Promise<readonly WorkflowV3Record[]>;
   getScheduleEvent(eventId: string): Promise<WorkflowScheduleEvent | undefined>;
+  listScheduleEvents(options: { readonly workflowId: string; readonly limit?: number; readonly cursor?: string }): Promise<{
+    readonly items: readonly WorkflowScheduleEvent[];
+    readonly nextCursor: string | null;
+  }>;
 }
 
 /** Directory and Teams route policies supplied by the host configuration. */
@@ -92,10 +102,13 @@ export interface ResponsibilityAuthorityConfig {
   readonly workspaceId: string;
   readonly teamsConnectorId: string;
   readonly allowedTenantId: string;
+  readonly allowedBotAppId?: string;
   readonly allowedTeamIds: readonly string[];
   readonly allowedChannelIds?: readonly string[];
   readonly workState: Pick<WorkStateStore, 'getTask' | 'getConnectorThread'>;
+  readonly workStateForActor?: (actorId: string) => Pick<WorkStateStore, 'getTask' | 'getConnectorThread'> | undefined;
   readonly workflows: ResponsibilityWorkflowStore;
+  readonly workflowsForActor?: (actorId: string) => ResponsibilityWorkflowStore | undefined;
   readonly isDirectoryAuthorized: (
     principal: ResponsibilityPrincipal,
     signal: AbortSignal,
@@ -153,8 +166,16 @@ export function createResponsibilityAuthorizationResolver(
   const tenantId = normalizeUuid(config.allowedTenantId, 'allowed Teams tenant');
 
   return async request => {
-    if (request.binding.providerId !== 'github' || request.taskId !== request.task.id) return undefined;
+    if (request.taskId !== request.task.id) return undefined;
     if (request.signal.aborted) throw abortError(request.signal);
+
+    const actorId = safeText(request.task.createdByActorId, 36)?.toLowerCase();
+    const v3Metadata = parseWorkflowV3TaskMetadata(request.task.metadata);
+    if (v3Metadata !== undefined) {
+      if (actorId === undefined || !isUuid(actorId)) return undefined;
+      return authorizeWorkflowV3SourceCall(config, request, v3Metadata, actorId, tenantId);
+    }
+    if (request.binding.providerId !== 'github') return undefined;
 
     const task = await config.workState.getTask(request.taskId);
     if (!task || !sameTaskAuthority(task as WorkflowTaskRecord, request.task)) return undefined;
@@ -250,6 +271,116 @@ export function createResponsibilityAuthorizationResolver(
     if (!isActionTargetWithinPolicy(actionGrant, request.tool.resourceProjection, request.arguments)) return undefined;
     return principal;
   };
+}
+
+interface WorkflowV3TaskMetadata {
+  readonly workflowId: string;
+  readonly triggerId: string;
+  readonly occurrenceId: string;
+  readonly scheduledAt: string;
+  readonly ownerTaskId: string;
+}
+
+async function authorizeWorkflowV3SourceCall(
+  config: ResponsibilityAuthorityConfig,
+  request: BackgroundConnectorCall,
+  metadata: WorkflowV3TaskMetadata,
+  actorId: string,
+  expectedTenantId: string,
+): Promise<ResponsibilityPrincipal | undefined> {
+  const workState = config.workStateForActor === undefined
+    ? config.workState
+    : config.workStateForActor(actorId);
+  const workflows = config.workflowsForActor === undefined
+    ? config.workflows
+    : config.workflowsForActor(actorId);
+  if (workState === undefined || workflows === undefined) return undefined;
+  const task = await workState.getTask(request.taskId);
+  if (!task || !sameTaskAuthority(task as WorkflowTaskRecord, request.task)
+    || task.createdByActorId?.toLowerCase() !== actorId
+    || task.workspaceId !== config.workspaceId || task.executionClass !== 'background'
+    || task.status !== 'running') return undefined;
+  const taskMetadata = parseWorkflowV3TaskMetadata(task.metadata);
+  if (!taskMetadata || canonicalJson(taskMetadata) !== canonicalJson(metadata)
+    || task.id !== `workflow-${metadata.occurrenceId.slice(4)}`) return undefined;
+  if (request.tool.mutating) return undefined;
+
+  const workflow = (await workflows.listWorkflows(3)).find(item => item.id === metadata.workflowId);
+  if (!workflow || !workflow.enabled || workflow.id !== metadata.workflowId
+    || workflow.authorization.kind !== 'owner_private'
+    || workflow.authorization.ownerTaskId !== metadata.ownerTaskId
+    || workflow.notifications.destination.kind !== 'owner_private') return undefined;
+  const trigger = workflow.triggers.find(item => item.id === metadata.triggerId && item.kind === 'source_poll');
+  if (!trigger) return undefined;
+  const actorSalt = sha256(actorId).slice(0, 16);
+  const expectedOccurrenceId = `occ-${sha256(`${workflow.id}\0${trigger.id}\0${metadata.scheduledAt}\0${actorSalt}`).slice(0, 40)}`;
+  if (metadata.occurrenceId !== expectedOccurrenceId) return undefined;
+
+  const receiptPage = await workflows.listScheduleEvents({ workflowId: workflow.id, limit: 100 });
+  const occurrence = receiptPage.items.find(item => item.workflowId === workflow.id
+    && item.triggerId === trigger.id && item.scheduledAt === metadata.scheduledAt
+    && item.taskId === task.id && item.status === 'running');
+  if (occurrence === undefined) return undefined;
+
+  const bindingTool = request.binding.tools.find(item => item.toolId === request.tool.toolId);
+  if (!bindingTool || bindingTool.operationId !== request.tool.operationId
+    || bindingTool.resourceProjection !== request.tool.resourceProjection || bindingTool.mutating !== false
+    || request.tool.operationId !== request.binding.tools.find(item => item.toolId === request.tool.toolId)?.operationId) {
+    return undefined;
+  }
+  const supportedKind = trigger.source === 'github' && request.binding.providerId === 'github'
+    && request.tool.toolId === 'github.issues.search' && request.tool.operationId === 'github.issues.search'
+    && request.tool.resourceProjection === 'github_repository'
+    ? 'github_repository'
+    : trigger.source === 'azure_devops' && request.binding.providerId === 'azure_devops'
+      && request.tool.toolId === 'azure_devops.observations.poll'
+      && request.tool.operationId === 'azure_devops.observations.poll'
+      && request.tool.resourceProjection === 'azure_devops_source'
+      ? 'azure_devops'
+      : trigger.source === 'office_graph' && request.binding.providerId === 'microsoft_graph'
+        && request.tool.toolId === 'microsoft_graph.planner.tasks.list'
+        && request.tool.operationId === 'microsoft_graph.planner.tasks.list'
+        && request.tool.resourceProjection === 'microsoft_graph_plan'
+        ? 'office_graph'
+        : undefined;
+  if (supportedKind === undefined) return undefined;
+
+  let target: WorkflowTarget | undefined;
+  let ownerTask: TaskRecord | undefined;
+  if (workflow.targets.length > 100) return undefined;
+  const triggerTargetIds = new Set(trigger.targetIds);
+  if (supportedKind === 'github_repository') {
+    const repositoryId = request.arguments.repository_id;
+    const repositoryLabel = request.arguments.repository;
+    target = workflow.targets.find(item => triggerTargetIds.has(item.id)
+      && item.kind === 'github_repository' && item.bindingId === request.binding.bindingId
+      && (item.id === String(repositoryId)) && item.label === repositoryLabel);
+  } else if (supportedKind === 'azure_devops') {
+    const value = asRecord(request.arguments.target);
+    const targetId = safeText(value?.id, 512);
+    const kind = safeText(value?.kind, 128);
+    const bindingId = safeText(value?.bindingId, 512);
+    if (request.arguments.pageSize !== trigger.pageSize || !targetId || !kind || bindingId !== request.binding.bindingId) return undefined;
+    target = workflow.targets.find(item => triggerTargetIds.has(item.id) && item.id === targetId
+      && item.bindingId === request.binding.bindingId && item.kind === kind
+      && (kind === 'pipeline_runs' || kind === 'release_deployments'));
+  } else {
+    const planId = safeText(request.arguments.plan_id, 128);
+    if (request.arguments.page_size !== trigger.pageSize || !planId) return undefined;
+    target = workflow.targets.find(item => triggerTargetIds.has(item.id) && item.kind === 'planner_plan'
+      && item.bindingId === request.binding.bindingId);
+  }
+  if (target === undefined) return undefined;
+
+  ownerTask = await workState.getTask(workflow.authorization.ownerTaskId);
+  if (!ownerTask || ownerTask.workspaceId !== config.workspaceId
+    || ownerTask.createdByActorId?.toLowerCase() !== actorId
+    || config.allowedBotAppId === undefined) return undefined;
+  const principal = verifiedTeamsPrincipalForTask(
+    ownerTask, actorId, expectedTenantId, config.allowedBotAppId,
+  );
+  if (!principal || !await config.isDirectoryAuthorized(principal, request.signal)) return undefined;
+  return principal;
 }
 
 /** Canonical schedule identity used to validate a route-free notification request. */
@@ -430,6 +561,23 @@ function parseWorkflowTaskMetadata(value: Readonly<Record<string, unknown>> | un
   };
 }
 
+function parseWorkflowV3TaskMetadata(value: Readonly<Record<string, unknown>> | undefined): WorkflowV3TaskMetadata | undefined {
+  if (!value || value.source !== 'workflow') return undefined;
+  const allowed = ['source', 'workflowId', 'triggerId', 'occurrenceId', 'scheduledAt', 'authorizationRef'];
+  if (Object.keys(value).some(key => !allowed.includes(key))) return undefined;
+  const workflowId = safeText(value.workflowId, 120);
+  const triggerId = safeText(value.triggerId, 120);
+  const occurrenceId = safeText(value.occurrenceId, 64);
+  const scheduledAt = safeText(value.scheduledAt, 64);
+  const authorization = asRecord(value.authorizationRef);
+  if (!workflowId || !triggerId || !occurrenceId || !scheduledAt || !authorization
+    || Object.keys(authorization).some(key => !['kind', 'ownerTaskId'].includes(key))
+    || authorization.kind !== 'owner_private') return undefined;
+  const ownerTaskId = safeText(authorization.ownerTaskId, 200);
+  if (!ownerTaskId || !/^occ-[a-f0-9]{40}$/u.test(occurrenceId) || !Number.isFinite(Date.parse(scheduledAt))) return undefined;
+  return { workflowId, triggerId, occurrenceId, scheduledAt, ownerTaskId };
+}
+
 async function readWorkflow(
   store: ResponsibilityWorkflowStore,
   workflowId: string,
@@ -552,6 +700,36 @@ function parseTeamsPrincipal(value: unknown): ResponsibilityPrincipal | undefine
     || issuer !== `https://login.microsoftonline.com/${tenantId}/v2.0`
     || row.actorAadObjectId !== undefined && String(row.actorAadObjectId).toLowerCase() !== subject) return undefined;
   return { issuer, subject, tenantId };
+}
+
+/** Resolve an authenticated Teams actor from Work creator identity and immutable private origin. */
+export function verifiedTeamsPrincipalForTask(
+  task: TaskRecord,
+  actorId: string,
+  expectedTenantId: string,
+  expectedBotAppId: string,
+): ResponsibilityPrincipal | undefined {
+  const subject = actorId.toLowerCase();
+  const tenantId = expectedTenantId.toLowerCase();
+  const botAppId = expectedBotAppId.toLowerCase();
+  if (!isUuid(subject) || !isUuid(tenantId) || !isUuid(botAppId)
+    || task.createdByActorId?.toLowerCase() !== subject) return undefined;
+  if (task.origin !== undefined) {
+    if (task.origin.kind !== 'teams_private'
+      || task.origin.actorAadObjectId.toLowerCase() !== subject
+      || task.origin.tenantId.toLowerCase() !== tenantId
+      || task.origin.botAppId.toLowerCase() !== botAppId) return undefined;
+    return {
+      issuer: `https://login.microsoftonline.com/${tenantId}/v2.0`,
+      subject,
+      tenantId,
+    };
+  }
+  const metadataPrincipal = parseTeamsPrincipal(task.metadata?.teamsCaller);
+  if (!metadataPrincipal || metadataPrincipal.subject !== subject || metadataPrincipal.tenantId !== tenantId) {
+    return undefined;
+  }
+  return metadataPrincipal;
 }
 
 function isAllowedThread(

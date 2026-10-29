@@ -26,17 +26,31 @@ import type {
   WorkflowCheckpoint,
   WorkflowDefinition,
   WorkflowEvidence,
+  WorkflowAutomationEventWrite,
+  WorkflowAutomationEventNoticeRequest,
+  WorkflowObservationSource,
   WorkflowRecord,
   WorkflowRepositoryCursor,
   WorkflowSchedule,
   WorkflowScheduleEvent,
   WorkflowV2Record,
+  WorkflowV3Record,
+  WorkflowV3Trigger,
+  WorkflowSourceCheckpoint,
+  WorkflowSourceCursor,
+  WorkflowSourceState,
+  WorkflowSourcePageReceipt,
+  WorkflowSourceTaskReceipt,
+  WorkflowSourceObservation,
   WorkflowOutboxType,
   WorkflowOperationState,
   WorkflowStore,
   WorkflowTeamsNoticeRequest,
   WorkflowWrite,
+  WorkflowSourceErrorReceipt,
 } from './store.js';
+import { validateWorkflowAutomationEvent } from './store.js';
+import type { WorkStateStore } from '../work-state-client.js';
 import { loadDefaultWorkflowTemplates } from './store.js';
 import { installWorkflowReadonlyGuard, resolveWorkflowReadonlyPolicy } from './readonly.js';
 
@@ -56,6 +70,65 @@ export interface WorkflowDispatchOutcome {
   readonly status: string;
   readonly output: string;
   readonly error?: string;
+}
+
+/** Bounded input for one source-specific page read within a frozen poll window. */
+export interface WorkflowObservationPageRequest {
+  readonly source: WorkflowObservationSource;
+  readonly ownerActorId: string;
+  readonly target: { readonly id: string; readonly kind: string; readonly bindingId: string; readonly label?: string };
+  readonly pageSize: number;
+  readonly pageCursor: string | null;
+  readonly windowStart: string | null;
+  readonly windowEnd: string;
+  readonly signal: AbortSignal;
+}
+
+/** Fixed registered connector invocation available only inside the active host-owned Work Task. */
+export interface WorkflowObservationExecutionContext {
+  readonly invokeConnectorTool: (request: {
+    readonly bindingId: string;
+    readonly providerId: string;
+    readonly toolId: string;
+    readonly operationId: string;
+    readonly resourceProjection: string;
+    readonly arguments: Readonly<Record<string, unknown>>;
+    readonly signal: AbortSignal;
+  }) => Promise<unknown>;
+}
+
+/** Classified provider failure; no vendor response body crosses into Work or notifications. */
+export interface WorkflowObservationPageError {
+  readonly code: 'not_configured' | 'forbidden' | 'unavailable' | 'timeout' | 'invalid' | 'partial';
+}
+
+/** One bounded normalized page from a fixed connector or host-native observation adapter. */
+export interface WorkflowObservationPage {
+  readonly source: WorkflowObservationSource;
+  readonly observedAt: number;
+  readonly pageCursor: string | null;
+  readonly nextCursor: string | null;
+  readonly complete: boolean;
+  readonly truncated: boolean;
+  readonly observations: readonly WorkflowSourceObservation[];
+  readonly error?: WorkflowObservationPageError;
+}
+
+/** Source driver port; implementations must use fixed host configuration and fail closed. */
+export interface WorkflowObservationSourceDriver {
+  readonly source: WorkflowObservationSource;
+  pollPage(
+    request: WorkflowObservationPageRequest,
+    context: WorkflowObservationExecutionContext,
+  ): Promise<WorkflowObservationPage>;
+}
+
+/** Durable host task fields for deterministic source calls. */
+export interface WorkflowFixedToolTaskRequest {
+  readonly taskId: string;
+  readonly sessionId: string;
+  readonly prompt: string;
+  readonly metadata: Readonly<Record<string, unknown>>;
 }
 
 /** Transition the UI or host should surface; unchanged successes produce no event. */
@@ -79,6 +152,33 @@ export interface WorkflowNotification {
 export interface WorkflowRuntimeOptions {
   readonly store: WorkflowStore;
   readonly executeTask: (request: WorkflowDispatchRequest) => Promise<WorkflowDispatchOutcome>;
+  /** Run fixed native connector calls in a durable Work Task without invoking an LLM. */
+  readonly executeFixedToolTask?: (
+    request: WorkflowFixedToolTaskRequest,
+    execute: (agent: Agent, signal: AbortSignal) => Promise<string>,
+    actorAadObjectId?: string,
+    actorWorkState?: WorkStateStore,
+  ) => Promise<WorkflowDispatchOutcome>;
+  /** Host-owned source adapters for fixed Product/health observations not registered as tool providers. */
+  readonly sourceDrivers?: readonly WorkflowObservationSourceDriver[];
+  /** Execute one fixed registered provider tool inside the already active durable Work Task. */
+  readonly invokeObservationConnectorTool?: (
+    agent: Agent,
+    request: Parameters<WorkflowObservationExecutionContext['invokeConnectorTool']>[0],
+  ) => Promise<unknown>;
+  /** Actor-owned Work and Workflow clients used for V3 dispatch isolation. */
+  readonly actorStores?: readonly {
+    readonly actorAadObjectId: string;
+    readonly store: WorkflowStore;
+    readonly workState?: WorkStateStore;
+    readonly sourceDrivers?: readonly WorkflowObservationSourceDriver[];
+  }[];
+  /** Recheck live Directory membership before a source poll. */
+  readonly authorizeWorkflowActor?: (actorAadObjectId: string, ownerTaskId: string) => Promise<boolean>;
+  /** Recover the owner actor only from Work's server-derived Task creator projection. */
+  readonly resolveWorkflowActor?: (ownerTaskId: string) => Promise<string | undefined>;
+  /** Append immutable page evidence to the active deterministic Work Task. */
+  readonly recordSourcePageReceipt?: (taskId: string, receipt: WorkflowSourceTaskReceipt, actorAadObjectId?: string) => Promise<void>;
   /** Read durable tool/operation receipts from the existing Work task authority. */
   readonly readTaskEvents?: (taskId: string, after?: number) => Promise<{
     readonly events: readonly { readonly seq: number; readonly event: Readonly<Record<string, unknown>> }[];
@@ -115,6 +215,7 @@ interface ScheduleSessionController {
 interface WorkflowTimerMarker {
   readonly workflowId: string;
   readonly triggerId: string;
+  readonly actorRef: string;
 }
 
 interface TimerOccurrence {
@@ -173,6 +274,8 @@ interface GitHubPollAssessment {
 const WORKFLOW_MARKER = '[CYRENE_WORKFLOW_TIMER_V1]';
 const DEFAULT_SCHEDULER_SESSION_ID = 'navigator-workflow-scheduler-v1';
 const DAILY_DIGEST_TRIGGER_ID = 'daily-digest';
+/** Work requires an explicit cursor for an incomplete chain; this means retry its first page. */
+const SOURCE_RETRY_FROM_START_CURSOR = 'navigator-source-start-v1';
 const ACTIVE_RUNTIMES = new WeakMap<Context, Promise<WorkflowRuntimeHandle>>();
 
 declare module '@deepseek-ai/cordis' {
@@ -237,7 +340,7 @@ async function createWorkflowRuntime(ctx: Context, options: WorkflowRuntimeOptio
   let reconciliationTimer: ReturnType<typeof setInterval> | undefined;
   const sync = async (): Promise<void> => {
     if (reconciliation !== undefined) return reconciliation;
-    const pending = reconcileSchedules(ctx, options.store, schedulerSessionId)
+    const pending = reconcileSchedules(ctx, options, schedulerSessionId)
       .then(() => reconcileWorkflowNotifications(ctx, options));
     reconciliation = pending;
     try {
@@ -348,27 +451,40 @@ async function seedWorkflowTemplates(store: WorkflowStore, templates: readonly W
 /** Bring DSH's durable cron rows into agreement with enabled, configured workflow definitions. */
 async function reconcileSchedules(
   ctx: Context,
-  store: WorkflowStore,
+  options: WorkflowRuntimeOptions,
   schedulerSessionId: ReturnType<typeof SessionId>,
 ): Promise<void> {
-  const workflows: readonly WorkflowDefinition[] = [
-    ...await store.listWorkflows(1),
-    ...await store.listWorkflows(2),
+  const definitions: { readonly workflow: WorkflowDefinition; readonly actorRef: string }[] = [
+    ...await options.store.listWorkflows(1).then(items => items.map(workflow => ({ workflow, actorRef: 'legacy' }))),
+    ...await options.store.listWorkflows(2).then(items => items.map(workflow => ({ workflow, actorRef: 'legacy' }))),
   ];
-  const desired = new Map<string, { readonly workflow: WorkflowDefinition; readonly triggerId: string; readonly schedule: WorkflowSchedule }>();
-  for (const workflow of workflows) {
+  if (options.actorStores === undefined || options.actorStores.length === 0) {
+    definitions.push(...await options.store.listWorkflows(3).then(items => items.map(workflow => ({ workflow, actorRef: 'legacy' }))));
+  } else {
+    for (const actorStore of options.actorStores) {
+      const actorRef = workflowActorRef(actorStore.actorAadObjectId);
+      definitions.push(...await actorStore.store.listWorkflows(3).then(items => items.map(workflow => ({ workflow, actorRef }))));
+    }
+  }
+  const desired = new Map<string, {
+    readonly workflow: WorkflowDefinition;
+    readonly triggerId: string;
+    readonly schedule: WorkflowSchedule;
+    readonly actorRef: string;
+  }>();
+  for (const { workflow, actorRef } of definitions) {
     if (!workflow.enabled || workflow.targets.length === 0) continue;
     if (workflow.version === 1) {
-      if (workflow.schedule !== undefined) desired.set(scheduleKey(workflow.id, 'default'), {
-        workflow, triggerId: 'default', schedule: workflow.schedule,
+      if (workflow.schedule !== undefined) desired.set(scheduleKey(workflow.id, 'default', actorRef), {
+        workflow, triggerId: 'default', schedule: workflow.schedule, actorRef,
       });
       continue;
     }
-    for (const trigger of workflow.triggers) desired.set(scheduleKey(workflow.id, trigger.id), {
-      workflow, triggerId: trigger.id, schedule: trigger.schedule,
+    for (const trigger of workflow.triggers) desired.set(scheduleKey(workflow.id, trigger.id, actorRef), {
+      workflow, triggerId: trigger.id, schedule: trigger.schedule, actorRef,
     });
-    if (workflow.notifications.digest.enabled) desired.set(scheduleKey(workflow.id, DAILY_DIGEST_TRIGGER_ID), {
-      workflow, triggerId: DAILY_DIGEST_TRIGGER_ID, schedule: workflow.notifications.digest.schedule,
+    if (workflow.notifications.digest.enabled) desired.set(scheduleKey(workflow.id, DAILY_DIGEST_TRIGGER_ID, actorRef), {
+      workflow, triggerId: DAILY_DIGEST_TRIGGER_ID, schedule: workflow.notifications.digest.schedule, actorRef,
     });
   }
   const catalog = await ctx.schedule.catalog();
@@ -380,7 +496,7 @@ async function reconcileSchedules(
     // Only recurring cron rows represent workflow definitions. A one-shot
     // marker may be a delivered Schedule receipt racing startup reconciliation.
     if (marker === undefined || entry.kind !== 'cron') continue;
-    const key = scheduleKey(marker.workflowId, marker.triggerId);
+    const key = scheduleKey(marker.workflowId, marker.triggerId, marker.actorRef);
     if (!desired.has(key)) {
       if (entry.status === 'active') await ctx.schedule.delete({ sessionId: schedulerSessionId, id: entry.id });
       continue;
@@ -393,10 +509,10 @@ async function reconcileSchedules(
   }
 
   for (const [key, target] of desired) {
-    const { workflow, triggerId, schedule: desiredSchedule } = target;
+    const { workflow, triggerId, schedule: desiredSchedule, actorRef } = target;
     const existing = matched.get(key);
-    const title = (workflow.version === 1 ? workflow.title : `${workflow.title} · ${triggerId}`).slice(0, 120);
-    const prompt = renderMarkerPrompt(workflow.id, triggerId);
+    const title = (workflow.version === 1 ? workflow.title : `${workflow.title} · ${triggerId}${actorRef === 'legacy' ? '' : ` · ${actorRef}`}`).slice(0, 120);
+    const prompt = renderMarkerPrompt(workflow.id, triggerId, actorRef);
     const schedule = canonicalSchedule(desiredSchedule);
     if (existing === undefined) {
       await ctx.schedule.create(schedulerSessionId, {
@@ -422,8 +538,12 @@ async function reconcileSchedules(
   }
 }
 
-function scheduleKey(workflowId: string, triggerId: string): string {
-  return `${workflowId}\0${triggerId}`;
+function workflowActorRef(actorAadObjectId: string): string {
+  return digest(actorAadObjectId.toLowerCase()).slice(0, 16);
+}
+
+function scheduleKey(workflowId: string, triggerId: string, actorRef = 'legacy'): string {
+  return `${actorRef}\0${workflowId}\0${triggerId}`;
 }
 
 /** Convert a Work API schedule into the canonical expression and zone stored by DSH. */
@@ -432,8 +552,8 @@ function canonicalSchedule(schedule: WorkflowSchedule): { readonly expression: s
 }
 
 /** Construct the fixed reminder content DSH persists and later returns to the source hook. */
-function renderMarkerPrompt(workflowId: string, triggerId = 'default'): string {
-  return `${WORKFLOW_MARKER}\n${JSON.stringify({ workflowId, triggerId })}`;
+function renderMarkerPrompt(workflowId: string, triggerId = 'default', actorRef = 'legacy'): string {
+  return `${WORKFLOW_MARKER}\n${JSON.stringify({ workflowId, triggerId, actorRef })}`;
 }
 
 /** Parse only the exact private marker envelope used for Navigator workflow timer rows. */
@@ -445,6 +565,8 @@ function parseMarkerPrompt(prompt: string): WorkflowTimerMarker | undefined {
     return {
       workflowId: value.workflowId,
       triggerId: typeof value.triggerId === 'string' && value.triggerId.length > 0 ? value.triggerId : 'default',
+      actorRef: typeof value.actorRef === 'string' && /^(?:legacy|[a-f0-9]{16})$/u.test(value.actorRef)
+        ? value.actorRef : 'legacy',
     };
   } catch {
     return undefined;
@@ -492,20 +614,52 @@ async function dispatchOccurrence(
     ctx.logger.warn('workflow timer marker contained an invalid occurrence time');
     return;
   }
+  const actorStore = occurrence.marker.actorRef === 'legacy' ? undefined
+    : options.actorStores?.find(item => workflowActorRef(item.actorAadObjectId) === occurrence.marker.actorRef);
+  if (occurrence.marker.actorRef !== 'legacy' && actorStore === undefined) {
+    ctx.logger.warn(`workflow timer ${occurrence.marker.actorRef} has no actor-scoped Work client`);
+    return;
+  }
+  const scopedOptions: WorkflowRuntimeOptions = actorStore === undefined ? options : {
+    ...options,
+    store: actorStore.store,
+    sourceDrivers: actorStore.sourceDrivers ?? options.sourceDrivers,
+    executeFixedToolTask: options.executeFixedToolTask === undefined ? undefined
+      : (request, execute) => options.executeFixedToolTask!(request, execute, actorStore.actorAadObjectId, actorStore.workState),
+    recordSourcePageReceipt: options.recordSourcePageReceipt === undefined ? undefined
+      : (taskId, receipt) => options.recordSourcePageReceipt!(taskId, receipt, actorStore.actorAadObjectId),
+  };
   const workflows: readonly WorkflowDefinition[] = [
-    ...await options.store.listWorkflows(1),
-    ...await options.store.listWorkflows(2),
+    ...await scopedOptions.store.listWorkflows(1),
+    ...await scopedOptions.store.listWorkflows(2),
+    ...await scopedOptions.store.listWorkflows(3),
   ];
   const workflow = workflows.find(candidate => candidate.id === occurrence.marker.workflowId);
   if (workflow === undefined || !workflow.enabled) return;
+  const ownerActorId = workflow.version === 3
+    ? actorStore?.actorAadObjectId ?? await options.resolveWorkflowActor?.(workflow.authorization.ownerTaskId)
+    : actorStore?.actorAadObjectId;
   if (workflow.version === 2) {
     if (occurrence.marker.triggerId === DAILY_DIGEST_TRIGGER_ID) {
-      await dispatchDailyDigest(ctx, options, workflow, occurrence.scheduledAt);
+      await dispatchDailyDigest(ctx, scopedOptions, workflow, occurrence.scheduledAt, occurrence.marker.actorRef,
+        ownerActorId);
       return;
     }
     const trigger = workflow.triggers.find(candidate => candidate.id === occurrence.marker.triggerId);
     if (trigger === undefined) return;
-    await dispatchV2Occurrence(ctx, options, workflow, trigger, occurrence.scheduledAt);
+    await dispatchV2Occurrence(ctx, scopedOptions, workflow, trigger, occurrence.scheduledAt);
+    return;
+  }
+  if (workflow.version === 3) {
+    if (occurrence.marker.triggerId === DAILY_DIGEST_TRIGGER_ID) {
+      await dispatchDailyDigest(ctx, scopedOptions, workflow, occurrence.scheduledAt, occurrence.marker.actorRef,
+        ownerActorId);
+      return;
+    }
+    const trigger = workflow.triggers.find(candidate => candidate.id === occurrence.marker.triggerId);
+    if (trigger === undefined) return;
+    await dispatchV3Occurrence(ctx, scopedOptions, workflow, trigger, occurrence.scheduledAt, occurrence.marker.actorRef,
+      ownerActorId);
     return;
   }
   if (occurrence.marker.triggerId !== 'default') return;
@@ -610,6 +764,667 @@ async function dispatchOccurrence(
     }
     ctx.logger.warn(`workflow ${workflow.id} occurrence failed (${errorCode})`);
   }
+}
+
+/** Collect one bounded v3 source window without entering any model path. */
+async function dispatchV3Occurrence(
+  ctx: Context,
+  options: WorkflowRuntimeOptions,
+  workflow: WorkflowV3Record,
+  trigger: WorkflowV3Trigger,
+  scheduledAt: string,
+  actorRef: string,
+  ownerActorId?: string,
+): Promise<void> {
+  const triggerId = trigger.id;
+  if (ownerActorId === undefined) {
+    ctx.logger.warn(`workflow ${workflow.id} has no verified owner actor for source polling`);
+    return;
+  }
+  const occurrenceId = workflowV3OccurrenceId(workflow.id, triggerId, scheduledAt, ownerActorId);
+  const taskId = `workflow-${occurrenceId.slice(4)}`;
+  const sessionId = `workflow-source-${actorRef}-${digest(occurrenceId).slice(0, 32)}`;
+  const history = await listWorkflowEvents(options.store, workflow.id);
+  const scoped = history.filter(event => eventTriggerId(event) === triggerId);
+  const successful = scoped.find(event => event.scheduledAt === scheduledAt && event.status === 'succeeded');
+  if (successful !== undefined) return;
+  const priorCheckpoint = latestSourceCheckpoint(scoped);
+  const baselineEstablished = scoped.some(event => event.status === 'succeeded' && event.baseline === true
+    && event.checkpoint?.kind === 'source_poll' && event.checkpoint.complete);
+  const initialBaseline = !baselineEstablished;
+  const continuingWindow = priorCheckpoint !== undefined && !priorCheckpoint.complete;
+  const windowStart = continuingWindow ? priorCheckpoint.windowStart : priorCheckpoint?.windowEnd ?? null;
+  const windowEnd = continuingWindow ? priorCheckpoint.windowEnd : utcSecond(scheduledAt);
+  const priorByTarget = new Map((priorCheckpoint?.sources ?? [])
+    .filter(cursor => cursor.source === trigger.source)
+    .map(cursor => [cursor.targetId, cursor]));
+  const metadata = workflowV3TaskMetadata(workflow, triggerId, occurrenceId, scheduledAt);
+  await appendOccurrenceEvent(options.store, workflow.id, scheduledAt, 'queued', {
+    taskId, sessionId, triggerId, actorRef,
+  });
+  await appendOccurrenceEvent(options.store, workflow.id, scheduledAt, 'running', {
+    taskId, sessionId, triggerId, baseline: initialBaseline, actorRef,
+  });
+
+  let outcome: WorkflowDispatchOutcome | undefined;
+  let failureCode: string | undefined;
+  let recordedSourceIncident: { readonly targetId: string; readonly reasonCode: WorkflowObservationPageError['code'] } | undefined;
+  let checkpoint: WorkflowSourceCheckpoint | undefined;
+  const collected: {
+    readonly targetId: string;
+    readonly pageCursor: string | null;
+    readonly nextCursor: string | null;
+    readonly observedAt: number;
+    readonly observation: WorkflowSourceObservation;
+  }[] = [];
+  const nextStates = new Map<string, WorkflowSourceCursor>();
+  const completedPages = new Map<string, {
+    readonly pageCursor: string | null;
+    readonly nextCursor: string | null;
+    readonly observedAt: number;
+  }>();
+  let pagesUsed = 0;
+  let currentTargetId = trigger.targetIds[0] ?? '';
+
+  try {
+    if (workflow.notifications.destination.kind !== 'owner_private'
+      || workflow.authorization.kind !== 'owner_private') {
+      // Source-event notices are owner-private unless Work proves an exact share grant.
+      // The runtime has no such grant resolver in this slice, so it never starts shared collection.
+      throw new WorkflowSourceError('forbidden');
+    }
+    if (options.executeFixedToolTask === undefined) throw new WorkflowSourceError('not_configured');
+
+    const targetById = new Map(workflow.targets.map(target => [target.id, target]));
+    const driver = options.sourceDrivers?.find(item => item.source === trigger.source);
+    const prompt = `Deterministic source poll ${workflow.id}/${triggerId} at ${scheduledAt}. No model execution is permitted.`;
+    outcome = await options.executeFixedToolTask({ taskId, sessionId, prompt, metadata }, async (agent, signal) => {
+      try {
+       let sourceComplete = true;
+       if (options.authorizeWorkflowActor === undefined) throw new WorkflowSourceError('not_configured', currentTargetId);
+       if (!await options.authorizeWorkflowActor(ownerActorId, workflow.authorization.ownerTaskId)) {
+         throw new WorkflowSourceError('forbidden', currentTargetId);
+       }
+       for (const targetId of trigger.targetIds) {
+        currentTargetId = targetId;
+        const target = targetById.get(targetId);
+        if (target === undefined || target.bindingId === undefined) throw new WorkflowSourceError('not_configured');
+        const prior = priorByTarget.get(targetId);
+        let pageCursor = continuingWindow ? prior?.pageCursor ?? null : prior?.resumeCursor ?? null;
+        if (pageCursor === SOURCE_RETRY_FROM_START_CURSOR) pageCursor = null;
+        let targetComplete = false;
+        let lastNextCursor = pageCursor;
+        let targetPages = 0;
+        const cursorChain = new Set<string>();
+        while (pagesUsed < trigger.maxPages && !targetComplete) {
+          if (signal.aborted) throw signal.reason instanceof Error ? signal.reason : new WorkflowSourceError('timeout');
+          const requestedCursor = pageCursor;
+          if (requestedCursor !== null) {
+            if (cursorChain.has(requestedCursor)) throw new WorkflowSourceError('invalid');
+            cursorChain.add(requestedCursor);
+          }
+          const request: WorkflowObservationPageRequest = {
+            source: trigger.source,
+            ownerActorId: ownerActorId ?? workflow.authorization.ownerTaskId,
+            target: { id: target.id, kind: target.kind, bindingId: target.bindingId, label: target.label },
+            pageSize: trigger.pageSize,
+            pageCursor: requestedCursor,
+            windowStart,
+            windowEnd,
+            signal,
+          };
+          const executionContext: WorkflowObservationExecutionContext = {
+            invokeConnectorTool: toolRequest => {
+              if (options.invokeObservationConnectorTool === undefined) {
+                throw new WorkflowSourceError('not_configured');
+              }
+              return options.invokeObservationConnectorTool(agent, toolRequest);
+            },
+          };
+          const page = driver === undefined
+            ? await pollRegisteredObservationPage(ctx, request, executionContext)
+            : await driver.pollPage(request, executionContext);
+          validateObservationPage(page, request);
+          if (page.error !== undefined) throw new WorkflowSourceError(page.error.code, targetId);
+          if (page.truncated) throw new WorkflowSourceError('partial');
+          if (!page.complete && (page.nextCursor === null || page.nextCursor === requestedCursor)) {
+            throw new WorkflowSourceError('partial');
+          }
+          const previousEnd = Date.parse(windowStart ?? '1970-01-01T00:00:00.000Z');
+          const frozenEnd = Date.parse(windowEnd);
+          for (const observation of page.observations) {
+            if (observation.occurredAt > frozenEnd
+              || trigger.source !== 'office_graph' && windowStart !== null && observation.occurredAt <= previousEnd) {
+              throw new WorkflowSourceError('invalid');
+            }
+            collected.push({
+              targetId,
+              pageCursor: requestedCursor,
+              nextCursor: page.nextCursor,
+              observedAt: page.observedAt,
+              observation,
+            });
+          }
+          pagesUsed += 1;
+          targetPages += 1;
+          lastNextCursor = page.nextCursor;
+          targetComplete = page.complete;
+          pageCursor = page.nextCursor;
+          if (page.complete) completedPages.set(targetId, {
+            pageCursor: requestedCursor,
+            nextCursor: page.nextCursor,
+            observedAt: page.observedAt,
+          });
+        }
+        if (!targetComplete) sourceComplete = false;
+        nextStates.set(targetId, {
+          source: trigger.source,
+          targetId,
+          pageCursor: targetComplete ? null : lastNextCursor,
+          ...(targetComplete && lastNextCursor !== null ? { resumeCursor: lastNextCursor } : {}),
+          watermark: targetComplete ? windowEnd : prior?.watermark ?? null,
+          complete: targetComplete,
+          pagesCollected: targetPages,
+          ...(prior?.seenEventIds === undefined ? {} : { seenEventIds: prior.seenEventIds }),
+          ...(prior?.states === undefined ? {} : { states: prior.states }),
+        });
+       }
+
+      // Server event ordering is deterministic even when providers return newest-first pages.
+      collected.sort((left, right) => left.observation.occurredAt - right.observation.occurredAt
+        || left.observation.sourceEventId.localeCompare(right.observation.sourceEventId)
+        || left.targetId.localeCompare(right.targetId));
+      const observationsById = new Map<string, typeof collected[number]>();
+      for (const item of collected) {
+        const key = `${item.observation.source}\0${item.observation.sourceEventId}`;
+        const existing = observationsById.get(key);
+        if (existing !== undefined) {
+          if (canonicalObservation(existing.observation) !== canonicalObservation(item.observation)) {
+            throw new WorkflowSourceError('invalid');
+          }
+          continue;
+        }
+        observationsById.set(key, item);
+      }
+      const eventIdsByTarget = new Map<string, Set<string>>();
+      const resourceStatesByTarget = new Map<string, Map<string, WorkflowSourceState>>();
+      for (const item of observationsById.values()) {
+        const write: WorkflowAutomationEventWrite = { ...item.observation };
+        const stored = await options.store.appendAutomationEvent(write);
+        const event = stored.event;
+        const pageReceipt: WorkflowSourcePageReceipt = {
+          workflowId: workflow.id,
+          triggerId,
+          occurrenceId,
+          scheduledAt,
+          source: trigger.source,
+          targetId: item.targetId,
+          pageCursor: item.pageCursor,
+          nextCursor: item.nextCursor,
+          windowStart,
+          windowEnd,
+          automationEventIds: [event.id],
+          sourceEventIds: [event.sourceEventId],
+          observedAt: item.observedAt,
+        };
+        if (options.recordSourcePageReceipt === undefined) throw new WorkflowSourceError('not_configured');
+        await options.recordSourcePageReceipt(taskId, pageReceipt, ownerActorId);
+        const notice: WorkflowAutomationEventNoticeRequest = {
+          eventId: event.id,
+          workflowId: workflow.id,
+          triggerId,
+          occurrenceId,
+          scheduledAt,
+          taskId,
+        };
+        // Always reconcile the atomic Work intent, even when POST replayed an existing event.
+        const receipt = await options.store.enqueueAutomationEventNotice(notice);
+        if (receipt.eventId !== event.id || receipt.workflowId !== workflow.id
+          || receipt.triggerId !== triggerId) {
+          throw new WorkflowSourceError('invalid');
+        }
+        const ids = eventIdsByTarget.get(item.targetId) ?? new Set<string>();
+        ids.add(event.sourceEventId);
+        eventIdsByTarget.set(item.targetId, ids);
+        const resourceStates = resourceStatesByTarget.get(item.targetId) ?? new Map<string, WorkflowSourceState>();
+        resourceStates.set(digest(event.resourceUri), {
+          resourceKey: digest(event.resourceUri),
+          fingerprint: event.semanticFingerprint!,
+          state: event.stateClass!,
+        });
+        resourceStatesByTarget.set(item.targetId, resourceStates);
+      }
+      for (const [targetId, state] of nextStates) {
+        const prior = priorByTarget.get(targetId);
+        const seen = new Set([...(prior?.seenEventIds ?? []), ...(eventIdsByTarget.get(targetId) ?? [])]);
+        const states = new Map((prior?.states ?? []).map(item => [item.resourceKey, item]));
+        for (const [key, value] of resourceStatesByTarget.get(targetId) ?? []) states.set(key, value);
+        nextStates.set(targetId, {
+          ...state,
+          seenEventIds: [...seen].sort().slice(-1_000),
+          states: [...states.values()].sort((left, right) => left.resourceKey.localeCompare(right.resourceKey)).slice(-1_000),
+        });
+      }
+
+      // A complete, authorized read resolves a prior source-poll incident even if the
+      // source returned no resource events. Work's semantic state receipt suppresses
+      // repeated healthy snapshots and owns the one recovery notice.
+      for (const [targetId, page] of completedPages) {
+        const prior = priorByTarget.get(targetId);
+        const statusResourceKey = digest(`cyrene://workflow-sources/${trigger.source}/${targetId}`);
+        if (!prior?.states?.some(item => item.resourceKey === statusResourceKey && item.state === 'incident')) continue;
+        await persistWorkflowSourceStatus(options, workflow, trigger, {
+          targetId,
+          occurrenceId,
+          scheduledAt,
+          taskId,
+          windowStart,
+          windowEnd,
+          pageCursor: page.pageCursor,
+          nextCursor: page.nextCursor,
+          observedAt: page.observedAt,
+          status: 'healthy',
+          actorAadObjectId: ownerActorId,
+        });
+        const state = nextStates.get(targetId);
+        if (state !== undefined) {
+          const states = new Map((state.states ?? []).map(item => [item.resourceKey, item]));
+          states.set(statusResourceKey, {
+            resourceKey: statusResourceKey,
+            fingerprint: digest('cyrene.source-poll.healthy.v1'),
+            state: 'healthy',
+          });
+          nextStates.set(targetId, {
+            ...state,
+            states: [...states.values()].sort((left, right) => left.resourceKey.localeCompare(right.resourceKey)).slice(-1_000),
+          });
+        }
+      }
+      checkpoint = {
+        kind: 'source_poll',
+        windowStart,
+        windowEnd,
+        complete: sourceComplete,
+        sources: [...nextStates.values()],
+      };
+      return safeJson({ pagesCollected: pagesUsed, observationsCollected: observationsById.size, complete: sourceComplete });
+      } catch (error: unknown) {
+        const sourceError = error instanceof WorkflowSourceError
+          ? error
+          : signal.aborted ? new WorkflowSourceError('timeout', currentTargetId)
+            : new WorkflowSourceError('unavailable', currentTargetId);
+        if (sourceError.code !== 'partial' && trigger.targetIds.includes(sourceError.targetId ?? currentTargetId)) {
+          await persistWorkflowSourceStatus(options, workflow, trigger, {
+            targetId: sourceError.targetId ?? currentTargetId,
+            occurrenceId,
+            scheduledAt,
+            taskId,
+            windowStart,
+            windowEnd,
+            pageCursor: null,
+            nextCursor: null,
+            observedAt: Date.now(),
+            status: 'incident',
+            reasonCode: sourceError.code,
+            actorAadObjectId: ownerActorId,
+          });
+          recordedSourceIncident = {
+            targetId: sourceError.targetId ?? currentTargetId,
+            reasonCode: sourceError.code,
+          };
+        }
+        throw sourceError;
+      }
+    }, ownerActorId, options.actorStores?.find(item => item.actorAadObjectId === ownerActorId)?.workState);
+
+    if (outcome.status !== 'completed') throw new WorkflowSourceError(outcome.status === 'aborted' ? 'timeout' : 'unavailable');
+  } catch (error: unknown) {
+    failureCode = error instanceof WorkflowSourceError ? `WORKFLOW_SOURCE_${error.code.toUpperCase()}` : 'WORKFLOW_SOURCE_UNAVAILABLE';
+    if (checkpoint === undefined) {
+      const sources = trigger.targetIds.map(targetId => {
+        const prior = priorByTarget.get(targetId);
+        // Nothing in the in-flight window is checkpointed until all event/evidence/
+        // intent writes finish. Replay from the window's original cursor after a
+        // failure so an event POST or Work intent response loss cannot drop a page.
+        const retryCursor = continuingWindow ? prior?.pageCursor : prior?.resumeCursor;
+        const states = new Map((prior?.states ?? []).map(item => [item.resourceKey, item]));
+        if (recordedSourceIncident?.targetId === targetId) {
+          const resourceKey = digest(`cyrene://workflow-sources/${trigger.source}/${targetId}`);
+          states.set(resourceKey, {
+            resourceKey,
+            fingerprint: digest(`cyrene.source-poll.failure.v1:${recordedSourceIncident.reasonCode}`),
+            state: 'incident',
+          });
+        }
+        return {
+          source: trigger.source,
+          targetId,
+          pageCursor: retryCursor ?? SOURCE_RETRY_FROM_START_CURSOR,
+          watermark: prior?.watermark ?? null,
+          complete: false,
+          pagesCollected: continuingWindow ? prior?.pagesCollected ?? 0 : 0,
+          ...(prior?.seenEventIds === undefined ? {} : { seenEventIds: prior.seenEventIds }),
+          ...(states.size === 0 ? {} : {
+            states: [...states.values()].sort((left, right) => left.resourceKey.localeCompare(right.resourceKey)).slice(-1_000),
+          }),
+        } satisfies WorkflowSourceCursor;
+      });
+      checkpoint = { kind: 'source_poll', windowStart, windowEnd, complete: false, sources };
+    }
+    const summary = sourceFailureSummary(failureCode);
+    await appendOccurrenceEvent(options.store, workflow.id, scheduledAt, 'failed', {
+      taskId, sessionId, triggerId, errorCode: failureCode, summary, checkpoint, actorRef,
+    });
+    ctx.logger.warn(`workflow ${workflow.id} source poll failed (${failureCode})`);
+    return;
+  }
+
+  const complete = checkpoint?.complete === true;
+  if (!complete) {
+    await appendOccurrenceEvent(options.store, workflow.id, scheduledAt, 'failed', {
+      taskId,
+      sessionId,
+      triggerId,
+      errorCode: 'WORKFLOW_SOURCE_PARTIAL',
+      summary: 'The deterministic source window reached its bounded page budget; its cursor was retained for continuation.',
+      checkpoint,
+      actorRef,
+    });
+    return;
+  }
+  const summary = complete ? 'The deterministic source window was collected.'
+    : 'The deterministic source window reached its bounded page budget; its cursor was retained for continuation.';
+  try {
+    await appendOccurrenceEvent(options.store, workflow.id, scheduledAt, 'succeeded', {
+      taskId,
+      sessionId,
+      triggerId,
+      baseline: initialBaseline && complete,
+      changed: false,
+      summary,
+      checkpoint,
+      actorRef,
+    });
+  } catch (error: unknown) {
+    ctx.logger.warn(`workflow ${workflow.id} source checkpoint could not be persisted (${error instanceof Error ? error.name : 'unknown'})`);
+    await appendOccurrenceEvent(options.store, workflow.id, scheduledAt, 'failed', {
+      taskId,
+      sessionId,
+      triggerId,
+      errorCode: 'WORKFLOW_SOURCE_CHECKPOINT_INVALID',
+      summary: 'The deterministic source checkpoint could not be persisted.',
+      actorRef,
+    }).catch(() => undefined);
+  }
+}
+
+class WorkflowSourceError extends Error {
+  constructor(readonly code: WorkflowObservationPageError['code'], readonly targetId?: string) {
+    super(code);
+  }
+}
+
+async function pollRegisteredObservationPage(
+  ctx: Context,
+  request: WorkflowObservationPageRequest,
+  execution: WorkflowObservationExecutionContext,
+): Promise<WorkflowObservationPage> {
+  if (request.source === 'github') {
+    const target = request.target;
+    if (target.kind !== 'github_repository' || target.bindingId === '' || !/^[1-9]\d{0,18}$/u.test(target.id)
+      || !/^[^/\s]+\/[^/\s]+$/u.test(target.label ?? '')) throw new WorkflowSourceError('not_configured', target.id);
+    const cursor = request.pageCursor ?? '1';
+    const args = {
+      repository_id: Number(target.id),
+      repository: target.label,
+      state: 'all',
+      labels: [],
+      limit: request.pageSize,
+      ...(request.windowStart === null ? {} : { updated_since: request.windowStart }),
+      updated_until: request.windowEnd,
+      page_cursor: cursor,
+    };
+    const result = await execution.invokeConnectorTool({
+      bindingId: target.bindingId,
+      providerId: 'github',
+      toolId: 'github.issues.search',
+      operationId: 'github.issues.search',
+      resourceProjection: 'github_repository',
+      arguments: args,
+      signal: request.signal,
+    });
+    const page = parseGitHubSearchPage(result);
+    if (page === undefined || page.echoedPageCursor !== cursor) throw new WorkflowSourceError('invalid', target.id);
+    if (page.incompleteResults || page.resultLimitReached) throw new WorkflowSourceError('partial', target.id);
+    const observations = page.issues.map(issue => githubIssueObservation(issue, target));
+    return {
+      source: 'github',
+      observedAt: Date.now(),
+      pageCursor: request.pageCursor,
+      nextCursor: page.nextCursor,
+      complete: page.complete,
+      truncated: page.truncated,
+      observations,
+    };
+  }
+  if (request.source === 'azure_devops') {
+    if (!['pipeline_runs', 'release_deployments'].includes(request.target.kind)) {
+      throw new WorkflowSourceError('not_configured', request.target.id);
+    }
+    const raw = await execution.invokeConnectorTool({
+      bindingId: request.target.bindingId,
+      providerId: 'azure_devops',
+      toolId: 'azure_devops.observations.poll',
+      operationId: 'azure_devops.observations.poll',
+      resourceProjection: 'azure_devops_source',
+      arguments: {
+        target: { id: request.target.id, kind: request.target.kind, bindingId: request.target.bindingId },
+        pageSize: request.pageSize,
+        pageCursor: request.pageCursor,
+        windowStart: request.windowStart,
+        windowEnd: request.windowEnd,
+      },
+      signal: request.signal,
+    });
+    const value = unwrapFixedConnectorResult(raw);
+    const row = asRecord(value);
+    if (row === undefined || row.source !== 'azure_devops' || row.pageCursor !== request.pageCursor
+      || !(row.nextCursor === null || typeof row.nextCursor === 'string')
+      || typeof row.complete !== 'boolean' || typeof row.truncated !== 'boolean'
+      || !Array.isArray(row.observations)) throw new WorkflowSourceError('invalid', request.target.id);
+    return {
+      source: 'azure_devops',
+      observedAt: Number.isSafeInteger(row.observedAt) ? row.observedAt as number : Date.now(),
+      pageCursor: request.pageCursor,
+      nextCursor: row.nextCursor,
+      complete: row.complete,
+      truncated: row.truncated,
+      observations: row.observations as WorkflowSourceObservation[],
+      ...(row.error === undefined ? {} : { error: row.error as WorkflowObservationPageError }),
+    };
+  }
+  throw new WorkflowSourceError('not_configured', request.target.id);
+}
+
+function githubIssueObservation(
+  issue: Readonly<Record<string, unknown>>,
+  target: WorkflowObservationPageRequest['target'],
+): WorkflowSourceObservation {
+  const number = issue.number;
+  const updatedAt = issue.updated_at;
+  if (typeof number !== 'number' || !Number.isSafeInteger(number) || number < 1
+    || typeof updatedAt !== 'string' || !Number.isFinite(Date.parse(updatedAt))) {
+    throw new WorkflowSourceError('invalid', target.id);
+  }
+  const repository = target.label!;
+  const uri = `https://github.com/${repository}/issues/${number}`;
+  const title = typeof issue.title === 'string' ? redactSummary(issue.title).slice(0, 256) : undefined;
+  const state = typeof issue.state === 'string' ? issue.state : 'unknown';
+  const semanticFingerprint = digest(JSON.stringify({ number, state, title: title ?? null, updatedAt }));
+  return {
+    source: 'github',
+    sourceEventId: `github:issue:${target.id}:${number}:${updatedAt}`,
+    resourceUri: uri,
+    sourceVersion: updatedAt,
+    eventType: 'github.issue.updated',
+    occurredAt: Date.parse(updatedAt),
+    ...(title === undefined ? {} : { title }),
+    summary: title === undefined ? `GitHub issue #${number} was updated.` : `GitHub issue #${number}: ${title}`,
+    semanticFingerprint,
+    stateClass: 'neutral',
+  };
+}
+
+function unwrapFixedConnectorResult(value: unknown): unknown {
+  let current = value;
+  for (let depth = 0; depth < 6; depth += 1) {
+    const row = asRecord(current);
+    if (row === undefined) return current;
+    if (row.isError === true || row.error !== undefined) throw new WorkflowSourceError('unavailable');
+    if (row.structuredContent !== undefined) { current = row.structuredContent; continue; }
+    if (row.businessResult !== undefined) { current = row.businessResult; continue; }
+    if (row.result !== undefined && asRecord(row.result) !== undefined) { current = row.result; continue; }
+    if (row.value !== undefined && asRecord(row.value) !== undefined) { current = row.value; continue; }
+    if (Array.isArray(row.content)) {
+      const block = row.content.find(item => asRecord(item)?.type === 'text' && typeof asRecord(item)?.text === 'string');
+      const text = block === undefined ? undefined : asRecord(block)?.text;
+      if (typeof text === 'string') {
+        try { current = JSON.parse(text) as unknown; continue; } catch { return current; }
+      }
+    }
+    return row;
+  }
+  return current;
+}
+
+function validateObservationPage(
+  page: WorkflowObservationPage,
+  request: WorkflowObservationPageRequest,
+): void {
+  if (page === null || typeof page !== 'object' || page.source !== request.source
+    || !Number.isSafeInteger(page.observedAt) || page.observedAt < 0
+    || page.pageCursor !== request.pageCursor
+    || !(page.nextCursor === null || typeof page.nextCursor === 'string' && page.nextCursor.length <= 32_768)
+    || typeof page.complete !== 'boolean' || typeof page.truncated !== 'boolean'
+    || !Array.isArray(page.observations) || page.observations.length > request.pageSize) {
+    throw new WorkflowSourceError('invalid', request.target.id);
+  }
+  if (page.error !== undefined) {
+    if (!['not_configured', 'forbidden', 'unavailable', 'timeout', 'invalid', 'partial'].includes(page.error.code)
+      || page.observations.length !== 0) throw new WorkflowSourceError('invalid', request.target.id);
+    return;
+  }
+  for (const observation of page.observations) {
+    if (observation.source !== request.source || typeof observation.semanticFingerprint !== 'string'
+      || typeof observation.stateClass !== 'string') throw new WorkflowSourceError('invalid', request.target.id);
+    try {
+      validateWorkflowAutomationEvent(observation);
+    } catch {
+      throw new WorkflowSourceError('invalid', request.target.id);
+    }
+  }
+}
+
+function canonicalObservation(value: WorkflowSourceObservation): string {
+  const normalize = (item: unknown): unknown => Array.isArray(item) ? item.map(normalize)
+    : item !== null && typeof item === 'object'
+      ? Object.fromEntries(Object.entries(item).sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, child]) => [key, normalize(child)]))
+      : item;
+  return JSON.stringify(normalize(value));
+}
+
+async function persistWorkflowSourceStatus(
+  options: WorkflowRuntimeOptions,
+  workflow: WorkflowV3Record,
+  trigger: WorkflowV3Trigger,
+  input: {
+    readonly targetId: string;
+    readonly occurrenceId: string;
+    readonly scheduledAt: string;
+    readonly taskId: string;
+    readonly windowStart: string | null;
+    readonly windowEnd: string;
+    readonly pageCursor: string | null;
+    readonly nextCursor: string | null;
+    readonly observedAt: number;
+    readonly status: 'incident' | 'healthy';
+    readonly reasonCode?: WorkflowObservationPageError['code'];
+    readonly actorAadObjectId?: string;
+  },
+): Promise<void> {
+  const fingerprintText = input.status === 'incident'
+    ? `cyrene.source-poll.failure.v1:${input.reasonCode ?? 'unavailable'}`
+    : 'cyrene.source-poll.healthy.v1';
+  const semanticFingerprint = digest(fingerprintText);
+  const sourceEventId = `workflow-poll:${workflow.id}:${trigger.id}:${input.targetId}:${input.occurrenceId}:${input.status}`;
+  const targetUri = `cyrene://workflow-sources/${trigger.source}/${input.targetId}`;
+  const event: WorkflowAutomationEventWrite = {
+    source: trigger.source,
+    sourceEventId,
+    resourceUri: targetUri,
+    sourceVersion: input.scheduledAt,
+    eventType: input.status === 'incident' ? 'source.poll.failure' : 'source.poll.recovery',
+    occurredAt: Date.parse(input.scheduledAt),
+    title: input.status === 'incident' ? 'Source poll failure' : 'Source poll recovered',
+    summary: input.status === 'incident'
+      ? `A configured ${trigger.source} source poll failed (${input.reasonCode ?? 'unavailable'}).`
+      : `The configured ${trigger.source} source is responding again.`,
+    severity: input.status === 'incident' ? 'warning' : 'info',
+    semanticFingerprint,
+    stateClass: input.status,
+  };
+  const stored = await options.store.appendAutomationEvent(event);
+  if (options.recordSourcePageReceipt === undefined) throw new WorkflowSourceError('not_configured', input.targetId);
+  if (input.status === 'incident') {
+    const failure: WorkflowSourceErrorReceipt = {
+      workflowId: workflow.id,
+      triggerId: trigger.id,
+      occurrenceId: input.occurrenceId,
+      scheduledAt: input.scheduledAt,
+      source: trigger.source,
+      targetId: input.targetId,
+      windowStart: input.windowStart,
+      windowEnd: input.windowEnd,
+      outcome: 'failed',
+      reasonCode: input.reasonCode ?? 'unavailable',
+      observedAt: new Date(input.observedAt).toISOString(),
+    };
+    await options.recordSourcePageReceipt(input.taskId, failure, input.actorAadObjectId);
+  } else {
+    const success: WorkflowSourcePageReceipt = {
+      workflowId: workflow.id,
+      triggerId: trigger.id,
+      occurrenceId: input.occurrenceId,
+      scheduledAt: input.scheduledAt,
+      source: trigger.source,
+      targetId: input.targetId,
+      pageCursor: input.pageCursor,
+      nextCursor: input.nextCursor,
+      windowStart: input.windowStart,
+      windowEnd: input.windowEnd,
+      automationEventIds: [stored.event.id],
+      sourceEventIds: [stored.event.sourceEventId],
+      observedAt: input.observedAt,
+    };
+    await options.recordSourcePageReceipt(input.taskId, success, input.actorAadObjectId);
+  }
+  await options.store.enqueueAutomationEventNotice({
+    eventId: stored.event.id,
+    workflowId: workflow.id,
+    triggerId: trigger.id,
+    occurrenceId: input.occurrenceId,
+    scheduledAt: input.scheduledAt,
+    taskId: input.taskId,
+  });
+}
+
+function sourceFailureSummary(code: string): string {
+  if (code.includes('FORBIDDEN')) return 'A configured source is not authorized for this actor.';
+  if (code.includes('NOT_CONFIGURED')) return 'A configured source binding or adapter is unavailable.';
+  if (code.includes('TIMEOUT')) return 'A configured source did not respond before the bounded timeout.';
+  if (code.includes('INVALID') || code.includes('PARTIAL')) return 'A configured source returned an incomplete or invalid page.';
+  return 'A configured source is temporarily unavailable.';
 }
 
 /** Run one v2 observation, then dispatch each approved proposal as a separate task. */
@@ -945,7 +1760,7 @@ async function reconcilePriorAction(
       return undefined;
     }
   }));
-  if (states.every((state, index) => state?.status === 'verified' && state.taskId === prior.taskId)) {
+  if (states.every((state, _index) => state?.status === 'verified' && state.taskId === prior.taskId)) {
     if (states.every(state => state !== undefined && isPositiveWriteReceipt(state))) {
       return { ...prior, status: 'completed' };
     }
@@ -997,13 +1812,59 @@ async function classifyActionOutcome(
 async function dispatchDailyDigest(
   ctx: Context,
   options: WorkflowRuntimeOptions,
-  workflow: WorkflowV2Record,
+  workflow: WorkflowV2Record | WorkflowV3Record,
   scheduledAt: string,
+  actorRef = 'legacy',
+  actorAadObjectId?: string,
 ): Promise<void> {
   const triggerId = DAILY_DIGEST_TRIGGER_ID;
   const events = await listWorkflowEvents(options.store, workflow.id);
-  if (events.some(event => eventTriggerId(event) === triggerId && event.scheduledAt === scheduledAt
-    && (event.status === 'succeeded' || event.status === 'failed'))) return;
+  const existing = events.find(event => eventTriggerId(event) === triggerId && event.scheduledAt === scheduledAt
+    && event.status === 'succeeded');
+  if (workflow.version === 3) {
+    if (existing !== undefined) {
+      await enqueueV3DigestNotice(options.store, workflow, existing, actorAadObjectId);
+      return;
+    }
+    if (events.some(event => eventTriggerId(event) === triggerId && event.scheduledAt === scheduledAt && event.status === 'failed')) return;
+    const occurrenceId = workflowV3OccurrenceId(workflow.id, triggerId, scheduledAt, actorAadObjectId);
+    const taskId = `workflow-${occurrenceId.slice(4)}`;
+    const sessionId = `workflow-digest-${actorRef}-${digest(occurrenceId).slice(0, 32)}`;
+    const metadata = workflowV3TaskMetadata(workflow, triggerId, occurrenceId, scheduledAt);
+    if (options.executeFixedToolTask === undefined) {
+      await appendOccurrenceEvent(options.store, workflow.id, scheduledAt, 'failed', {
+        triggerId, taskId, sessionId, errorCode: 'WORKFLOW_FIXED_TASK_UNAVAILABLE',
+        summary: 'The deterministic digest task could not be started.', actorRef,
+      });
+      return;
+    }
+    await appendOccurrenceEvent(options.store, workflow.id, scheduledAt, 'queued', { triggerId, taskId, sessionId, actorRef });
+    await appendOccurrenceEvent(options.store, workflow.id, scheduledAt, 'running', { triggerId, taskId, sessionId, actorRef });
+    const outcome = await options.executeFixedToolTask({
+      taskId,
+      sessionId,
+      prompt: `Deterministic digest receipt ${workflow.id}/${scheduledAt}. No model execution is permitted.`,
+      metadata,
+    }, async () => 'V3 digest schedule receipt completed without model invocation.', actorAadObjectId,
+    options.actorStores?.find(item => item.actorAadObjectId === actorAadObjectId)?.workState);
+    if (outcome.status !== 'completed') {
+      await appendOccurrenceEvent(options.store, workflow.id, scheduledAt, 'failed', {
+        triggerId, taskId, sessionId, errorCode: 'WORKFLOW_DIGEST_TASK_FAILED',
+        summary: 'The deterministic digest task did not complete.', actorRef,
+      });
+      return;
+    }
+    await appendOccurrenceEvent(options.store, workflow.id, scheduledAt, 'succeeded', {
+      triggerId, taskId, sessionId, changed: false,
+      summary: 'Daily digest receipt completed.', actorRef,
+    });
+    const terminal = (await listWorkflowEvents(options.store, workflow.id)).find(event => eventTriggerId(event) === triggerId
+      && event.scheduledAt === scheduledAt && event.status === 'succeeded');
+    if (terminal !== undefined) await enqueueV3DigestNotice(options.store, workflow, terminal, actorAadObjectId);
+    return;
+  }
+  if (existing !== undefined || events.some(event => eventTriggerId(event) === triggerId && event.scheduledAt === scheduledAt
+    && event.status === 'failed')) return;
   const previousDigest = events.filter(event => eventTriggerId(event) === triggerId && event.status === 'succeeded')
     .sort((left, right) => right.scheduledAt.localeCompare(left.scheduledAt))[0]?.scheduledAt;
   const changes = events.filter(event => eventTriggerId(event) !== triggerId
@@ -1025,6 +1886,24 @@ async function dispatchDailyDigest(
   if (changed && workflow.notifications.digest.enabled) {
     await enqueueWorkflowNotification(ctx, options, workflow, scheduledAt, triggerId, 'digest', summary, taskId);
   }
+}
+
+async function enqueueV3DigestNotice(
+  store: WorkflowStore,
+  workflow: WorkflowV3Record,
+  event: WorkflowScheduleEvent,
+  actorAadObjectId?: string,
+): Promise<void> {
+  if (event.taskId === undefined || event.status !== 'succeeded') return;
+  const occurrenceId = workflowV3OccurrenceId(workflow.id, DAILY_DIGEST_TRIGGER_ID, event.scheduledAt, actorAadObjectId);
+  const taskId = `workflow-${occurrenceId.slice(4)}`;
+  if (event.taskId !== taskId) throw new WorkflowSourceError('forbidden');
+  await store.enqueueV3DigestNotice(workflow.id, {
+    occurrenceId,
+    triggerId: DAILY_DIGEST_TRIGGER_ID,
+    scheduledAt: event.scheduledAt,
+    taskId,
+  });
 }
 
 function isPositiveWriteReceipt(operation: WorkflowOperationState): boolean {
@@ -1059,10 +1938,14 @@ async function appendOccurrenceEvent(
   status: WorkflowScheduleEvent['status'],
   extra: Pick<WorkflowScheduleEvent,
     'changed' | 'summary' | 'errorCode' | 'taskId' | 'sessionId' | 'triggerId' | 'baseline'
-    | 'evidence' | 'operationIds' | 'actionTaskIds' | 'actionResults' | 'checkpoint' | 'attentionKind'>,
+    | 'evidence' | 'operationIds' | 'actionTaskIds' | 'actionResults' | 'checkpoint' | 'attentionKind'> & {
+      readonly actorRef?: string;
+    },
 ): Promise<void> {
   const triggerId = extra.triggerId ?? 'default';
-  const occurrenceKey = triggerId === 'default' ? `${workflowId}\0${scheduledAt}` : `${workflowId}\0${triggerId}\0${scheduledAt}`;
+  const actorPrefix = extra.actorRef === undefined || extra.actorRef === 'legacy' ? '' : `${extra.actorRef}\0`;
+  const occurrenceKey = actorPrefix + (triggerId === 'default'
+    ? `${workflowId}\0${scheduledAt}` : `${workflowId}\0${triggerId}\0${scheduledAt}`);
   const id = `workflow-${digest(`${occurrenceKey}\0${status}`).slice(0, 48)}`;
   await store.appendScheduleEvent({
     id, workflowId, scheduledAt, status, createdAt: scheduledAt,
@@ -1149,8 +2032,16 @@ async function listWorkflowEvents(store: WorkflowStore, workflowId: string): Pro
 
 function latestCheckpoint(events: readonly WorkflowScheduleEvent[]): WorkflowCheckpoint | undefined {
   return [...events]
-    .filter(event => event.checkpoint !== undefined)
+    .filter((event): event is WorkflowScheduleEvent & { readonly checkpoint: WorkflowCheckpoint } =>
+      event.checkpoint?.kind === 'github_issues_search')
     .sort((left, right) => right.scheduledAt.localeCompare(left.scheduledAt))[0]?.checkpoint;
+}
+
+function latestSourceCheckpoint(events: readonly WorkflowScheduleEvent[]): WorkflowSourceCheckpoint | undefined {
+  for (const event of [...events].sort((left, right) => right.scheduledAt.localeCompare(left.scheduledAt))) {
+    if (event.checkpoint?.kind === 'source_poll') return event.checkpoint;
+  }
+  return undefined;
 }
 
 function isInFailureBackoff(events: readonly WorkflowScheduleEvent[], scheduledAt: string): boolean {
@@ -1184,8 +2075,9 @@ function hasNoRunnableGitHubCursor(
 }
 
 function isInIncompleteSearchBackoff(events: readonly WorkflowScheduleEvent[], scheduledAt: string): boolean {
-  const recent = events.filter(event => event.status === 'succeeded'
-    && event.checkpoint?.complete === false
+  const recent = events.filter((event): event is WorkflowScheduleEvent & { readonly checkpoint: WorkflowCheckpoint } =>
+    event.status === 'succeeded' && event.checkpoint?.kind === 'github_issues_search'
+    && event.checkpoint.complete === false
     && event.checkpoint.repositories.some(cursor => cursor.blockedReason === 'incomplete_results'))
     .sort((left, right) => right.scheduledAt.localeCompare(left.scheduledAt));
   const latest = recent[0];
@@ -1214,6 +2106,37 @@ function workflowOccurrenceId(workflowId: string, triggerId: string, scheduledAt
     ? `${workflowId}\0${scheduledAt}`
     : `${workflowId}\0${triggerId}\0${scheduledAt}`;
   return `occ-${digest(key).slice(0, 40)}`;
+}
+
+/** V3 identity is namespaced by Work's server-derived actor subject. */
+function workflowV3OccurrenceId(
+  workflowId: string,
+  triggerId: string,
+  scheduledAt: string,
+  createdByActorId?: string,
+): string {
+  if (createdByActorId === undefined) throw new WorkflowSourceError('not_configured');
+  const actorRef = digest(createdByActorId.toLowerCase()).slice(0, 16);
+  return `occ-${digest(`${workflowId}\0${triggerId}\0${scheduledAt}\0${actorRef}`).slice(0, 40)}`;
+}
+
+function workflowV3TaskMetadata(
+  workflow: WorkflowV3Record,
+  triggerId: string,
+  occurrenceId: string,
+  scheduledAt: string,
+): Readonly<Record<string, unknown>> {
+  return {
+    source: 'workflow',
+    workflowId: workflow.id,
+    triggerId,
+    occurrenceId,
+    scheduledAt,
+    authorizationRef: {
+      kind: workflow.authorization.kind,
+      ownerTaskId: workflow.authorization.ownerTaskId,
+    },
+  };
 }
 
 /** Give the executor a constrained read-only task and a strict small result contract. */
@@ -1655,13 +2578,27 @@ const RECORDED_NOTICES = new WeakMap<Context, Set<string>>();
 
 /** Retry outbox writes from durable terminal events, including after a host restart. */
 async function reconcileWorkflowNotifications(ctx: Context, options: WorkflowRuntimeOptions): Promise<void> {
-  const store = options.store;
-  const workflows: readonly WorkflowDefinition[] = [
-    ...await store.listWorkflows(1),
-    ...await store.listWorkflows(2),
+  const scoped: { readonly store: WorkflowStore; readonly workflow: WorkflowDefinition; readonly actorAadObjectId?: string }[] = [
+    ...await options.store.listWorkflows(1).then(items => items.map(workflow => ({ store: options.store, workflow }))),
+    ...await options.store.listWorkflows(2).then(items => items.map(workflow => ({ store: options.store, workflow }))),
   ];
-  for (const workflow of workflows) {
+  if (options.actorStores === undefined || options.actorStores.length === 0) {
+    scoped.push(...await options.store.listWorkflows(3).then(items => items.map(workflow => ({ store: options.store, workflow }))));
+  } else {
+    for (const actorStore of options.actorStores) {
+      scoped.push(...await actorStore.store.listWorkflows(3).then(items => items.map(workflow => ({
+        store: actorStore.store, workflow, actorAadObjectId: actorStore.actorAadObjectId,
+      }))));
+    }
+  }
+  for (const { store, workflow, actorAadObjectId } of scoped) {
     const events = await listWorkflowEvents(store, workflow.id);
+    if (workflow.version === 3) {
+      const digestEvents = events.filter(event => eventTriggerId(event) === DAILY_DIGEST_TRIGGER_ID
+        && event.status === 'succeeded' && event.taskId !== undefined);
+      for (const event of digestEvents) await enqueueV3DigestNotice(store, workflow, event, actorAadObjectId);
+      continue;
+    }
     const terminals = new Map<string, WorkflowScheduleEvent>();
     for (const event of events) {
       if (event.status !== 'failed' && event.status !== 'succeeded') continue;
@@ -1702,7 +2639,7 @@ async function reconcileWorkflowNotifications(ctx: Context, options: WorkflowRun
         } else if (previous?.status === 'failed' && workflow.notifications.onRecovery
           && !isQuietTime(event.scheduledAt, workflow.notifications.quietHours)) {
           kind = 'recovery';
-        } else if (event.changed && event.baseline !== true && event.checkpoint?.complete !== false
+        } else if (workflow.version === 2 && event.changed && event.baseline !== true && event.checkpoint?.complete !== false
           && workflow.notifications.onChange && !isQuietTime(event.scheduledAt, workflow.notifications.quietHours)) {
           kind = 'change';
         }
@@ -1761,7 +2698,7 @@ async function enqueueWorkflowNotification(
       },
     });
     let teamsDuplicate = true;
-    if (workflow.version === 2 && options.projectTeamsNotification !== undefined) {
+    if (workflow.version >= 2 && options.projectTeamsNotification !== undefined) {
       const notice: WorkflowNotification = {
         workflowId: workflow.id,
         occurrenceId,

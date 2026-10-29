@@ -44,6 +44,7 @@ function acpConfigDirectories(configRoot) {
 
 async function createHarness({
   teamsCaller = taskActor,
+  taskCreatorActorId = taskActor.subject,
   exchangeQueryExecution,
   providerOperationExecution,
   turnTimeoutMs = 2_000,
@@ -133,6 +134,7 @@ async function createHarness({
         return {
           id: path.split('/').at(-1), sessionId, prompt: 'fixture', status: 'running',
           createdAt: Date.now(), output: '', reasoning: '', durationMs: 0,
+          createdByActorId: taskCreatorActorId,
           metadata,
         };
       }
@@ -660,6 +662,27 @@ test('an ACP connector call without a trusted Work actor never reaches connector
     });
     assert.equal(outcome.status, 'completed');
     assert.match(outcome.output, /connector denied=true/u);
+    assert.equal(harness.providerCalls.length, 0);
+    assert.equal(harness.bridgeCalls.some(call => call.kind === 'grant'), false);
+    assert.equal(harness.bridgeCalls.some(call => call.kind === 'mutate'), false);
+    assert.deepEqual(acpConfigDirectories(harness.codeBuddyConfigDir), priorConfigDirectories);
+  } finally {
+    await disposeHarness(harness);
+  }
+});
+
+test('a member-owned Work Task cannot borrow the owner connector identity from forged teamsCaller metadata', async () => {
+  const memberId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  const harness = await createHarness({ teamsCaller: taskActor, taskCreatorActorId: memberId });
+  const priorConfigDirectories = acpConfigDirectories(harness.codeBuddyConfigDir);
+  try {
+    const executor = harness.createExecutor(harness.createBackend('tool'));
+    const outcome = await executor.executeTask({
+      taskId: 'teams-acp-forged-owner-task',
+      sessionId,
+      prompt: 'Try to use the owner connector identity from member B.',
+    });
+    assert.equal(outcome.status, 'failed', 'the actor mismatch prevents the DSH turn from using owner connector grants');
     assert.equal(harness.providerCalls.length, 0);
     assert.equal(harness.bridgeCalls.some(call => call.kind === 'grant'), false);
     assert.equal(harness.bridgeCalls.some(call => call.kind === 'mutate'), false);

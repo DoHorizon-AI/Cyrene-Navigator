@@ -4,7 +4,7 @@
 // │ 模块职责：通过 REST/SSE 执行经过认证且持久化的任务。                    │
 // └─────────────────────────────────────────────────────────────────────┘
 
-import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import type { IncomingMessage, ServerResponse, Server } from 'node:http';
@@ -18,7 +18,8 @@ import { SessionId, SessionSeq } from '@deepseek-ai/dsh-session';
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
 import type { DynamicPluginManager } from './plugin-manager.js';
 import { WorkStateHttpError } from './work-state-client.js';
-import type { CredentialHealthSnapshot, ExecutionStatus, TaskRecord, WorkStateStore } from './work-state-client.js';
+import type { CredentialHealthSnapshot, ExecutionStatus, NotificationLease, TaskRecord, WorkStateStore } from './work-state-client.js';
+import type { WorkActorClientRegistry } from './work-state-client.js';
 import type { ExchangeAuthorizationWaitReceipt } from './integrations/exchange-authorization.js';
 import {
   ExchangeConnectorAuthorizationClient,
@@ -37,6 +38,7 @@ import {
 } from './model-policy.js';
 import type { ModelRoute } from './model-policy.js';
 import type { ConversationExecutionBackend } from './codebuddy-acp-execution.js';
+import type { WorkflowSourceTaskReceipt } from './workflows/store.js';
 
 export type TaskStatus = ExecutionStatus;
 export type TaskExecutionClass = 'foreground' | 'background';
@@ -53,6 +55,14 @@ export interface ExecuteTaskParams {
   readonly executionClass?: TaskExecutionClass;
   /** Host-owned provenance and policy facts persisted with the Work Task. */
   readonly metadata?: Readonly<Record<string, unknown>>;
+}
+
+/** Host-only durable background task that invokes fixed registered tools without an LLM turn. */
+export interface ExecuteFixedToolTaskParams {
+  readonly taskId: string;
+  readonly sessionId: string;
+  readonly prompt: string;
+  readonly metadata: Readonly<Record<string, unknown>>;
 }
 
 export type ExecutorStreamEvent =
@@ -104,6 +114,8 @@ interface InternalTaskState {
   readonly abortController: AbortController;
   readonly subscribers: Set<(event: ExecutorStreamEvent) => void>;
   record: TaskRecord;
+  workState?: WorkStateStore;
+  actorAadObjectId?: string;
   output: string;
   reasoning: string;
   blocked?: Map<string, Extract<ExecutorStreamEvent, { type: 'subagent-blocked' }>>;
@@ -114,6 +126,7 @@ interface InternalTaskState {
   agent?: Agent;
   modelSelection?: ModelSelectionRef;
   modelRoute?: ModelSelection;
+  fixedToolTask?: boolean;
   authorizationPause?: boolean;
   eventChain: Promise<void>;
   eventFailure?: unknown;
@@ -131,6 +144,10 @@ export interface ExecutorConfig {
   /** Real configured provider routes to use only after a provider availability failure. */
   readonly modelFallbacks?: readonly ModelRoute[];
   readonly workState: WorkStateStore;
+  /** Host-selected global Work token env for the explicit legacy owner route. */
+  readonly workStateTokenEnv?: string;
+  /** Host-only per-actor Work principals created from the private provisioned actor map. */
+  readonly workActorClients?: WorkActorClientRegistry;
   /** Optional top-level conversation engine; omission preserves the DSH AgentLoop backend. */
   readonly conversationBackend?: ConversationExecutionBackend;
   readonly workspaceId: string;
@@ -186,11 +203,42 @@ export interface TeamsExecutorConfig {
   readonly botAppId: string;
   readonly taskActorSubjects: readonly string[];
   readonly taskActorSubjectsFile?: string;
+  /** Explicit opt-in gate paired with the Teams package's personal-chat setting. */
+  readonly personalChatEnabled?: boolean;
+  /** Host-selected actor allowed to use the existing free-form model entitlement. */
+  readonly modelActorSubject?: string;
   readonly ingressSecretEnv: string;
   readonly exchangeConnectionRef: string;
   readonly exchangeProfileRef: string;
   readonly exchangeAuthorization: ExchangeConnectorAuthorizationClient;
+  /** Fixed host bridge for the existing message.connector.v1 PRIVATE send capability. */
+  readonly sendPrivateMessage?: (
+    request: TeamsPersonalMessageSendRequest,
+    signal: AbortSignal,
+  ) => Promise<TeamsPersonalMessageSendOutcome>;
   readonly credentialNotifications?: CredentialNotificationsConfig;
+}
+
+export interface TeamsPersonalMessageSendRequest {
+  readonly requestId: string;
+  readonly conversation: {
+    readonly vendor: 'msteams';
+    readonly account_id: string;
+    readonly conversation_id: string;
+    readonly kind: 'private';
+  };
+  readonly tenant_id: string;
+  readonly service_url: string;
+  readonly target_kind: 'owner_private';
+  readonly actor_aad_object_id: string;
+  readonly text: string;
+}
+
+export interface TeamsPersonalMessageSendOutcome {
+  readonly outcome: 'accepted' | 'rejected' | 'rate_limited' | 'uncertain';
+  readonly vendorMessageId?: string;
+  readonly reasonCode?: string;
+  readonly retryAfterSeconds?: number;
 }
 
 /** Fixed host-owned health selectors and the only Teams route for credential notices. */
@@ -376,6 +424,10 @@ export class NavigatorExecutor {
   private readonly agentTaskMap = new Map<Agent, string>();
   private readonly sessionTaskMap = new Map<Session, string>();
   private readonly activeTaskBySessionId = new Map<string, string>();
+  private readonly taskWorkStateById = new Map<string, WorkStateStore>();
+  private readonly taskActorById = new Map<string, string>();
+  private readonly sessionActorById = new Map<string, string>();
+  private legacyWorkActorId?: string;
   private readonly agentModelSelections = new WeakMap<Agent, ModelSelectionRef>();
   private readonly sessionTails = new Map<string, Promise<void>>();
   private readonly taskLimiter: TaskConcurrencyLimiter;
@@ -469,18 +521,9 @@ export class NavigatorExecutor {
     await this.ready;
     let queuedTasks = 0;
     let activeTasks = 0;
-    let cursor: string | undefined;
-    const seenCursors = new Set<string>();
-    for (;;) {
-      const page = await this.config.workState.listTasks({ cursor, limit: 100 });
-      for (const task of page.items) {
-        if (task.status === 'queued') queuedTasks += 1;
-        else if (task.status === 'running') activeTasks += 1;
-      }
-      if (!page.nextCursor) break;
-      if (seenCursors.has(page.nextCursor)) throw new Error('Work task listing returned a repeated cursor');
-      seenCursors.add(page.nextCursor);
-      cursor = page.nextCursor;
+    for (const { task } of await this.listDurableTaskRows()) {
+      if (task.status === 'queued') queuedTasks += 1;
+      else if (task.status === 'running') activeTasks += 1;
     }
     const dispatches = this.taskLimiter.snapshot();
     const notificationsInFlight = this.teamsNotificationDrain !== undefined;
@@ -694,17 +737,19 @@ export class NavigatorExecutor {
 
   /** Fail uncertain running rows, then safely adopt queued rows with no model/tool side effects.  中文：失败关闭不确定的运行记录，并安全接管尚未产生模型/工具副作用的排队记录。 */
   private async recoverInterruptedTasks(): Promise<void> {
-    let cursor: string | undefined;
-    for (;;) {
-      const page = await this.config.workState.listTasks({ cursor, limit: 100 });
-      for (const row of page.items) {
+    for (const { task: row, workState, actorAadObjectId } of await this.listDurableTaskRows()) {
+      this.taskWorkStateById.set(row.id, workState);
+      if (actorAadObjectId !== undefined) {
+        this.taskActorById.set(row.id, actorAadObjectId);
+        this.sessionActorById.set(row.sessionId, actorAadObjectId);
+      }
         if (row.status === 'awaiting_user_authorization') {
-          const events = await this.readAllTaskEvents(row.id);
+          const events = await this.readAllTaskEvents(row.id, workState);
           const hasPauseFinish = events.some(item => item.event.type === 'finish'
             && item.event.status === 'awaiting_user_authorization');
           if (!hasPauseFinish) {
             const now = Date.now();
-            await this.config.workState.appendEvent(row.id, {
+            await workState.appendEvent(row.id, {
               type: 'finish',
               taskId: row.id,
               status: 'awaiting_user_authorization',
@@ -721,29 +766,56 @@ export class NavigatorExecutor {
           const reason = row.status === 'running'
             ? 'Execution interrupted by executor restart; automatic replay is disabled.'
             : 'Human-gated execution was interrupted by executor restart; review the preserved approval record before creating a new task.';
-          const blocked = await this.readBlockedReceipts(row.id);
+          const blocked = await this.readBlockedReceipts(row.id, workState);
           const output = appendBlockedSummary(row.output, blocked);
-          await this.config.workState.patchTask(row.id, { status: 'failed', error: reason, output });
-          await this.config.workState.appendEvent(row.id, {
+          await workState.patchTask(row.id, { status: 'failed', error: reason, output });
+          await workState.appendEvent(row.id, {
             type: 'error', taskId: row.id, message: reason, code: 'EXECUTOR_RESTARTED', timestamp: now,
           });
-          await this.config.workState.appendEvent(row.id, {
+          await workState.appendEvent(row.id, {
             type: 'finish', taskId: row.id, status: 'failed', output,
             durationMs: Math.max(row.durationMs, now - startedAt), timestamp: now,
           });
         }
-      }
-      if (!page.nextCursor) break;
-      cursor = page.nextCursor;
     }
   }
 
+  /** Enumerate only the legacy Work principal or each explicitly configured actor owner. */
+  private async listDurableTaskRows(): Promise<readonly {
+    readonly task: TaskRecord;
+    readonly workState: WorkStateStore;
+    readonly actorAadObjectId?: string;
+  }[]> {
+    if (this.config.workActorClients !== undefined) {
+      return (await this.config.workActorClients.listOwnedTasks()).map(item => ({
+        task: item.task,
+        workState: item.store,
+        actorAadObjectId: item.actorAadObjectId,
+      }));
+    }
+    const rows: { task: TaskRecord; workState: WorkStateStore }[] = [];
+    let cursor: string | undefined;
+    const seenCursors = new Set<string>();
+    for (;;) {
+      const page = await this.config.workState.listTasks({ ...(cursor === undefined ? {} : { cursor }), limit: 100 });
+      rows.push(...page.items.map(task => ({ task, workState: this.config.workState })));
+      if (!page.nextCursor) break;
+      if (seenCursors.has(page.nextCursor)) throw new Error('Work task listing returned a repeated cursor');
+      seenCursors.add(page.nextCursor);
+      cursor = page.nextCursor;
+    }
+    return rows;
+  }
+
   /** Restore refused work from ordered receipts without replaying native operations. | 从事件恢复无法执行记录，不重放原生操作。 */
-  private async readBlockedReceipts(taskId: string): Promise<InternalTaskState['blocked']> {
+  private async readBlockedReceipts(
+    taskId: string,
+    workState: WorkStateStore = this.taskWorkStateById.get(taskId) ?? this.config.workState,
+  ): Promise<InternalTaskState['blocked']> {
     const blocked: NonNullable<InternalTaskState['blocked']> = new Map();
     let after = 0;
     for (;;) {
-      const page = await this.config.workState.getEvents(taskId, after);
+      const page = await workState.getEvents(taskId, after);
       for (const row of page.events) {
         const value = row.event;
         if (value.type !== 'subagent-blocked' || value.taskId !== taskId
@@ -773,6 +845,127 @@ export class NavigatorExecutor {
     return outcome(state.record);
   }
 
+  /** Execute one authenticated Teams task using the separate Work principal for its verified actor. */
+  async executeTaskForActor(
+    actorAadObjectId: string,
+    params: ExecuteTaskParams,
+    subscriber?: (event: ExecutorStreamEvent) => void,
+  ): Promise<TaskOutcome> {
+    await this.ready;
+    const actorId = uuidText(actorAadObjectId, 'verified Teams actor id');
+    if (this.config.workActorClients === undefined && this.legacyWorkActorId !== actorId) {
+      throw new Error('No verified legacy Work owner is bound to this Teams actor.');
+    }
+    const workState = this.config.workActorClients === undefined
+      ? this.config.workState
+      : this.config.workActorClients.forActor(actorId);
+    if (workState === undefined) throw new Error('No actor-scoped Work client is provisioned for this verified Teams actor.');
+    const existing = params.taskId === undefined ? undefined : await workState.getTask(params.taskId);
+    if (existing === undefined || existing.createdByActorId?.toLowerCase() !== actorId) {
+      throw new Error('Verified Teams actor has no matching server-owned Work Task.');
+    }
+    if (this.config.workActorClients !== undefined
+      && this.config.teams?.modelActorSubject?.toLowerCase() !== actorId) {
+      throw new Error('Free-form model authorization is not configured for this Teams actor.');
+    }
+    if (this.config.workActorClients !== undefined) {
+      const teams = this.config.teams;
+      if (teams === undefined) throw new Error('Teams model authorization is unavailable for this actor task.');
+      const issuer = `https://login.microsoftonline.com/${teams.tenantId.toLowerCase()}/v2.0`;
+      const currentActors = await resolveTeamsTaskActorSubjects(teams, this.config.workspaceId, issuer);
+      if (!currentActors.includes(actorId)) {
+        throw new Error('Teams actor is no longer authorized for free-form model execution.');
+      }
+    }
+    if (existing.origin !== undefined
+      && (existing.origin.kind !== 'teams_private'
+        || existing.origin.actorAadObjectId.toLowerCase() !== actorId)) {
+      throw new Error('Verified Work Task origin does not match the Teams actor.');
+    }
+    const state = await this.prepareTask(params, subscriber, true, workState, actorId);
+    if (state.completion) return state.completion;
+    return outcome(state.record);
+  }
+
+  /**
+   * Run one fixed native connector action as a durable background Task without entering the model loop.
+   * The task remains subject to Work claims, executor background concurrency, host tool authorization, and receipts.
+   */
+  async executeFixedToolTask(
+    params: ExecuteFixedToolTaskParams,
+    execute: (agent: Agent, signal: AbortSignal) => Promise<string>,
+    actorAadObjectId?: string,
+    actorWorkState?: WorkStateStore,
+  ): Promise<TaskOutcome> {
+    await this.ready;
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/u.test(params.taskId)
+      || typeof params.sessionId !== 'string' || params.sessionId.length < 1 || params.sessionId.length > 200
+      || typeof params.prompt !== 'string' || params.prompt.length < 1 || params.prompt.length > 20_000) {
+      throw new TypeError('Invalid fixed-tool task identity or prompt');
+    }
+    const metadata = normalizeTaskMetadata(params.metadata);
+    const live = this.tasks.get(params.taskId);
+    if (live !== undefined) return live.completion ?? outcome(live.record);
+    const actorId = actorAadObjectId === undefined ? undefined : uuidText(actorAadObjectId, 'workflow owner actor id');
+    const workState = actorWorkState ?? (actorId === undefined
+      ? this.config.workState
+      : this.config.workActorClients === undefined
+        ? this.config.workState
+        : this.config.workActorClients.forActor(actorId));
+    if (workState === undefined) throw new Error('No actor-scoped Work client is provisioned for this workflow owner.');
+    let record = await workState.getTask(params.taskId);
+    if (record !== undefined) {
+      assertTaskActorScope(record, actorId);
+      assertFixedToolTaskIdentity(record, params, metadata);
+      if (record.status === 'running') {
+        throw new Error('Fixed-tool task outcome is still running and must be reconciled before retry.');
+      }
+      if (record.status !== 'queued') return outcome(record);
+    } else {
+      try {
+        record = await workState.createTask({
+          id: params.taskId,
+          sessionId: params.sessionId,
+          prompt: params.prompt,
+          executionClass: 'background',
+          metadata,
+        });
+        assertTaskActorScope(record, actorId);
+      } catch (error: unknown) {
+        const raced = await workState.getTask(params.taskId);
+        if (raced === undefined) throw error;
+        assertFixedToolTaskIdentity(raced, params, metadata);
+        record = raced;
+      }
+      if (record.status !== 'queued') return outcome(record);
+    }
+
+    const task: InternalTaskState = {
+      id: record.id,
+      sessionId: record.sessionId,
+      prompt: record.prompt,
+      executionClass: 'background',
+      abortController: new AbortController(),
+      subscribers: new Set(),
+      record,
+      workState,
+      ...(actorId === undefined ? {} : { actorAadObjectId: actorId }),
+      output: record.output,
+      reasoning: record.reasoning,
+      eventChain: Promise.resolve(),
+      patchChain: Promise.resolve(),
+      fixedToolTask: true,
+    };
+    this.tasks.set(task.id, task);
+    this.taskWorkStateById.set(task.id, workState);
+    if (actorId !== undefined) {
+      this.taskActorById.set(task.id, actorId);
+      this.sessionActorById.set(task.sessionId, actorId);
+    }
+    task.completion = this.runFixedToolTask(task, execute);
+    return task.completion;
+  }
+
   /** Admit a task asynchronously for the task-control API and return its durable queued record.  中文：供任务控制 API 异步接收任务并返回持久排队记录。 */
   async startTask(params: ExecuteTaskParams): Promise<TaskRecord> {
     await this.ready;
@@ -782,15 +975,81 @@ export class NavigatorExecutor {
 
   /** Dispatch one already-admitted queued task without creating a second TaskRecord.  中文：派发已接收的排队任务，不创建重复 TaskRecord。 */
   async dispatchTask(taskId: string, subscriber?: (event: ExecutorStreamEvent) => void): Promise<TaskOutcome> {
-    const record = await this.getTask(taskId);
+    const actorRecord = await this.config.workActorClients?.resolveTask(taskId);
+    const record = actorRecord?.task ?? await this.getTask(taskId);
     if (!record) throw new Error('Task not found');
-    return this.executeTask({
+    const params: ExecuteTaskParams = {
       taskId,
       sessionId: record.sessionId,
       prompt: record.prompt,
       executionClass: recordExecutionClass(record),
       ...(record.metadata === undefined ? {} : { metadata: record.metadata }),
-    }, subscriber);
+    };
+    const actorAadObjectId = actorRecord?.actorAadObjectId ?? this.taskActorById.get(taskId);
+    return actorAadObjectId === undefined
+      ? this.executeTask(params, subscriber)
+      : this.executeTaskForActor(actorAadObjectId, params, subscriber);
+  }
+
+  /** Resolve active task data and actor identity through the server-selected Work client. */
+  async readTaskForExecution(taskId: string): Promise<TaskRecord | undefined> {
+    const workState = this.taskWorkStateById.get(taskId);
+    if (workState !== undefined) return workState.getTask(taskId);
+    const resolved = await this.config.workActorClients?.resolveTask(taskId);
+    if (resolved !== undefined) {
+      this.taskWorkStateById.set(taskId, resolved.store);
+      this.taskActorById.set(taskId, resolved.actorAadObjectId);
+      this.sessionActorById.set(resolved.task.sessionId, resolved.actorAadObjectId);
+    }
+    return resolved?.task ?? this.config.workState.getTask(taskId);
+  }
+
+  /** Trusted in-process actor mapping populated from ingress or Work server projections. */
+  actorForTask(taskId: string): string | undefined {
+    return this.taskActorById.get(taskId);
+  }
+
+  /** Resolve the dedicated Work token environment for a trusted active task actor. */
+  workTokenEnvForTask(taskId: string): string | undefined {
+    const actorId = this.taskActorById.get(taskId);
+    return actorId === undefined ? undefined : this.config.workActorClients?.tokenEnvForActor(actorId);
+  }
+
+  /** Select persistence credentials only for an active verified task matching the private session owner. */
+  workTokenEnvForSession(sessionId: string): string | undefined {
+    const expectedActor = this.sessionActorById.get(sessionId);
+    const active = [...this.tasks.values()].find(task => task.sessionId === sessionId
+      && task.actorAadObjectId !== undefined && !TERMINAL_STATUSES.has(task.record.status));
+    if (expectedActor === undefined || active?.actorAadObjectId !== expectedActor) return undefined;
+    return this.config.workActorClients?.tokenEnvForActor(expectedActor)
+      ?? (this.config.workActorClients === undefined && this.legacyWorkActorId === expectedActor
+        ? this.config.workStateTokenEnv ?? 'CYRENE_SESSION_TOKEN'
+        : undefined);
+  }
+
+  /** Identify actor-private persistence sessions without accepting caller-supplied task metadata. */
+  actorPrivateSession(sessionId: string): boolean {
+    return this.config.workActorClients !== undefined
+      && (sessionId.startsWith('teams-') || this.sessionActorById.has(sessionId));
+  }
+
+  /** Read task event receipts through its selected owner-scoped Work client. */
+  async readTaskEventsForExecution(taskId: string, after = 0) {
+    const workState = await this.resolveTaskWorkState(taskId);
+    return workState.getEvents(taskId, after);
+  }
+
+  private async resolveTaskWorkState(taskId: string): Promise<WorkStateStore> {
+    const known = this.taskWorkStateById.get(taskId);
+    if (known !== undefined) return known;
+    const resolved = await this.config.workActorClients?.resolveTask(taskId);
+    if (resolved !== undefined) {
+      this.taskWorkStateById.set(taskId, resolved.store);
+      this.taskActorById.set(taskId, resolved.actorAadObjectId);
+      this.sessionActorById.set(resolved.task.sessionId, resolved.actorAadObjectId);
+      return resolved.store;
+    }
+    return this.config.workState;
   }
 
   /** Poll durable queued rows and race-safely claim each for execution.  中文：轮询持久排队记录并通过原子认领安全执行。 */
@@ -798,35 +1057,149 @@ export class NavigatorExecutor {
     await this.ready;
     if (this.drainToken !== undefined) return 0;
     let started = 0;
-    let cursor: string | undefined;
-    for (;;) {
+    const queued = (await this.listDurableTaskRows()).filter(({ task }) => task.status === 'queued' && !this.tasks.has(task.id));
+    queued.sort((left, right) => Number(recordExecutionClass(right.task) === 'foreground')
+      - Number(recordExecutionClass(left.task) === 'foreground'));
+    for (const { task: record, workState, actorAadObjectId } of queued) {
       if (this.drainToken !== undefined) return started;
-      const page = await this.config.workState.listTasks({ cursor, limit: 100 });
-      const queued = page.items.filter(record => record.status === 'queued' && !this.tasks.has(record.id));
-      queued.sort((left, right) => Number(recordExecutionClass(right) === 'foreground')
-        - Number(recordExecutionClass(left) === 'foreground'));
-      for (const record of queued) {
-        if (this.drainToken !== undefined) return started;
-        this.adoptQueuedTask(record, {
-          taskId: record.id,
-          sessionId: record.sessionId,
-          prompt: record.prompt,
-          executionClass: recordExecutionClass(record),
-          ...(record.metadata === undefined ? {} : { metadata: record.metadata }),
-        });
-        started += 1;
-      }
-      if (!page.nextCursor) break;
-      cursor = page.nextCursor;
+      // V3 fixed-tool source tasks are resumed by their durable Schedule row only;
+      // adopting them here as freeform Agent tasks would cross the no-LLM boundary.
+      const authorizationRef = record.metadata?.authorizationRef;
+      if (record.metadata?.source === 'workflow' && authorizationRef !== null
+        && typeof authorizationRef === 'object' && !Array.isArray(authorizationRef)
+        && (authorizationRef as Record<string, unknown>).kind === 'owner_private') continue;
+      this.adoptQueuedTask(record, {
+        taskId: record.id,
+        sessionId: record.sessionId,
+        prompt: record.prompt,
+        executionClass: recordExecutionClass(record),
+        ...(record.metadata === undefined ? {} : { metadata: record.metadata }),
+      }, undefined, workState, actorAadObjectId);
+      started += 1;
     }
     return started;
+  }
+
+  /** Claim and finish a fixed connector-only background task while reserving foreground capacity. */
+  private runFixedToolTask(
+    task: InternalTaskState,
+    execute: (agent: Agent, signal: AbortSignal) => Promise<string>,
+  ): Promise<TaskOutcome> {
+    const predecessor = this.sessionTails.get(task.sessionId) ?? Promise.resolve();
+    const completion = predecessor.then(async () => {
+      let claimed = false;
+      let agentHandle: { dispose(): Promise<void> } | undefined;
+      let signalListener: (() => void) | undefined;
+      try {
+        return await this.taskLimiter.run('background', task.abortController.signal, async () => {
+          const workState = task.workState ?? this.config.workState;
+          this.taskLimiter.assertDispatchAllowed();
+          try {
+            const claim = await workState.claimTask(task.id);
+            task.record = claim.task;
+            if (!claim.claimed) {
+              if (TERMINAL_STATUSES.has(claim.task.status)) return outcome(claim.task);
+              throw new Error('Fixed-tool task is already claimed; provider receipts must be reconciled before retry.');
+            }
+            claimed = true;
+            await this.publish(task, {
+              type: 'status', taskId: task.id, sessionId: task.sessionId,
+              status: 'running', timestamp: task.record.startedAt ?? Date.now(),
+            });
+
+            const agents = this.ctx.get('agents');
+            if (agents === undefined) throw new Error('DSH AgentRegistry is unavailable for the fixed tool call.');
+            const sessionId = brandString<SessionId>(task.sessionId);
+            let agent = agents.get(sessionId);
+            if (agent === undefined) {
+              const created = await agents.create({ sessionId, meta: { cwd: process.cwd() } });
+              agent = created.agent;
+              agentHandle = created;
+            }
+            task.agent = agent;
+            this.agentTaskMap.set(agent, task.id);
+            this.sessionTaskMap.set(agent.session, task.id);
+            this.activeTaskBySessionId.set(task.sessionId, task.id);
+            signalListener = () => agent?.cancel({ kind: 'hook', reason: 'navigator_executor_cancelled' });
+            task.abortController.signal.addEventListener('abort', signalListener, { once: true });
+
+            const output = await execute(agent, task.abortController.signal);
+            task.abortController.signal.throwIfAborted();
+            if (typeof output !== 'string' || Buffer.byteLength(output, 'utf8') > 1_000_000) {
+              throw new TypeError('Fixed-tool task output exceeds its safe bound.');
+            }
+            task.output = output;
+            await this.patch(task, { status: 'completed', output, reasoning: '' });
+            await this.flushPatches(task);
+            const endedAt = Date.now();
+            await this.publish(task, {
+              type: 'status', taskId: task.id, sessionId: task.sessionId, status: 'completed', timestamp: endedAt,
+            });
+            await this.publish(task, {
+              type: 'finish', taskId: task.id, status: 'completed', output,
+              durationMs: Math.max(0, endedAt - (task.record.startedAt ?? task.record.createdAt)), timestamp: endedAt,
+            });
+            await this.flushEvents(task);
+            return outcome(task.record);
+          } catch (error: unknown) {
+            if (!claimed) {
+              const latest = await workState.getTask(task.id).catch(() => undefined);
+              if (latest !== undefined) task.record = latest;
+              throw error;
+            }
+            const endedAt = Date.now();
+            const aborted = task.abortController.signal.aborted;
+            const message = safeErrorMessage(error);
+            task.output ||= '';
+            task.record = await workState.patchTask(task.id, {
+              status: aborted ? 'aborted' : 'failed', output: task.output, reasoning: '', error: message,
+            });
+            await this.publish(task, {
+              type: 'error', taskId: task.id, message,
+              code: aborted ? 'TASK_ABORTED' : 'FIXED_TOOL_TASK_FAILED', timestamp: endedAt,
+            });
+            await this.publish(task, {
+              type: 'status', taskId: task.id, sessionId: task.sessionId,
+              status: task.record.status, timestamp: endedAt,
+            });
+            await this.publish(task, {
+              type: 'finish', taskId: task.id, status: task.record.status, output: task.output,
+              durationMs: Math.max(0, endedAt - (task.record.startedAt ?? task.record.createdAt)), timestamp: endedAt,
+            });
+            await this.flushEvents(task);
+            return outcome(task.record, message, task.record.status);
+          }
+        });
+      } catch (error: unknown) {
+        return outcome(task.record, safeErrorMessage(error), task.record.status);
+      } finally {
+        if (task.agent !== undefined) {
+          if (signalListener !== undefined) task.abortController.signal.removeEventListener('abort', signalListener);
+          if (this.agentTaskMap.get(task.agent) === task.id) this.agentTaskMap.delete(task.agent);
+          if (this.sessionTaskMap.get(task.agent.session) === task.id) this.sessionTaskMap.delete(task.agent.session);
+        }
+        if (this.activeTaskBySessionId.get(task.sessionId) === task.id) this.activeTaskBySessionId.delete(task.sessionId);
+        task.agent = undefined;
+        await agentHandle?.dispose().catch(() => undefined);
+        if (this.tasks.get(task.id) === task) this.tasks.delete(task.id);
+      }
+    });
+    const tail = completion.then(() => undefined, () => undefined);
+    this.sessionTails.set(task.sessionId, tail);
+    void tail.then(() => {
+      if (this.sessionTails.get(task.sessionId) === tail) this.sessionTails.delete(task.sessionId);
+    });
+    return completion;
   }
 
   private async prepareTask(
     params: ExecuteTaskParams,
     subscriber?: (event: ExecutorStreamEvent) => void,
     dispatchQueued = true,
+    selectedWorkState?: WorkStateStore,
+    actorAadObjectId?: string,
   ): Promise<InternalTaskState> {
+    const workState = selectedWorkState ?? this.config.workState;
     if (typeof params.prompt !== 'string' || params.prompt.length === 0) throw new TypeError('Missing or invalid "prompt" parameter');
     const requestedExecutionClass = params.executionClass === undefined
       ? undefined
@@ -838,8 +1211,10 @@ export class NavigatorExecutor {
     }
     const requestedId = params.taskId ?? `task-${randomUUID()}`;
     if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/u.test(requestedId)) throw new TypeError('Invalid taskId');
-    const existing = await this.config.workState.getTask(requestedId);
+    const existing = await workState.getTask(requestedId);
     if (existing) {
+      assertTaskActorScope(existing, actorAadObjectId);
+      if (actorAadObjectId !== undefined) this.sessionActorById.set(existing.sessionId, actorAadObjectId);
       if (requestedExecutionClass !== undefined && recordExecutionClass(existing) !== requestedExecutionClass) {
         throw new Error('Existing task execution class does not match this dispatch request');
       }
@@ -848,6 +1223,9 @@ export class NavigatorExecutor {
       }
       const active = this.tasks.get(existing.id);
       if (active) {
+        if (active.workState !== undefined && active.workState !== workState) {
+          throw new Error('Existing active Task belongs to a different actor-scoped Work client.');
+        }
         if (subscriber) active.subscribers.add(subscriber);
         return active;
       }
@@ -857,7 +1235,7 @@ export class NavigatorExecutor {
         }
         if (dispatchQueued && this.drainToken !== undefined) return stateFromRecord(existing);
         return dispatchQueued
-          ? this.adoptQueuedTask(existing, params, subscriber)
+          ? this.adoptQueuedTask(existing, params, subscriber, workState, actorAadObjectId)
           : stateFromRecord(existing);
       }
       const state = stateFromRecord(existing);
@@ -871,17 +1249,20 @@ export class NavigatorExecutor {
     if (typeof sessionId !== 'string' || sessionId.length < 1 || sessionId.length > 200) throw new TypeError('Invalid sessionId');
     let record: TaskRecord;
     try {
-      record = await this.config.workState.createTask({
+      record = await workState.createTask({
         id: requestedId,
         sessionId,
         prompt: params.prompt,
         executionClass,
         ...(metadata === undefined ? {} : { metadata }),
       });
+      assertTaskActorScope(record, actorAadObjectId);
     } catch (error) {
       // A simultaneous retry may have won the durable ID race. Read it once and never start duplicate work.
-      const raced = await this.config.workState.getTask(requestedId);
+      const raced = await workState.getTask(requestedId);
       if (!raced) throw error;
+      assertTaskActorScope(raced, actorAadObjectId);
+      if (actorAadObjectId !== undefined) this.sessionActorById.set(raced.sessionId, actorAadObjectId);
       if (requestedExecutionClass !== undefined && recordExecutionClass(raced) !== requestedExecutionClass) {
         throw new Error('Existing task execution class does not match this dispatch request');
       }
@@ -890,12 +1271,17 @@ export class NavigatorExecutor {
       }
       const active = this.tasks.get(raced.id);
       if (active) {
+        if (active.workState !== undefined && active.workState !== workState) {
+          throw new Error('Existing active Task belongs to a different actor-scoped Work client.');
+        }
         if (subscriber) active.subscribers.add(subscriber);
         return active;
       }
       if (raced.status === 'queued') {
         if (dispatchQueued && this.drainToken !== undefined) return stateFromRecord(raced);
-        return dispatchQueued ? this.adoptQueuedTask(raced, params, subscriber) : stateFromRecord(raced);
+        return dispatchQueued
+          ? this.adoptQueuedTask(raced, params, subscriber, workState, actorAadObjectId)
+          : stateFromRecord(raced);
       }
       return stateFromRecord(raced);
     }
@@ -913,11 +1299,19 @@ export class NavigatorExecutor {
     const task: InternalTaskState = {
       id: record.id, sessionId: record.sessionId, prompt: record.prompt,
       executionClass: recordExecutionClass(record),
-      record, output: record.output, reasoning: record.reasoning,
+      record,
+      workState,
+      ...(actorAadObjectId === undefined ? {} : { actorAadObjectId }),
+      output: record.output, reasoning: record.reasoning,
       abortController: new AbortController(), subscribers: new Set(), eventChain: Promise.resolve(), patchChain: Promise.resolve(),
     };
     if (subscriber) task.subscribers.add(subscriber);
     this.tasks.set(task.id, task);
+    this.taskWorkStateById.set(task.id, workState);
+    if (actorAadObjectId !== undefined) {
+      this.taskActorById.set(task.id, actorAadObjectId);
+      this.sessionActorById.set(task.sessionId, actorAadObjectId);
+    }
     task.abortController.signal.addEventListener('abort', () => {
       task.agent?.cancel({ kind: 'hook', reason: 'navigator_executor_cancelled' });
     }, { once: true });
@@ -933,6 +1327,8 @@ export class NavigatorExecutor {
     record: TaskRecord,
     params: ExecuteTaskParams,
     subscriber?: (event: ExecutorStreamEvent) => void,
+    workState: WorkStateStore = this.config.workState,
+    actorAadObjectId?: string,
   ): InternalTaskState {
     const concurrent = this.tasks.get(record.id);
     if (concurrent) {
@@ -940,8 +1336,15 @@ export class NavigatorExecutor {
       return concurrent;
     }
     const task = stateFromRecord(record);
+    task.workState = workState;
+    if (actorAadObjectId !== undefined) task.actorAadObjectId = actorAadObjectId;
     if (subscriber) task.subscribers.add(subscriber);
     this.tasks.set(task.id, task);
+    this.taskWorkStateById.set(task.id, workState);
+    if (actorAadObjectId !== undefined) {
+      this.taskActorById.set(task.id, actorAadObjectId);
+      this.sessionActorById.set(task.sessionId, actorAadObjectId);
+    }
     task.abortController.signal.addEventListener('abort', () => {
       task.agent?.cancel({ kind: 'hook', reason: 'navigator_executor_cancelled' });
     }, { once: true });
@@ -983,12 +1386,13 @@ export class NavigatorExecutor {
     } catch (error: unknown) {
       if (error instanceof TaskDispatchPausedError) return outcome(task.record);
       if (!task.abortController.signal.aborted) throw error;
-      const latest = await this.config.workState.getTask(task.id).catch(() => undefined);
+      const latest = await (task.workState ?? this.config.workState).getTask(task.id).catch(() => undefined);
       return outcome(latest ?? task.record, safeErrorMessage(error), 'aborted');
     }
   }
 
   private async runTaskWithSlot(task: InternalTaskState, params: ExecuteTaskParams): Promise<TaskOutcome> {
+    const workState = task.workState ?? this.config.workState;
     const timeoutMs = params.timeoutMs ?? this.defaultTimeoutMs;
     if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
       throw new TypeError('timeoutMs must be a positive number');
@@ -1001,14 +1405,14 @@ export class NavigatorExecutor {
     try {
       task.abortController.signal.throwIfAborted();
       this.taskLimiter.assertDispatchAllowed();
-      const claim = await this.config.workState.claimTask(task.id);
+      const claim = await workState.claimTask(task.id);
       task.record = claim.task;
       if (!claim.claimed) {
         if (claim.task.status === 'running') return await this.waitForTask(task.id, event => this.deliver(task, event));
         return outcome(claim.task);
       }
       claimed = true;
-      task.blocked = await this.readBlockedReceipts(task.id);
+      task.blocked = await this.readBlockedReceipts(task.id, workState);
       const startedAt = claim.task.startedAt ?? Date.now();
       await this.flushEvents(task);
       await this.publish(task, {
@@ -1090,7 +1494,7 @@ export class NavigatorExecutor {
       await this.flushPatches(task);
       task.abortController.signal.throwIfAborted();
       await sessions.flush(agent.session);
-      const latestRecord = await this.config.workState.getTask(task.id);
+      const latestRecord = await workState.getTask(task.id);
       if (latestRecord) task.record = latestRecord;
       if (PAUSED_STATUSES.has(task.record.status)) {
         if (task.blocked?.size) await this.patch(task, { output: appendBlockedSummary(task.output, task.blocked) });
@@ -1137,7 +1541,7 @@ export class NavigatorExecutor {
     } catch (err: unknown) {
       if (!claimed) {
         try {
-          const latest = await this.config.workState.getTask(task.id);
+          const latest = await workState.getTask(task.id);
           if (latest) {
             task.record = latest;
             if (latest.status === 'running') return await this.waitForTask(task.id);
@@ -1167,7 +1571,7 @@ export class NavigatorExecutor {
         // Close a failed write chain with an independent terminal reconciliation.
         // 中文：写入链失败后，独立尝试持久化失败终态，避免把执行成功写入事件。
         await task.patchChain;
-        task.record = await this.config.workState.patchTask(task.id, {
+        task.record = await workState.patchTask(task.id, {
           status, output: task.output, reasoning: task.reasoning, error: message,
         });
         if (!awaitingAuthorization || cleanupIncomplete) {
@@ -1196,6 +1600,7 @@ export class NavigatorExecutor {
 
   /** Execute one host-owned backend turn while preserving the same durable Work lifecycle. */
   private async runConversationBackendTask(task: InternalTaskState, params: ExecuteTaskParams): Promise<TaskOutcome> {
+    const workState = task.workState ?? this.config.workState;
     const backend = this.config.conversationBackend;
     if (backend === undefined) throw new Error('The configured conversation backend is unavailable');
     task.authorizationPauseController ??= new AbortController();
@@ -1225,7 +1630,7 @@ export class NavigatorExecutor {
     await this.flushEvents(task);
     await this.flushPatches(task);
     task.abortController.signal.throwIfAborted();
-    const latest = await this.config.workState.getTask(task.id);
+    const latest = await workState.getTask(task.id);
     if (latest) task.record = latest;
     if (PAUSED_STATUSES.has(task.record.status)) {
       const finishedAt = Date.now();
@@ -1241,7 +1646,7 @@ export class NavigatorExecutor {
 
     const finishedAt = Date.now();
     const durationMs = Math.max(0, finishedAt - (task.record.startedAt ?? task.record.createdAt));
-    task.record = await this.config.workState.patchTask(task.id, {
+    task.record = await workState.patchTask(task.id, {
       status: 'completed', output: task.output, reasoning: '',
     });
     await this.publish(task, {
@@ -1267,22 +1672,23 @@ export class NavigatorExecutor {
     taskId: string,
     subscriber?: (event: ExecutorStreamEvent) => void,
   ): Promise<TaskOutcome> {
+    const workState = this.taskWorkStateById.get(taskId) ?? this.config.workState;
     let cursor = 0;
     const deadline = performance.now() + (this.defaultTimeoutMs ?? 300_000) + 10_000;
     while (performance.now() < deadline) {
-      const page = await this.config.workState.getEvents(taskId, cursor);
+      const page = await workState.getEvents(taskId, cursor);
       for (const row of page.events) {
         cursor = row.seq;
         if (subscriber) subscriber({ ...row.event, seq: row.seq } as unknown as ExecutorStreamEvent);
       }
-      const record = await this.config.workState.getTask(taskId);
+      const record = await workState.getTask(taskId);
       if (!record) throw new Error('Task disappeared from durable work state');
       if (TERMINAL_STATUSES.has(record.status) || PAUSED_STATUSES.has(record.status)) {
         return outcome(record);
       }
       await delay(250);
     }
-    const latest = await this.config.workState.getTask(taskId);
+    const latest = await workState.getTask(taskId);
     if (!latest) throw new Error('Task disappeared from durable work state');
     return outcome(latest);
   }
@@ -1332,7 +1738,8 @@ export class NavigatorExecutor {
   /** Read one current record directly from the durable authority.  中文：直接从持久化权威读取任务。 */
   async getTask(taskId: string): Promise<TaskRecord | undefined> {
     await this.ready;
-    return this.config.workState.getTask(taskId);
+    const workState = await this.resolveTaskWorkState(taskId);
+    return workState.getTask(taskId);
   }
 
   /** List records directly from the durable authority.  中文：直接从持久化权威列出任务。 */
@@ -1498,11 +1905,15 @@ export class NavigatorExecutor {
   }
 
   /** Read a bounded durable event history for one continuation decision. */
-  private async readAllTaskEvents(taskId: string): Promise<Awaited<ReturnType<WorkStateStore['getEvents']>>['events']> {
+  private async readAllTaskEvents(
+    taskId: string,
+    suppliedWorkState?: WorkStateStore,
+  ): Promise<Awaited<ReturnType<WorkStateStore['getEvents']>>['events']> {
+    const workState = suppliedWorkState ?? await this.resolveTaskWorkState(taskId);
     const events: Awaited<ReturnType<WorkStateStore['getEvents']>>['events'][number][] = [];
     let cursor = 0;
     for (;;) {
-      const page = await this.config.workState.getEvents(taskId, cursor);
+      const page = await workState.getEvents(taskId, cursor);
       events.push(...page.events);
       if (events.length > 100_000) {
         throw new ExecutorRequestError(409, 'TASK_EVIDENCE_LIMIT_EXCEEDED', 'Task evidence is too large to revalidate safely.');
@@ -1611,7 +2022,69 @@ export class NavigatorExecutor {
 
   /** Read durable task events for a workflow receipt without adding another persistence client. */
   async readTaskEvents(taskId: string, after = 0) {
-    return this.config.workState.getEvents(taskId, after);
+    return (await this.resolveTaskWorkState(taskId)).getEvents(taskId, after);
+  }
+
+  /** Persist exact completed-page evidence before Work accepts a source-event notice intent. */
+  async recordWorkflowSourcePage(taskId: string, receipt: WorkflowSourceTaskReceipt): Promise<void> {
+    await this.ready;
+    const workState = this.taskWorkStateById.get(taskId) ?? this.config.workState;
+    const task = await workState.getTask(taskId);
+    const metadata = task?.metadata;
+    if (!task || task.status !== 'running' || task.executionClass !== 'background'
+      || metadata?.source !== 'workflow' || metadata.workflowId !== receipt.workflowId
+      || metadata.triggerId !== receipt.triggerId || metadata.occurrenceId !== receipt.occurrenceId
+      || metadata.scheduledAt !== receipt.scheduledAt
+      || taskId !== `workflow-${receipt.occurrenceId.slice(4)}`) {
+      throw new Error('Source page evidence is outside its active deterministic workflow task.');
+    }
+    const base = {
+      workflowId: receipt.workflowId,
+      triggerId: receipt.triggerId,
+      occurrenceId: receipt.occurrenceId,
+      scheduledAt: receipt.scheduledAt,
+      source: receipt.source,
+      targetId: receipt.targetId,
+      windowStart: receipt.windowStart,
+      windowEnd: receipt.windowEnd,
+    };
+    if (!Number.isFinite(Date.parse(receipt.scheduledAt))
+      || !Number.isFinite(Date.parse(receipt.windowEnd))
+      || receipt.windowStart !== null && !Number.isFinite(Date.parse(receipt.windowStart))) {
+      throw new TypeError('Invalid source observation evidence.');
+    }
+    let event: Record<string, unknown>;
+    if ('outcome' in receipt) {
+      if (receipt.outcome !== 'failed'
+        || !['not_configured', 'forbidden', 'unavailable', 'timeout', 'invalid', 'partial'].includes(receipt.reasonCode)
+        || !Number.isFinite(Date.parse(receipt.observedAt))) {
+        throw new TypeError('Invalid source error evidence.');
+      }
+      event = { type: 'workflow.source-error.v1', ...base, outcome: 'failed', reasonCode: receipt.reasonCode,
+        observedAt: receipt.observedAt };
+    } else {
+      if (!Number.isSafeInteger(receipt.observedAt) || receipt.observedAt < 0
+        || typeof receipt.pageCursor !== 'string' && receipt.pageCursor !== null
+        || typeof receipt.nextCursor !== 'string' && receipt.nextCursor !== null
+        || receipt.automationEventIds.length !== receipt.sourceEventIds.length
+        || receipt.automationEventIds.length > 50
+        || receipt.automationEventIds.some(value => typeof value !== 'string' || !value || value.length > 512)
+        || receipt.sourceEventIds.some(value => typeof value !== 'string' || !value || value.length > 512)) {
+        throw new TypeError('Invalid completed source page evidence.');
+      }
+      event = {
+        type: 'workflow.source-page.v1', ...base,
+        pageCursor: receipt.pageCursor,
+        nextCursor: receipt.nextCursor,
+        complete: true,
+        truncated: false,
+        automationEventIds: [...receipt.automationEventIds],
+        sourceEventIds: [...receipt.sourceEventIds],
+        observedAt: receipt.observedAt,
+      };
+    }
+    const messageId = `workflow-source-page-${sha256(canonicalJson(event)).slice(0, 48)}`;
+    await workState.appendEvent(taskId, event, messageId);
   }
 
   /** Aggregate only durable provider-reported counts; absent counts remain absent and never gate work. */
@@ -1745,10 +2218,26 @@ export class NavigatorExecutor {
       throw new ExecutorRequestError(401, 'CONNECTOR_SOURCE_UNAUTHENTICATED', 'Teams event authentication failed.');
     }
     const body = parseTeamsJsonObject(rawBody.toString('utf8'), 'Teams event body');
-    if (!isExactObjectKeys(body, ['event_type', 'payload', 'trust']) || body.event_type !== 'inbound_message') {
+    if (!isExactObjectKeys(body, ['event_type', 'payload', 'trust'])) {
       throw new ExecutorRequestError(400, 'TEAMS_EVENT_INVALID', 'Teams event is invalid.');
     }
+    if (body.event_type === 'personal_installation') {
+      return this.acceptTeamsPrivateInstallation(body.payload, body.trust, config);
+    }
+    if (body.event_type !== 'inbound_message') {
+      throw new ExecutorRequestError(400, 'TEAMS_EVENT_INVALID', 'Teams event is invalid.');
+    }
+    const canonicalPayload = objectValue(body.payload, 'Teams canonical payload');
+    const canonicalConversation = objectValue(canonicalPayload.conversation, 'Teams conversation');
+    if (canonicalConversation.kind === 'private') {
+      return this.acceptTeamsPrivateMessage(body.payload, body.trust, config);
+    }
     const normalized = normalizeTeamsActivity(body.payload, body.trust, config);
+    const actorWorkState = this.config.workActorClients?.forActor(normalized.actorSubject);
+    if (this.config.workActorClients !== undefined && actorWorkState === undefined) {
+      throw new ExecutorRequestError(403, 'TEAMS_TASK_ACTOR_NOT_PROVISIONED', 'No actor-scoped Work principal is configured.');
+    }
+    const workState = actorWorkState ?? this.config.workState;
     const threadId = sha256(canonicalJson({
       tenantId: normalized.route.tenantId,
       teamId: normalized.route.teamId,
@@ -1764,20 +2253,35 @@ export class NavigatorExecutor {
 
     let priorThread: Awaited<ReturnType<WorkStateStore['getConnectorThread']>> | undefined;
     try {
-      priorThread = await this.config.workState.getConnectorThread(
+      priorThread = await workState.getConnectorThread(
         config.connectorId, threadId, 20, normalized.messageId,
       );
       assertTeamsThreadRoute(priorThread, normalized.route, threadId);
     } catch (error: unknown) {
       if (!(error instanceof WorkStateHttpError) || error.status !== 404) throw error;
     }
-    const activeSessionId = priorThread?.sessionId;
     const taskActorSubjects = await resolveTeamsTaskActorSubjects(
       config, this.config.workspaceId, normalized.actorIssuer,
     );
     const isTaskActor = taskActorSubjects.includes(normalized.actorSubject);
-    const createTask = isTaskActor && (activeSessionId !== undefined || normalized.mentionsBot);
-    const sessionId = activeSessionId ?? (createTask ? `teams-${threadId}` : undefined);
+    const modelActorMatches = this.config.workActorClients === undefined
+      || config.modelActorSubject?.toLowerCase() === normalized.actorSubject;
+    const actorHasPriorTask = priorThread?.sessionId !== undefined;
+    const legacyOwnerMatches = this.config.workActorClients !== undefined
+      || this.legacyWorkActorId === undefined
+      || this.legacyWorkActorId === normalized.actorSubject;
+    const createTask = isTaskActor && modelActorMatches && legacyOwnerMatches
+      && (actorHasPriorTask || normalized.mentionsBot);
+    const actorThreadId = sha256(canonicalJson({
+      tenantId: normalized.route.tenantId,
+      botAppId: config.botAppId,
+      actorAadObjectId: normalized.actorSubject,
+      threadId,
+    }));
+    // Never reuse a thread-wide Session that may have belonged to a different actor.
+    const sessionId = createTask
+      ? `${this.config.workActorClients === undefined ? 'legacyteams-' : 'teams-'}${actorThreadId.slice(0, 60)}`
+      : undefined;
     const teamsThreadMessage = {
       threadId,
       messageId: normalized.messageId,
@@ -1822,7 +2326,7 @@ export class NavigatorExecutor {
         },
       }
       : undefined;
-    const receipt = await this.config.workState.registerConnectorEvent({
+    const receipt = await workState.registerConnectorEvent({
       connectorId: config.connectorId,
       messageId: eventId,
       type: 'message.received',
@@ -1843,6 +2347,14 @@ export class NavigatorExecutor {
       teamsThreadMessage,
       ...(task === undefined ? {} : { task }),
     });
+    if (receipt.task !== undefined) {
+      if (receipt.task.createdByActorId?.toLowerCase() !== normalized.actorSubject) {
+        throw new ExecutorRequestError(403, 'TEAMS_TASK_ACTOR_MISMATCH', 'Persisted task actor does not match ingress.');
+      }
+      if (this.config.workActorClients === undefined) this.legacyWorkActorId = normalized.actorSubject;
+      this.taskWorkStateById.set(receipt.task.id, workState);
+      this.taskActorById.set(receipt.task.id, normalized.actorSubject);
+    }
     return {
       duplicate: receipt.duplicate,
       ...(receipt.task === undefined ? {} : { taskId: receipt.task.id }),
@@ -1851,6 +2363,170 @@ export class NavigatorExecutor {
         duplicate: receipt.duplicate,
         eventId: receipt.eventId,
         ...(receipt.task === undefined ? {} : { taskId: receipt.task.id, status: receipt.task.status }),
+      },
+    };
+  }
+
+  /** Admit an authenticated private activity only for its provisioned actor and model-entitled owner. */
+  private async acceptTeamsPrivateMessage(
+    payloadValue: unknown,
+    trustValue: unknown,
+    config: TeamsExecutorConfig,
+  ): Promise<{
+    readonly duplicate: boolean;
+    readonly taskId?: string;
+    readonly receipt: Record<string, unknown>;
+  }> {
+    if (config.personalChatEnabled !== true) {
+      throw new ExecutorRequestError(403, 'TEAMS_PERSONAL_CHAT_DISABLED', 'Personal Teams messages are disabled.');
+    }
+    const normalized = normalizeTeamsPrivateActivity(payloadValue, trustValue, config);
+    const actorWorkState = this.config.workActorClients?.forActor(normalized.actorSubject);
+    if (this.config.workActorClients === undefined || actorWorkState === undefined) {
+      throw new ExecutorRequestError(403, 'TEAMS_TASK_ACTOR_NOT_PROVISIONED', 'No actor-scoped Work principal is configured.');
+    }
+    const taskActorSubjects = await resolveTeamsTaskActorSubjects(
+      config, this.config.workspaceId, normalized.actorIssuer,
+    );
+    if (!taskActorSubjects.includes(normalized.actorSubject)) {
+      throw new ExecutorRequestError(403, 'TEAMS_TASK_ACTOR_NOT_ALLOWED', 'Teams actor is not currently authorized.');
+    }
+    if (config.modelActorSubject?.toLowerCase() !== normalized.actorSubject) {
+      throw new ExecutorRequestError(
+        403,
+        'TEAMS_MODEL_AUTHORIZATION_REQUIRED',
+        'Free-form model authorization is not configured for this Teams actor.',
+      );
+    }
+
+    const taskId = `teams-private-${sha256(canonicalJson({
+      tenantId: normalized.tenantId,
+      botAppId: normalized.botAppId,
+      actorAadObjectId: normalized.actorSubject,
+      messageId: normalized.messageId,
+    }))}`;
+    const sessionId = `teams-private-${sha256(canonicalJson({
+      tenantId: normalized.tenantId,
+      botAppId: normalized.botAppId,
+      actorAadObjectId: normalized.actorSubject,
+    }))}`;
+    const receipt = await actorWorkState.registerConnectorEvent({
+      connectorId: config.connectorId,
+      messageId: normalized.messageId,
+      type: 'message.received',
+      payload: {
+        provider: 'teams',
+        messageId: normalized.messageId,
+        text: normalized.text,
+      },
+      teamsPrivateMessage: {
+        messageId: normalized.messageId,
+        text: normalized.text,
+      },
+      task: {
+        id: taskId,
+        sessionId,
+        prompt: normalized.text,
+        title: 'Private Teams request',
+        metadata: {},
+      },
+    });
+    if (receipt.task !== undefined) {
+      const origin = receipt.task.origin;
+      if (receipt.task.createdByActorId?.toLowerCase() !== normalized.actorSubject
+        || origin?.kind !== 'teams_private'
+        || origin.actorAadObjectId.toLowerCase() !== normalized.actorSubject
+        || origin.messageId !== normalized.messageId
+        || origin.tenantId.toLowerCase() !== normalized.tenantId
+        || origin.botAppId.toLowerCase() !== normalized.botAppId) {
+        throw new ExecutorRequestError(403, 'TEAMS_TASK_ACTOR_MISMATCH', 'Persisted private task origin does not match ingress.');
+      }
+      this.taskWorkStateById.set(receipt.task.id, actorWorkState);
+      this.taskActorById.set(receipt.task.id, normalized.actorSubject);
+      this.sessionActorById.set(receipt.task.sessionId, normalized.actorSubject);
+    }
+    return {
+      duplicate: receipt.duplicate,
+      ...(receipt.task === undefined ? {} : { taskId: receipt.task.id }),
+      receipt: {
+        accepted: true,
+        duplicate: receipt.duplicate,
+        eventId: receipt.eventId,
+        ...(receipt.task === undefined ? {} : { taskId: receipt.task.id, status: receipt.task.status }),
+      },
+    };
+  }
+
+  /** Persist only authenticated personal-install state through the dedicated private Work principal. */
+  private async acceptTeamsPrivateInstallation(
+    payloadValue: unknown,
+    trustValue: unknown,
+    config: TeamsExecutorConfig,
+  ): Promise<{ readonly duplicate: boolean; readonly receipt: Record<string, unknown> }> {
+    if (config.personalChatEnabled !== true) {
+      throw new ExecutorRequestError(403, 'TEAMS_PERSONAL_CHAT_DISABLED', 'Personal Teams chat is disabled.');
+    }
+    const register = this.config.workState.registerTeamsPrivateInstallation;
+    if (register === undefined) {
+      throw new ExecutorRequestError(503, 'TEAMS_PRIVATE_INSTALLATION_UNAVAILABLE', 'Private installation binding is unavailable.');
+    }
+    const payload = parseTeamsJsonObject(JSON.stringify(payloadValue), 'personal installation payload');
+    const trust = parseTeamsJsonObject(JSON.stringify(trustValue), 'personal installation trust');
+    if (!isExactObjectKeys(payload, ['action']) || !['add', 'remove'].includes(String(payload.action))) {
+      throw new ExecutorRequestError(400, 'TEAMS_PRIVATE_INSTALLATION_INVALID', 'Personal installation event is invalid.');
+    }
+    const trustKeys = [
+      'version', 'provider', 'conversation_kind', 'installation_action', 'tenant_id', 'actor_aad_object_id',
+      'bot_app_id', 'conversation_id', 'activity_id', 'activity_occurred_at', 'service_url',
+    ];
+    if (!isExactObjectKeys(trust, trustKeys) || trust.version !== 1 || trust.provider !== 'teams'
+      || trust.conversation_kind !== 'private' || trust.installation_action !== payload.action) {
+      throw new ExecutorRequestError(400, 'TEAMS_TRUST_ENVELOPE_INVALID', 'Teams private installation trust context is invalid.');
+    }
+    const tenantId = uuidText(trust.tenant_id, 'private installation tenant');
+    const actorAadObjectId = uuidText(trust.actor_aad_object_id, 'private installation actor');
+    const botAppId = uuidText(trust.bot_app_id, 'private installation bot app');
+    if (tenantId !== config.tenantId.toLowerCase() || botAppId !== config.botAppId.toLowerCase()) {
+      throw new ExecutorRequestError(403, 'TEAMS_TENANT_NOT_ALLOWED', 'Teams tenant is not configured.');
+    }
+    const conversationId = boundedText(trust.conversation_id, 'private conversation id', 512);
+    const activityId = boundedText(trust.activity_id, 'private installation activity id', 512);
+    const activityOccurredAt = boundedText(trust.activity_occurred_at, 'private installation activity timestamp', 32);
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/u.test(activityOccurredAt)
+      || !Number.isFinite(Date.parse(activityOccurredAt))) {
+      throw new ExecutorRequestError(400, 'TEAMS_TRUST_ENVELOPE_INVALID', 'Teams private installation timestamp is invalid.');
+    }
+    const serviceUrl = validateTeamsServiceUrl(trust.service_url, tenantId);
+    const issuer = `https://login.microsoftonline.com/${tenantId}/v2.0`;
+    const allowedActors = await resolveTeamsTaskActorSubjects(config, this.config.workspaceId, issuer);
+    if (!allowedActors.includes(actorAadObjectId)) {
+      throw new ExecutorRequestError(403, 'TEAMS_TASK_ACTOR_NOT_ALLOWED', 'Teams actor is not currently authorized.');
+    }
+    const receipt = await register.call(this.config.workState, {
+      eventType: 'personal_installation',
+      payload: { action: payload.action as 'add' | 'remove' },
+      trust: {
+        version: 1,
+        provider: 'teams',
+        conversationKind: 'private',
+        installationAction: payload.action as 'add' | 'remove',
+        tenantId,
+        actorAadObjectId,
+        botAppId,
+        conversationId,
+        activityId,
+        activityOccurredAt,
+        serviceUrl,
+      },
+    });
+    return {
+      duplicate: receipt.duplicate,
+      receipt: {
+        accepted: true,
+        duplicate: receipt.duplicate,
+        action: receipt.action,
+        active: receipt.active,
+        applied: receipt.applied,
       },
     };
   }
@@ -1870,14 +2546,47 @@ export class NavigatorExecutor {
         }
       }
       if (this.drainToken !== undefined) return;
-      const leases = await this.config.workState.claimNotifications({
+      if (config.personalChatEnabled === true && config.sendPrivateMessage !== undefined
+        && this.config.workActorClients !== undefined
+        && this.config.workState.claimPrivateNotifications !== undefined
+        && this.config.workState.startPrivateNotification !== undefined
+        && this.config.workState.finishPrivateNotification !== undefined) {
+        const privateLeases = await this.config.workState.claimPrivateNotifications({
+          workerId: `navigator-teams-private-${process.pid}`,
+          limit: 10,
+          leaseSeconds: 60,
+          type: 'teams.message',
+          connectorId: config.connectorId,
+        });
+        for (const lease of privateLeases) await this.deliverTeamsPersonalNotification(lease, config);
+      }
+      if (this.drainToken !== undefined) return;
+      const claim = {
         workerId: `navigator-teams-${process.pid}`,
         limit: 10,
         leaseSeconds: 60,
         type: 'teams.message',
         connectorId: config.connectorId,
-      });
-      for (const lease of leases) await this.deliverTeamsNotification(lease, config);
+      } as const;
+      if (this.config.workActorClients === undefined) {
+        const leases = await this.config.workState.claimNotifications(claim);
+        for (const lease of leases) {
+          await this.deliverTeamsNotification(lease, config, this.config.workState);
+        }
+      } else {
+        // Owner-private actor principals must claim and finalize their own channel rows.
+        // The shared principal cannot see those Tasks and must not take their leases.
+        for (const actorId of this.config.workActorClients.actorIds()) {
+          const actorStore = this.config.workActorClients.forActor(actorId);
+          if (actorStore === undefined) continue;
+          try {
+            const leases = await actorStore.claimNotifications({ ...claim, workerId: `${claim.workerId}-${actorId.slice(0, 8)}` });
+            for (const lease of leases) await this.deliverTeamsNotification(lease, config, actorStore, actorId);
+          } catch (error: unknown) {
+            this.ctx.logger.warn(`Teams actor notification dispatch failed (${safeErrorMessage(error)})`);
+          }
+        }
+      }
       if (config.credentialNotifications !== undefined && this.drainToken === undefined) {
         const credentialLeases = await this.config.workState.claimNotifications({
           workerId: `navigator-credential-notices-${process.pid}`,
@@ -1926,12 +2635,14 @@ export class NavigatorExecutor {
   private async deliverTeamsNotification(
     lease: Awaited<ReturnType<WorkStateStore['claimNotifications']>>[number],
     config: TeamsExecutorConfig,
+    workState: WorkStateStore = this.config.workState,
+    expectedActorId?: string,
   ): Promise<void> {
     const notification = lease.notification;
     let started = false;
     let providerCallStarted = false;
     try {
-      await this.config.workState.startNotification(notification.id, lease.leaseToken);
+      await workState.startNotification(notification.id, lease.leaseToken);
       started = true;
       const retryCountValue = notification.result.retryCount ?? 0;
       if (typeof retryCountValue !== 'number' || !Number.isSafeInteger(retryCountValue)
@@ -1941,10 +2652,17 @@ export class NavigatorExecutor {
       const requestId = `${notification.id}:attempt:${retryCountValue + 1}`;
       if (requestId.length > 200) throw new TypeError('Teams notification request identifier is too long');
       if (notification.taskId === undefined) throw new TypeError('Teams notification has no source task');
-      const task = await this.config.workState.getTask(notification.taskId);
+      const task = await workState.getTask(notification.taskId);
       if (!task) throw new TypeError('Teams notification source task is unavailable');
+      if (expectedActorId !== undefined
+        && task.createdByActorId?.toLowerCase() !== expectedActorId.toLowerCase()) {
+        throw new TypeError('Teams notification source Task is outside the claiming actor scope');
+      }
       const metadata = task.metadata ?? {};
       const caller = readTeamsCaller(metadata.teamsCaller);
+      if (expectedActorId !== undefined && caller.subject.toLowerCase() !== expectedActorId.toLowerCase()) {
+        throw new TypeError('Teams notification original actor does not match its Work principal');
+      }
       const currentTaskActors = await resolveTeamsTaskActorSubjects(
         config, this.config.workspaceId, caller.issuer,
       );
@@ -1983,13 +2701,13 @@ export class NavigatorExecutor {
       if (result.outcome === 'rate_limited' && result.retryAfterSeconds !== undefined) {
         await this.finishTeamsRateLimit(notification.id, lease.leaseToken, result.retryAfterSeconds, {
           reasonCode: result.reasonCode ?? 'rate_limited',
-        });
+        }, workState);
         return;
       }
       const outcome = result.outcome === 'accepted'
         ? 'delivered'
         : result.outcome === 'uncertain' ? 'uncertain' : 'failed';
-      await this.config.workState.finishNotification(notification.id, lease.leaseToken, outcome, {
+      await workState.finishNotification(notification.id, lease.leaseToken, outcome, {
         reasonCode: result.reasonCode ?? null,
         vendorMessageId: result.vendorMessageId ?? null,
       });
@@ -1999,12 +2717,12 @@ export class NavigatorExecutor {
         && error.status === 429 && error.retryAfterSeconds !== undefined) {
         await this.finishTeamsRateLimit(notification.id, lease.leaseToken, error.retryAfterSeconds, {
           code: 'EXCHANGE_HTTP_429',
-        }).catch(() => undefined);
+        }, workState).catch(() => undefined);
         return;
       }
       const unknown = providerCallStarted && isUncertainConnectorOutcome(error);
       try {
-        await this.config.workState.finishNotification(
+        await workState.finishNotification(
           notification.id,
           lease.leaseToken,
           unknown ? 'uncertain' : 'failed',
@@ -2013,6 +2731,92 @@ export class NavigatorExecutor {
       } catch (finishError: unknown) {
         this.ctx.logger.warn(`Teams notification receipt could not be finalized (${safeErrorMessage(finishError)})`);
       }
+    }
+  }
+
+  /** Deliver one Work-resolved owner-private notification through the fixed PRIVATE connector port. */
+  private async deliverTeamsPersonalNotification(
+    lease: NotificationLease,
+    config: TeamsExecutorConfig,
+  ): Promise<void> {
+    const notification = lease.notification;
+    let started = false;
+    let providerCallStarted = false;
+    const start = this.config.workState.startPrivateNotification;
+    const finish = this.config.workState.finishPrivateNotification;
+    if (config.personalChatEnabled !== true || start === undefined || finish === undefined
+      || config.sendPrivateMessage === undefined) return;
+    try {
+      await start.call(this.config.workState, notification.id, lease.leaseToken);
+      started = true;
+      const route = lease.teamsPersonalRoute;
+      if (route === undefined || notification.type !== 'teams.message'
+        || notification.connectorId !== config.connectorId || notification.recipient !== 'teams:owner-private'
+        || notification.taskId === undefined || route.tenantId !== config.tenantId.toLowerCase()
+        || route.botAppId !== config.botAppId.toLowerCase()) {
+        throw new TypeError('Work private notification lease has an invalid fixed recipient projection');
+      }
+      const workState = this.config.workActorClients?.forActor(route.actorAadObjectId);
+      if (workState === undefined) throw new TypeError('Private notification owner has no actor-scoped Work client');
+      const task = await workState.getTask(notification.taskId);
+      if (!task || task.createdByActorId?.toLowerCase() !== route.actorAadObjectId) {
+        throw new TypeError('Private notification source Task does not match the Work owner actor');
+      }
+      const issuer = `https://login.microsoftonline.com/${route.tenantId}/v2.0`;
+      const authorized = await resolveTeamsTaskActorSubjects(config, this.config.workspaceId, issuer);
+      if (!authorized.includes(route.actorAadObjectId)) throw new TypeError('Private notification owner is no longer authorized');
+      const serviceUrl = validateTeamsServiceUrl(route.serviceUrl, route.tenantId);
+      const text = boundedTeamsMessageText(notification.payload.text, 'private notification text', 20_000);
+      const retryCount = notification.result.retryCount ?? 0;
+      if (typeof retryCount !== 'number' || !Number.isSafeInteger(retryCount) || retryCount < 0) {
+        throw new TypeError('Private notification retry counter is invalid');
+      }
+      const requestId = `${notification.id}:attempt:${retryCount + 1}`;
+      if (requestId.length > 200) throw new TypeError('Private notification request id is too long');
+      providerCallStarted = true;
+      const result = await config.sendPrivateMessage({
+        requestId,
+        conversation: {
+          vendor: 'msteams',
+          account_id: route.botAppId,
+          conversation_id: route.conversationId,
+          kind: 'private',
+        },
+        tenant_id: route.tenantId,
+        service_url: serviceUrl,
+        target_kind: 'owner_private',
+        actor_aad_object_id: route.actorAadObjectId,
+        text,
+      }, AbortSignal.timeout(15_000));
+      if (result.outcome === 'rate_limited' && result.retryAfterSeconds !== undefined) {
+        await finish.call(this.config.workState, notification.id, lease.leaseToken, 'retry', {
+          reasonCode: result.reasonCode ?? 'rate_limited',
+        }, Math.min(Math.max(Math.ceil(result.retryAfterSeconds), 1), 300));
+        return;
+      }
+      const outcome = result.outcome === 'accepted' ? 'delivered'
+        : result.outcome === 'uncertain' ? 'uncertain' : 'failed';
+      await finish.call(this.config.workState, notification.id, lease.leaseToken, outcome, {
+        reasonCode: result.reasonCode ?? null,
+        vendorMessageId: result.vendorMessageId ?? null,
+      });
+    } catch (error: unknown) {
+      if (!started) return;
+      if (providerCallStarted && error instanceof ExchangeConnectorRequestError
+        && error.status === 429 && !error.outcomeUnknown && error.retryAfterSeconds !== undefined) {
+        await finish.call(
+          this.config.workState,
+          notification.id,
+          lease.leaseToken,
+          'retry',
+          { code: 'EXCHANGE_HTTP_429' },
+          Math.min(Math.max(Math.ceil(error.retryAfterSeconds), 1), 300),
+        ).catch(() => undefined);
+        return;
+      }
+      const uncertain = providerCallStarted && isUncertainConnectorOutcome(error);
+      await finish.call(this.config.workState, notification.id, lease.leaseToken,
+        uncertain ? 'uncertain' : 'failed', { code: safeErrorCode(error) }).catch(() => undefined);
     }
   }
 
@@ -2148,8 +2952,9 @@ export class NavigatorExecutor {
     leaseToken: string,
     retryAfterSeconds: number,
     result: Readonly<Record<string, unknown>>,
+    workState: WorkStateStore = this.config.workState,
   ): Promise<void> {
-    await this.config.workState.finishNotification(
+    await workState.finishNotification(
       notificationId,
       leaseToken,
       'retry',
@@ -2197,7 +3002,14 @@ export class NavigatorExecutor {
               terminal: false,
               sourceAuthenticated: false,
             });
-          } else if (['TEAMS_TENANT_NOT_ALLOWED', 'TEAMS_TEAM_NOT_ALLOWED'].includes(error.code)) {
+          } else if ([
+            'TEAMS_TENANT_NOT_ALLOWED',
+            'TEAMS_TEAM_NOT_ALLOWED',
+            'TEAMS_PERSONAL_CHAT_DISABLED',
+            'TEAMS_TASK_ACTOR_NOT_ALLOWED',
+            'TEAMS_TASK_ACTOR_NOT_PROVISIONED',
+            'TEAMS_MODEL_AUTHORIZATION_REQUIRED',
+          ].includes(error.code)) {
             this.sendJson(res, error.status, {
               code: error.code,
               error: error.message,
@@ -2209,10 +3021,22 @@ export class NavigatorExecutor {
           }
         } else if (error instanceof WorkStateHttpError) {
           const status = error.status >= 500 ? 503 : error.status;
-          this.sendJson(res, status, {
-            code: error.code,
-            error: 'Teams event admission could not be persisted',
-          });
+          if (status === 403 && [
+            'WORK_TEAMS_PRIVATE_INSTALLATION_NOT_FOUND',
+            'WORK_TEAMS_PRIVATE_MESSAGE_FORBIDDEN',
+          ].includes(error.code)) {
+            this.sendJson(res, status, {
+              code: error.code,
+              error: 'Teams event admission is not authorized.',
+              terminal: true,
+              sourceAuthenticated: true,
+            });
+          } else {
+            this.sendJson(res, status, {
+              code: error.code,
+              error: 'Teams event admission could not be persisted',
+            });
+          }
         } else {
           this.sendJson(res, 503, { code: 'TEAMS_INGRESS_UNAVAILABLE', error: 'Teams event admission is unavailable' });
         }
@@ -2570,7 +3394,7 @@ export class NavigatorExecutor {
   private async patch(task: InternalTaskState, patch: Partial<Omit<TaskRecord, 'id' | 'workspaceId' | 'sequence'>>): Promise<void> {
     const next = task.patchChain.then(async () => {
       if (task.patchFailure) throw task.patchFailure;
-      task.record = await this.config.workState.patchTask(task.id, patch);
+      task.record = await (task.workState ?? this.config.workState).patchTask(task.id, patch);
     });
     task.patchChain = next.catch(error => { task.patchFailure ??= error; });
     await next;
@@ -2585,7 +3409,7 @@ export class NavigatorExecutor {
     const serialized = JSON.parse(JSON.stringify(event)) as Record<string, unknown>;
     const next = task.eventChain.then(async () => {
       if (task.eventFailure) throw task.eventFailure;
-      const stored = await this.config.workState.appendEvent(task.id, serialized);
+      const stored = await (task.workState ?? this.config.workState).appendEvent(task.id, serialized);
       const delivered = { ...event, seq: stored.seq } as ExecutorStreamEvent;
       for (const subscriber of task.subscribers) {
         try { subscriber(delivered); } catch { /* One disconnected stream must not disrupt the task. */ }
@@ -2678,6 +3502,26 @@ function stateFromRecord(record: TaskRecord): InternalTaskState {
   };
 }
 
+function assertFixedToolTaskIdentity(
+  record: TaskRecord,
+  params: ExecuteFixedToolTaskParams,
+  metadata: Readonly<Record<string, unknown>>,
+): void {
+  if (record.id !== params.taskId || record.sessionId !== params.sessionId || record.prompt !== params.prompt
+    || record.executionClass !== 'background'
+    || canonicalJson(record.metadata ?? {}) !== canonicalJson(metadata)) {
+    throw new Error('Existing fixed-tool task does not match its deterministic workflow identity.');
+  }
+}
+
+/** Require the server-derived Work creator to match an already verified Teams actor. */
+function assertTaskActorScope(record: TaskRecord, actorAadObjectId?: string): void {
+  if (actorAadObjectId === undefined) return;
+  if (record.createdByActorId?.toLowerCase() !== actorAadObjectId.toLowerCase()) {
+    throw new Error('Work Task creator does not match the verified Teams actor.');
+  }
+}
+
 /** Treat an explicit persisted marker or server-reserved ID prefix as read-only. */
 function isReadOnlyContinuation(record: TaskRecord): boolean {
   return record.continuationMode === 'read_only' || record.id.startsWith('continuation-');
@@ -2731,6 +3575,15 @@ interface NormalizedTeamsActivity {
   readonly route: TeamsMessageRoute;
   readonly text: string;
   readonly mentionsBot: boolean;
+}
+
+interface NormalizedTeamsPrivateActivity {
+  readonly messageId: string;
+  readonly actorSubject: string;
+  readonly actorIssuer: string;
+  readonly tenantId: string;
+  readonly botAppId: string;
+  readonly text: string;
 }
 
 function normalizeTeamsActivity(
@@ -2819,6 +3672,72 @@ function normalizeTeamsActivity(
     route: { tenantId, teamId, channelId, conversationId, rootThreadId, serviceUrl },
     text,
     mentionsBot,
+  };
+}
+
+/** Normalize a signed personal activity while keeping its conversation route out of Work and model state. */
+function normalizeTeamsPrivateActivity(
+  payloadValue: unknown,
+  trustValue: unknown,
+  config: TeamsExecutorConfig,
+): NormalizedTeamsPrivateActivity {
+  const payload = objectValue(payloadValue, 'Teams canonical private payload');
+  const trust = objectValue(trustValue, 'Teams private trust envelope');
+  const trustKeys = [
+    'version', 'provider', 'tenant_id', 'actor_aad_object_id', 'message_id',
+    'bot_app_id', 'service_url', 'conversation_kind', 'conversation_id',
+  ];
+  if (!isExactObjectKeys(trust, trustKeys) || trust.version !== 1 || trust.provider !== 'teams'
+    || trust.conversation_kind !== 'private') {
+    throw new ExecutorRequestError(400, 'TEAMS_TRUST_ENVELOPE_INVALID', 'Teams private trust context is invalid.');
+  }
+  const tenantId = uuidText(trust.tenant_id, 'private tenant id');
+  const actorSubject = uuidText(trust.actor_aad_object_id, 'private actor id');
+  const botAppId = uuidText(trust.bot_app_id, 'private bot app id');
+  if (tenantId !== config.tenantId.toLowerCase() || botAppId !== config.botAppId.toLowerCase()) {
+    throw new ExecutorRequestError(403, 'TEAMS_TENANT_NOT_ALLOWED', 'Teams tenant is not configured.');
+  }
+  const conversationId = boundedText(trust.conversation_id, 'private conversation id', 512);
+  const trustedMessageId = boundedText(trust.message_id, 'private trusted message id', 512);
+  validateTeamsServiceUrl(trust.service_url, tenantId);
+  const messageId = boundedText(payload.message_id, 'private canonical message id', 512);
+  const senderId = uuidText(payload.sender_id, 'private canonical sender id');
+  if (messageId !== trustedMessageId || senderId !== actorSubject || senderId === botAppId) {
+    throw new ExecutorRequestError(403, 'TEAMS_SENDER_MISMATCH', 'Teams private sender context does not match.');
+  }
+  const conversation = objectValue(payload.conversation, 'Teams private conversation');
+  if (!isExactObjectKeys(conversation, ['vendor', 'account_id', 'conversation_id', 'kind'])
+    || conversation.vendor !== 'msteams' || conversation.kind !== 'private'
+    || uuidText(conversation.account_id, 'private canonical bot account id') !== botAppId
+    || boundedText(conversation.conversation_id, 'private canonical conversation id', 512) !== conversationId) {
+    throw new ExecutorRequestError(400, 'TEAMS_CONVERSATION_INVALID', 'Teams private conversation context is invalid.');
+  }
+  if (!Array.isArray(payload.content) || payload.content.length > 500) {
+    throw new ExecutorRequestError(400, 'TEAMS_CONTENT_INVALID', 'Teams private message content is invalid.');
+  }
+  const textParts: string[] = [];
+  for (const blockValue of payload.content) {
+    const block = objectValue(blockValue, 'Teams private message content block');
+    if (block.mention !== undefined) {
+      const mention = objectValue(block.mention, 'Teams private message mention');
+      const target = typeof mention.target_id === 'string' ? mention.target_id.toLowerCase() : '';
+      if (target && target !== botAppId) textParts.push('@person');
+    }
+    if (block.text !== undefined) {
+      const textBlock = objectValue(block.text, 'Teams private text block');
+      if (typeof textBlock.text === 'string' && textBlock.text.trim()) textParts.push(textBlock.text.trim());
+    }
+    if (block.image !== undefined) textParts.push('[Image attachment is present in Teams; its contents were not transferred.]');
+    if (block.file !== undefined) textParts.push('[File attachment is present in Teams; its contents were not transferred.]');
+  }
+  const text = boundedTeamsMessageText(textParts.join('\n').trim(), 'Teams private message text', 20_000);
+  return {
+    messageId,
+    actorSubject,
+    actorIssuer: `https://login.microsoftonline.com/${tenantId}/v2.0`,
+    tenantId,
+    botAppId,
+    text,
   };
 }
 

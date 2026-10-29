@@ -266,8 +266,10 @@ test('authorization and cloud reads match the owner DTOs and operation grant bou
   assert.deepEqual(renewal.schema.properties.state.enum, [...EXCHANGE_RENEWAL_SESSION_STATES]);
   assert.deepEqual(renewal.schema.required, [
     'sessionRef', 'authorizationRef', 'state', 'createdAt', 'expiresAt',
-    'authorizationUrl', 'qrAttachmentRef', 'generation', 'reasonCode',
+    'authorizationUrl', 'userCode', 'qrAttachmentRef', 'generation', 'reasonCode',
   ]);
+  assert.equal(renewal.schema.properties.userCode.anyOf.some(branch => branch.type === 'null'), true);
+  assert.equal(renewal.schema.properties.userCode.anyOf.find(branch => branch.type === 'string').pattern, '^[A-Z0-9]{4}-[A-Z0-9]{4}$');
   assert.equal(renewal.schema.additionalProperties, false);
   assert.equal(hasIdempotencyHeader('accountBeginRenewalSession'), true);
   assert.equal(hasIdempotencyHeader('accountGetRenewalSession'), false);

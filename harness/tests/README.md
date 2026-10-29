@@ -50,6 +50,18 @@ HTTP 429 responses.
 
 `workflows-v2.test.mjs` exercises the real DSH Schedule hook and a launcher-authorized GitHub tool catalog for two repositories. A truncated first page cannot advance the watermark; a later occurrence resumes the stored cursor and accepts the window only after the contiguous page chain is complete. The fixture is local and makes no external GitHub or Teams request.
 
+`product-observation.test.mjs`, `host-observation.test.mjs`,
+`source-config.test.mjs`, and `office-observation.test.mjs` cover fixed resource
+paths, current actor/source authorization, bounded pages, safe metadata, freshness
+and status transitions. `persistence.actor-token.test.mjs` covers dedicated
+per-session persistence identities and missing restart mappings. Their transports
+and identities are synthetic; real provider authorization and personal Teams
+installation/delivery remain separate acceptance gates.
+
+这些来源测试验证固定资源路径、当前 actor 和来源权限、有界分页、安全元数据、时效及
+状态转换；actor-token 测试验证独立会话持久身份和重启后缺失映射的拒绝行为。传输和身份
+均为本地 fixture，真实供应商授权及 Teams 个人安装、消息送达须单独验收。
+
 `delivery-feedback.test.mjs` is a browser state regression over freshly built
 `harness/dist/client.js`. `windows-native-imports.test.mjs` checks the packaged
 host's PE imports on Windows. Both remain narrower than installed desktop smoke
