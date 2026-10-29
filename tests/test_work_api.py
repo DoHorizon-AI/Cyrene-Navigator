@@ -2734,6 +2734,125 @@ def test_actor_private_principals_get_private_task_memory_and_attachment_rows(
         )
 
 
+def test_v3_github_actions_workflow_target_roundtrips_and_stays_actor_private(
+    tmp_path: Path,
+) -> None:
+    """The typed Actions selector survives Work API validation without crossing actors."""
+
+    actor_id = "22222222-2222-4222-8222-222222222222"
+    member_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    policy = _private_policy(tmp_path / "teams-owner-subjects.json", subjects=[actor_id, member_id])
+    base = BASE.format(workspace="w1")
+    owner_headers = _headers("actor-private-owner")
+    member_headers = _headers("actor-private-member")
+    workflow_id = "github-actions-watch"
+    target_id = "github-actions-workflow:123456:987654321"
+    target = {
+        "id": target_id,
+        "label": "DoHorizon-AI/Cyrene-Workspace",
+        "kind": "github_actions_workflow",
+        "bindingId": "github-binding-1",
+    }
+    workflow = {
+        "id": workflow_id,
+        "version": 3,
+        "title": "GitHub Actions status",
+        "description": "Observe one configured workflow on develop.",
+        "targets": [target],
+        "triggers": [
+            {
+                "id": "github-actions-poll",
+                "kind": "source_poll",
+                "source": "github",
+                "targetIds": [target_id],
+                "schedule": {
+                    "kind": "cron",
+                    "expression": "*/5 * * * *",
+                    "timeZone": "UTC",
+                },
+            }
+        ],
+        "authorization": {"kind": "owner_private", "ownerTaskId": "actions-owner-task"},
+        "notifications": {"destination": {"kind": "owner_private"}},
+        "enabled": True,
+    }
+
+    with _client_with_policy(tmp_path / "work.sqlite3", policy) as client:
+        installation = client.post(
+            base + "/private-installations/events",
+            json=_private_install_event(
+                actor_id,
+                "add",
+                "actions-owner-install",
+                "actions-owner-private-conversation",
+                activity_occurred_at=_private_activity_time(),
+            ),
+            headers=_headers("teams-bridge"),
+        )
+        assert installation.status_code == 200, installation.text
+        admitted = client.post(
+            base + "/connectors/teams-v1/events",
+            json=_teams_channel_task_event(
+                actor_id,
+                "actions-owner-message",
+                "actions-owner-task",
+                "actions-owner-session",
+                "Create my private Actions watch.",
+            ),
+            headers=owner_headers,
+        )
+        assert admitted.status_code == 200, admitted.text
+
+        put_result = client.put(
+            base + f"/workflows/{workflow_id}?definitionVersion=3",
+            json=workflow,
+            headers=owner_headers,
+        )
+        assert put_result.status_code == 200, put_result.text
+        target_response = {**target, "uri": None}
+        assert put_result.json()["targets"] == [target_response]
+
+        owner_readback = client.get(base + "/workflows?definitionVersion=3", headers=owner_headers)
+        assert owner_readback.status_code == 200, owner_readback.text
+        assert owner_readback.json()["items"][0]["targets"] == [target_response]
+        member_readback = client.get(
+            base + "/workflows?definitionVersion=3", headers=member_headers
+        )
+        assert member_readback.status_code == 200, member_readback.text
+        assert member_readback.json()["items"] == []
+
+        for invalid_target_id in (
+            "github-actions-workflow:123456:../workflow",
+            "github-actions-workflow:\u066123456:987654321",
+        ):
+            malformed_id = json.loads(json.dumps(workflow))
+            malformed_id["targets"][0]["id"] = invalid_target_id
+            malformed = client.put(
+                base + f"/workflows/{workflow_id}?definitionVersion=3",
+                json=malformed_id,
+                headers=owner_headers,
+            )
+            assert malformed.status_code == 422, malformed.text
+
+        malformed_label = json.loads(json.dumps(workflow))
+        malformed_label["targets"][0]["label"] = "DoHorizon-AI/Cyrene Workspace"
+        label_response = client.put(
+            base + f"/workflows/{workflow_id}?definitionVersion=3",
+            json=malformed_label,
+            headers=owner_headers,
+        )
+        assert label_response.status_code == 422, label_response.text
+
+        uri_target = json.loads(json.dumps(workflow))
+        uri_target["targets"][0]["uri"] = "https://example.invalid/workflow"
+        uri_response = client.put(
+            base + f"/workflows/{workflow_id}?definitionVersion=3",
+            json=uri_target,
+            headers=owner_headers,
+        )
+        assert uri_response.status_code == 422, uri_response.text
+
+
 def test_v3_quiet_hours_defer_non_immediate_notice_until_local_end() -> None:
     """Private non-immediate notices respect the stored timezone across midnight."""
 

@@ -7,7 +7,7 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type { CloudConnectionRegistry } from '../integrations/cloud-connections.js';
 import { getConnectorToolCatalog } from '../tool-providers.js';
-import type { WorkflowDefinition } from './store.js';
+import { parseGitHubActionsWorkflowTargetId, type WorkflowDefinition } from './store.js';
 
 const WORKFLOW_MEMORY_TOOLS = new Set(['work_memory_search', 'work_sources']);
 const GITHUB_READONLY_TOOLS = new Set([
@@ -71,16 +71,26 @@ export function resolveWorkflowReadonlyPolicy(ctx: Context, workflow: WorkflowDe
     let projectId: string | undefined;
     if (target.kind === 'cloud-connection' && target.id in READONLY_CONNECTIONS) {
       names = readonlyConnectionTools(registry, target.id);
-    } else if (target.kind === 'github_repository') {
+    } else if (target.kind === 'github_repository' || target.kind === 'github_actions_workflow') {
+      const actionsIdentity = target.kind === 'github_actions_workflow'
+        ? parseGitHubActionsWorkflowTargetId(target.id)
+        : undefined;
+      const repositoryId = actionsIdentity?.repositoryId ?? target.id;
       const catalog = getConnectorToolCatalog(ctx).filter(entry => entry.providerId === 'github'
-        && entry.bindingId === target.bindingId && !entry.mutating && GITHUB_READONLY_TOOLS.has(entry.operationId));
+        && entry.bindingId === target.bindingId && !entry.mutating && GITHUB_READONLY_TOOLS.has(entry.operationId)
+        && (target.kind !== 'github_actions_workflow'
+          || entry.operationId === 'github.branch.get' || entry.operationId === 'github.actions.runs.list'));
       names = catalog.map(entry => entry.name);
       if (workflow.version === 2 && workflow.triggers.some(trigger => trigger.kind === 'github_incremental_poll')
         && !catalog.some(entry => entry.operationId === 'github.issues.search')) names = [];
-      if (!/^\d+$/.test(target.id) || !/^[^/\s]+\/[^/\s]+$/.test(target.label)
-        || !target.bindingId || target.uri !== `https://github.com/${target.label}`) names = [];
+      if (!/^[1-9]\d{0,18}$/u.test(repositoryId) || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(target.label)
+        || !target.bindingId || (target.kind === 'github_repository'
+          ? target.uri !== `https://github.com/${target.label}`
+          : actionsIdentity === undefined || target.uri !== undefined
+            || !['github.branch.get', 'github.actions.runs.list'].every(operationId =>
+              catalog.some(entry => entry.operationId === operationId)))) names = [];
       if (names.length > 0) {
-        observationTargets.push({ index, id: target.id, tools: new Set(names), repositoryId: target.id, repository: target.label, bindingId: target.bindingId });
+        observationTargets.push({ index, id: target.id, tools: new Set(names), repositoryId, repository: target.label, bindingId: target.bindingId });
       }
     } else if (target.kind === 'google-cloud-project') {
       const projects = registry?.workflowReadonlyProjectIds('google-cloud-readonly') ?? [];
@@ -95,7 +105,7 @@ export function resolveWorkflowReadonlyPolicy(ctx: Context, workflow: WorkflowDe
       supported = false;
       continue;
     }
-    if (target.kind !== 'github_repository') {
+    if (target.kind !== 'github_repository' && target.kind !== 'github_actions_workflow') {
       observationTargets.push({ index, id: target.id, tools: new Set(names), ...(projectId === undefined ? {} : { projectId }) });
     }
     for (const name of names) {

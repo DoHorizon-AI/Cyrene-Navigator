@@ -16,6 +16,21 @@ export interface WorkflowTarget {
   readonly bindingId?: string;
 }
 
+/** Provider ids encoded in a fixed GitHub Actions observation target. | 固定 Actions 观察 target 中的 Provider ID。 */
+export interface GitHubActionsWorkflowTargetIdentity {
+  readonly repositoryId: string;
+  readonly workflowId: string;
+}
+
+/** Decode one fixed composite target id without accepting URLs or arbitrary provider arguments. | 只解析复合 ID，不接受 URL 或任意 Provider 参数。 */
+export function parseGitHubActionsWorkflowTargetId(
+  value: string,
+): GitHubActionsWorkflowTargetIdentity | undefined {
+  const match = /^github-actions-workflow:([1-9]\d{0,18}):([1-9]\d{0,19})$/u.exec(value);
+  if (match === null) return undefined;
+  return { repositoryId: match[1]!, workflowId: match[2]! };
+}
+
 /** Only notification transitions intended for visible status updates. */
 export interface WorkflowNotifications {
   readonly onChange: boolean;
@@ -1198,6 +1213,12 @@ function validateWorkflowV3Write(value: WorkflowV3Write): void {
         || target.uri !== `https://github.com/${target.label}`) {
         throw new TypeError('GitHub source targets require a canonical repository identity');
       }
+    } else if (target.kind === 'github_actions_workflow') {
+      if (parseGitHubActionsWorkflowTargetId(target.id) === undefined
+        || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(target.label)
+        || target.uri !== undefined) {
+        throw new TypeError('GitHub Actions targets require a numeric repository/workflow identity and owner/repository label');
+      }
     } else if (target.uri !== undefined) {
       throw new TypeError('Non-GitHub source targets cannot configure a URL');
     }
@@ -1275,7 +1296,7 @@ function validateWorkflowV3Write(value: WorkflowV3Write): void {
 
 function isTargetKindForSource(source: WorkflowObservationSource, kind: string): boolean {
   switch (source) {
-    case 'github': return kind === 'github_repository';
+    case 'github': return kind === 'github_repository' || kind === 'github_actions_workflow';
     case 'azure_devops': return kind === 'pipeline_runs' || kind === 'release_deployments';
     case 'vm_health': return kind === 'host_health';
     case 'training': return kind === 'training_run';

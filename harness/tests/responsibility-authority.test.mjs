@@ -112,6 +112,13 @@ test('V3 private source polling authenticates immutable private origin and prese
     expectedTenantId = TENANT_ID,
     expectedBotAppId = botAppId,
     directoryAuthorized = true,
+    workflowDefinition = workflow,
+    bindingId = BINDING_ID,
+    toolId = 'github.issues.search',
+    operationId = 'github.issues.search',
+    resourceProjection = 'github_repository',
+    mutating = false,
+    arguments: args = { repository_id: 12345, repository: 'owner/repository', query: 'is:open' },
   } = {}) => {
     const task = {
       id: taskId, workspaceId: WORKSPACE_ID, createdByActorId: actorId,
@@ -123,7 +130,7 @@ test('V3 private source polling authenticates immutable private origin and prese
       async getTask(id) { return id === taskId ? task : id === OWNER_TASK_ID ? ownerTask : undefined; },
     };
     const workflows = {
-      async listWorkflows(version) { return version === 3 ? [workflow] : []; },
+      async listWorkflows(version) { return version === 3 ? [workflowDefinition] : []; },
       async listScheduleEvents() {
         return { items: [{
           id: 'private-running-occurrence', workflowId, triggerId, scheduledAt,
@@ -146,18 +153,18 @@ test('V3 private source polling authenticates immutable private origin and prese
       },
     };
     const binding = {
-      bindingId: BINDING_ID,
+      bindingId,
       connectionRef: CONNECTION_REF,
       providerId: 'github',
       profileRef: PROFILE_REF,
-      tools: [{ toolId: 'github.issues.search', operationId: 'github.issues.search', resourceProjection: 'github_repository', mutating: false }],
+      tools: [{ toolId, operationId, resourceProjection, mutating }],
     };
     return createResponsibilityAuthorizationResolver(config)({
       taskId,
       task,
       binding,
-      tool: { toolId: 'github.issues.search', operationId: 'github.issues.search', resourceProjection: 'github_repository', mutating: false },
-      arguments: { repository_id: 12345, repository: 'owner/repository', query: 'is:open' },
+      tool: { toolId, operationId, resourceProjection, mutating },
+      arguments: args,
       signal: new AbortController().signal,
     });
   };
@@ -204,6 +211,250 @@ test('V3 private source polling authenticates immutable private origin and prese
     createdByActorId: MEMBER_ID,
     origin: ownerOrigin,
   })), undefined, 'a private origin cannot borrow the owner actor from another Work principal');
+
+  const actionsTargetId = `github-actions-workflow:${REPOSITORY_ID}:98765`;
+  const actionsWorkflow = structuredClone(workflow);
+  actionsWorkflow.targets = [{
+    id: actionsTargetId,
+    label: 'owner/repository',
+    kind: 'github_actions_workflow',
+    bindingId: BINDING_ID,
+  }];
+  actionsWorkflow.triggers[0].targetIds = [actionsTargetId];
+  const actionsTool = (operationId) => ({
+    workflowDefinition: actionsWorkflow,
+    toolId: operationId,
+    operationId,
+    resourceProjection: 'github_repository',
+    mutating: false,
+  });
+  const actionsOwner = makeTask({ origin: ownerOrigin });
+  assert.deepEqual(await makeResolver(actionsOwner, {
+    ...actionsTool('github.branch.get'),
+    arguments: { repository_id: REPOSITORY_ID, repository: 'owner/repository', branch: 'develop' },
+  }), { issuer: OWNER_ISSUER, subject: OWNER_ID, tenantId: TENANT_ID },
+  'the real V3 authority permits the fixed develop-head read for its encoded repository and binding');
+  assert.deepEqual(await makeResolver(actionsOwner, {
+    ...actionsTool('github.actions.runs.list'),
+    arguments: {
+      repository_id: REPOSITORY_ID, repository: 'owner/repository', branch: 'develop', commit_sha: 'a'.repeat(40),
+    },
+  }), { issuer: OWNER_ISSUER, subject: OWNER_ID, tenantId: TENANT_ID },
+  'the real V3 authority permits the read-only Actions snapshot against a bounded head SHA');
+  assert.equal(await makeResolver(actionsOwner, {
+    ...actionsTool('github.branch.get'),
+    arguments: { repository_id: '54321', repository: 'owner/repository', branch: 'develop' },
+  }), undefined, 'another repository ID cannot borrow the configured workflow target');
+  assert.equal(await makeResolver(actionsOwner, {
+    ...actionsTool('github.actions.runs.list'),
+    bindingId: 'exchange-github-other',
+    arguments: {
+      repository_id: REPOSITORY_ID, repository: 'owner/repository', branch: 'develop', commit_sha: 'a'.repeat(40),
+    },
+  }), undefined, 'a different Exchange binding cannot read the configured target');
+  assert.equal(await makeResolver(actionsOwner, {
+    ...actionsTool('github.branch.get'),
+    arguments: { repository_id: REPOSITORY_ID, repository: 'other/repository', branch: 'develop' },
+  }), undefined, 'the repository slug must match the configured workflow target');
+  assert.equal(await makeResolver(actionsOwner, {
+    ...actionsTool('github.branch.get'),
+    arguments: { repository_id: REPOSITORY_ID, repository: 'owner/repository', branch: 'main' },
+  }), undefined, 'the Actions target cannot choose a different branch');
+  assert.equal(await makeResolver(actionsOwner, {
+    ...actionsTool('github.actions.runs.list'),
+    arguments: {
+      repository_id: REPOSITORY_ID, repository: 'owner/repository', branch: 'develop',
+      commit_sha: 'a'.repeat(40), workflow_url: 'https://attacker.example/workflow',
+    },
+  }), undefined, 'URL and unknown provider fields are rejected');
+  assert.equal(await makeResolver(actionsOwner, {
+    ...actionsTool('github.repository.get'),
+    arguments: { repository_id: REPOSITORY_ID, repository: 'owner/repository' },
+  }), undefined, 'the source target cannot invoke another read operation');
+});
+
+test('V3 GitHub Actions tool call passes the real background authority before Exchange and rejects a changed branch', async () => {
+  const botAppId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+  const workflowId = 'actions-source-poll';
+  const triggerId = 'poll-actions';
+  const scheduledAt = '2026-10-28T14:00:00.000Z';
+  const targetId = `github-actions-workflow:${REPOSITORY_ID}:98765`;
+  const occurrenceId = `occ-${hash(`${workflowId}\0${triggerId}\0${scheduledAt}\0${hash(OWNER_ID).slice(0, 16)}`).slice(0, 40)}`;
+  const taskId = `workflow-${occurrenceId.slice(4)}`;
+  const metadata = {
+    source: 'workflow', workflowId, triggerId, occurrenceId, scheduledAt,
+    authorizationRef: { kind: 'owner_private', ownerTaskId: OWNER_TASK_ID },
+  };
+  const ownerTask = {
+    ...baseTask(OWNER_TASK_ID, {}),
+    workspaceId: WORKSPACE_ID,
+    createdByActorId: OWNER_ID,
+    status: 'completed',
+    origin: {
+      kind: 'teams_private', messageId: 'owner-origin', tenantId: TENANT_ID,
+      botAppId, actorAadObjectId: OWNER_ID,
+    },
+  };
+  const task = {
+    ...baseTask(taskId, metadata, { createdByActorId: OWNER_ID, executionClass: 'background' }),
+    workspaceId: WORKSPACE_ID,
+    status: 'running',
+  };
+  const workflow = {
+    id: workflowId,
+    version: 3,
+    title: 'Workspace Actions status',
+    description: 'Read one workflow on the current develop head.',
+    targets: [{
+      id: targetId, label: REPOSITORY, kind: 'github_actions_workflow', bindingId: BINDING_ID,
+    }],
+    triggers: [{
+      id: triggerId, kind: 'source_poll', source: 'github',
+      schedule: { kind: 'cron', expression: '*/5 * * * *', timeZone: 'UTC' },
+      targetIds: [targetId], initialBaseline: 'record_without_notification', pageSize: 10, maxPages: 1,
+    }],
+    authorization: { kind: 'owner_private', ownerTaskId: OWNER_TASK_ID },
+    notifications: {
+      onChange: true, onFailure: true, onRecovery: true, quietWhenUnchanged: true,
+      quietHours: { start: '22:00', end: '08:00', timeZone: 'America/New_York' },
+      digest: { enabled: true, schedule: { kind: 'cron', expression: '0 9 * * 1-5', timeZone: 'America/New_York' }, maxPerDay: 1 },
+      destination: { kind: 'owner_private' }, immediateOn: ['blocked_goal', 'user_decision', 'service_or_auth_outage'],
+    },
+    enabled: true,
+  };
+  const workState = {
+    async getTask(id) { return id === taskId ? task : id === OWNER_TASK_ID ? ownerTask : undefined; },
+  };
+  const workflowStore = {
+    async listWorkflows(version) { return version === 3 ? [workflow] : []; },
+    async listScheduleEvents() {
+      return { items: [{
+        id: 'actions-source-occurrence', workflowId, triggerId, scheduledAt,
+        taskId, status: 'running', sessionId: task.sessionId,
+      }], nextCursor: null };
+    },
+  };
+  const config = {
+    workspaceId: WORKSPACE_ID,
+    teamsConnectorId: CONNECTOR_ID,
+    allowedTenantId: TENANT_ID,
+    allowedBotAppId: botAppId,
+    allowedTeamIds: [],
+    workState,
+    workStateForActor: () => workState,
+    workflows: workflowStore,
+    workflowsForActor: () => workflowStore,
+    async isDirectoryAuthorized(principal) {
+      return principal.subject === OWNER_ID && principal.tenantId === TENANT_ID;
+    },
+  };
+  const binding = {
+    bindingId: BINDING_ID,
+    connectionRef: CONNECTION_REF,
+    providerId: 'github',
+    profileRef: PROFILE_REF,
+    tools: [
+      { toolId: 'github.branch.get', operationId: 'github.branch.get', resourceProjection: 'github_repository', mutating: false },
+      { toolId: 'github.actions.runs.list', operationId: 'github.actions.runs.list', resourceProjection: 'github_repository', mutating: false },
+    ],
+  };
+  const toolCatalog = {
+    schemaVersion: 1,
+    items: [{
+      bindingId: BINDING_ID,
+      capabilityId: 'tool.provider.v1',
+      providerId: 'github',
+      connectionRef: CONNECTION_REF,
+      profileRef: PROFILE_REF,
+      tools: [
+        {
+          id: 'github.branch.get', name: 'Get GitHub branch', description: 'Read one configured branch.', readOnly: true,
+          inputSchema: {
+            type: 'object', properties: {
+              repository_id: { type: 'string' }, repository: { type: 'string' }, branch: { type: 'string' },
+            }, required: ['repository_id', 'repository', 'branch'], additionalProperties: false,
+          },
+        },
+        {
+          id: 'github.actions.runs.list', name: 'List GitHub Actions runs', description: 'Read bounded run metadata.', readOnly: true,
+          inputSchema: {
+            type: 'object', properties: {
+              repository_id: { type: 'string' }, repository: { type: 'string' }, branch: { type: 'string' },
+              commit_sha: { type: 'string', pattern: '^[0-9a-f]{40}$' },
+            }, required: ['repository_id', 'repository', 'branch', 'commit_sha'], additionalProperties: false,
+          },
+        },
+      ],
+    }],
+  };
+  const providerCalls = [];
+  const grants = [];
+  const bridge = {
+    async request(path) {
+      assert.equal(path, '/operations/unresolved?limit=500');
+      return { items: [] };
+    },
+    async requestApproval() { throw new Error('Actions source reads cannot request approval.'); },
+    async mutate() { throw new Error('Actions source reads cannot perform Work mutations.'); },
+  };
+  const exchange = {
+    async mintGrant(request) { grants.push(request); return { token: 'test-grant' }; },
+    async callProviderOperation(request) {
+      providerCalls.push(request);
+      return {
+        requestId: request.requestId,
+        outcome: 'verified',
+        result: { content: [{ type: 'text', text: 'Read Actions metadata.' }] },
+      };
+    },
+  };
+  const context = new Context();
+  await context.plugin(SystemPrompt);
+  await context.plugin(ToolRuntime);
+  const dispose = await registerToolProviders(context, {
+    bridge,
+    taskIdForSession: sessionId => sessionId === task.sessionId ? taskId : undefined,
+    readBackgroundTask: async id => id === taskId ? task : undefined,
+    backgroundTaskAuthority: createResponsibilityAuthorizationResolver(config),
+    connectorAuthorization: { client: exchange, workspaceId: WORKSPACE_ID, bindings: new Map([[BINDING_ID, binding]]) },
+    connectorToolCatalogSnapshot: toolCatalog,
+  });
+
+  try {
+    const branchSchema = context.tools.schemas().find(item => item.description.startsWith(`Get GitHub branch (configured provider ${BINDING_ID})`));
+    const runsSchema = context.tools.schemas().find(item => item.description.startsWith(`List GitHub Actions runs (configured provider ${BINDING_ID})`));
+    assert.ok(branchSchema);
+    assert.ok(runsSchema);
+    const execute = (schema, args, callId) => context.tools.execute({
+      name: schema.name,
+      callId: ToolCallId(callId),
+      arguments: args,
+      signal: new AbortController().signal,
+      agent: { id: 'navigator-actions-source', session: { id: task.sessionId } },
+    });
+    const repositoryArgs = { repository_id: REPOSITORY_ID, repository: REPOSITORY, branch: 'develop' };
+    const branchRead = await execute(branchSchema, repositoryArgs, 'actions-branch-read');
+    assert.equal(branchRead.isError, false);
+    assert.equal(providerCalls.length, 1);
+    const runsRead = await execute(runsSchema, { ...repositoryArgs, commit_sha: 'a'.repeat(40) }, 'actions-runs-read');
+    assert.equal(runsRead.isError, false);
+    assert.equal(providerCalls.length, 2, 'both fixed operations reached Exchange only after the real resolver allowed them');
+    assert.equal(grants.length, 2);
+    assert.ok(grants.every(item => item.connectionRef === CONNECTION_REF && item.profileRef === PROFILE_REF
+      && item.principalSubject === OWNER_ID));
+
+    const wrongBranch = await execute(branchSchema, { ...repositoryArgs, branch: 'main' }, 'actions-wrong-branch');
+    const wrongRepository = await execute(branchSchema, { ...repositoryArgs, repository_id: '54321' }, 'actions-wrong-repository');
+    const wrongHead = await execute(runsSchema, { ...repositoryArgs, commit_sha: 'not-a-commit' }, 'actions-wrong-head');
+    assert.equal(wrongBranch.isError, true);
+    assert.equal(wrongRepository.isError, true);
+    assert.equal(wrongHead.isError, true);
+    assert.equal(providerCalls.length, 2, 'out-of-scope arguments do not reach Exchange');
+    assert.equal(grants.length, 2, 'out-of-scope arguments cannot mint connector grants');
+  } finally {
+    dispose();
+    await context.fiber.dispose();
+  }
 });
 
 function baseTask(id, metadata, overrides = {}) {

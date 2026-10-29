@@ -49,10 +49,16 @@ import type {
   WorkflowWrite,
   WorkflowSourceErrorReceipt,
 } from './store.js';
-import { validateWorkflowAutomationEvent } from './store.js';
+import { parseGitHubActionsWorkflowTargetId, validateWorkflowAutomationEvent } from './store.js';
 import type { WorkStateStore } from '../work-state-client.js';
 import { loadDefaultWorkflowTemplates } from './store.js';
 import { installWorkflowReadonlyGuard, resolveWorkflowReadonlyPolicy } from './readonly.js';
+
+// The deployment target policy pins this observation to the integration branch. | 不隐式切换到 main。
+const GITHUB_ACTIONS_OBSERVED_BRANCH = 'develop';
+const GITHUB_ACTIONS_FAILURE_CONCLUSIONS = new Set([
+  'FAILURE', 'TIMED_OUT', 'STARTUP_FAILURE', 'ACTION_REQUIRED', 'STALE',
+]);
 
 /** Exact executor input for a durable workflow occurrence. */
 export interface WorkflowDispatchRequest {
@@ -1171,6 +1177,9 @@ async function pollRegisteredObservationPage(
 ): Promise<WorkflowObservationPage> {
   if (request.source === 'github') {
     const target = request.target;
+    if (target.kind === 'github_actions_workflow') {
+      return pollGitHubActionsWorkflowPage(request, execution);
+    }
     if (target.kind !== 'github_repository' || target.bindingId === '' || !/^[1-9]\d{0,18}$/u.test(target.id)
       || !/^[^/\s]+\/[^/\s]+$/u.test(target.label ?? '')) throw new WorkflowSourceError('not_configured', target.id);
     const cursor = request.pageCursor ?? '1';
@@ -1244,6 +1253,217 @@ async function pollRegisteredObservationPage(
     };
   }
   throw new WorkflowSourceError('not_configured', request.target.id);
+}
+
+/**
+ * Read one bounded current-head Actions snapshot through the actor's registered Exchange tools.
+ * 通过当前 actor 的 Exchange 工具读取一个有界 head 快照；不完整结果不推进水位。
+ */
+async function pollGitHubActionsWorkflowPage(
+  request: WorkflowObservationPageRequest,
+  execution: WorkflowObservationExecutionContext,
+): Promise<WorkflowObservationPage> {
+  const target = request.target;
+  const identity = parseGitHubActionsWorkflowTargetId(target.id);
+  const repository = target.label;
+  if (identity === undefined || target.bindingId === ''
+    || typeof repository !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(repository)) {
+    throw new WorkflowSourceError('not_configured', target.id);
+  }
+  const repositoryArgs = { repository_id: identity.repositoryId, repository };
+  const branchValue = unwrapFixedConnectorResult(await execution.invokeConnectorTool({
+    bindingId: target.bindingId,
+    providerId: 'github',
+    toolId: 'github.branch.get',
+    operationId: 'github.branch.get',
+    resourceProjection: 'github_repository',
+    arguments: { ...repositoryArgs, branch: GITHUB_ACTIONS_OBSERVED_BRANCH },
+    signal: request.signal,
+  }));
+  const branch = asRecord(branchValue);
+  if (branch === undefined || branch.branch !== GITHUB_ACTIONS_OBSERVED_BRANCH
+    || typeof branch.exists !== 'boolean'
+    || !(branch.commit_sha === null || typeof branch.commit_sha === 'string')) {
+    throw new WorkflowSourceError('invalid', target.id);
+  }
+  if (!branch.exists) throw new WorkflowSourceError('not_configured', target.id);
+  if (typeof branch.commit_sha !== 'string' || !/^[0-9a-f]{40}$/iu.test(branch.commit_sha)) {
+    throw new WorkflowSourceError('invalid', target.id);
+  }
+  const headSha = branch.commit_sha.toLowerCase();
+  const runsValue = unwrapFixedConnectorResult(await execution.invokeConnectorTool({
+    bindingId: target.bindingId,
+    providerId: 'github',
+    toolId: 'github.actions.runs.list',
+    operationId: 'github.actions.runs.list',
+    resourceProjection: 'github_repository',
+    arguments: {
+      ...repositoryArgs,
+      branch: GITHUB_ACTIONS_OBSERVED_BRANCH,
+      commit_sha: headSha,
+    },
+    signal: request.signal,
+  }));
+  const runsPage = asRecord(runsValue);
+  if (runsPage === undefined || !Array.isArray(runsPage.workflow_runs)
+    || typeof runsPage.complete !== 'boolean' || typeof runsPage.truncated !== 'boolean'
+    || typeof runsPage.total_count !== 'number' || !Number.isSafeInteger(runsPage.total_count)
+    || runsPage.total_count < runsPage.workflow_runs.length || runsPage.workflow_runs.length > 100) {
+    throw new WorkflowSourceError('invalid', target.id);
+  }
+  if (!runsPage.complete || runsPage.truncated || runsPage.total_count !== runsPage.workflow_runs.length) {
+    // This fixed provider call has no page cursor. A truncated snapshot must stay pending rather
+    // than advancing a checkpoint over workflow runs the provider did not return.
+    return {
+      source: 'github',
+      observedAt: Date.now(),
+      pageCursor: request.pageCursor,
+      nextCursor: null,
+      complete: false,
+      truncated: true,
+      observations: [],
+      error: { code: 'partial' },
+    };
+  }
+
+  const runs = runsPage.workflow_runs.map(value => parseGitHubWorkflowRun(value, target.id, headSha));
+  const matchingRuns = runs.filter(run => run.workflowId === identity.workflowId);
+  matchingRuns.sort((left, right) => compareNumericIds(right.runId, left.runId)
+    || right.attempt - left.attempt
+    || Date.parse(right.updatedAt) - Date.parse(left.updatedAt));
+  const latest = matchingRuns[0];
+  const observations: WorkflowSourceObservation[] = [];
+  if (latest !== undefined && latest.status === 'COMPLETED') {
+    const updatedAt = Date.parse(latest.updatedAt);
+    const windowStart = request.windowStart === null ? null : Date.parse(request.windowStart);
+    const withinWindow = updatedAt <= Date.parse(request.windowEnd)
+      && (windowStart === null || updatedAt > windowStart);
+    const isFailure = latest.conclusion !== null
+      && GITHUB_ACTIONS_FAILURE_CONCLUSIONS.has(latest.conclusion);
+    const isSuccess = latest.conclusion === 'SUCCESS';
+    if (withinWindow && (isFailure || isSuccess)) {
+      observations.push(githubActionsWorkflowObservation(
+        latest,
+        identity.repositoryId,
+        identity.workflowId,
+        repository,
+        headSha,
+        isFailure ? 'incident' : 'healthy',
+      ));
+    }
+  }
+  return {
+    source: 'github',
+    observedAt: Date.now(),
+    pageCursor: request.pageCursor,
+    nextCursor: null,
+    complete: true,
+    truncated: false,
+    observations,
+  };
+}
+
+interface GitHubWorkflowRunSnapshot {
+  readonly runId: string;
+  readonly workflowId: string;
+  readonly status: string;
+  readonly conclusion: string | null;
+  readonly branch: string;
+  readonly headSha: string;
+  readonly attempt: number;
+  readonly updatedAt: string;
+}
+
+/**
+ * Validate every provider run against the exact branch-head query before using its metadata.
+ * 使用 run 元数据前，核对它属于刚读取的确切分支与 commit。
+ */
+function parseGitHubWorkflowRun(
+  value: unknown,
+  targetId: string,
+  expectedHeadSha: string,
+): GitHubWorkflowRunSnapshot {
+  const row = asRecord(value);
+  const status = row?.status;
+  const conclusion = row?.conclusion;
+  const branch = row?.head_branch;
+  const headSha = row?.head_sha;
+  const updatedAt = row?.updated_at;
+  if (row === undefined || typeof row.run_id !== 'string' || !/^[1-9]\d{0,19}$/u.test(row.run_id)
+    || typeof row.workflow_id !== 'string' || !/^[1-9]\d{0,19}$/u.test(row.workflow_id)
+    || typeof status !== 'string'
+    || !['QUEUED', 'IN_PROGRESS', 'COMPLETED', 'WAITING', 'REQUESTED', 'PENDING', 'ACTION_REQUIRED'].includes(status)
+    || !(conclusion === null || typeof conclusion === 'string'
+      && ['SUCCESS', 'FAILURE', 'NEUTRAL', 'CANCELLED', 'SKIPPED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE', 'STALE'].includes(conclusion))
+    || branch !== GITHUB_ACTIONS_OBSERVED_BRANCH
+    || typeof headSha !== 'string' || !/^[0-9a-f]{40}$/iu.test(headSha)
+    || headSha.toLowerCase() !== expectedHeadSha
+    || typeof row.run_attempt !== 'number' || !Number.isSafeInteger(row.run_attempt) || row.run_attempt < 1
+    || typeof updatedAt !== 'string' || !Number.isFinite(Date.parse(updatedAt))) {
+    throw new WorkflowSourceError('invalid', targetId);
+  }
+  return {
+    runId: row.run_id,
+    workflowId: row.workflow_id,
+    status,
+    conclusion,
+    branch,
+    headSha: headSha.toLowerCase(),
+    attempt: row.run_attempt,
+    updatedAt,
+  };
+}
+
+/** Compare canonical numeric provider IDs without lossy JavaScript number conversion. | 避免数字精度丢失。 */
+function compareNumericIds(left: string, right: string): number {
+  const leftValue = BigInt(left);
+  const rightValue = BigInt(right);
+  return leftValue === rightValue ? 0 : leftValue > rightValue ? 1 : -1;
+}
+
+/**
+ * Emit status revisions against one stable workflow resource so healthy can recover failure.
+ * run URL 和 commit SHA 仅作为引用；稳定的 workflow URI 负责失败/恢复状态关联。
+ */
+function githubActionsWorkflowObservation(
+  run: GitHubWorkflowRunSnapshot,
+  repositoryId: string,
+  workflowId: string,
+  repository: string,
+  headSha: string,
+  stateClass: 'healthy' | 'incident',
+): WorkflowSourceObservation {
+  const resourceUri = `https://github.com/${repository}/actions/workflows/${workflowId}`;
+  const runUri = `https://github.com/${repository}/actions/runs/${run.runId}`;
+  const commitUri = `https://github.com/${repository}/commit/${headSha}`;
+  const revision = `${run.runId}:${run.attempt}:${run.updatedAt}`;
+  const semanticFingerprint = digest(JSON.stringify({
+    workflowId,
+    runId: run.runId,
+    attempt: run.attempt,
+    status: run.status,
+    conclusion: run.conclusion,
+    headSha,
+    updatedAt: run.updatedAt,
+  }));
+  const outcome = stateClass === 'incident' ? 'failed' : 'succeeded';
+  return {
+    source: 'github',
+    sourceEventId: `github:actions:${repositoryId}:${workflowId}:${run.runId}:${run.attempt}:${digest(revision).slice(0, 32)}`,
+    resourceUri,
+    sourceVersion: revision,
+    eventType: 'github.actions.workflow_run.completed',
+    occurredAt: Date.parse(run.updatedAt),
+    title: `GitHub Actions workflow ${workflowId}`,
+    summary: `Workflow ${workflowId} ${outcome} on ${GITHUB_ACTIONS_OBSERVED_BRANCH} at ${headSha.slice(0, 12)} (run ${run.runId}, attempt ${run.attempt}).`,
+    severity: stateClass === 'incident' ? 'critical' : 'info',
+    metadataReferences: [
+      { kind: 'github_actions_run', resourceUri: runUri, resourceVersion: revision },
+      { kind: 'git_commit', resourceUri: commitUri, resourceVersion: headSha },
+    ],
+    semanticFingerprint,
+    stateClass,
+  };
 }
 
 function githubIssueObservation(

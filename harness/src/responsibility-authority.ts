@@ -8,6 +8,7 @@
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
 import { canonicalJson, sha256 } from './connector-authorization.ts';
 import type { ConnectorThreadRecord, TaskRecord, WorkStateStore } from './work-state-client.ts';
+import { parseGitHubActionsWorkflowTargetId } from './workflows/store.ts';
 import type {
   WorkflowAction,
   WorkflowActionGrant,
@@ -148,6 +149,8 @@ type WorkflowTaskRecord = ResponsibilityTaskRecord;
 
 type WorkflowDefinition = WorkflowV2Record;
 type ScheduleEvent = WorkflowScheduleEvent;
+
+const GITHUB_ACTIONS_SOURCE_BRANCH = 'develop';
 
 /**
  * Create a host-only resolver that independently reloads Work API provenance,
@@ -328,7 +331,14 @@ async function authorizeWorkflowV3SourceCall(
     || request.tool.operationId !== request.binding.tools.find(item => item.toolId === request.tool.toolId)?.operationId) {
     return undefined;
   }
-  const supportedKind = trigger.source === 'github' && request.binding.providerId === 'github'
+  const isGitHubActionsTargetCall = trigger.source === 'github' && request.binding.providerId === 'github'
+    && request.tool.resourceProjection === 'github_repository'
+    && request.tool.toolId === request.tool.operationId
+    && (request.tool.operationId === 'github.branch.get'
+      || request.tool.operationId === 'github.actions.runs.list');
+  const supportedKind = isGitHubActionsTargetCall
+    ? 'github_actions_workflow'
+    : trigger.source === 'github' && request.binding.providerId === 'github'
     && request.tool.toolId === 'github.issues.search' && request.tool.operationId === 'github.issues.search'
     && request.tool.resourceProjection === 'github_repository'
     ? 'github_repository'
@@ -355,6 +365,28 @@ async function authorizeWorkflowV3SourceCall(
     target = workflow.targets.find(item => triggerTargetIds.has(item.id)
       && item.kind === 'github_repository' && item.bindingId === request.binding.bindingId
       && (item.id === String(repositoryId)) && item.label === repositoryLabel);
+  } else if (supportedKind === 'github_actions_workflow') {
+    const repositoryId = safeText(request.arguments.repository_id, 19);
+    const repositoryLabel = safeText(request.arguments.repository, 255);
+    const branch = safeText(request.arguments.branch, 255);
+    const expectedFields = request.tool.operationId === 'github.branch.get'
+      ? ['repository_id', 'repository', 'branch']
+      : ['repository_id', 'repository', 'branch', 'commit_sha'];
+    if (!hasExactFields(request.arguments, expectedFields)
+      || !repositoryId || !/^[1-9]\d{0,18}$/u.test(repositoryId)
+      || !repositoryLabel || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(repositoryLabel)
+      || branch !== GITHUB_ACTIONS_SOURCE_BRANCH) return undefined;
+    if (request.tool.operationId === 'github.actions.runs.list') {
+      const headSha = safeText(request.arguments.commit_sha, 40);
+      if (!headSha || !/^[0-9a-f]{40}$/u.test(headSha)) return undefined;
+    }
+    target = workflow.targets.find(item => {
+      if (!triggerTargetIds.has(item.id) || item.kind !== 'github_actions_workflow'
+        || item.bindingId !== request.binding.bindingId || item.label !== repositoryLabel
+        || item.uri !== undefined) return false;
+      const identity = parseGitHubActionsWorkflowTargetId(item.id);
+      return identity !== undefined && identity.repositoryId === repositoryId;
+    });
   } else if (supportedKind === 'azure_devops') {
     const value = asRecord(request.arguments.target);
     const targetId = safeText(value?.id, 512);
@@ -903,6 +935,12 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+}
+
+/** Keep background source calls to the exact host-defined provider argument shape. | 限定后台来源读取的参数字段。 */
+function hasExactFields(value: Readonly<Record<string, unknown>>, fields: readonly string[]): boolean {
+  const keys = Object.keys(value);
+  return keys.length === fields.length && fields.every(field => Object.hasOwn(value, field));
 }
 
 function safeText(value: unknown, maxLength: number): string | undefined {
