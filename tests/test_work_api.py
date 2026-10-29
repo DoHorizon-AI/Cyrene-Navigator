@@ -324,6 +324,12 @@ def test_task_scope_approval_replay_and_conflict(tmp_path: Path) -> None:
         assert created.status_code == 201
         approval = created.json()["approval"]
         assert created.json()["task"]["status"] == "waiting_approval"
+        pending = client.get(
+            BASE.format(workspace="w1") + "/approvals?status=pending&limit=100",
+            headers=_headers(),
+        )
+        assert pending.status_code == 200, pending.text
+        assert [item["id"] for item in pending.json()] == [approval["id"]]
 
         replay = client.post(approval_url, json=approval_body, headers=_headers())
         assert replay.status_code == 200
@@ -336,6 +342,12 @@ def test_task_scope_approval_replay_and_conflict(tmp_path: Path) -> None:
         assert resolved.status_code == 200
         assert resolved.json()["task"]["status"] == "running"
         assert resolved.json()["task"]["startedAt"] is not None
+        approved = client.get(
+            BASE.format(workspace="w1") + "/approvals?status=approved&limit=100",
+            headers=_headers(),
+        )
+        assert approved.status_code == 200, approved.text
+        assert [item["id"] for item in approved.json()] == [approval["id"]]
         assert (
             client.post(resolve_url, json=decision, headers=_headers()).json()["duplicate"] is True
         )

@@ -1138,7 +1138,7 @@ class WorkStore:
                     workspace_id=? AND status=? """
                     + visibility
                     + " ORDER BY created_at DESC LIMIT ?",
-                    (org, workspace, actor, int(actor_private_scope), actor, actor, limit),
+                    (org, workspace, status, actor, int(actor_private_scope), actor, actor, limit),
                 ).fetchall()
             else:
                 rows = conn.execute(
