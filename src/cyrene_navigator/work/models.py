@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.alias_generators import to_camel
 
 
@@ -72,11 +72,22 @@ class TaskPatch(WorkModel):
     metadata: dict[str, Any] | None = None
 
 
+class TeamsPrivateTaskOrigin(WorkModel):
+    """Server-derived proof that a task came from verified private Teams ingress."""
+
+    kind: Literal["teams_private"]
+    message_id: str
+    tenant_id: str
+    bot_app_id: str
+    actor_aad_object_id: str
+
+
 class TaskRecord(WorkModel):
     """Public execution record with server-owned timestamps. | 执行任务公开记录。"""
 
     id: str
     workspace_id: str
+    created_by_actor_id: str | None = None
     session_id: str
     prompt: str
     status: TaskStatus
@@ -91,6 +102,7 @@ class TaskRecord(WorkModel):
     title: str | None = None
     description: str | None = None
     metadata: dict[str, Any]
+    origin: TeamsPrivateTaskOrigin | None = None
     continuation_of_task_id: str | None = None
     continuation_mode: Literal["read_only"] | None = None
     execution_class: TaskExecutionClass = "foreground"
@@ -253,6 +265,261 @@ class InputList(WorkModel):
     """Workspace-scoped input requests for the human control surface. | 工作区输入列表。"""
 
     items: list[InputRecord]
+
+
+class AutomationResourceReference(WorkModel):
+    """Typed opaque reference to a Product resource. | 产品资源的有类型引用。"""
+
+    kind: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    resource_uri: str = Field(min_length=1, max_length=2_000)
+    resource_version: str | int | None = None
+
+    @field_validator("resource_version")
+    @classmethod
+    def validate_resource_version(cls, value: str | int | None) -> str | int | None:
+        """Bound version values without coercing integer Product versions. | 限制版本值。"""
+
+        if value is None:
+            return None
+        if type(value) is int:
+            if value < 0 or value > 2**53 - 1:
+                raise ValueError("resourceVersion must be a non-negative safe integer")
+            return value
+        if not isinstance(value, str):
+            raise ValueError("resourceVersion must be bounded text or integer")
+        if not value.strip() or len(value) > 512 or any(ord(ch) < 32 for ch in value):
+            raise ValueError("resourceVersion must be bounded non-empty text")
+        return value
+
+
+class AutomationCommitReference(WorkModel):
+    """Reference one immutable repository commit. | 引用一个不可变仓库提交。"""
+
+    repository_uri: str = Field(min_length=1, max_length=2_000)
+    sha: str = Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+class AutomationArtifactRef(WorkModel):
+    """Canonical Platform ArtifactRef metadata without artifact bytes.
+
+    中文：标准 ArtifactRef 元数据。
+    """
+
+    uri: str = Field(pattern=r"^artifact://sha256/[0-9a-f]{64}$")
+    digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    size_bytes: int = Field(alias="size_bytes", ge=0, le=2**53 - 1)
+    kind: str = Field(min_length=1, max_length=128)
+    manifest_digest: str | None = Field(
+        default=None,
+        alias="manifest_digest",
+        pattern=r"^sha256:[0-9a-f]{64}$",
+    )
+
+    @model_validator(mode="after")
+    def digest_matches_uri(self) -> AutomationArtifactRef:
+        """Bind the artifact URI to its declared content digest. | 校验 URI 与摘要一致。"""
+
+        if self.uri.removeprefix("artifact://sha256/") != self.digest.removeprefix("sha256:"):
+            raise ValueError("ArtifactRef uri and digest must identify the same bytes")
+        return self
+
+
+class AutomationEventCreate(WorkModel):
+    """Submit one bounded source observation without client-owned identity. | 提交有界来源观察。"""
+
+    source: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"
+    )
+    source_event_id: str = Field(min_length=1, max_length=512)
+    resource_uri: str = Field(min_length=1, max_length=2_000)
+    source_version: str | int
+    event_type: str = Field(
+        min_length=1, max_length=256, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$"
+    )
+    occurred_at: int = Field(ge=0, le=2**53 - 1)
+    title: str | None = Field(default=None, max_length=512)
+    summary: str | None = Field(default=None, max_length=2_000)
+    severity: Literal["info", "warning", "critical"] | None = None
+    correlation_id: str | None = Field(default=None, min_length=1, max_length=128)
+    experiment_id: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+    )
+    semantic_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    state_class: Literal["healthy", "incident", "neutral"] | None = None
+    metadata_references: list[AutomationResourceReference] = Field(
+        default_factory=list, max_length=32
+    )
+
+    @field_validator("source_version")
+    @classmethod
+    def validate_source_version(cls, value: str | int) -> str | int:
+        """Bound the upstream version while preserving its original JSON type. | 限制来源版本。"""
+
+        if type(value) is int:
+            if value < 0 or value > 2**53 - 1:
+                raise ValueError("sourceVersion must be a non-negative safe integer")
+            return value
+        if not isinstance(value, str):
+            raise ValueError("sourceVersion must be bounded text or integer")
+        if not value.strip() or len(value) > 512 or any(ord(ch) < 32 for ch in value):
+            raise ValueError("sourceVersion must be bounded non-empty text")
+        return value
+
+
+class AutomationEvent(AutomationEventCreate):
+    """Immutable stored observation with server-derived provenance. | 含服务端来源的事件。"""
+
+    id: str
+    observed_at: int = Field(ge=0, le=2**53 - 1)
+    actor_id: str
+    organization_id: str
+    workspace_id: str
+    revision: Literal[1]
+    visibility: Literal["owner"]
+
+
+class AutomationEventReceipt(AutomationEvent):
+    """POST acknowledgement indicating whether the receipt was replayed. | 事件写入回执。"""
+
+    duplicate: bool
+
+
+class AutomationEventList(WorkModel):
+    """Actor-owned observations with an opaque stable cursor. | 按 actor 分页读取事件。"""
+
+    items: list[AutomationEvent]
+    next_cursor: str | None
+
+
+class AutomationEventNoticeIntentCreate(WorkModel):
+    """Link one immutable event to its exact running workflow occurrence. | 事件通知意图。"""
+
+    workflow_id: str = Field(min_length=1, max_length=512)
+    trigger_id: str = Field(min_length=1, max_length=128)
+    occurrence_id: str = Field(pattern=r"^occ-[0-9a-f]{40}$")
+    scheduled_at: str = Field(min_length=1, max_length=128)
+    task_id: str = Field(min_length=1, max_length=512)
+
+
+class AutomationEventNoticeIntentReceipt(WorkModel):
+    """Server-derived event decision and its stable retry result. | 事件通知决策回执。"""
+
+    event_id: str
+    workflow_id: str
+    trigger_id: str
+    occurrence_id: str
+    decision: Literal[
+        "initial_baseline",
+        "unchanged",
+        "stale",
+        "change",
+        "failure",
+        "recovery",
+        "blocker",
+        "quiet",
+    ]
+    notification_id: str | None = None
+    duplicate: bool
+
+
+class ExperimentPut(WorkModel):
+    """Replace reference-only experiment lineage at an expected revision. | 更新实验引用索引。"""
+
+    dataset_version: AutomationResourceReference | None = None
+    training_run: AutomationResourceReference | None = None
+    training_attempt: AutomationResourceReference | None = None
+    checkpoint_artifact_ref: AutomationArtifactRef | None = None
+    evaluation_run: AutomationResourceReference | None = None
+    model_version: AutomationResourceReference | None = None
+    deployment: AutomationResourceReference | None = None
+    commit: AutomationCommitReference | None = None
+    expected_revision: int = Field(ge=0, le=2**53 - 1)
+
+
+class ExperimentRecord(WorkModel):
+    """Actor-owned index of Product references, never Product lifecycle state. | 实验引用索引。"""
+
+    experiment_id: str = Field(
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    )
+    dataset_version: AutomationResourceReference | None = None
+    training_run: AutomationResourceReference | None = None
+    training_attempt: AutomationResourceReference | None = None
+    checkpoint_artifact_ref: AutomationArtifactRef | None = None
+    evaluation_run: AutomationResourceReference | None = None
+    model_version: AutomationResourceReference | None = None
+    deployment: AutomationResourceReference | None = None
+    commit: AutomationCommitReference | None = None
+    actor_id: str
+    organization_id: str
+    workspace_id: str
+    revision: int = Field(ge=1, le=2**53 - 1)
+    updated_at: int = Field(ge=0, le=2**53 - 1)
+    visibility: Literal["owner"]
+
+
+class PrivateInstallationPayload(WorkModel):
+    """Minimal add/remove intent from the authenticated Teams bridge. | 安装操作意图。"""
+
+    action: Literal["add", "remove"]
+
+
+class PrivateInstallationTrust(WorkModel):
+    """Host-verified Teams private-install identity, never client/model supplied.
+
+    中文：可信安装身份。
+    """
+
+    version: Literal[1]
+    provider: Literal["teams"]
+    conversation_kind: Literal["private"]
+    installation_action: Literal["add", "remove"]
+    tenant_id: str = Field(min_length=36, max_length=36)
+    actor_aad_object_id: str = Field(min_length=36, max_length=36)
+    bot_app_id: str = Field(min_length=36, max_length=36)
+    conversation_id: str = Field(min_length=1, max_length=512)
+    activity_id: str = Field(min_length=1, max_length=512)
+    activity_occurred_at: str = Field(min_length=20, max_length=64)
+    service_url: str = Field(min_length=1, max_length=512)
+
+
+class PrivateInstallationEvent(WorkModel):
+    """Trusted package event relayed after DSH verifies its HMAC envelope. | 可信安装事件。"""
+
+    event_type: Literal["personal_installation"]
+    payload: PrivateInstallationPayload
+    trust: PrivateInstallationTrust
+
+    @model_validator(mode="after")
+    def action_matches_trust(self) -> PrivateInstallationEvent:
+        """Prevent a body from changing the package-verified add/remove intent."""
+
+        if self.payload.action != self.trust.installation_action:
+            raise ValueError("payload action must match the verified installation action")
+        return self
+
+
+class PrivateInstallationReceipt(WorkModel):
+    """Route-free acknowledgement of one private installation update. | 私有安装回执。"""
+
+    action: Literal["add", "remove"]
+    active: bool
+    applied: bool
+    revision: int = Field(ge=0, le=2**53 - 1)
+    updated_at: int = Field(ge=0, le=2**53 - 1)
+    duplicate: bool
+
+
+class TeamsPersonalRoute(WorkModel):
+    """Private host-only delivery route materialized only on a trusted lease. | 私有投递路由。"""
+
+    kind: Literal["teams_personal"]
+    tenant_id: str
+    bot_app_id: str
+    actor_aad_object_id: str
+    conversation_id: str
+    service_url: str
 
 
 class OperationCreate(WorkModel):
@@ -486,6 +753,21 @@ class NotificationClaimResult(WorkModel):
     items: list[NotificationLease]
 
 
+class PrivateNotificationLease(WorkModel):
+    """Private route materialized only for the dedicated trusted delivery lease. | 私有租约。"""
+
+    notification: NotificationRecord
+    lease_token: str
+    lease_expires_at: int
+    teams_personal_route: TeamsPersonalRoute
+
+
+class PrivateNotificationClaimResult(WorkModel):
+    """Lease response containing private routing only for the Teams bridge. | Teams 私聊租约。"""
+
+    items: list[PrivateNotificationLease]
+
+
 CredentialHealthProvider = Literal["hf", "runpod", "azure", "gcp"]
 CredentialHealthState = Literal[
     "VALID", "REAUTHORIZATION_REQUIRED", "PERMISSION_DENIED", "UNKNOWN", "UNAVAILABLE"
@@ -623,6 +905,18 @@ class TeamsThreadMessageCreate(WorkModel):
     session_id: str | None = Field(default=None, min_length=1, max_length=512)
 
 
+class TeamsPrivateMessageCreate(WorkModel):
+    """Private ingress identity without recipient or model-controlled route fields.
+
+    The actor, tenant, bot app, and active installation are resolved from the
+    authenticated principal and server-pinned Teams policy. 中文：私聊入口只传消息正文。
+    中文：私聊入口只传消息与安装匹配值，不接受收件路由身份。
+    """
+
+    message_id: str = Field(min_length=1, max_length=512)
+    text: str = Field(min_length=1, max_length=20_000)
+
+
 class ConnectorEventCreate(WorkModel):
     """Register one connector event and optional atomic task admission. | 连接事件。"""
 
@@ -635,6 +929,7 @@ class ConnectorEventCreate(WorkModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     task: TaskCreate | None = None
     teams_thread_message: TeamsThreadMessageCreate | None = None
+    teams_private_message: TeamsPrivateMessageCreate | None = None
 
 
 class TeamsThreadMessage(WorkModel):
@@ -891,7 +1186,112 @@ class WorkflowV2Record(WorkModel):
     updated_at: str | None = None
 
 
-WorkflowDefinition = Annotated[WorkflowRecord | WorkflowV2Record, Field(discriminator="version")]
+WorkflowSource = Literal[
+    "github", "azure_devops", "office_graph", "vm_health", "training", "product"
+]
+WorkflowV3TargetKind = Literal[
+    "github_repository",
+    "pipeline_runs",
+    "release_deployments",
+    "planner_plan",
+    "host_health",
+    "training_run",
+    "product_resource",
+]
+
+
+class WorkflowV3Target(WorkModel):
+    """Host-bound target selector with no arbitrary network destination. | 宿主绑定目标。"""
+
+    id: str = Field(min_length=1, max_length=512)
+    label: str = Field(min_length=1, max_length=512)
+    kind: WorkflowV3TargetKind
+    binding_id: str = Field(min_length=1, max_length=512)
+    uri: str | None = Field(default=None, max_length=2_000)
+
+
+class WorkflowV3Trigger(WorkModel):
+    """Typed source polling trigger with bounded page work. | 有界来源轮询触发器。"""
+
+    id: str = Field(min_length=1, max_length=128)
+    kind: Literal["source_poll"]
+    source: WorkflowSource
+    target_ids: list[str] = Field(min_length=1, max_length=20)
+    schedule: WorkflowSchedule
+    initial_baseline: Literal["record_without_notification"] = "record_without_notification"
+    page_size: int = Field(default=50, ge=1, le=50)
+    max_pages: int = Field(default=20, ge=1, le=20)
+
+
+class WorkflowV3OwnerPrivateAuthorization(WorkModel):
+    """Resolve a private Teams route from the original verified owner task. | 私聊授权引用。"""
+
+    kind: Literal["owner_private"]
+    owner_task_id: str = Field(min_length=1, max_length=512)
+
+
+WorkflowV3Authorization = Annotated[
+    WorkflowAuthorizationReference | WorkflowV3OwnerPrivateAuthorization,
+    Field(discriminator="kind"),
+]
+
+
+class WorkflowV3Destination(WorkModel):
+    """No model-selected route; Work resolves the configured owner destination. | 宿主解析路由。"""
+
+    kind: Literal["responsibility_thread", "owner_private"]
+
+
+class WorkflowV3DigestPolicy(WorkModel):
+    """At most one weekday digest using the approved owner timezone. | 工作日摘要策略。"""
+
+    enabled: bool = True
+    schedule: WorkflowSchedule = Field(
+        default_factory=lambda: WorkflowSchedule(
+            kind="cron", expression="0 9 * * 1-5", time_zone="America/New_York"
+        )
+    )
+    max_per_day: Literal[1] = 1
+
+
+class WorkflowNotificationsV3(WorkModel):
+    """Quiet-by-default V3 notices with a server-resolved destination. | v3 通知策略。"""
+
+    on_change: bool = True
+    on_failure: bool = True
+    on_recovery: bool = True
+    quiet_when_unchanged: Literal[True] = True
+    quiet_hours: WorkflowQuietHours = Field(default_factory=WorkflowQuietHours)
+    digest: WorkflowV3DigestPolicy = Field(default_factory=WorkflowV3DigestPolicy)
+    destination: WorkflowV3Destination = Field(
+        default_factory=lambda: WorkflowV3Destination(kind="owner_private")
+    )
+    immediate_on: list[WorkflowAttentionKind] = Field(
+        default_factory=lambda: cast(
+            list[WorkflowAttentionKind],
+            ["blocked_goal", "user_decision", "service_or_auth_outage"],
+        )
+    )
+
+
+class WorkflowV3Record(WorkModel):
+    """Actor-owned source-poll definition using DSH Schedule only. | actor 私有轮询定义。"""
+
+    id: str = Field(min_length=1, max_length=512)
+    version: Literal[3]
+    title: str = Field(min_length=1, max_length=512)
+    description: str = Field(max_length=20_000)
+    targets: list[WorkflowV3Target] = Field(min_length=1, max_length=100)
+    triggers: list[WorkflowV3Trigger] = Field(min_length=1, max_length=100)
+    authorization: WorkflowV3Authorization
+    notifications: WorkflowNotificationsV3 = Field(default_factory=WorkflowNotificationsV3)
+    enabled: bool = False
+    updated_at: str | None = None
+
+
+WorkflowDefinition = Annotated[
+    WorkflowRecord | WorkflowV2Record | WorkflowV3Record, Field(discriminator="version")
+]
 
 
 class WorkflowList(WorkModel):
@@ -901,14 +1301,15 @@ class WorkflowList(WorkModel):
 
 
 class WorkflowNoticeCreate(WorkModel):
-    """Project a terminal v2 receipt to its owner Teams thread. | 投影工作流终态通知。"""
+    """Submit either a v2 notice or route-free V3 digest identity. | 工作流通知请求。"""
 
     occurrence_id: str = Field(min_length=1, max_length=128)
     trigger_id: str = Field(min_length=1, max_length=128)
     scheduled_at: str = Field(min_length=1, max_length=128)
-    kind: Literal["change", "failure", "recovery", "digest", "blocker"]
-    summary: str = Field(min_length=1, max_length=400)
+    kind: Literal["change", "failure", "recovery", "digest", "blocker"] | None = None
+    summary: str | None = Field(default=None, min_length=1, max_length=400)
     attention_kind: WorkflowAttentionKind | None = None
+    task_id: str | None = Field(default=None, min_length=1, max_length=512)
 
 
 class WorkflowEvidence(WorkModel):
@@ -943,6 +1344,44 @@ class WorkflowCheckpoint(WorkModel):
     repositories: list[WorkflowRepositoryCursor] = Field(default_factory=list, max_length=100)
 
 
+class WorkflowSourceStateFingerprint(WorkModel):
+    """Compact semantic state used to detect changes and recovery. | 语义状态指纹。"""
+
+    resource_key: str = Field(pattern=r"^[0-9a-f]{64}$")
+    fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    state: Literal["healthy", "incident", "neutral"]
+
+
+class WorkflowSourcePollCursor(WorkModel):
+    """One target's resumable page cursor and last complete source watermark. | 来源分页状态。"""
+
+    source: WorkflowSource
+    target_id: str = Field(min_length=1, max_length=512)
+    page_cursor: str | None = Field(default=None, max_length=2_000)
+    resume_cursor: str | None = Field(default=None, max_length=2_000)
+    watermark: str | None = Field(default=None, max_length=512)
+    complete: bool
+    pages_collected: int = Field(ge=0, le=20)
+    seen_event_ids: list[str] = Field(default_factory=list, max_length=1_000)
+    states: list[WorkflowSourceStateFingerprint] = Field(default_factory=list, max_length=1_000)
+
+
+class WorkflowSourcePollCheckpoint(WorkModel):
+    """Typed DSH source-poll checkpoint for restart and partial-page recovery. | 轮询检查点。"""
+
+    kind: Literal["source_poll"]
+    window_start: str | None = Field(default=None, max_length=128)
+    window_end: str = Field(min_length=1, max_length=128)
+    complete: bool
+    sources: list[WorkflowSourcePollCursor] = Field(min_length=1, max_length=100)
+
+
+WorkflowScheduleCheckpoint = Annotated[
+    WorkflowCheckpoint | WorkflowSourcePollCheckpoint,
+    Field(discriminator="kind"),
+]
+
+
 class WorkflowActionReceipt(WorkModel):
     """Durable child action status and provider operation references. | 动作子任务及操作回执。"""
 
@@ -974,7 +1413,7 @@ class WorkflowScheduleEvent(WorkModel):
     evidence: list[WorkflowEvidence] = Field(default_factory=list, max_length=1_000)
     operation_ids: list[str] = Field(default_factory=list, max_length=100)
     action_task_ids: list[str] = Field(default_factory=list, max_length=100)
-    checkpoint: WorkflowCheckpoint | None = None
+    checkpoint: WorkflowScheduleCheckpoint | None = None
     attention_kind: WorkflowAttentionKind | None = None
     action_results: list[WorkflowActionReceipt] = Field(default_factory=list, max_length=100)
     created_at: str = Field(min_length=1, max_length=128)

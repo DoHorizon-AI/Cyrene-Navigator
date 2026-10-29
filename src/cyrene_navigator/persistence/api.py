@@ -42,7 +42,11 @@ from cyrene_navigator.persistence.models import (
     WorkspaceSessionSummary,
 )
 from cyrene_navigator.persistence.store import PersistencePrincipal, PersistenceStore
-from cyrene_navigator.work.api import ConnectorBridge, mount_work_routes
+from cyrene_navigator.work.api import (
+    ConnectorBridge,
+    TeamsPrivateConversationPolicy,
+    mount_work_routes,
+)
 
 _SESSIONS_PATH = "/api/v1/harness/workspaces/{workspace_id}/sessions"
 
@@ -56,6 +60,7 @@ def create_persistence_app(
     echo_url: str | None = None,
     work_attachment_root: Path | None = None,
     work_connector_bridges: Mapping[tuple[str | None, str, str], ConnectorBridge] | None = None,
+    private_conversation_policy: TeamsPrivateConversationPolicy | None = None,
 ) -> FastAPI:
     """Build the authoritative Harness persistence HTTP service. | 创建持久化 HTTP 服务。"""
 
@@ -89,6 +94,7 @@ def create_persistence_app(
     ) -> EchoReceipt:
         principal = authenticate(request, workspace_id)
         require_legacy_writer(principal)
+        store.authorize_session_access(workspace_id, session_id, principal)
         return handoff.send(workspace_id, session_id, body)
 
     @app.exception_handler(PersistenceError)
@@ -204,7 +210,11 @@ def create_persistence_app(
         """List Workspace sessions without write capabilities. | 列出 Workspace 会话。"""
 
         principal = authenticate(request, workspace_id)
-        return {"items": store.list_snapshots(workspace_id, principal.organization_id)}
+        return {
+            "items": store.list_snapshots(
+                workspace_id, principal.organization_id, principal=principal
+            )
+        }
 
     @app.get(
         "/internal/workspace/v1/workspaces/{workspace_id}/sessions/{session_id}",
@@ -225,7 +235,12 @@ def create_persistence_app(
                 "The private Workspace session read requires an organization-scoped bearer.",
             )
         snapshot = Snapshot.model_validate(
-            store.get_snapshot(workspace_id, session_id, principal.organization_id)
+            store.get_snapshot(
+                workspace_id,
+                session_id,
+                principal.organization_id,
+                principal=principal,
+            )
         )
         return WorkspaceSessionSummary(
             product_metadata=snapshot.product_metadata,
@@ -243,7 +258,12 @@ def create_persistence_app(
         """Read one Workspace session snapshot. | 读取一个会话快照。"""
 
         principal = authenticate(request, workspace_id)
-        return store.get_snapshot(workspace_id, session_id, principal.organization_id)
+        return store.get_snapshot(
+            workspace_id,
+            session_id,
+            principal.organization_id,
+            principal=principal,
+        )
 
     @app.get(
         _SESSIONS_PATH + "/{session_id}/metadata",
@@ -259,7 +279,12 @@ def create_persistence_app(
         """
 
         principal = authenticate(request, workspace_id)
-        return store.get_product_metadata(workspace_id, session_id, principal.organization_id)
+        return store.get_product_metadata(
+            workspace_id,
+            session_id,
+            principal.organization_id,
+            principal=principal,
+        )
 
     @app.post(
         _SESSIONS_PATH + "/{session_id}/handles",
@@ -303,7 +328,12 @@ def create_persistence_app(
 
         principal = authenticate(request, workspace_id)
         events, next_seq = store.read_events(
-            workspace_id, session_id, offset, length, principal.organization_id
+            workspace_id,
+            session_id,
+            offset,
+            length,
+            principal.organization_id,
+            principal=principal,
         )
         return {"events": events, "nextSeq": next_seq}
 
@@ -397,5 +427,6 @@ def create_persistence_app(
         authenticate,
         attachment_root=work_attachment_root,
         connector_bridges=work_connector_bridges,
+        private_conversation_policy=private_conversation_policy,
     )
     return app

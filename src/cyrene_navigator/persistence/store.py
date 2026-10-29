@@ -48,6 +48,8 @@ class PersistencePrincipal:
     organization_id: str | None = None
     can_write_harness: bool = False
     can_publish_credential_health: bool = False
+    can_bind_teams_private_conversations: bool = False
+    actor_private_scope: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.actor_id, str) or not self.actor_id.strip():
@@ -60,6 +62,26 @@ class PersistencePrincipal:
             raise ValueError("principal can_write_harness must be a boolean")
         if not isinstance(self.can_publish_credential_health, bool):
             raise ValueError("principal can_publish_credential_health must be a boolean")
+        if not isinstance(self.can_bind_teams_private_conversations, bool):
+            raise ValueError("principal can_bind_teams_private_conversations must be a boolean")
+        if not isinstance(self.actor_private_scope, bool):
+            raise ValueError("principal actor_private_scope must be a boolean")
+        if self.actor_private_scope and (
+            self.organization_id is None or len(self.workspace_ids) != 1
+        ):
+            raise ValueError("actor-private principals require one organization-scoped Workspace")
+        if self.can_bind_teams_private_conversations and (
+            self.can_takeover
+            or self.can_write_harness
+            or self.can_publish_credential_health
+            or self.actor_private_scope
+            or self.organization_id is None
+            or len(self.workspace_ids) != 1
+        ):
+            raise ValueError(
+                "private Teams bridge principals require one organization-scoped Workspace "
+                "and cannot carry other persistence grants"
+            )
 
 
 # The shorter name is convenient for callers while keeping the API contract explicit.
@@ -184,8 +206,8 @@ class PersistenceStore:
                     """
                     INSERT INTO session_product_metadata (
                         organization_id, workspace_id, session_id, creator_actor_id, owner_actor_id,
-                        owner_state, metadata_version, source, created_at
-                    ) VALUES (?, ?, ?, ?, ?, 'known', 1, 'cyrene', ?)
+                        owner_state, metadata_version, source, created_at, actor_private
+                    ) VALUES (?, ?, ?, ?, ?, 'known', 1, 'cyrene', ?, ?)
                     """,
                     (
                         organization_id,
@@ -194,6 +216,7 @@ class PersistenceStore:
                         creator_actor_id,
                         creator_actor_id,
                         now,
+                        int(principal.actor_private_scope),
                     ),
                 )
                 row = self._require_session(conn, organization_id, workspace_id, session_id)
@@ -206,7 +229,11 @@ class PersistenceStore:
             ) from exc
 
     def list_snapshots(
-        self, workspace_id: str, organization_id: str | None = None
+        self,
+        workspace_id: str,
+        organization_id: str | None = None,
+        *,
+        principal: PersistencePrincipal | None = None,
     ) -> list[JsonObject]:
         """List Harness and Product metadata without writer lease state. | 列出会话与产品元数据。"""
 
@@ -218,13 +245,19 @@ class PersistenceStore:
                 "ORDER BY session_id",
                 (organization_key, workspace_id),
             ).fetchall()
-            return [self._snapshot_from_row(conn, row) for row in rows]
+            return [
+                self._snapshot_from_row(conn, row)
+                for row in rows
+                if principal is None or self._can_access_session(conn, row, principal)
+            ]
 
     def get_snapshot(
         self,
         workspace_id: str,
         session_id: str,
         organization_id: str | None = None,
+        *,
+        principal: PersistencePrincipal | None = None,
     ) -> JsonObject:
         """Read one Harness and Product metadata snapshot. | 读取会话与产品元数据快照。"""
 
@@ -232,16 +265,18 @@ class PersistenceStore:
         session_id = _validate_identifier(session_id, "session_id")
         organization_key = _organization_key(organization_id)
         with self._read() as conn:
-            return self._snapshot_from_row(
-                conn,
-                self._require_session(conn, organization_key, workspace_id, session_id),
-            )
+            row = self._require_session(conn, organization_key, workspace_id, session_id)
+            if principal is not None:
+                self._assert_session_access(conn, row, principal)
+            return self._snapshot_from_row(conn, row)
 
     def get_product_metadata(
         self,
         workspace_id: str,
         session_id: str,
         organization_id: str | None = None,
+        *,
+        principal: PersistencePrincipal | None = None,
     ) -> JsonObject:
         """Read stable Product metadata without opening a writer handle. | 读取稳定产品元数据。"""
 
@@ -249,10 +284,30 @@ class PersistenceStore:
         session_id = _validate_identifier(session_id, "session_id")
         organization_key = _organization_key(organization_id)
         with self._read() as conn:
-            self._require_session(conn, organization_key, workspace_id, session_id)
+            row = self._require_session(conn, organization_key, workspace_id, session_id)
+            if principal is not None:
+                self._assert_session_access(conn, row, principal)
             return self._product_metadata_from_row(
                 self._require_product_metadata(conn, organization_key, workspace_id, session_id)
             )
+
+    def authorize_session_access(
+        self,
+        workspace_id: str,
+        session_id: str,
+        principal: PersistencePrincipal,
+    ) -> None:
+        """Apply the same stable actor boundary before a trusted export operation.
+
+        中文：在受信导出操作读取会话前执行同一稳定 actor 边界检查。
+        """
+
+        workspace_id = _validate_identifier(workspace_id, "workspace_id")
+        session_id = _validate_identifier(session_id, "session_id")
+        organization_id = _organization_key(principal.organization_id)
+        with self._read() as conn:
+            row = self._require_session(conn, organization_id, workspace_id, session_id)
+            self._assert_session_access(conn, row, principal)
 
     def open_handle(
         self,
@@ -281,10 +336,12 @@ class PersistenceStore:
         if access == "read":
             with self._read() as conn:
                 row = self._require_session(conn, organization_id, workspace_id, session_id)
+                self._assert_session_access(conn, row, principal)
                 return self._handle_from_row(row, "read")
 
         with self._mutation() as conn:
             row = self._require_session(conn, organization_id, workspace_id, session_id)
+            self._assert_session_access(conn, row, principal)
 
             current_epoch = _column_int(row, "epoch")
             owner_actor = _column_optional_string(row, "owner_actor_id")
@@ -352,6 +409,8 @@ class PersistenceStore:
         offset: int = 0,
         length: int = 10_000,
         organization_id: str | None = None,
+        *,
+        principal: PersistencePrincipal | None = None,
     ) -> tuple[list[JsonObject], int]:
         """Read a committed contiguous slice without mutating the log. | 读取已提交事件。"""
 
@@ -366,6 +425,8 @@ class PersistenceStore:
             )
         with self._read() as conn:
             session = self._require_session(conn, organization_key, workspace_id, session_id)
+            if principal is not None:
+                self._assert_session_access(conn, session, principal)
             next_seq = _column_int(session, "event_count")
             if length == 0 or offset >= next_seq:
                 return [], next_seq
@@ -421,6 +482,7 @@ class PersistenceStore:
 
         with self._mutation() as conn:
             row = self._require_session(conn, organization_id, workspace_id, session_id)
+            self._assert_session_access(conn, row, principal)
             self._assert_writer(row, principal, writer_token, epoch)
             existing = conn.execute(
                 """
@@ -548,6 +610,7 @@ class PersistenceStore:
         organization_id = _organization_key(principal.organization_id)
         with self._mutation() as conn:
             row = self._require_session(conn, organization_id, workspace_id, session_id)
+            self._assert_session_access(conn, row, principal)
             self._assert_writer(row, principal, writer_token, epoch)
             next_epoch = _column_int(row, "epoch") + 1
             conn.execute(
@@ -580,6 +643,7 @@ class PersistenceStore:
         organization_id = _organization_key(principal.organization_id)
         with self._mutation() as conn:
             row = self._require_session(conn, organization_id, workspace_id, session_id)
+            self._assert_session_access(conn, row, principal)
             self._assert_writer(row, principal, writer_token, epoch)
             lease_expires_at = _column_int(row, "lease_expires_at")
             if renew:
@@ -729,6 +793,53 @@ class PersistenceStore:
             )
         return row
 
+    def _can_access_session(
+        self,
+        conn: sqlite3.Connection,
+        session_row: sqlite3.Row,
+        principal: PersistencePrincipal,
+    ) -> bool:
+        """Use immutable Product ownership for actor-private session reads.
+
+        中文：actor-private 会话只认不可变 Product owner，不认可变 writer lease。
+        """
+
+        organization_id = _column_string(session_row, "organization_id")
+        workspace_id = _column_string(session_row, "workspace_id")
+        session_id = _column_string(session_row, "session_id")
+        metadata_row = self._require_product_metadata(
+            conn, organization_id, workspace_id, session_id
+        )
+        actor_private = _column_int(metadata_row, "actor_private")
+        if actor_private not in {0, 1}:
+            raise PersistenceError(
+                SESSION_STORAGE_CORRUPT,
+                500,
+                "The session privacy marker is invalid.",
+            )
+        owner = self._product_metadata_from_row(metadata_row)
+        same_actor = bool(
+            owner["ownerState"] == "known" and owner["ownerActorId"] == principal.actor_id
+        )
+        if actor_private == 1 or principal.actor_private_scope:
+            return same_actor
+        return True
+
+    def _assert_session_access(
+        self,
+        conn: sqlite3.Connection,
+        session_row: sqlite3.Row,
+        principal: PersistencePrincipal,
+    ) -> None:
+        """Hide private or foreign-owner sessions as not found. | 隐藏越权会话。"""
+
+        if not self._can_access_session(conn, session_row, principal):
+            raise PersistenceError(
+                SESSION_NOT_FOUND,
+                404,
+                "The session does not exist in this Workspace.",
+            )
+
     @staticmethod
     def _product_metadata_from_row(row: sqlite3.Row) -> JsonObject:
         """Validate and project stable Product metadata. | 校验并返回稳定产品元数据。"""
@@ -738,6 +849,7 @@ class PersistenceStore:
         creator_actor_id = _column_optional_string(row, "creator_actor_id")
         owner_actor_id = _column_optional_string(row, "owner_actor_id")
         metadata_version = _column_int(row, "metadata_version")
+        actor_private = _column_int(row, "actor_private")
         created_at = _column_optional_int(row, "created_at")
         if source not in {"cyrene", "legacy"}:
             raise PersistenceError(
@@ -756,6 +868,12 @@ class PersistenceStore:
                 SESSION_STORAGE_CORRUPT,
                 500,
                 "The Product metadata version is invalid.",
+            )
+        if actor_private not in {0, 1}:
+            raise PersistenceError(
+                SESSION_STORAGE_CORRUPT,
+                500,
+                "The session privacy marker is invalid.",
             )
         if source == "cyrene" and (
             creator_actor_id is None
@@ -801,6 +919,7 @@ class PersistenceStore:
                 self._rebuild_scope_schema(conn, existing_tables)
             else:
                 self._create_scoped_schema(conn)
+            self._ensure_actor_private_column(conn)
 
             # This additive bootstrap is the migration for databases created before
             # Product metadata existed. The old mutable writer is intentionally not
@@ -927,6 +1046,7 @@ class PersistenceStore:
                 metadata_version INTEGER NOT NULL CHECK (metadata_version >= 1),
                 source TEXT NOT NULL CHECK (source IN ('cyrene', 'legacy')),
                 created_at INTEGER,
+                actor_private INTEGER NOT NULL DEFAULT 0 CHECK (actor_private IN (0, 1)),
                 PRIMARY KEY (organization_id, workspace_id, session_id),
                 FOREIGN KEY (organization_id, workspace_id, session_id)
                     REFERENCES sessions (organization_id, workspace_id, session_id)
@@ -935,6 +1055,23 @@ class PersistenceStore:
             """,
         ):
             conn.execute(statement)
+
+    @staticmethod
+    def _ensure_actor_private_column(conn: sqlite3.Connection) -> None:
+        """Add the actor-private marker without changing existing shared sessions.
+
+        中文：通过仅追加迁移新增 actor-private 标记，旧会话继续保持 Workspace 共享。
+        """
+
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(session_product_metadata)").fetchall()
+        }
+        if "actor_private" not in columns:
+            conn.execute(
+                "ALTER TABLE session_product_metadata ADD COLUMN actor_private "
+                "INTEGER NOT NULL DEFAULT 0 CHECK (actor_private IN (0, 1))"
+            )
 
     @staticmethod
     def _rebuild_scope_schema(conn: sqlite3.Connection, existing_tables: set[str]) -> None:
@@ -1020,6 +1157,7 @@ class PersistenceStore:
                 metadata_version INTEGER NOT NULL CHECK (metadata_version >= 1),
                 source TEXT NOT NULL CHECK (source IN ('cyrene', 'legacy')),
                 created_at INTEGER,
+                actor_private INTEGER NOT NULL DEFAULT 0 CHECK (actor_private IN (0, 1)),
                 PRIMARY KEY (organization_id, workspace_id, session_id),
                 FOREIGN KEY (organization_id, workspace_id, session_id)
                     REFERENCES sessions_scope_v2 (organization_id, workspace_id, session_id)
@@ -1062,14 +1200,23 @@ class PersistenceStore:
                 """
             )
         if "session_product_metadata" in existing_tables:
+            metadata_columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(session_product_metadata)").fetchall()
+            }
+            actor_private_expression = (
+                "actor_private" if "actor_private" in metadata_columns else "0"
+            )
             conn.execute(
-                """
+                f"""
                 INSERT INTO session_product_metadata_scope_v2 (
                     organization_id, workspace_id, session_id, creator_actor_id,
-                    owner_actor_id, owner_state, metadata_version, source, created_at
+                    owner_actor_id, owner_state, metadata_version, source, created_at,
+                    actor_private
                 )
                 SELECT '', workspace_id, session_id, creator_actor_id,
-                       owner_actor_id, owner_state, metadata_version, source, created_at
+                       owner_actor_id, owner_state, metadata_version, source, created_at,
+                       {actor_private_expression}
                 FROM session_product_metadata
                 """
             )
