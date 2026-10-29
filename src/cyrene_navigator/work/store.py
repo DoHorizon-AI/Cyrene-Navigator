@@ -9185,6 +9185,7 @@ def _validate_workflow_v3(value: Mapping[str, Any]) -> JsonObject:
     normalized_targets: list[JsonObject] = []
     allowed_target_kinds = {
         "github_repository",
+        "github_actions_workflow",
         "pipeline_runs",
         "release_deployments",
         "planner_plan",
@@ -9224,6 +9225,20 @@ def _validate_workflow_v3(value: Mapping[str, Any]) -> JsonObject:
                     "GitHub target must match the configured owner/repository reference.",
                 )
             normalized_target["uri"] = _safe_resource_uri(uri_value, "target.uri")
+        elif kind == "github_actions_workflow":
+            if (
+                re.fullmatch(
+                    r"github-actions-workflow:[1-9][0-9]{0,18}:[1-9][0-9]{0,19}", target_id
+                )
+                is None
+                or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", label) is None
+                or uri_value is not None
+            ):
+                raise _invalid(
+                    "WORK_WORKFLOW_V3_TARGET_INVALID",
+                    "GitHub Actions targets require a numeric repository/workflow identity, "
+                    "an owner/repository label, and no URI.",
+                )
         elif uri_value is not None:
             raise _invalid(
                 "WORK_WORKFLOW_V3_TARGET_INVALID",
@@ -9247,7 +9262,7 @@ def _validate_workflow_v3(value: Mapping[str, Any]) -> JsonObject:
         "product",
     }
     target_kinds_by_source = {
-        "github": {"github_repository"},
+        "github": {"github_repository", "github_actions_workflow"},
         "azure_devops": {"pipeline_runs", "release_deployments"},
         "office_graph": {"planner_plan"},
         "vm_health": {"host_health"},

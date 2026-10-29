@@ -116,6 +116,90 @@ function addSeconds(timestamp, seconds) {
   return new Date(Date.parse(timestamp) + seconds * 1_000).toISOString();
 }
 
+function githubActionsWorkflow(id = 'github-workspace-ci') {
+  const targetId = 'github-actions-workflow:123456789:987654321';
+  return {
+    id,
+    version: 3,
+    title: 'Cyrene Workspace develop CI',
+    description: 'Observe one Actions workflow on the current develop head.',
+    targets: [{
+      id: targetId,
+      label: 'DoHorizon-AI/Cyrene-Workspace',
+      kind: 'github_actions_workflow',
+      bindingId: 'github-workspace-binding',
+    }],
+    triggers: [{
+      id: 'actions-poll',
+      kind: 'source_poll',
+      source: 'github',
+      schedule: { kind: 'cron', expression: '*/5 * * * *', timeZone: 'UTC' },
+      targetIds: [targetId],
+      initialBaseline: 'record_without_notification',
+      pageSize: 10,
+      maxPages: 1,
+    }],
+    authorization: { kind: 'owner_private', ownerTaskId: 'teams-owner-task' },
+    notifications: {
+      onChange: true,
+      onFailure: true,
+      onRecovery: true,
+      quietWhenUnchanged: true,
+      quietHours: { start: '22:00', end: '08:00', timeZone: 'America/New_York' },
+      digest: {
+        enabled: true,
+        schedule: { kind: 'cron', expression: '0 9 * * 1-5', timeZone: 'America/New_York' },
+        maxPerDay: 1,
+      },
+      destination: { kind: 'owner_private' },
+      immediateOn: ['blocked_goal', 'user_decision', 'service_or_auth_outage'],
+    },
+    enabled: true,
+  };
+}
+
+async function createFixedGitHubHost(directory, store, invokeProvider, authorizeWorkflowActor = async () => true) {
+  const context = new Context();
+  await context.plugin(LlmRuntime);
+  await context.plugin(SessionStore);
+  await context.plugin(SessionProjectionRegistry);
+  await context.plugin(SystemPrompt);
+  await context.plugin(ToolRuntime);
+  await context.plugin(AgentRegistry);
+  await context.plugin(SessionPersistenceJsonl, { root: join(directory, 'session-logs'), compression: 'none' });
+  await context.plugin(AgentLoop, { agents: [] });
+  context.llm.registerAdapter(['v3-no-model-proof'], new NoModelAdapter());
+  let modelCalls = 0;
+  const fixedTasks = [];
+  const sourcePageReceipts = [];
+  const runtime = await registerWorkflowRuntime(context, {
+    store,
+    storageRoot: join(directory, 'dsh-storage'),
+    schedulerSessionId: `navigator-github-actions-${WORKFLOW_ID}`,
+    defaultWorkflows: [],
+    reconcileEveryMs: 0,
+    actorStores: [{ actorAadObjectId: OWNER_ID, store }],
+    authorizeWorkflowActor,
+    executeTask: async () => {
+      modelCalls += 1;
+      throw new Error('GitHub Actions source polling must never invoke model inference.');
+    },
+    executeFixedToolTask: async (request, execute, actorAadObjectId) => {
+      assert.equal(actorAadObjectId, OWNER_ID);
+      fixedTasks.push(request);
+      try {
+        const output = await execute({}, new AbortController().signal);
+        return { taskId: request.taskId, sessionId: request.sessionId, status: 'completed', output };
+      } catch {
+        return { taskId: request.taskId, sessionId: request.sessionId, status: 'failed', output: '' };
+      }
+    },
+    invokeObservationConnectorTool: async (_agent, request) => invokeProvider(request),
+    recordSourcePageReceipt: async (_taskId, receipt) => { sourcePageReceipts.push(receipt); },
+  });
+  return { context, runtime, modelCalls: () => modelCalls, fixedTasks, sourcePageReceipts };
+}
+
 test('v3 DSH hook records a silent baseline and emits one failure plus recovery around unchanged source state', { timeout: 60_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'navigator-workflow-v3-'));
   const store = new InMemoryWorkflowStore();
@@ -374,5 +458,266 @@ test('v3 DSH hook replays event POST and atomic intent after response-loss crash
     await runtime?.dispose();
     if (context !== undefined) await context.fiber.dispose().catch(() => undefined);
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('v3 GitHub Actions observes one develop workflow, recovers the same resource after restart, and never treats an in-progress attempt as healthy', { timeout: 60_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'navigator-github-actions-v3-'));
+  const store = new InMemoryWorkflowStore();
+  const definition = githubActionsWorkflow();
+  const repositoryId = '123456789';
+  const workflowId = '987654321';
+  const repository = 'DoHorizon-AI/Cyrene-Workspace';
+  const bindingId = 'github-workspace-binding';
+  const headSha = 'a'.repeat(40);
+  let actionSnapshot = [];
+  const providerCalls = [];
+  let host;
+  let restartedHost;
+  await store.putWorkflow(definition);
+
+  const invokeProvider = async request => {
+    providerCalls.push({
+      toolId: request.toolId,
+      operationId: request.operationId,
+      bindingId: request.bindingId,
+      arguments: structuredClone(request.arguments),
+    });
+    assert.equal(request.providerId, 'github');
+    assert.equal(request.resourceProjection, 'github_repository');
+    assert.equal(request.bindingId, bindingId);
+    if (request.operationId === 'github.branch.get') {
+      return {
+        structuredContent: {
+          businessResult: {
+            branch: 'develop', exists: true, commit_sha: headSha,
+          },
+        },
+      };
+    }
+    assert.equal(request.operationId, 'github.actions.runs.list');
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          workflow_runs: actionSnapshot,
+          total_count: actionSnapshot.length,
+          complete: true,
+          truncated: false,
+        }),
+      }],
+    };
+  };
+  const run = (runId, attempt, status, conclusion, updatedAt) => ({
+    run_id: runId,
+    workflow_id: workflowId,
+    name: 'Untrusted provider workflow name is deliberately not included in notices',
+    status,
+    conclusion,
+    head_sha: headSha,
+    head_branch: 'develop',
+    run_attempt: attempt,
+    workflow_path: '.github/workflows/source.yml',
+    html_url: `https://github.com/${repository}/actions/runs/${runId}`,
+    updated_at: updatedAt,
+  });
+  const createHost = async () => createFixedGitHubHost(directory, store, invokeProvider);
+
+  try {
+    host = await createHost();
+    const cron = (await host.context.schedule.catalog()).find(entry => entry.kind === 'cron'
+      && entry.prompt.includes(definition.id));
+    assert.ok(cron, 'the Actions source uses the existing DSH Schedule domain');
+    const baselineAt = new Date(Date.now() + 5_000).toISOString();
+    actionSnapshot = [run('101', 1, 'COMPLETED', 'SUCCESS', addSeconds(baselineAt, -1))];
+    await deliverDshScheduleBatch(host.context, host.runtime, cron.prompt, [baselineAt]);
+    assert.equal(store.listNotifications().length, 0, 'the first source state is a silent baseline');
+
+    const failureAt = addSeconds(baselineAt, 60);
+    actionSnapshot = [run('101', 1, 'COMPLETED', 'FAILURE', addSeconds(failureAt, -1))];
+    await deliverDshScheduleBatch(host.context, host.runtime, cron.prompt, [failureAt]);
+    assert.deepEqual(store.listNotifications().map(item => item.type), ['workflow.failure']);
+
+    const noWorkflowAt = addSeconds(failureAt, 60);
+    actionSnapshot = [{
+      ...run('202', 1, 'COMPLETED', 'SUCCESS', addSeconds(noWorkflowAt, -1)),
+      workflow_id: '222222222',
+    }];
+    await deliverDshScheduleBatch(host.context, host.runtime, cron.prompt, [noWorkflowAt]);
+    assert.deepEqual(store.listNotifications().map(item => item.type), ['workflow.failure'],
+      'a successful run from another workflow does not claim the selected workflow is healthy');
+
+    const noRunAt = addSeconds(noWorkflowAt, 60);
+    actionSnapshot = [];
+    await deliverDshScheduleBatch(host.context, host.runtime, cron.prompt, [noRunAt]);
+    assert.deepEqual(store.listNotifications().map(item => item.type), ['workflow.failure'],
+      'no matching run is unknown and cannot manufacture a healthy transition');
+
+    const duplicateAt = addSeconds(noRunAt, 60);
+    actionSnapshot = [run('101', 1, 'COMPLETED', 'FAILURE', addSeconds(failureAt, -1))];
+    await deliverDshScheduleBatch(host.context, host.runtime, cron.prompt, [duplicateAt]);
+    assert.deepEqual(store.listNotifications().map(item => item.type), ['workflow.failure'],
+      'the same run revision does not create duplicate source events or notices');
+
+    const pendingAt = addSeconds(duplicateAt, 60);
+    actionSnapshot = [
+      run('100', 1, 'COMPLETED', 'SUCCESS', addSeconds(pendingAt, -1)),
+      run('202', 1, 'IN_PROGRESS', null, addSeconds(pendingAt, -10)),
+    ];
+    await deliverDshScheduleBatch(host.context, host.runtime, cron.prompt, [pendingAt]);
+    assert.deepEqual(store.listNotifications().map(item => item.type), ['workflow.failure'],
+      'a newer in-progress run must not recover an older failure or claim health');
+
+    const storedBeforeRestart = await store.listAutomationEvents();
+    assert.equal(storedBeforeRestart.items.length, 2);
+    assert.equal(host.sourcePageReceipts.length, 2,
+      'baseline and incident observations each persist the exact source page receipt');
+    assert.ok(storedBeforeRestart.items.every(event => event.resourceUri
+      === `https://github.com/${repository}/actions/workflows/${workflowId}`),
+    'all workflow run revisions share one stable resource key for failure/recovery state');
+    assert.equal(host.modelCalls(), 0, 'fixed Actions polling does not call the model before restart');
+    await host.runtime.dispose();
+    await host.context.fiber.dispose();
+    host = undefined;
+
+    restartedHost = await createHost();
+    const restartedCron = (await restartedHost.context.schedule.catalog()).find(entry => entry.kind === 'cron'
+      && entry.prompt.includes(definition.id));
+    assert.ok(restartedCron, 'the persisted DSH Schedule definition resumes after runtime restart');
+    const recoveredAt = addSeconds(pendingAt, 60);
+    actionSnapshot = [
+      run('101', 1, 'COMPLETED', 'FAILURE', addSeconds(failureAt, -1)),
+      run('202', 2, 'COMPLETED', 'SUCCESS', addSeconds(recoveredAt, -1)),
+    ];
+    await deliverDshScheduleBatch(restartedHost.context, restartedHost.runtime, restartedCron.prompt, [recoveredAt]);
+    assert.deepEqual(store.listNotifications().map(item => item.type), ['workflow.failure', 'workflow.recovery'],
+      'the same workflow resource recovers after a host restart without replaying its failure');
+
+    const stored = await store.listAutomationEvents();
+    assert.equal(stored.items.length, 3);
+    assert.equal(restartedHost.sourcePageReceipts.length, 1,
+      'the post-restart success persists its source page receipt');
+    assert.ok(stored.items.some(event => event.stateClass === 'incident'));
+    assert.ok(stored.items.some(event => event.stateClass === 'healthy'));
+    const recoveryEvent = stored.items.find(event => event.metadataReferences?.some(reference =>
+      reference.resourceUri === `https://github.com/${repository}/actions/runs/202`));
+    assert.equal(recoveryEvent?.stateClass, 'healthy');
+    assert.ok(recoveryEvent?.metadataReferences?.some(reference =>
+      reference.resourceUri === `https://github.com/${repository}/actions/runs/202`));
+    assert.ok(recoveryEvent?.metadataReferences?.some(reference =>
+      reference.resourceUri === `https://github.com/${repository}/commit/${headSha}`));
+    assert.equal(recoveryEvent?.metadataReferences?.some(reference =>
+      reference.resourceUri.includes('Untrusted provider workflow name')), false);
+
+    assert.equal(restartedHost.modelCalls(), 0, 'fixed Actions polling does not call the model after restart');
+    assert.equal(providerCalls.length, 14, 'each complete poll uses exactly one branch read and one Actions read');
+    for (let index = 0; index < providerCalls.length; index += 2) {
+      const branchCall = providerCalls[index];
+      const runsCall = providerCalls[index + 1];
+      assert.equal(branchCall?.toolId, 'github.branch.get');
+      assert.deepEqual(branchCall?.arguments, {
+        repository_id: repositoryId, repository, branch: 'develop',
+      });
+      assert.equal(runsCall?.toolId, 'github.actions.runs.list');
+      assert.deepEqual(runsCall?.arguments, {
+        repository_id: repositoryId, repository, branch: 'develop', commit_sha: headSha,
+      });
+    }
+  } finally {
+    await host?.runtime.dispose().catch(() => undefined);
+    if (host !== undefined) await host.context.fiber.dispose().catch(() => undefined);
+    await restartedHost?.runtime.dispose().catch(() => undefined);
+    if (restartedHost !== undefined) await restartedHost.context.fiber.dispose().catch(() => undefined);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('v3 GitHub Actions fails closed on partial, malformed, cross-head, and unauthorized reads', { timeout: 60_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'navigator-github-actions-boundary-'));
+  const headSha = 'b'.repeat(40);
+  const otherSha = 'c'.repeat(40);
+  const workflow = githubActionsWorkflow('github-actions-boundaries');
+  const branchValue = {
+    structuredContent: { branch: 'develop', exists: true, commit_sha: headSha },
+  };
+  const fixedRun = {
+    run_id: '303', workflow_id: '987654321', status: 'COMPLETED', conclusion: 'FAILURE',
+    head_sha: headSha, head_branch: 'develop', run_attempt: 1,
+    workflow_path: '.github/workflows/source.yml', updated_at: new Date().toISOString(),
+  };
+  let response;
+  const calls = [];
+  const invokeProvider = async request => {
+    calls.push({ operationId: request.operationId, arguments: structuredClone(request.arguments) });
+    if (request.operationId === 'github.branch.get') return branchValue;
+    return { structuredContent: { businessResult: response } };
+  };
+  let host;
+
+  try {
+    const store = new InMemoryWorkflowStore();
+    await store.putWorkflow(workflow);
+    const malformed = githubActionsWorkflow('github-actions-invalid-target');
+    malformed.targets[0].id = 'github-actions-workflow:123456789:https://evil.example';
+    await assert.rejects(store.putWorkflow(malformed), /GitHub Actions targets/u,
+      'target ids cannot smuggle workflow URLs or arbitrary provider input');
+
+    host = await createFixedGitHubHost(directory, store, invokeProvider);
+    const cron = (await host.context.schedule.catalog()).find(entry => entry.kind === 'cron'
+      && entry.prompt.includes(workflow.id));
+    assert.ok(cron);
+    const partialAt = new Date(Date.now() + 5_000).toISOString();
+    response = {
+      workflow_runs: [fixedRun], total_count: 101, complete: false, truncated: true,
+    };
+    await deliverDshScheduleBatch(host.context, host.runtime, cron.prompt, [partialAt]);
+    const partialFailure = (await store.listScheduleEvents({ workflowId: workflow.id, limit: 100 })).items
+      .find(event => event.scheduledAt === partialAt && event.status === 'failed');
+    assert.equal(partialFailure?.checkpoint?.complete, false);
+    assert.equal(partialFailure?.checkpoint?.sources[0]?.watermark, null);
+    assert.equal(partialFailure?.checkpoint?.sources[0]?.pageCursor, 'navigator-source-start-v1');
+    assert.equal((await store.listAutomationEvents()).items.length, 0,
+      'a provider-truncated snapshot does not emit events or advance its source watermark');
+    assert.equal(store.listNotifications().length, 0);
+
+    const mismatchAt = addSeconds(partialAt, 60);
+    response = { workflow_runs: [{ ...fixedRun, head_sha: otherSha }], total_count: 1, complete: true, truncated: false };
+    await deliverDshScheduleBatch(host.context, host.runtime, cron.prompt, [mismatchAt]);
+    assert.equal((await store.listAutomationEvents()).items.some(event =>
+      event.eventType === 'github.actions.workflow_run.completed'), false,
+    'a run for a different commit cannot be disclosed as the configured develop-head status');
+    assert.ok(calls.every(call => call.arguments.repository_id === '123456789'
+      && call.arguments.repository === 'DoHorizon-AI/Cyrene-Workspace'),
+    'both provider operations remain bound to the configured numeric repository ID and slug');
+  } finally {
+    await host?.runtime.dispose().catch(() => undefined);
+    if (host !== undefined) await host.context.fiber.dispose().catch(() => undefined);
+    await rm(directory, { recursive: true, force: true });
+  }
+
+  const unauthorizedDirectory = await mkdtemp(join(tmpdir(), 'navigator-github-actions-unauthorized-'));
+  const unauthorizedStore = new InMemoryWorkflowStore();
+  await unauthorizedStore.putWorkflow(githubActionsWorkflow('github-actions-unauthorized'));
+  const unauthorizedCalls = [];
+  let unauthorizedHost;
+  try {
+    unauthorizedHost = await createFixedGitHubHost(
+      unauthorizedDirectory,
+      unauthorizedStore,
+      async request => { unauthorizedCalls.push(request); return branchValue; },
+      async () => false,
+    );
+    const cron = (await unauthorizedHost.context.schedule.catalog()).find(entry => entry.kind === 'cron'
+      && entry.prompt.includes('github-actions-unauthorized'));
+    assert.ok(cron);
+    const scheduledAt = new Date(Date.now() + 5_000).toISOString();
+    await deliverDshScheduleBatch(unauthorizedHost.context, unauthorizedHost.runtime, cron.prompt, [scheduledAt]);
+    assert.equal(unauthorizedCalls.length, 0, 'a revoked/unauthorized owner is rejected before provider access');
+    assert.equal((await unauthorizedStore.listAutomationEvents()).items.some(event =>
+      event.eventType === 'github.actions.workflow_run.completed'), false);
+  } finally {
+    await unauthorizedHost?.runtime.dispose().catch(() => undefined);
+    if (unauthorizedHost !== undefined) await unauthorizedHost.context.fiber.dispose().catch(() => undefined);
+    await rm(unauthorizedDirectory, { recursive: true, force: true });
   }
 });

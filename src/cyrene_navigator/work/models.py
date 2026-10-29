@@ -1191,6 +1191,7 @@ WorkflowSource = Literal[
 ]
 WorkflowV3TargetKind = Literal[
     "github_repository",
+    "github_actions_workflow",
     "pipeline_runs",
     "release_deployments",
     "planner_plan",

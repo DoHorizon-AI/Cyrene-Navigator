@@ -50,10 +50,43 @@ Incomplete pages keep their prior watermark. Work persists immutable events and
 server-derived notification decisions so retries can resume after either an event
 write or an outbox write. Initial baselines remain quiet.
 
+V3 also accepts a fixed GitHub Actions workflow target whose ID is
+`github-actions-workflow:<repository-id>:<workflow-id>`, whose label is the exact
+`owner/repository` slug, and whose `bindingId` is the actor's existing GitHub
+Exchange binding. The host reads only the `develop` branch head, then calls the
+registered `github.actions.runs.list` tool for that exact commit and selects the
+configured numeric workflow ID. It selects the highest numeric run ID first,
+then that run's latest attempt/update; a late completion from an older run cannot
+override a newer pending run. It does not accept a URL, CLI arguments, or a
+branch chosen by model output. The provider returns at most 100 runs and no
+continuation cursor; the host accepts the snapshot only when the provider reports
+it complete. A truncated result records a partial source run and retains the
+previous watermark. Missing or in-progress runs are unknown and do not count as
+healthy. Completed failures and successes use one stable workflow resource URI,
+so a later completed success can recover a prior failure through the same Work
+event/outbox state machine. This observes only the configured workflow on the
+current `develop` head, not every historical or other-branch run; a failure on a
+commit superseded before a poll may be missed. V3 notification delivery still
+requires the owner-private Teams route; this adapter does not grant channel sharing.
+
 V3 通过 `definitionVersion=3` 单独协商，v1、v2 保持原有契约。来源采集使用固定工具或
 类型化只读适配器，不调用模型。来源绑定只负责选择目标；每次轮询仍须验证当前 Directory
 和来源访问权，缺少证明时关闭该来源。不完整分页不推进原有水位。Work 持久保存不可变
 事件和服务端生成的通知决定，使事件写入或 outbox 写入后的重试能够继续；首次基线不通知。
+
+V3 还接受固定的 GitHub Actions 工作流 target：ID 为
+`github-actions-workflow:<repository-id>:<workflow-id>`，label 必须是精确的
+`owner/repository`，`bindingId` 必须是该 actor 现有的 GitHub Exchange binding。宿主只读取
+`develop` 分支 head，再通过已注册的 `github.actions.runs.list` 工具读取该确切 commit，并
+筛选配置的数字 workflow ID。它优先选择数值最大的 run ID，再选择该 run 的最新 attempt/update；
+旧 run 的迟到完成不能覆盖更新的 pending run。它不接受 URL、CLI 参数或模型选择的分支。
+Provider 最多返回 100 条 run 且不提供续页 cursor；只有 Provider 明确报告完整时宿主才接受该快照。截断结果会
+记录为 partial source run 并保留原水位。没有 run 或仍在执行的 run 表示状态未知，不会被算作
+健康。已完成失败和成功事件使用同一个稳定 workflow resource URI，因此后续已完成的成功可
+通过同一 Work 事件/outbox 状态机恢复先前失败。该观察只覆盖配置的 workflow 在当前
+`develop` head 上的状态，不覆盖历史或其他分支的所有 run；若失败所在 commit 在 poll 前已
+被新 commit 替代，该历史失败可能漏报。V3 通知仍要求 owner-private Teams route；此适配器
+不会授予频道共享权限。
 
 The optional pilot uses a dedicated host token for each actor, including the
 owner. Each token must have `actor_private_scope`, Work write and Harness write
