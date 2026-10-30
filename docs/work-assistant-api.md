@@ -221,6 +221,7 @@ inventories retain the previous snapshot and never mark omitted facts missing.
 | `POST /credential-health/snapshots` | Host-only endpoint accepting a bounded, secret-free Exchange health projection; atomically checkpoints incident state and writes credential notices to the same outbox. |
 | `GET /notifications?status=uncertain&limit=100` | Inspect outbox state, including unknown delivery. |
 | `POST /notifications/claim` | Lease with `{ "workerId":"wecom-1", "limit":10, "leaseSeconds":60, "type":"wecom.message", "connectorId":"binding-1", "recipient":"bot:7/group/room-1" }`. Type/connector/recipient filters apply before leasing. |
+| `POST /private-notifications/claim` | The dedicated Teams installation bridge leases owner-private task messages or host-authored Microsoft Graph credential notices; the route comes from the verified personal installation. |
 | `POST /notifications/{notificationId}/start` | `{ "leaseToken":"..." }` immediately before attempting the remote send. |
 | `POST /notifications/{notificationId}/finish` | `{ "leaseToken":"...", "outcome":"delivered", "result":{} }`; outcome is `delivered`, `failed`, `uncertain`, or bounded `retry` with `retryAfterSeconds`. |
 | `POST /attachments` | Upload `{ "name":"report.pdf", "mediaType":"application/pdf", "contentBase64":"..." }`; returns a content digest. |
@@ -274,22 +275,37 @@ incident, repeat reminders are limited to once every 24 hours, and a valid state
 closes the incident with one recovery notice. Unknown, unavailable, and stale
 snapshots remain silent.
 
+Microsoft Graph snapshots additionally require the host-derived `privateOwner`
+projection (`actorAadObjectId`, `tenantId`, and `botAppId`). Navigator verifies
+Exchange's `externalSubject` against the current Directory owner before
+publishing it. Work queues Graph notices as `teams:owner-private`; the private
+bridge resolves the active installation at lease time. A missing installation
+keeps the notice queued with `WORK_TEAMS_PRIVATE_INSTALLATION_NOT_FOUND`. It is
+never sent through the shared channel destination.
+
 Credential notices reuse `work_notifications` but do not have a task, workflow
 occurrence, or model-facing tool. Navigator reads Exchange's cached provider
 snapshots on the existing Teams notification worker tick and uses the
 host-mounted `TEAMS_CREDENTIAL_NOTIFICATIONS_CONFIG_FILE` to pin the connection
-selectors, owner, dedicated Exchange notification profile, and verified Teams
-thread. Exchange remains the only provider health poller and owns automatic
-refresh. Navigator does not call the model or initiate credential renewal for
-this deterministic job.
+selectors, owner, dedicated Exchange notification profile, and Teams
+destination. Existing non-Graph notices use that configured destination; Graph
+notices use the owner-private installation route. Exchange remains the only
+provider health poller and owns automatic refresh. Navigator does not call the
+model or initiate credential renewal for this deterministic job.
 
 系统保留类型 `teams.credential-health` 不能通过通用通知路由或任务 metadata 入队。
 `POST /credential-health/snapshots` 只允许显式配置
 `can_publish_credential_health:true` 且有组织范围的 principal。请求只接受 Exchange 授权健康字段；未知字段、自由文本错误、授权引用、令牌和授权启动 URL 都会被拒绝。请求中的 `organizationId` 必须与认证 principal 完全一致。健康检查点与 outbox 记录在同一事务中提交。最新的
 `REAUTHORIZATION_REQUIRED` 或 `PERMISSION_DENIED` 会打开一个事件；重复提醒最多每 24 小时一次；授权恢复后关闭事件并发送一次恢复通知。未知、不可用和过期快照保持静默。
 
+Microsoft Graph 快照还必须携带宿主推导的 `privateOwner` 投影
+（`actorAadObjectId`、`tenantId`、`botAppId`）。Navigator 会在发布前验证 Exchange 的
+`externalSubject` 与当前 Directory owner 一致。Work 将 Graph 告警排入
+`teams:owner-private`；私聊 bridge 在租用时通过已验证的个人安装记录解析路由。安装缺失时保留
+通知并记录 `WORK_TEAMS_PRIVATE_INSTALLATION_NOT_FOUND`，绝不回退到共享频道。
+
 凭据通知复用 `work_notifications`，不关联任务、工作流发生记录或模型工具。Navigator 在现有 Teams 通知 worker tick 中读取 Exchange 已缓存快照，并使用宿主挂载的
-`TEAMS_CREDENTIAL_NOTIFICATIONS_CONFIG_FILE` 固定连接选择器、owner、专用 Exchange 通知 profile 和已验证的 Teams 线程。Exchange 仍是唯一 provider 健康轮询器并负责自动刷新。Navigator 的这项确定性工作不会调用模型或发起凭据续期。
+`TEAMS_CREDENTIAL_NOTIFICATIONS_CONFIG_FILE` 固定连接选择器、owner、专用 Exchange 通知 profile 和 Teams 目标。现有非 Graph 告警使用该配置目标；Graph 告警使用 owner 私聊安装路由。Exchange 仍是唯一 provider 健康轮询器并负责自动刷新。Navigator 的这项确定性工作不会调用模型或发起凭据续期。
 
 ## Connectors, QQ login, and workflows / 连接器、QQ 登录与工作流
 

@@ -186,7 +186,7 @@ export interface TeamsPrivateInstallationReceipt {
 /** Credential-free authorization health returned by Exchange's fixed snapshot projection. */
 export interface CredentialHealthSnapshot {
   readonly connectionId: string;
-  readonly provider: 'hf' | 'runpod' | 'azure' | 'gcp';
+  readonly provider: 'hf' | 'runpod' | 'azure' | 'gcp' | 'microsoft_graph';
   readonly loginState: 'PRESENT' | 'MISSING' | 'UNKNOWN' | 'UNAVAILABLE';
   readonly authorizationState: 'VALID' | 'REAUTHORIZATION_REQUIRED' | 'PERMISSION_DENIED' | 'UNKNOWN' | 'UNAVAILABLE';
   readonly checkedAt: string | null;
@@ -199,6 +199,12 @@ export interface CredentialHealthSnapshot {
     readonly expiresAt: string | null;
     readonly reasonCode: string | null;
   }[];
+  /** Host-derived owner and Bot installation scope for private Graph health notices. */
+  readonly privateOwner?: {
+    readonly actorAadObjectId: string;
+    readonly tenantId: string;
+    readonly botAppId: string;
+  };
   readonly reasonCode: string | null;
 }
 

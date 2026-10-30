@@ -11,9 +11,9 @@ import { Context } from '@deepseek-ai/cordis';
 import { ToolCallId } from '@deepseek-ai/dsh-llm';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import ToolRuntime from '@deepseek-ai/dsh-tools';
-import { canonicalJson, sha256 } from '../dist/connector-authorization.js';
+import { ExchangeConnectorRequestError, canonicalJson, sha256 } from '../dist/connector-authorization.js';
 import { buildGithubBindingDisplayHints, validateConnectorBindingMap } from '../dist/serve.js';
-import { registerToolProviders } from '../dist/tool-providers.js';
+import { executeCodeBuddyAcpTool, getCodeBuddyAcpToolCatalog, registerToolProviders } from '../dist/tool-providers.js';
 import { registerWorkTools, WorkAssistantBridge } from '../dist/work-tools.js';
 
 const bindingId = 'exchange-azure-11111111-1111-4111-8111-111111111111';
@@ -147,6 +147,8 @@ function createHarness(providerResponses = [
   const configuredConnectionRef = options.connectionRef ?? connectionRef;
   const configuredProfileRef = options.profileRef ?? profileRef;
   const configuredProviderId = options.providerId ?? 'azure';
+  const taskActorId = options.taskActorId ?? ownerId;
+  const configuredTaskId = options.taskId ?? taskId;
   const catalog = options.catalog ?? tools;
   const authorizedTools = options.authorizedTools ?? [
     { toolId: stopToolId, operationId: 'cloud.resource.stop', resourceProjection: 'cloud_target', mutating: true },
@@ -162,15 +164,22 @@ function createHarness(providerResponses = [
     async mintGrant(input) {
       this.mintCount += 1;
       this.mintInputs.push(input);
+      if (options.rejectGrantSubject !== undefined && input.principalSubject !== options.rejectGrantSubject) {
+        throw new ExchangeConnectorRequestError('The Microsoft Graph profile belongs to another actor.', 403, false);
+      }
       return {
         connectorGrantBin: 'AQ==', grantRef: `grant-${this.mintCount}`, audience: 'exchange',
         organizationId: 'org-1', issuedAt: Math.floor(Date.now() / 1000),
         expiresAt: Math.floor(Date.now() / 1000) + 15, request: input,
       };
     },
-    async callProviderOperation(input) {
+    async callProviderOperation(input, grant) {
       this.callCount += 1;
       this.providerInputs.push(input);
+      if (options.rejectProviderSubject !== undefined
+        && grant.request.principalSubject !== options.rejectProviderSubject) {
+        throw new ExchangeConnectorRequestError('The Microsoft Graph profile belongs to another actor.', 403, false);
+      }
       const response = providerResponses.shift();
       if (!response) throw new Error('Unexpected provider call');
       return { ...response, requestId: input.requestId };
@@ -191,10 +200,11 @@ function createHarness(providerResponses = [
         };
       }
       if (path === `/tool-providers/${encodeURIComponent(configuredBindingId)}/tools` && method === 'GET') return catalog;
-      if (path === `/tasks/${taskId}` && method === 'GET') {
+      if (path === `/tasks/${configuredTaskId}` && method === 'GET') {
         return {
-          createdByActorId: ownerId,
-          metadata: { teamsCaller: { issuer, subject: ownerId, tenantId } },
+          createdByActorId: taskActorId,
+          metadata: { teamsCaller: { issuer, subject: taskActorId, tenantId } },
+          ...(options.taskOrigin === undefined ? {} : { origin: options.taskOrigin }),
         };
       }
       if (path.startsWith('/operations/unresolved') && method === 'GET') {
@@ -229,7 +239,7 @@ function createHarness(providerResponses = [
     profileRef: configuredProfileRef,
     tools: authorizedTools,
   };
-  return { bridge, client, events, receipts, bindingAuthorization };
+  return { bridge, client, events, receipts, bindingAuthorization, taskId: configuredTaskId };
 }
 
 async function setupHarness(fixture) {
@@ -238,7 +248,7 @@ async function setupHarness(fixture) {
   await ctx.plugin(ToolRuntime);
   const dispose = await registerToolProviders(ctx, {
     bridge: fixture.bridge,
-    taskIdForSession: value => value === sessionId ? taskId : undefined,
+    taskIdForSession: value => value === sessionId ? fixture.taskId : undefined,
     connectorAuthorization: {
       client: fixture.client,
       workspaceId: 'workspace-1',
@@ -609,6 +619,228 @@ test('launcher policy admits GitHub and Hugging Face vendor CLI only as profile-
       () => validateConnectorBindingMap({ schemaVersion: 1, bindings: [mismatchedToolId] }),
       /canonical tool mapping/u,
     );
+  }
+});
+
+test('launcher policy admits only the typed Planner, To Do, calendar, and SharePoint Graph catalog', () => {
+  const rows = [
+    ['microsoft_graph.planner.plans.list', 'microsoft_graph_plan', false],
+    ['microsoft_graph.planner.task.create', 'microsoft_graph_task', true],
+    ['microsoft_graph.planner.task.update', 'microsoft_graph_task', true],
+    ['microsoft_graph.todo.lists.list', 'microsoft_graph_todo_list', false],
+    ['microsoft_graph.todo.tasks.list', 'microsoft_graph_todo_list', false],
+    ['microsoft_graph.todo.task.get', 'microsoft_graph_todo_task', false],
+    ['microsoft_graph.todo.task.create', 'microsoft_graph_todo_task', true],
+    ['microsoft_graph.todo.task.update', 'microsoft_graph_todo_task', true],
+    ['microsoft_graph.todo.task.delete', 'microsoft_graph_todo_task', true],
+    ['microsoft_graph.calendar.calendars.list', 'microsoft_graph_calendar', false],
+    ['microsoft_graph.calendar.events.list', 'microsoft_graph_calendar', false],
+    ['microsoft_graph.calendar.event.get', 'microsoft_graph_event', false],
+    ['microsoft_graph.calendar.event.create', 'microsoft_graph_event', true],
+    ['microsoft_graph.calendar.event.update', 'microsoft_graph_event', true],
+    ['microsoft_graph.calendar.event.delete', 'microsoft_graph_event', true],
+    ['microsoft_graph.calendar.freebusy.get', 'microsoft_graph_freebusy', false],
+    ['microsoft_graph.sharepoint.site.get', 'microsoft_graph_site', false],
+    ['microsoft_graph.sharepoint.list.get', 'microsoft_graph_list', false],
+    ['microsoft_graph.sharepoint.list.items.delta', 'microsoft_graph_list', false],
+    ['microsoft_graph.sharepoint.drives.list', 'microsoft_graph_drive', false],
+    ['microsoft_graph.sharepoint.drive.items.list', 'microsoft_graph_drive_item', false],
+  ];
+  for (const [index, [operationId, resourceProjection, mutating]] of rows.entries()) {
+    const connection = `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`;
+    const binding = {
+      bindingId: `exchange-microsoft-graph-${connection}`,
+      connectionRef: connection,
+      providerId: 'microsoft_graph',
+      profileRef: 'microsoft-graph-owner-profile',
+      tools: [{ toolId: operationId, operationId, resourceProjection, mutating }],
+    };
+    const parsed = validateConnectorBindingMap({ schemaVersion: 1, bindings: [binding] });
+    assert.equal(parsed.get(binding.bindingId).tools[0].mutating, mutating);
+    assert.equal(parsed.get(binding.bindingId).tools[0].resourceProjection, resourceProjection);
+    assert.throws(
+      () => validateConnectorBindingMap({
+        schemaVersion: 1,
+        bindings: [{ ...binding, tools: [{ ...binding.tools[0], mutating: !mutating }] }],
+      }),
+      /canonical operation policy/u,
+    );
+  }
+
+  const mailBinding = {
+    bindingId: 'exchange-microsoft-graph-mail-disabled',
+    connectionRef: '99999999-9999-4999-8999-999999999999',
+    providerId: 'microsoft_graph',
+    profileRef: 'microsoft-graph-owner-profile',
+    tools: [{
+      toolId: 'microsoft_graph.mail.messages.list',
+      operationId: 'microsoft_graph.mail.messages.list',
+      resourceProjection: 'profile',
+      mutating: false,
+    }],
+  };
+  assert.throws(
+    () => validateConnectorBindingMap({ schemaVersion: 1, bindings: [mailBinding] }),
+    /not in the canonical operation table/u,
+  );
+});
+
+test('personal Graph tools reject channel tasks and use the immutable private actor grant', async () => {
+  const graphBindingId = 'exchange-microsoft-graph-11111111-1111-4111-8111-111111111111';
+  const graphConnectionRef = '11111111-1111-4111-8111-111111111111';
+  const graphProfileRef = 'microsoft-graph-owner-profile';
+  const graphToolId = 'microsoft_graph.todo.tasks.list';
+  const graphCatalog = {
+    tools: [{
+      id: graphToolId,
+      name: 'List personal Microsoft To Do tasks',
+      description: 'List tasks in one selected personal list.',
+      readOnly: true,
+      providerId: 'microsoft_graph',
+      operationId: graphToolId,
+      inputSchema: {
+        type: 'object',
+        properties: { task_list_id: { type: 'string', minLength: 1, maxLength: 128 } },
+        required: ['task_list_id'],
+        additionalProperties: false,
+      },
+      constraints: [],
+    }],
+  };
+  const graphAuthorization = [{
+    toolId: graphToolId,
+    operationId: graphToolId,
+    resourceProjection: 'microsoft_graph_todo_list',
+    mutating: false,
+  }];
+  const providerReply = () => ({
+    requestId: 'graph-private-read',
+    outcome: 'verified',
+    result: { content: [{ type: 'text', text: JSON.stringify({ items: [] }) }], isError: false },
+  });
+  const privateOrigin = {
+    kind: 'teams_private',
+    messageId: 'private-message-1',
+    tenantId,
+    botAppId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+    actorAadObjectId: ownerId,
+  };
+  const graphOptions = {
+    bindingId: graphBindingId,
+    connectionRef: graphConnectionRef,
+    providerId: 'microsoft_graph',
+    profileRef: graphProfileRef,
+    catalog: graphCatalog,
+    authorizedTools: graphAuthorization,
+  };
+
+  const channelFixture = createHarness([providerReply()], graphOptions);
+  const { ctx: channelContext, dispose: disposeChannel } = await setupHarness(channelFixture);
+  try {
+    const name = toolName(channelContext, 'List personal Microsoft To Do tasks', graphBindingId);
+    assert.ok(name);
+    const denied = await execute(channelContext, name, { task_list_id: 'todo-list-1' }, 'channel-graph-read');
+    assert.equal(denied.isError, true);
+    assert.match(denied.error.message, /private Teams conversation/u);
+    assert.equal(channelFixture.client.mintCount, 0);
+    assert.equal(channelFixture.client.callCount, 0);
+  } finally {
+    disposeChannel();
+    await channelContext.fiber.dispose();
+  }
+
+  const privateFixture = createHarness([providerReply(), providerReply()], {
+    ...graphOptions,
+    taskId: 'teams-private-task-owner',
+    taskOrigin: privateOrigin,
+  });
+  const { ctx: privateContext, dispose: disposePrivate } = await setupHarness(privateFixture);
+  try {
+    const name = toolName(privateContext, 'List personal Microsoft To Do tasks', graphBindingId);
+    assert.ok(name);
+    const accepted = await execute(privateContext, name, { task_list_id: 'todo-list-1' }, 'private-graph-read');
+    assert.equal(accepted.isError, false);
+    assert.equal(privateFixture.client.callCount, 1);
+    assert.equal(privateFixture.client.mintInputs[0].principalSubject, ownerId);
+    assert.equal(privateFixture.client.mintInputs[0].connectionRef, graphConnectionRef);
+    assert.deepEqual(privateFixture.client.providerInputs[0].arguments, { task_list_id: 'todo-list-1' });
+
+    const acpTool = getCodeBuddyAcpToolCatalog(privateContext).find(item => item.name === name);
+    assert.ok(acpTool);
+    const resumedRead = await executeCodeBuddyAcpTool(privateContext, {
+      name,
+      arguments: { task_list_id: 'todo-list-1' },
+      callId: 'private-graph-read-only-continuation',
+      sessionId,
+      signal: new AbortController().signal,
+      readOnly: true,
+    });
+    assert.equal(resumedRead?.isError, false);
+    assert.equal(privateFixture.client.callCount, 2);
+  } finally {
+    disposePrivate();
+    await privateContext.fiber.dispose();
+  }
+});
+
+test('a different Teams actor cannot borrow the owner Graph connection', async () => {
+  const graphBindingId = 'exchange-microsoft-graph-22222222-2222-4222-8222-222222222222';
+  const graphToolId = 'microsoft_graph.todo.tasks.list';
+  const memberId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  const graphCatalog = {
+    tools: [{
+      id: graphToolId,
+      name: 'List personal Microsoft To Do tasks',
+      description: 'List tasks in one selected personal list.',
+      readOnly: true,
+      providerId: 'microsoft_graph',
+      operationId: graphToolId,
+      inputSchema: {
+        type: 'object',
+        properties: { task_list_id: { type: 'string', minLength: 1, maxLength: 128 } },
+        required: ['task_list_id'],
+        additionalProperties: false,
+      },
+      constraints: [],
+    }],
+  };
+  const fixture = createHarness([{
+    requestId: 'cross-actor-graph-read', outcome: 'verified',
+    result: { content: [{ type: 'text', text: JSON.stringify({ items: [] }) }], isError: false },
+  }], {
+    bindingId: graphBindingId,
+    connectionRef: '22222222-2222-4222-8222-222222222222',
+    providerId: 'microsoft_graph',
+    profileRef: 'microsoft-graph-owner-profile',
+    catalog: graphCatalog,
+    authorizedTools: [{
+      toolId: graphToolId,
+      operationId: graphToolId,
+      resourceProjection: 'microsoft_graph_todo_list',
+      mutating: false,
+    }],
+    taskId: 'teams-private-task-member',
+    taskActorId: memberId,
+    rejectGrantSubject: ownerId,
+    taskOrigin: {
+      kind: 'teams_private',
+      messageId: 'private-message-member',
+      tenantId,
+      botAppId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+      actorAadObjectId: memberId,
+    },
+  });
+  const { ctx, dispose } = await setupHarness(fixture);
+  try {
+    const name = toolName(ctx, 'List personal Microsoft To Do tasks', graphBindingId);
+    assert.ok(name);
+    const denied = await execute(ctx, name, { task_list_id: 'member-list' }, 'cross-actor-graph-read');
+    assert.equal(denied.isError, true);
+    assert.equal(fixture.client.mintInputs[0].principalSubject, memberId);
+    assert.equal(fixture.client.callCount, 0);
+  } finally {
+    dispose();
+    await ctx.fiber.dispose();
   }
 });
 

@@ -768,7 +768,7 @@ class PrivateNotificationClaimResult(WorkModel):
     items: list[PrivateNotificationLease]
 
 
-CredentialHealthProvider = Literal["hf", "runpod", "azure", "gcp"]
+CredentialHealthProvider = Literal["hf", "runpod", "azure", "gcp", "microsoft_graph"]
 CredentialHealthState = Literal[
     "VALID", "REAUTHORIZATION_REQUIRED", "PERMISSION_DENIED", "UNKNOWN", "UNAVAILABLE"
 ]
@@ -801,6 +801,26 @@ class CredentialCapabilityHealth(WorkModel):
     )
 
 
+class CredentialHealthPrivateOwner(WorkModel):
+    """Host-derived private recipient for Microsoft Graph notices. | Graph 私聊收件人。"""
+
+    actor_aad_object_id: str = Field(
+        min_length=36,
+        max_length=36,
+        pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+    )
+    tenant_id: str = Field(
+        min_length=36,
+        max_length=36,
+        pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+    )
+    bot_app_id: str = Field(
+        min_length=36,
+        max_length=36,
+        pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+    )
+
+
 class CredentialHealthSnapshot(WorkModel):
     """Secret-free Exchange authorization projection consumed by the host worker.
 
@@ -827,11 +847,23 @@ class CredentialHealthSnapshot(WorkModel):
     )
     generation: int = Field(ge=0, le=2**53 - 1)
     capabilities: list[CredentialCapabilityHealth] = Field(default_factory=list, max_length=100)
+    private_owner: CredentialHealthPrivateOwner | None = None
     reason_code: str | None = Field(
         default=None,
         max_length=160,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$",
     )
+
+    @model_validator(mode="after")
+    def validate_private_owner(self) -> CredentialHealthSnapshot:
+        if self.provider == "microsoft_graph":
+            if self.private_owner is None:
+                raise ValueError(
+                    "Microsoft Graph health snapshots require a host-derived private owner"
+                )
+        elif self.private_owner is not None:
+            raise ValueError("Only Microsoft Graph health snapshots may route to a private owner")
+        return self
 
 
 class CredentialHealthSnapshotBatch(WorkModel):

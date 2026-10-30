@@ -1009,7 +1009,8 @@ test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and p
   const privateFinished = [];
   const workStateStore = new InMemoryWorkStateStore();
   let privateClaimCalls = 0;
-  workStateStore.claimPrivateNotifications = async () => {
+  workStateStore.claimPrivateNotifications = async input => {
+    if (input.type !== 'teams.message') return [];
     privateClaimCalls += 1;
     return privateLeases.splice(0, 1);
   };
@@ -1137,7 +1138,7 @@ test('NavigatorExecutor: a slow channel claim cannot delay a queued private ackn
       serviceUrl: 'https://smba.trafficmanager.net/emea/',
     },
   };
-  workState.claimPrivateNotifications = async () => [privateLease];
+  workState.claimPrivateNotifications = async input => input.type === 'teams.message' ? [privateLease] : [];
   const workActorClients = {
     actorIds: () => [ownerId],
     forActor: actorId => actorId === ownerId ? actorStore : undefined,
@@ -1209,7 +1210,9 @@ test('NavigatorExecutor: only a known-safe private 429 is retried with a bounded
     teamsPersonalRoute: route,
   }));
   const finished = [];
-  workState.claimPrivateNotifications = async () => leases.splice(0, leases.length);
+  workState.claimPrivateNotifications = async input => input.type === 'teams.message'
+    ? leases.splice(0, leases.length)
+    : [];
   workState.startPrivateNotification = async () => {};
   workState.finishPrivateNotification = async (id, leaseToken, outcome, result, retryAfterSeconds) => {
     finished.push({ id, leaseToken, outcome, result, retryAfterSeconds });
@@ -1399,6 +1402,218 @@ test('NavigatorExecutor: credential notices use cached Exchange health and the f
     assert.doesNotMatch(sentMessages[0].text, /bearer|token value|authorizationRef/iu);
     assert.deepEqual(finished.map(item => [item.notificationId, item.outcome]), [
       ['credential-notice-1', 'delivered'],
+    ]);
+  } finally {
+    await disposeApp(app);
+  }
+});
+
+test('NavigatorExecutor: Graph credential health must prove the configured private Teams owner', async () => {
+  const store = new InMemoryWorkStateStore();
+  const app = await createTestApp(new TestMockAdapter(), { workStateStore: store, workspaceId: 'graph-health-workspace' });
+  const { executor } = app;
+  const tenantId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const ownerId = '11111111-1111-4111-8111-111111111111';
+  const botAppId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  const connectionId = '22222222-2222-4222-8222-222222222222';
+  const graphSnapshot = {
+    connectionId,
+    provider: 'microsoft_graph',
+    loginState: 'PRESENT',
+    authorizationState: 'REAUTHORIZATION_REQUIRED',
+    checkedAt: '2026-10-26T15:00:00Z',
+    expiresAt: null,
+    generation: 3,
+    capabilities: [],
+    reasonCode: 'CONSENT_REQUIRED',
+    externalSubject: `${tenantId}:${ownerId}`,
+  };
+  const credentialConfig = {
+    organizationId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+    workspaceId: 'graph-health-workspace',
+    owner: {
+      issuer: `https://login.microsoftonline.com/${tenantId}/v2.0`,
+      subject: ownerId,
+      tenantId,
+    },
+    connections: [{ connectionId, provider: 'microsoft_graph' }],
+    destination: {
+      tenantId,
+      teamId: 'team-1',
+      channelId: 'channel-1',
+      conversationId: 'channel-message-1',
+      rootThreadId: '1793027795187',
+      serviceUrl: 'https://smba.trafficmanager.net/amer/',
+    },
+    exchangeProfileRef: 'graph-health-test-profile',
+    pollIntervalMs: 60_000,
+  };
+  const processedSnapshots = [];
+  store.processCredentialHealthSnapshots = async (_organizationId, snapshots) => {
+    processedSnapshots.push(...snapshots);
+    return { processed: snapshots.length, stale: 0, notificationsQueued: 0 };
+  };
+  executor.config.teams = {
+    connectorId: 'teams-v1',
+    tenantId,
+    allowedTeamIds: ['team-1'],
+    botAppId,
+    taskActorSubjects: [ownerId],
+    ingressSecretEnv: 'TEAMS_NAVIGATOR_HMAC_KEY',
+    exchangeConnectionRef: 'teams-chat-connection',
+    exchangeProfileRef: 'teams-chat-profile',
+    personalChatEnabled: false,
+    credentialNotifications: credentialConfig,
+    exchangeAuthorization: {
+      async getAuthorizationHealthSnapshots() { return [graphSnapshot]; },
+      async mintGrant() { throw new Error('Graph health polling must not send Teams messages'); },
+      async sendTeamsMessage() { throw new Error('Graph health must not use the shared channel route'); },
+    },
+  };
+
+  try {
+    await executor['drainTeamsNotifications']();
+    assert.equal(processedSnapshots.length, 1);
+    assert.equal(processedSnapshots[0].provider, 'microsoft_graph');
+    assert.equal(processedSnapshots[0].externalSubject, undefined);
+    assert.deepEqual(processedSnapshots[0].privateOwner, { actorAadObjectId: ownerId, tenantId, botAppId });
+
+    executor['lastCredentialHealthSnapshotAt'] = 0;
+    executor.config.teams.exchangeAuthorization.getAuthorizationHealthSnapshots = async () => [{
+      ...graphSnapshot,
+      externalSubject: `${tenantId}:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb`,
+    }];
+    await executor['drainTeamsNotifications']();
+    assert.equal(processedSnapshots.length, 1, 'a mismatched Graph profile must not publish an owner notice');
+  } finally {
+    await disposeApp(app);
+  }
+});
+
+test('NavigatorExecutor: Graph credential notices leave the channel outbox and send to the private owner route', async () => {
+  const ownerId = '11111111-1111-4111-8111-111111111111';
+  const tenantId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const botAppId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  const connectionId = '22222222-2222-4222-8222-222222222222';
+  const store = new InMemoryWorkStateStore();
+  const app = await createTestApp(new TestMockAdapter(), { workStateStore: store, workspaceId: 'graph-private-notice' });
+  const { executor } = app;
+  const privateLease = {
+    notification: {
+      id: 'graph-private-notice-1',
+      deduplicationKey: 'graph-private-notice-1',
+      type: 'teams.credential-health',
+      payload: {
+        schemaVersion: 1,
+        event: 'action_required',
+        incidentId: '0123456789abcdef0123456789abcdef',
+        connectionId,
+        provider: 'microsoft_graph',
+        generation: 3,
+        loginState: 'PRESENT',
+        authorizationState: 'REAUTHORIZATION_REQUIRED',
+        capabilities: [{ capabilityId: 'microsoft_graph.calendar.read', state: 'REAUTHORIZATION_REQUIRED' }],
+        checkedAt: '2026-10-26T15:00:00Z',
+        expiresAt: null,
+        reasonCode: 'CONSENT_REQUIRED',
+      },
+      connectorId: 'teams-v1',
+      recipient: 'teams:owner-private',
+      status: 'leased',
+      result: { retryCount: 0 },
+    },
+    leaseToken: 'graph-private-notice-lease',
+    teamsPersonalRoute: {
+      kind: 'teams_personal',
+      tenantId,
+      botAppId,
+      actorAadObjectId: ownerId,
+      conversationId: '19:verified-owner-installation',
+      serviceUrl: 'https://smba.trafficmanager.net/amer/',
+    },
+  };
+  const privateClaims = [];
+  const channelClaims = [];
+  const starts = [];
+  const finishes = [];
+  const privateSends = [];
+  let sharedChannelSends = 0;
+  store.claimPrivateNotifications = async input => {
+    privateClaims.push(input);
+    return input.type === 'teams.credential-health' ? [privateLease] : [];
+  };
+  store.claimNotifications = async input => {
+    channelClaims.push(input);
+    return [];
+  };
+  store.startPrivateNotification = async (notificationId, leaseToken) => starts.push({ notificationId, leaseToken });
+  store.finishPrivateNotification = async (notificationId, leaseToken, outcome, result) => {
+    finishes.push({ notificationId, leaseToken, outcome, result });
+  };
+  executor.config.workActorClients = {
+    actorIds: () => [ownerId],
+    forActor: actorId => actorId === ownerId ? store : undefined,
+  };
+  executor.config.teams = {
+    connectorId: 'teams-v1',
+    tenantId,
+    allowedTeamIds: ['team-1'],
+    botAppId,
+    taskActorSubjects: [ownerId],
+    ingressSecretEnv: 'TEAMS_NAVIGATOR_HMAC_KEY',
+    exchangeConnectionRef: 'teams-chat-connection',
+    exchangeProfileRef: 'teams-chat-profile',
+    personalChatEnabled: true,
+    sendPrivateMessage: async request => {
+      privateSends.push(request);
+      return { outcome: 'accepted', vendorMessageId: 'graph-private-delivery' };
+    },
+    credentialNotifications: {
+      organizationId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      workspaceId: 'graph-private-notice',
+      owner: {
+        issuer: `https://login.microsoftonline.com/${tenantId}/v2.0`,
+        subject: ownerId,
+        tenantId,
+      },
+      connections: [{ connectionId, provider: 'microsoft_graph' }],
+      destination: {
+        tenantId,
+        teamId: 'team-1',
+        channelId: 'channel-1',
+        conversationId: 'channel-message-1',
+        rootThreadId: '1793027795187',
+        serviceUrl: 'https://smba.trafficmanager.net/amer/',
+      },
+      exchangeProfileRef: 'graph-private-notice-profile',
+      pollIntervalMs: 900_000,
+    },
+    exchangeAuthorization: {
+      async getAuthorizationHealthSnapshots() { return []; },
+      async mintGrant() {
+        sharedChannelSends += 1;
+        throw new Error('Graph health must never use the shared channel sender');
+      },
+      async sendTeamsMessage() {
+        sharedChannelSends += 1;
+        throw new Error('Graph health must never use the shared channel sender');
+      },
+    },
+  };
+
+  try {
+    await executor['drainTeamsNotifications']();
+    assert.equal(privateSends.length, 1);
+    assert.equal(privateSends[0].target_kind, 'owner_private');
+    assert.equal(privateSends[0].actor_aad_object_id, ownerId);
+    assert.equal(privateSends[0].conversation.conversation_id, '19:verified-owner-installation');
+    assert.match(privateSends[0].text, /Microsoft 365/u);
+    assert.equal(sharedChannelSends, 0);
+    assert.ok(privateClaims.some(item => item.type === 'teams.credential-health'));
+    assert.ok(channelClaims.some(item => item.type === 'teams.credential-health'));
+    assert.deepEqual(starts, [{ notificationId: privateLease.notification.id, leaseToken: privateLease.leaseToken }]);
+    assert.deepEqual(finishes.map(item => [item.notificationId, item.outcome]), [
+      [privateLease.notification.id, 'delivered'],
     ]);
   } finally {
     await disposeApp(app);

@@ -50,6 +50,16 @@ rechecks the Platform identity, operation grant, account binding, and delegation
 before provider execution. Actor binding setup belongs to the non-AI management
 surface. Navigator stores no Exchange sync rows or issue snapshots.
 
+Microsoft Graph provider operations use the same signed actor grant and durable
+Work receipt path. The launcher admits only the fixed Planner, To Do, Calendar,
+and selected SharePoint metadata operations present in the Exchange catalog; it
+does not expose arbitrary Graph URLs, SharePoint bytes, or mail operations.
+Personal Graph operations require an immutable private Teams task origin, so a
+channel reply cannot read an owner's calendar or To Do data. Graph credential
+health notices use the existing durable outbox and resolve their recipient from
+the owner's verified personal installation; a missing installation stays
+queued with a delivery hold and is never sent to a shared channel.
+
 Authorization integration adds five fixed tools: exchange_connections_list,
 exchange_authorization_health, exchange_reauthorization_start,
 exchange_reauthorization_status, and exchange_cloud_resources_query. Connection,
@@ -117,6 +127,12 @@ Exchange 最新投影。Exchange 负责 provider
 事件／恢复通知写入持久 Work outbox。该监控不会发起续期或创建模型任务。
 连接列表只返回 Product 生成的连接 ID 及 Provider、显示名、仓库、启用状态和时间戳；模型看不到
 binding、target、account、actor 或 tenant 引用。
+
+Microsoft Graph provider 操作复用签名 actor 授权和持久 Work 回执链路。Navigator 只接受
+Exchange 目录中固定的 Planner、To Do、日历和选定 SharePoint 元数据操作；不暴露任意 Graph
+URL、SharePoint 文件字节或邮件操作。个人 Graph 工具要求不可变的 Teams 私聊任务来源，频道回复
+不能读取个人日历或 To Do。Graph 授权健康提醒写入现有持久 outbox，并从已验证的个人安装记录
+推导收件人；缺少安装时保留队列和待发送状态，绝不发送到共享频道。
 
 只有 HTTP 409 且 Product code 为
 EXCHANGE_CONNECTION_REAUTHORIZATION_REQUIRED 才会进入持久状态

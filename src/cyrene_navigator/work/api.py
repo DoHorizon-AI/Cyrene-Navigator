@@ -1194,11 +1194,11 @@ def mount_work_routes(
     def claim_private_notifications(
         workspace_id: str, body: NotificationClaim, request: Request
     ) -> dict[str, Any]:
-        """Lease private Teams messages only to the configured installation bridge."""
+        """Lease private messages and Graph notices to the configured installation bridge."""
 
         principal, policy = require_private_installation_bridge(request, workspace_id)
         if (
-            body.type not in {None, "teams.message"}
+            body.type not in {None, "teams.message", "teams.credential-health"}
             or body.connector_id not in {None, "teams-v1"}
             or body.recipient not in {None, "teams:owner-private"}
         ):
@@ -1216,6 +1216,7 @@ def mount_work_routes(
                 body.limit,
                 body.lease_seconds,
                 scope,
+                notification_type=body.type,
             )
         }
 

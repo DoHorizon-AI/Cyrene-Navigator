@@ -2555,31 +2555,49 @@ class WorkStore:
         )
         private_fields: JsonObject = {}
         if private_owner is not None:
-            required_private_fields = {
-                "taskId",
-                "tenantId",
-                "actorAadObjectId",
-            }
-            if (
-                owner_actor_id is None
-                or not required_private_fields.issubset(private_owner)
-                or set(private_owner) - required_private_fields - {"botAppId"}
-            ):
+            private_health_notice = (
+                notification_type == _CREDENTIAL_HEALTH_NOTIFICATION_TYPE
+                and connector_id == _CREDENTIAL_HEALTH_CONNECTOR_ID
+                and recipient == "teams:owner-private"
+                and task_id is None
+                and payload.get("provider") == "microsoft_graph"
+                and set(private_owner) == {"tenantId", "actorAadObjectId", "botAppId"}
+            )
+            private_task_notice = (
+                notification_type == "teams.message"
+                and connector_id == _TEAMS_CONNECTOR_ID
+                and recipient == "teams:owner-private"
+                and task_id is not None
+                and frozenset(private_owner)
+                in {
+                    frozenset({"taskId", "tenantId", "actorAadObjectId"}),
+                    frozenset({"taskId", "tenantId", "actorAadObjectId", "botAppId"}),
+                }
+            )
+            if owner_actor_id is None or not (private_health_notice or private_task_notice):
                 raise _invalid(
                     "WORK_NOTIFICATION_PRIVATE_OWNER_INVALID",
                     "private notification owner references are incomplete",
                 )
+            private_actor = _canonical_uuid(
+                private_owner.get("actorAadObjectId"), "private actorAadObjectId"
+            )
+            if _identifier(owner_actor_id, "private owner actorId").lower() != private_actor:
+                raise _invalid(
+                    "WORK_NOTIFICATION_PRIVATE_OWNER_INVALID",
+                    "private owner actor references do not match",
+                )
             private_fields = {
-                "owner_actor_id": _identifier(owner_actor_id, "private owner actorId"),
-                "private_owner_task_id": _identifier(
-                    private_owner.get("taskId"), "private ownerTaskId"
+                "owner_actor_id": private_actor,
+                "private_owner_task_id": (
+                    _identifier(private_owner.get("taskId"), "private ownerTaskId")
+                    if private_task_notice
+                    else None
                 ),
                 "private_tenant_id": _canonical_uuid(
                     private_owner.get("tenantId"), "private tenantId"
                 ),
-                "private_owner_aad_object_id": _canonical_uuid(
-                    private_owner.get("actorAadObjectId"), "private actorAadObjectId"
-                ),
+                "private_owner_aad_object_id": private_actor,
                 "private_bot_app_id": (
                     _canonical_uuid(private_owner["botAppId"], "private botAppId")
                     if private_owner.get("botAppId") is not None
@@ -2936,6 +2954,8 @@ class WorkStore:
                     reminder_count = 0
 
                 if notification is not None and deduplication_key is not None:
+                    private_owner = snapshot.get("privateOwner")
+                    is_private_graph = snapshot["provider"] == "microsoft_graph"
                     _, duplicate = self._enqueue_notification(
                         conn,
                         org,
@@ -2944,10 +2964,18 @@ class WorkStore:
                         _CREDENTIAL_HEALTH_NOTIFICATION_TYPE,
                         notification,
                         _CREDENTIAL_HEALTH_CONNECTOR_ID,
-                        _CREDENTIAL_HEALTH_RECIPIENT,
+                        "teams:owner-private" if is_private_graph else _CREDENTIAL_HEALTH_RECIPIENT,
                         None,
                         now,
                         now,
+                        **(
+                            {
+                                "owner_actor_id": private_owner["actorAadObjectId"],
+                                "private_owner": private_owner,
+                            }
+                            if is_private_graph and isinstance(private_owner, Mapping)
+                            else {}
+                        ),
                     )
                     if not duplicate:
                         queued += 1
@@ -3227,18 +3255,24 @@ class WorkStore:
         limit: int,
         lease_seconds: int,
         scope: PrivateConversationScope,
+        notification_type: str | None = None,
     ) -> list[JsonObject]:
         """Lease active owner-private Teams rows and resolve routes only for this bridge.
 
-        SQL filters held rows against the current owner projection, origin, bot, and active
-        installation before applying a bounded candidate limit. Route resolution below remains
-        the final authorization check.
+        SQL filters candidates against the current owner projection and conversation origin
+        before applying a bounded limit. Route resolution below verifies the active installation;
+        missing installations stay queued with an explicit delivery hold.
 
-        中文：先按当前目录、任务来源、Bot 和活动安装筛除 held 项，再限制候选数量；
-        逐条路由校验仍是最终授权检查。
+        中文：先按当前目录及消息来源限制候选，再逐条验证活动安装；尚未安装时保留
+        队列并记录待安装原因，不转发到共享频道。
         """
 
         org, workspace = _scope(organization_id, workspace_id)
+        if notification_type not in {None, "teams.message", _CREDENTIAL_HEALTH_NOTIFICATION_TYPE}:
+            raise _invalid(
+                "WORK_NOTIFICATION_INVALID_FILTER",
+                "Private notification type is not supported.",
+            )
         if scope.workspace_id != workspace:
             raise PersistenceError(
                 "WORK_TEAMS_PRIVATE_INSTALLATION_FORBIDDEN",
@@ -3274,27 +3308,16 @@ class WorkStore:
                 )
             candidates = conn.execute(
                 """SELECT notification.* FROM work_notifications notification
-                   JOIN work_tasks task ON task.organization_id=notification.organization_id
+                   LEFT JOIN work_tasks task ON task.organization_id=notification.organization_id
                      AND task.workspace_id=notification.workspace_id
                      AND task.task_id=notification.private_owner_task_id
                      AND task.created_by_actor_id=notification.owner_actor_id
-                   JOIN work_task_teams_origins origin
+                   LEFT JOIN work_task_teams_origins origin
                      ON origin.organization_id=notification.organization_id
                      AND origin.workspace_id=notification.workspace_id
                      AND origin.task_id=notification.private_owner_task_id
                      AND origin.actor_id=notification.owner_actor_id
                      AND origin.actor_subject=notification.private_owner_aad_object_id
-                     AND origin.actor_issuer=?
-                     AND lower(origin.tenant_id)=?
-                     AND (origin.conversation_kind!='private' OR
-                          lower(origin.bot_app_id)=?)
-                   JOIN work_private_installations installation
-                     ON installation.organization_id=notification.organization_id
-                     AND installation.workspace_id=notification.workspace_id
-                     AND installation.tenant_id=?
-                     AND installation.actor_aad_object_id=
-                         notification.private_owner_aad_object_id
-                     AND installation.bot_app_id=? AND installation.active=1
                    WHERE notification.organization_id=? AND notification.workspace_id=?
                      AND notification.owner_actor_id IS NOT NULL
                      AND notification.owner_actor_id=notification.private_owner_aad_object_id
@@ -3303,20 +3326,34 @@ class WorkStore:
                      AND notification.private_tenant_id=?
                      AND (notification.private_bot_app_id IS NULL OR
                           lower(notification.private_bot_app_id)=?)
-                     AND notification.notification_type='teams.message'
                      AND notification.connector_id='teams-v1'
                      AND notification.recipient='teams:owner-private'
+                     AND (? IS NULL OR notification.notification_type=?)
+                     AND (
+                       (notification.notification_type='teams.message'
+                        AND task.task_id IS NOT NULL
+                        AND origin.task_id=notification.private_owner_task_id
+                        AND origin.actor_issuer=?
+                        AND lower(origin.tenant_id)=?
+                        AND (origin.conversation_kind!='private' OR
+                             lower(origin.bot_app_id)=?))
+                       OR
+                       (notification.notification_type='teams.credential-health'
+                        AND notification.task_id IS NULL
+                        AND notification.private_owner_task_id IS NULL
+                        AND json_extract(notification.payload_json,'$.provider')='microsoft_graph')
+                     )
                      AND notification.status='queued' AND notification.available_at<=?
                    ORDER BY notification.available_at,notification.created_at LIMIT ?""",
                 (
-                    scope.issuer,
-                    scope.tenant_id.lower(),
-                    scope.bot_app_id.lower(),
-                    scope.tenant_id.lower(),
-                    scope.bot_app_id.lower(),
                     org,
                     workspace,
                     owner_subjects_json,
+                    scope.tenant_id.lower(),
+                    scope.bot_app_id.lower(),
+                    notification_type,
+                    notification_type,
+                    scope.issuer,
                     scope.tenant_id.lower(),
                     scope.bot_app_id.lower(),
                     now,
@@ -3328,10 +3365,9 @@ class WorkStore:
                 route_error: str | None = None
                 try:
                     if (
-                        str(row["notification_type"]) != "teams.message"
-                        or str(row["connector_id"] or "") != "teams-v1"
+                        str(row["connector_id"] or "") != "teams-v1"
                         or str(row["recipient"] or "") != "teams:owner-private"
-                        or str(row["private_tenant_id"] or "") != scope.tenant_id
+                        or str(row["private_tenant_id"] or "").lower() != scope.tenant_id.lower()
                         or (
                             row["private_bot_app_id"] is not None
                             and str(row["private_bot_app_id"]).lower() != scope.bot_app_id.lower()
@@ -3343,14 +3379,43 @@ class WorkStore:
                             403,
                             "The private Teams owner binding is unavailable or unauthorized.",
                         )
-                    route = _resolve_private_teams_route(
-                        conn,
-                        org,
-                        workspace,
-                        str(row["private_owner_task_id"] or ""),
-                        str(row["owner_actor_id"] or ""),
-                        scope,
-                    )
+                    if str(row["notification_type"]) == "teams.message":
+                        route = _resolve_private_teams_route(
+                            conn,
+                            org,
+                            workspace,
+                            str(row["private_owner_task_id"] or ""),
+                            str(row["owner_actor_id"] or ""),
+                            scope,
+                        )
+                    elif str(row["notification_type"]) == _CREDENTIAL_HEALTH_NOTIFICATION_TYPE:
+                        payload = _stored_object(
+                            row["payload_json"], "private credential health notice"
+                        )
+                        if (
+                            payload.get("provider") != "microsoft_graph"
+                            or row["task_id"] is not None
+                        ):
+                            raise PersistenceError(
+                                "WORK_TEAMS_PRIVATE_INSTALLATION_FORBIDDEN",
+                                403,
+                                "The private credential notice scope is invalid.",
+                            )
+                        route = _resolve_private_teams_installation_route(
+                            conn,
+                            org,
+                            workspace,
+                            str(row["private_owner_aad_object_id"] or ""),
+                            str(row["private_tenant_id"] or ""),
+                            str(row["private_bot_app_id"] or ""),
+                            scope,
+                        )
+                    else:
+                        raise PersistenceError(
+                            "WORK_TEAMS_PRIVATE_INSTALLATION_FORBIDDEN",
+                            403,
+                            "The private notification type is not supported.",
+                        )
                 except PersistenceError as exc:
                     if exc.code not in {
                         "WORK_TEAMS_PRIVATE_INSTALLATION_FORBIDDEN",
@@ -6193,14 +6258,42 @@ class WorkStore:
                         "WORK_NOTIFICATION_NOT_FOUND",
                         "The notification does not exist in this Workspace.",
                     )
-                _resolve_private_teams_route(
-                    conn,
-                    org,
-                    workspace,
-                    str(row["private_owner_task_id"] or ""),
-                    str(row["owner_actor_id"] or ""),
-                    private_scope,
-                )
+                if str(row["notification_type"]) == _CREDENTIAL_HEALTH_NOTIFICATION_TYPE:
+                    payload = _stored_object(
+                        row["payload_json"], "private credential health notice"
+                    )
+                    if (
+                        str(row["connector_id"] or "") != _TEAMS_CONNECTOR_ID
+                        or str(row["recipient"] or "") != "teams:owner-private"
+                        or row["task_id"] is not None
+                        or row["private_owner_task_id"] is not None
+                        or str(row["owner_actor_id"] or "").lower()
+                        != str(row["private_owner_aad_object_id"] or "").lower()
+                        or row["private_bot_app_id"] is None
+                        or payload.get("provider") != "microsoft_graph"
+                    ):
+                        raise _not_found(
+                            "WORK_NOTIFICATION_NOT_FOUND",
+                            "The notification does not exist in this Workspace.",
+                        )
+                    _resolve_private_teams_installation_route(
+                        conn,
+                        org,
+                        workspace,
+                        str(row["private_owner_aad_object_id"] or ""),
+                        str(row["private_tenant_id"] or ""),
+                        str(row["private_bot_app_id"] or ""),
+                        private_scope,
+                    )
+                else:
+                    _resolve_private_teams_route(
+                        conn,
+                        org,
+                        workspace,
+                        str(row["private_owner_task_id"] or ""),
+                        str(row["owner_actor_id"] or ""),
+                        private_scope,
+                    )
             elif private_only:
                 raise _not_found(
                     "WORK_NOTIFICATION_NOT_FOUND",
@@ -7927,7 +8020,10 @@ def _credential_health_snapshot(value: object) -> JsonObject:
         "capabilities",
         "reasonCode",
     }
-    if not isinstance(value, Mapping) or set(value) != allowed:
+    if not isinstance(value, Mapping) or frozenset(value) not in {
+        frozenset(allowed),
+        frozenset(allowed | {"privateOwner"}),
+    }:
         raise _invalid(
             "WORK_CREDENTIAL_HEALTH_INVALID",
             "A credential health snapshot has an unsupported shape.",
@@ -7940,8 +8036,37 @@ def _credential_health_snapshot(value: object) -> JsonObject:
             "WORK_CREDENTIAL_HEALTH_INVALID", "connectionId must be a canonical UUID"
         ) from exc
     provider = _bounded_text(value.get("provider"), "provider", 32)
-    if provider not in {"hf", "runpod", "azure", "gcp"}:
+    if provider not in {"hf", "runpod", "azure", "gcp", "microsoft_graph"}:
         raise _invalid("WORK_CREDENTIAL_HEALTH_INVALID", "provider is not supported")
+    raw_private_owner = value.get("privateOwner")
+    if provider == "microsoft_graph" and raw_private_owner is None:
+        raise _invalid(
+            "WORK_CREDENTIAL_HEALTH_INVALID",
+            "Microsoft Graph health snapshots require exactly one private owner projection.",
+        )
+    if provider != "microsoft_graph" and raw_private_owner is not None:
+        raise _invalid(
+            "WORK_CREDENTIAL_HEALTH_INVALID",
+            "Only Microsoft Graph health snapshots may include a private owner projection.",
+        )
+    private_owner: JsonObject | None = None
+    if raw_private_owner is not None:
+        raw_owner = raw_private_owner
+        if not isinstance(raw_owner, Mapping) or set(raw_owner) != {
+            "actorAadObjectId",
+            "tenantId",
+            "botAppId",
+        }:
+            raise _invalid(
+                "WORK_CREDENTIAL_HEALTH_INVALID", "privateOwner has an unsupported shape"
+            )
+        private_owner = {
+            "actorAadObjectId": _canonical_uuid(
+                raw_owner.get("actorAadObjectId"), "privateOwner.actorAadObjectId"
+            ),
+            "tenantId": _canonical_uuid(raw_owner.get("tenantId"), "privateOwner.tenantId"),
+            "botAppId": _canonical_uuid(raw_owner.get("botAppId"), "privateOwner.botAppId"),
+        }
     login_state = _bounded_text(value.get("loginState"), "loginState", 32)
     if login_state not in {"PRESENT", "MISSING", "UNKNOWN", "UNAVAILABLE"}:
         raise _invalid("WORK_CREDENTIAL_HEALTH_INVALID", "loginState is not supported")
@@ -8018,6 +8143,7 @@ def _credential_health_snapshot(value: object) -> JsonObject:
         "generation": generation,
         "capabilities": sorted(capabilities, key=lambda item: str(item["capabilityId"])),
         "reasonCode": reason_code,
+        **({"privateOwner": private_owner} if private_owner is not None else {}),
     }
 
 
@@ -9032,6 +9158,56 @@ def _resolve_private_teams_route(
         "tenantId": scope.tenant_id.lower(),
         "botAppId": scope.bot_app_id.lower(),
         "actorAadObjectId": subject.lower(),
+        "conversationId": str(row["conversation_id"]),
+        "serviceUrl": str(row["service_url"]),
+    }
+
+
+def _resolve_private_teams_installation_route(
+    conn: sqlite3.Connection,
+    organization_id: str,
+    workspace_id: str,
+    actor_aad_object_id: str,
+    tenant_id: str,
+    bot_app_id: str,
+    scope: PrivateConversationScope | None,
+) -> JsonObject:
+    """Resolve a verified direct-install route for private Graph credential notices.
+
+    中文：从已验证的个人安装记录解析授权告警的私聊路由。
+    """
+
+    actor = _canonical_uuid(actor_aad_object_id, "private owner actorAadObjectId")
+    tenant = _canonical_uuid(tenant_id, "private owner tenantId")
+    bot_app = _canonical_uuid(bot_app_id, "private owner botAppId")
+    if (
+        scope is None
+        or scope.workspace_id != workspace_id
+        or tenant != scope.tenant_id.lower()
+        or bot_app != scope.bot_app_id.lower()
+        or actor not in scope.owner_subjects
+    ):
+        raise PersistenceError(
+            "WORK_TEAMS_PRIVATE_INSTALLATION_FORBIDDEN",
+            403,
+            "The private Teams owner binding is unavailable or unauthorized.",
+        )
+    row = conn.execute(
+        """SELECT conversation_id,service_url,active FROM work_private_installations
+           WHERE organization_id=? AND workspace_id=? AND tenant_id=?
+             AND actor_aad_object_id=? AND bot_app_id=?""",
+        (organization_id, workspace_id, tenant, actor, bot_app),
+    ).fetchone()
+    if row is None or not bool(row["active"]):
+        raise _not_found(
+            "WORK_TEAMS_PRIVATE_INSTALLATION_NOT_FOUND",
+            "No active private Teams installation exists for this owner.",
+        )
+    return {
+        "kind": "teams_personal",
+        "tenantId": tenant,
+        "botAppId": bot_app,
+        "actorAadObjectId": actor,
         "conversationId": str(row["conversation_id"]),
         "serviceUrl": str(row["service_url"]),
     }
