@@ -2269,21 +2269,33 @@ export class NavigatorExecutor {
     const isTaskActor = taskActorSubjects.includes(normalized.actorSubject);
     const modelActorMatches = this.config.workActorClients === undefined
       || config.modelActorSubject?.toLowerCase() === normalized.actorSubject;
-    const actorHasPriorTask = priorThread?.sessionId !== undefined;
     const legacyOwnerMatches = this.config.workActorClients !== undefined
       || this.legacyWorkActorId === undefined
       || this.legacyWorkActorId === normalized.actorSubject;
-    const createTask = isTaskActor && modelActorMatches && legacyOwnerMatches
-      && (actorHasPriorTask || normalized.mentionsBot);
     const actorThreadId = sha256(canonicalJson({
       tenantId: normalized.route.tenantId,
       botAppId: config.botAppId,
       actorAadObjectId: normalized.actorSubject,
       threadId,
     }));
+    const actorThreadSuffix = actorThreadId.slice(0, 60);
+    const currentActorSessionId = `teams-${actorThreadSuffix}`;
+    const legacyActorSessionId = `legacyteams-${actorThreadSuffix}`;
+    // Preserve a legacy name only when its hash still binds this authenticated actor and route.
+    const priorActorSessionId = this.config.workActorClients !== undefined
+      && (priorThread?.sessionId === currentActorSessionId
+        || priorThread?.sessionId === legacyActorSessionId)
+      ? priorThread.sessionId
+      : undefined;
+    const actorHasPriorTask = this.config.workActorClients === undefined
+      ? priorThread?.sessionId !== undefined
+      : priorActorSessionId !== undefined;
+    const createTask = isTaskActor && modelActorMatches && legacyOwnerMatches
+      && (actorHasPriorTask || normalized.mentionsBot);
     // Never reuse a thread-wide Session that may have belonged to a different actor.
     const sessionId = createTask
-      ? `${this.config.workActorClients === undefined ? 'legacyteams-' : 'teams-'}${actorThreadId.slice(0, 60)}`
+      ? priorActorSessionId
+        ?? `${this.config.workActorClients === undefined ? 'legacyteams-' : 'teams-'}${actorThreadSuffix}`
       : undefined;
     const teamsThreadMessage = {
       threadId,
