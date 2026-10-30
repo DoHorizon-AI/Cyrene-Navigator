@@ -899,6 +899,136 @@ def test_credential_health_incident_outbox_is_atomic_deduplicated_and_owner_scop
     ) == {"processed": 1, "stale": 0, "notificationsQueued": 0}
 
 
+def test_graph_credential_notice_uses_owner_private_route_and_waits_for_installation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Graph health never enters the shared channel outbox and waits for the owner install."""
+
+    from datetime import UTC, datetime
+
+    import cyrene_navigator.work.store as work_store_module
+
+    clock = [int(_PRIVATE_INSTALL_TEST_BASE.timestamp() * 1_000) + 1_000]
+    monkeypatch.setattr(work_store_module, "_unix_ms", lambda: clock[0])
+    actor = "22222222-2222-4222-8222-222222222222"
+    tenant = "11111111-1111-4111-8111-111111111111"
+    bot_app = "33333333-3333-4333-8333-333333333333"
+    base = BASE.format(workspace="w1")
+    policy = _private_policy(tmp_path / "graph-owner-subjects.json", subjects=[actor])
+    db_path = tmp_path / "graph-private-health.sqlite3"
+    checked_at = datetime.fromtimestamp(clock[0] / 1000, UTC).isoformat().replace("+00:00", "Z")
+    graph_snapshot = {
+        "connectionId": "22222222-2222-4222-8222-222222222223",
+        "provider": "microsoft_graph",
+        "loginState": "PRESENT",
+        "authorizationState": "REAUTHORIZATION_REQUIRED",
+        "checkedAt": checked_at,
+        "expiresAt": None,
+        "generation": 1,
+        "capabilities": [
+            {
+                "capabilityId": "microsoft_graph.calendar.read",
+                "state": "REAUTHORIZATION_REQUIRED",
+                "lastVerifiedAt": checked_at,
+                "expiresAt": None,
+                "reasonCode": "CONSENT_REQUIRED",
+            }
+        ],
+        "privateOwner": {
+            "actorAadObjectId": actor,
+            "tenantId": tenant,
+            "botAppId": bot_app,
+        },
+        "reasonCode": "CONSENT_REQUIRED",
+    }
+
+    with _client_with_policy(db_path, policy) as client:
+        published = client.post(
+            base + "/credential-health/snapshots",
+            json={"organizationId": "org-a", "connections": [graph_snapshot]},
+            headers=_headers("credential-monitor"),
+        )
+        assert published.status_code == 200, published.text
+        assert published.json() == {"processed": 1, "stale": 0, "notificationsQueued": 1}
+
+        shared_claim = client.post(
+            base + "/notifications/claim",
+            json={
+                "workerId": "shared-credential-worker",
+                "limit": 10,
+                "leaseSeconds": 60,
+                "type": "teams.credential-health",
+                "connectorId": "teams-v1",
+                "recipient": "teams:credential-health",
+            },
+            headers=_headers(),
+        )
+        assert shared_claim.status_code == 200, shared_claim.text
+        assert shared_claim.json()["items"] == []
+
+        private_claim_url = base + "/private-notifications/claim"
+        claim_body = {
+            "workerId": "private-graph-health-worker",
+            "limit": 10,
+            "leaseSeconds": 60,
+            "type": "teams.credential-health",
+            "connectorId": "teams-v1",
+            "recipient": "teams:owner-private",
+        }
+        pending_install = client.post(
+            private_claim_url, json=claim_body, headers=_headers("teams-bridge")
+        )
+        assert pending_install.status_code == 200, pending_install.text
+        assert pending_install.json()["items"] == []
+        owner_notices = client.get(base + "/notifications", headers=_headers("teams-v2-owner"))
+        assert owner_notices.status_code == 200
+        notice = owner_notices.json()["items"][0]
+        assert notice["recipient"] == "teams:owner-private"
+        assert notice["result"]["deliveryHoldCode"] == "WORK_TEAMS_PRIVATE_INSTALLATION_NOT_FOUND"
+        assert notice["payload"]["provider"] == "microsoft_graph"
+        assert "privateOwner" not in notice["payload"]
+        member_notices = client.get(base + "/notifications", headers=_headers("teams-member"))
+        assert member_notices.json()["items"] == []
+
+        installed = client.post(
+            base + "/private-installations/events",
+            json=_private_install_event(actor, "add", "graph-health-install", "graph-owner-chat"),
+            headers=_headers("teams-bridge"),
+        )
+        assert installed.status_code == 200, installed.text
+        task_message_claim = client.post(
+            private_claim_url,
+            json={**claim_body, "type": "teams.message"},
+            headers=_headers("teams-bridge"),
+        )
+        assert task_message_claim.status_code == 200, task_message_claim.text
+        assert task_message_claim.json()["items"] == []
+        private_claim = client.post(
+            private_claim_url, json=claim_body, headers=_headers("teams-bridge")
+        )
+        assert private_claim.status_code == 200, private_claim.text
+        leases = private_claim.json()["items"]
+        assert len(leases) == 1
+        lease = leases[0]
+        assert lease["teamsPersonalRoute"]["actorAadObjectId"] == actor
+        assert lease["teamsPersonalRoute"]["conversationId"] == "graph-owner-chat"
+        assert lease["notification"]["payload"]["connectionId"] == graph_snapshot["connectionId"]
+
+        started = client.post(
+            base + f"/notifications/{lease['notification']['id']}/start",
+            json={"leaseToken": lease["leaseToken"]},
+            headers=_headers("teams-bridge"),
+        )
+        assert started.status_code == 200, started.text
+        finished = client.post(
+            base + f"/notifications/{lease['notification']['id']}/finish",
+            json={"leaseToken": lease["leaseToken"], "outcome": "delivered", "result": {}},
+            headers=_headers("teams-bridge"),
+        )
+        assert finished.status_code == 200, finished.text
+        assert finished.json()["status"] == "delivered"
+
+
 def test_credential_health_accepts_scoped_capability_ids_and_keeps_contract_bounds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

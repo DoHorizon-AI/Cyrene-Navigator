@@ -39,6 +39,7 @@ import {
 import type { ModelRoute } from './model-policy.js';
 import type { ConversationExecutionBackend } from './codebuddy-acp-execution.js';
 import type { WorkflowSourceTaskReceipt } from './workflows/store.js';
+import { getConnectorToolCatalog } from './tool-providers.js';
 
 export type TaskStatus = ExecutionStatus;
 export type TaskExecutionClass = 'foreground' | 'background';
@@ -1480,6 +1481,8 @@ export class NavigatorExecutor {
         // Agent-scoped guards are inherited by child-agent contexts, without blocking unrelated sessions.
         disposeContinuationGuard = agent.ctx.tools.guard(execution => {
           if (SAFE_CONTINUATION_TOOLS.has(execution.name)) return undefined;
+          const connectorTool = getConnectorToolCatalog(agent.ctx).find(item => item.name === execution.name);
+          if (connectorTool !== undefined && !connectorTool.mutating) return undefined;
           return 'This authorization continuation is read-only; start a separately approved task for writes.';
         });
       }
@@ -2559,6 +2562,16 @@ export class NavigatorExecutor {
           connectorId: config.connectorId,
         });
         for (const lease of privateLeases) await this.deliverTeamsPersonalNotification(lease, config);
+        const privateCredentialLeases = await this.config.workState.claimPrivateNotifications({
+          workerId: `navigator-graph-credential-private-${process.pid}`,
+          limit: 10,
+          leaseSeconds: 60,
+          type: 'teams.credential-health',
+          connectorId: config.connectorId,
+        });
+        for (const lease of privateCredentialLeases) {
+          await this.deliverTeamsPersonalCredentialHealthNotification(lease, config);
+        }
       }
       if (this.drainToken !== undefined) return;
       const claim = {
@@ -2625,9 +2638,30 @@ export class NavigatorExecutor {
       }
     }
     if (snapshots.length > 0) {
+      const snapshotsForWork = snapshots.map(snapshot => {
+        const { externalSubject, ...workSnapshot } = snapshot;
+        if (snapshot.provider !== 'microsoft_graph') {
+          if (externalSubject !== undefined) {
+            throw new TypeError('Exchange returned a Graph actor proof for a non-Graph connection');
+          }
+          return workSnapshot;
+        }
+        const expectedSubject = `${config.owner.tenantId.toLowerCase()}:${config.owner.subject.toLowerCase()}`;
+        if (externalSubject !== expectedSubject) {
+          throw new TypeError('Microsoft Graph credential profile does not match the private Teams owner');
+        }
+        return {
+          ...workSnapshot,
+          privateOwner: {
+            actorAadObjectId: config.owner.subject,
+            tenantId: config.owner.tenantId,
+            botAppId: teams.botAppId,
+          },
+        };
+      });
       await this.config.workState.processCredentialHealthSnapshots(
         config.organizationId,
-        snapshots,
+        snapshotsForWork,
       );
     }
   }
@@ -2820,6 +2854,91 @@ export class NavigatorExecutor {
     }
   }
 
+  /** Deliver one Graph authorization notice only to its verified personal Teams installation. */
+  private async deliverTeamsPersonalCredentialHealthNotification(
+    lease: NotificationLease,
+    config: TeamsExecutorConfig,
+  ): Promise<void> {
+    const notification = lease.notification;
+    const start = this.config.workState.startPrivateNotification;
+    const finish = this.config.workState.finishPrivateNotification;
+    if (config.personalChatEnabled !== true || start === undefined || finish === undefined
+      || config.sendPrivateMessage === undefined || config.credentialNotifications === undefined) return;
+    let started = false;
+    let providerCallStarted = false;
+    try {
+      await start.call(this.config.workState, notification.id, lease.leaseToken);
+      started = true;
+      const route = lease.teamsPersonalRoute;
+      if (route === undefined || notification.type !== 'teams.credential-health'
+        || notification.connectorId !== config.connectorId || notification.recipient !== 'teams:owner-private'
+        || notification.taskId !== undefined || route.tenantId !== config.tenantId.toLowerCase()
+        || route.botAppId !== config.botAppId.toLowerCase()
+        || route.actorAadObjectId !== config.credentialNotifications.owner.subject) {
+        throw new TypeError('Work Graph credential notice has an invalid private recipient projection');
+      }
+      const notice = readCredentialHealthNotice(notification.payload);
+      if (notice.provider !== 'microsoft_graph'
+        || !config.credentialNotifications.connections.some(item =>
+          item.connectionId === notice.connectionId && item.provider === notice.provider)) {
+        throw new TypeError('Work Graph credential notice is outside the owner connection selectors');
+      }
+      const issuer = `https://login.microsoftonline.com/${route.tenantId}/v2.0`;
+      const allowedSubjects = await resolveTeamsTaskActorSubjects(config, this.config.workspaceId, issuer);
+      if (!allowedSubjects.includes(route.actorAadObjectId)) {
+        throw new TypeError('Private Graph credential owner is no longer authorized');
+      }
+      const text = boundedTeamsMessageText(
+        formatCredentialHealthNotice(notice), 'private credential health text', 20_000,
+      );
+      const retryCount = notification.result.retryCount ?? 0;
+      if (typeof retryCount !== 'number' || !Number.isSafeInteger(retryCount) || retryCount < 0) {
+        throw new TypeError('Private credential health retry counter is invalid');
+      }
+      const requestId = `${notification.id}:attempt:${retryCount + 1}`;
+      if (requestId.length > 200) throw new TypeError('Private credential health request id is too long');
+      providerCallStarted = true;
+      const result = await config.sendPrivateMessage({
+        requestId,
+        conversation: {
+          vendor: 'msteams',
+          account_id: route.botAppId,
+          conversation_id: route.conversationId,
+          kind: 'private',
+        },
+        tenant_id: route.tenantId,
+        service_url: validateTeamsServiceUrl(route.serviceUrl, route.tenantId),
+        target_kind: 'owner_private',
+        actor_aad_object_id: route.actorAadObjectId,
+        text,
+      }, AbortSignal.timeout(15_000));
+      if (result.outcome === 'rate_limited' && result.retryAfterSeconds !== undefined) {
+        await finish.call(this.config.workState, notification.id, lease.leaseToken, 'retry', {
+          reasonCode: result.reasonCode ?? 'rate_limited',
+        }, Math.min(Math.max(Math.ceil(result.retryAfterSeconds), 1), 300));
+        return;
+      }
+      const outcome = result.outcome === 'accepted' ? 'delivered'
+        : result.outcome === 'uncertain' ? 'uncertain' : 'failed';
+      await finish.call(this.config.workState, notification.id, lease.leaseToken, outcome, {
+        reasonCode: result.reasonCode ?? null,
+        vendorMessageId: result.vendorMessageId ?? null,
+      });
+    } catch (error: unknown) {
+      if (!started) return;
+      if (providerCallStarted && error instanceof ExchangeConnectorRequestError
+        && error.status === 429 && !error.outcomeUnknown && error.retryAfterSeconds !== undefined) {
+        await finish.call(this.config.workState, notification.id, lease.leaseToken, 'retry', {
+          code: 'EXCHANGE_HTTP_429',
+        }, Math.min(Math.max(Math.ceil(error.retryAfterSeconds), 1), 300)).catch(() => undefined);
+        return;
+      }
+      const uncertain = providerCallStarted && isUncertainConnectorOutcome(error);
+      await finish.call(this.config.workState, notification.id, lease.leaseToken,
+        uncertain ? 'uncertain' : 'failed', { code: safeErrorCode(error) }).catch(() => undefined);
+    }
+  }
+
   /** Deliver one host-owned credential alert through its dedicated fixed Exchange profile. */
   private async deliverCredentialHealthNotification(
     lease: Awaited<ReturnType<WorkStateStore['claimNotifications']>>[number],
@@ -2846,6 +2965,9 @@ export class NavigatorExecutor {
       const requestId = `${notification.id}:attempt:${retryCountValue + 1}`;
       if (requestId.length > 200) throw new TypeError('Credential health request identifier is too long');
       const notice = readCredentialHealthNotice(notification.payload);
+      if (notice.provider === 'microsoft_graph') {
+        throw new TypeError('Microsoft Graph credential notices require the private Teams route');
+      }
       const selectedConnection = config.connections.find(
         item => item.connectionId === notice.connectionId,
       );
@@ -3844,7 +3966,8 @@ export function parseCredentialNotificationsConfig(
     }
     const connectionId = uuidText(selector.connectionId, `credential notification connection ${index} id`);
     const provider = selector.provider;
-    if (provider !== 'hf' && provider !== 'runpod' && provider !== 'azure' && provider !== 'gcp') {
+    if (provider !== 'hf' && provider !== 'runpod' && provider !== 'azure' && provider !== 'gcp'
+      && provider !== 'microsoft_graph') {
       throw new TypeError('Credential notification connection provider is not supported');
     }
     return {
@@ -3914,7 +4037,7 @@ interface CredentialHealthNotice {
   readonly event: 'action_required' | 'reminder' | 'recovered';
   readonly incidentId: string;
   readonly connectionId: string;
-  readonly provider: 'hf' | 'runpod' | 'azure' | 'gcp';
+  readonly provider: 'hf' | 'runpod' | 'azure' | 'gcp' | 'microsoft_graph';
   readonly generation: number;
   readonly loginState: 'PRESENT' | 'MISSING' | 'UNKNOWN' | 'UNAVAILABLE';
   readonly authorizationState: 'VALID' | 'REAUTHORIZATION_REQUIRED' | 'PERMISSION_DENIED' | 'UNKNOWN' | 'UNAVAILABLE';
@@ -3942,7 +4065,8 @@ function readCredentialHealthNotice(value: Record<string, unknown>): CredentialH
   const incidentId = boundedText(value.incidentId, 'credential incident id', 64);
   if (!/^[0-9a-f]{32}$/u.test(incidentId)) throw new TypeError('Credential incident id is invalid');
   const provider = value.provider;
-  if (provider !== 'hf' && provider !== 'runpod' && provider !== 'azure' && provider !== 'gcp') {
+  if (provider !== 'hf' && provider !== 'runpod' && provider !== 'azure' && provider !== 'gcp'
+    && provider !== 'microsoft_graph') {
     throw new TypeError('Credential health notice provider is not supported');
   }
   if (typeof value.generation !== 'number' || !Number.isSafeInteger(value.generation) || value.generation < 0) {
@@ -4027,7 +4151,9 @@ function readCredentialReasonCode(value: unknown): string | null {
 
 /** Format a short provider-owned status message without arbitrary provider text. */
 function formatCredentialHealthNotice(notice: CredentialHealthNotice): string {
-  const labels = { hf: 'Hugging Face', runpod: 'RunPod', azure: 'Azure', gcp: 'Google Cloud' };
+  const labels = {
+    hf: 'Hugging Face', runpod: 'RunPod', azure: 'Azure', gcp: 'Google Cloud', microsoft_graph: 'Microsoft 365',
+  };
   const headline = notice.event === 'recovered'
     ? '授权已恢复'
     : notice.event === 'reminder' ? '授权仍需处理' : '授权需要处理';

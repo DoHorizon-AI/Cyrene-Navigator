@@ -1150,6 +1150,9 @@ export function validateConnectorBindingMap(value: unknown): Map<string, Connect
     'computer_workspace', 'computer_file', 'computer_directory',
     'huggingface_repository', 'cloud_target', 'cloud_operation',
     'azure_devops_source', 'microsoft_graph_plan', 'microsoft_graph_task',
+    'microsoft_graph_site', 'microsoft_graph_list', 'microsoft_graph_todo_list', 'microsoft_graph_todo_task',
+    'microsoft_graph_calendar', 'microsoft_graph_event', 'microsoft_graph_freebusy',
+    'microsoft_graph_drive', 'microsoft_graph_drive_item',
   ]);
   const result = new Map<string, ConnectorBindingAuthorization>();
   const connectionRefs = new Set<string>();
@@ -1306,6 +1309,9 @@ function connectorOperationPolicy(
     'azure_devops.observations.poll': {
       toolId: 'azure_devops.observations.poll', mutating: false, resourceProjection: 'azure_devops_source',
     },
+    'microsoft_graph.planner.plans.list': {
+      toolId: 'microsoft_graph.planner.plans.list', mutating: false, resourceProjection: 'microsoft_graph_plan',
+    },
     'microsoft_graph.planner.plan.get': {
       toolId: 'microsoft_graph.planner.plan.get', mutating: false, resourceProjection: 'microsoft_graph_plan',
     },
@@ -1314,6 +1320,66 @@ function connectorOperationPolicy(
     },
     'microsoft_graph.planner.task.get': {
       toolId: 'microsoft_graph.planner.task.get', mutating: false, resourceProjection: 'microsoft_graph_task',
+    },
+    'microsoft_graph.planner.task.create': {
+      toolId: 'microsoft_graph.planner.task.create', mutating: true, resourceProjection: 'microsoft_graph_task',
+    },
+    'microsoft_graph.planner.task.update': {
+      toolId: 'microsoft_graph.planner.task.update', mutating: true, resourceProjection: 'microsoft_graph_task',
+    },
+    'microsoft_graph.sharepoint.site.get': {
+      toolId: 'microsoft_graph.sharepoint.site.get', mutating: false, resourceProjection: 'microsoft_graph_site',
+    },
+    'microsoft_graph.sharepoint.list.get': {
+      toolId: 'microsoft_graph.sharepoint.list.get', mutating: false, resourceProjection: 'microsoft_graph_list',
+    },
+    'microsoft_graph.sharepoint.list.items.delta': {
+      toolId: 'microsoft_graph.sharepoint.list.items.delta', mutating: false, resourceProjection: 'microsoft_graph_list',
+    },
+    'microsoft_graph.todo.lists.list': {
+      toolId: 'microsoft_graph.todo.lists.list', mutating: false, resourceProjection: 'microsoft_graph_todo_list',
+    },
+    'microsoft_graph.todo.tasks.list': {
+      toolId: 'microsoft_graph.todo.tasks.list', mutating: false, resourceProjection: 'microsoft_graph_todo_list',
+    },
+    'microsoft_graph.todo.task.get': {
+      toolId: 'microsoft_graph.todo.task.get', mutating: false, resourceProjection: 'microsoft_graph_todo_task',
+    },
+    'microsoft_graph.todo.task.create': {
+      toolId: 'microsoft_graph.todo.task.create', mutating: true, resourceProjection: 'microsoft_graph_todo_task',
+    },
+    'microsoft_graph.todo.task.update': {
+      toolId: 'microsoft_graph.todo.task.update', mutating: true, resourceProjection: 'microsoft_graph_todo_task',
+    },
+    'microsoft_graph.todo.task.delete': {
+      toolId: 'microsoft_graph.todo.task.delete', mutating: true, resourceProjection: 'microsoft_graph_todo_task',
+    },
+    'microsoft_graph.calendar.calendars.list': {
+      toolId: 'microsoft_graph.calendar.calendars.list', mutating: false, resourceProjection: 'microsoft_graph_calendar',
+    },
+    'microsoft_graph.calendar.events.list': {
+      toolId: 'microsoft_graph.calendar.events.list', mutating: false, resourceProjection: 'microsoft_graph_calendar',
+    },
+    'microsoft_graph.calendar.event.get': {
+      toolId: 'microsoft_graph.calendar.event.get', mutating: false, resourceProjection: 'microsoft_graph_event',
+    },
+    'microsoft_graph.calendar.event.create': {
+      toolId: 'microsoft_graph.calendar.event.create', mutating: true, resourceProjection: 'microsoft_graph_event',
+    },
+    'microsoft_graph.calendar.event.update': {
+      toolId: 'microsoft_graph.calendar.event.update', mutating: true, resourceProjection: 'microsoft_graph_event',
+    },
+    'microsoft_graph.calendar.event.delete': {
+      toolId: 'microsoft_graph.calendar.event.delete', mutating: true, resourceProjection: 'microsoft_graph_event',
+    },
+    'microsoft_graph.calendar.freebusy.get': {
+      toolId: 'microsoft_graph.calendar.freebusy.get', mutating: false, resourceProjection: 'microsoft_graph_freebusy',
+    },
+    'microsoft_graph.sharepoint.drives.list': {
+      toolId: 'microsoft_graph.sharepoint.drives.list', mutating: false, resourceProjection: 'microsoft_graph_drive',
+    },
+    'microsoft_graph.sharepoint.drive.items.list': {
+      toolId: 'microsoft_graph.sharepoint.drive.items.list', mutating: false, resourceProjection: 'microsoft_graph_drive_item',
     },
   };
   const policy = policies[operationId];
@@ -1327,7 +1393,7 @@ function connectorOperationPolicy(
         : providerId === 'azure_devops'
           ? operationId.startsWith('azure_devops.')
           : providerId === 'microsoft_graph'
-            ? operationId.startsWith('microsoft_graph.planner.')
+            ? operationId.startsWith('microsoft_graph.')
             : ['azure', 'gcp', 'runpod'].includes(providerId) && operationId.startsWith('cloud.');
   if (!providerAllowed || (operationId === 'cloud.resource.restart' && providerId !== 'runpod')) {
     throw new TypeError(`Connector operation ${operationId} is not valid for provider ${providerId}`);

@@ -249,21 +249,38 @@ test('reads only the fixed signed Exchange authorization snapshot projection', a
   const key = Buffer.alloc(32, 0x5a);
   await writeFile(keyFile, key, { mode: 0o600 });
   const connectionId = '22222222-2222-4222-8222-222222222222';
+  const graphConnectionId = '44444444-4444-4444-8444-444444444444';
+  const graphTenantId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const graphActorId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
   const responseBody = {
-    connections: [{
-      connectionId,
-      provider: 'hf',
-      loginState: 'PRESENT',
-      authorizationState: 'REAUTHORIZATION_REQUIRED',
-      checkedAt: '2026-10-26T15:00:00Z',
-      expiresAt: '2026-10-26T16:00:00Z',
-      generation: 3,
-      capabilities: [{
-        capabilityId: 'model.read', state: 'REAUTHORIZATION_REQUIRED',
-        lastVerifiedAt: '2026-10-26T15:00:00Z', expiresAt: null, reasonCode: 'TOKEN_EXPIRED',
-      }],
-      reasonCode: 'TOKEN_EXPIRED',
-    }],
+    connections: [
+      {
+        connectionId,
+        provider: 'hf',
+        loginState: 'PRESENT',
+        authorizationState: 'REAUTHORIZATION_REQUIRED',
+        checkedAt: '2026-10-26T15:00:00Z',
+        expiresAt: '2026-10-26T16:00:00Z',
+        generation: 3,
+        capabilities: [{
+          capabilityId: 'model.read', state: 'REAUTHORIZATION_REQUIRED',
+          lastVerifiedAt: '2026-10-26T15:00:00Z', expiresAt: null, reasonCode: 'TOKEN_EXPIRED',
+        }],
+        reasonCode: 'TOKEN_EXPIRED',
+      },
+      {
+        connectionId: graphConnectionId,
+        provider: 'microsoft_graph',
+        loginState: 'PRESENT',
+        authorizationState: 'VALID',
+        checkedAt: '2026-10-26T15:00:00Z',
+        expiresAt: '2026-10-26T16:00:00Z',
+        generation: 3,
+        capabilities: [],
+        reasonCode: null,
+        externalSubject: `${graphTenantId}:${graphActorId}`,
+      },
+    ],
   };
   let received;
   const server = createServer(async (request, response) => {
@@ -290,14 +307,14 @@ test('reads only the fixed signed Exchange authorization snapshot projection', a
       requestId: 'health-request-1',
       organizationId: 'org-1',
       workspaceId: 'workspace-1',
-      connectionIds: [connectionId],
+      connectionIds: [connectionId, graphConnectionId],
     }, new AbortController().signal);
     assert.equal(received.method, 'POST');
     assert.equal(received.url, '/internal/v1/authorization-health/snapshots');
     assert.equal(received.headers.authorization, undefined);
     assert.deepEqual(JSON.parse(received.bodyText), {
       requestId: 'health-request-1', organizationId: 'org-1', workspaceId: 'workspace-1',
-      connectionIds: [connectionId],
+      connectionIds: [connectionId, graphConnectionId],
     });
     const timestamp = received.headers['x-cyrene-navigator-timestamp'];
     const expectedSignature = createHmac('sha256', key)
@@ -314,9 +331,20 @@ test('reads only the fixed signed Exchange authorization snapshot projection', a
         requestId: 'health-request-2',
         organizationId: 'org-1',
         workspaceId: 'workspace-1',
-        connectionIds: [connectionId],
+        connectionIds: [connectionId, graphConnectionId],
       }, new AbortController().signal),
       /unsupported authorization health snapshot/u,
+    );
+    delete responseBody.connections[0].authorizationRef;
+    responseBody.connections[1].externalSubject = 'not-a-verified-actor';
+    await assert.rejects(
+      client.getAuthorizationHealthSnapshots({
+        requestId: 'health-request-3',
+        organizationId: 'org-1',
+        workspaceId: 'workspace-1',
+        connectionIds: [connectionId, graphConnectionId],
+      }, new AbortController().signal),
+      /invalid Microsoft Graph health actor proof/u,
     );
   } finally {
     await new Promise(resolve => server.close(resolve));

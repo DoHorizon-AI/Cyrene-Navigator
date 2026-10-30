@@ -173,7 +173,9 @@ export async function executeCodeBuddyAcpTool(
 ): Promise<ToolExecutionResult | undefined> {
   const declared = getCodeBuddyAcpToolCatalog(ctx).find(item => item.name === input.name);
   if (declared === undefined) return undefined;
-  if (input.readOnly && !CODEBUDDY_ACP_READ_ONLY_CONTINUATION_TOOLS.has(declared.name)) {
+  const connectorTool = getConnectorToolCatalog(ctx).find(item => item.name === declared.name);
+  if (input.readOnly && !CODEBUDDY_ACP_READ_ONLY_CONTINUATION_TOOLS.has(declared.name)
+    && (connectorTool === undefined || connectorTool.mutating)) {
     throw new Error('This authorization continuation is read-only; this tool is outside the approved read-only set.');
   }
   const definition = ctx.tools.get(declared.name);
@@ -539,6 +541,7 @@ interface TeamsTaskCaller {
   readonly issuer: string;
   readonly subject: string;
   readonly tenantId: string;
+  readonly conversationKind: 'private' | 'channel';
 }
 
 function readBackgroundTaskRecord(value: unknown, expectedTaskId: string): ResponsibilityTaskRecord {
@@ -585,7 +588,7 @@ async function readTeamsCallerForTask(
     if (!taskId.startsWith('teams-private-')) {
       throw new TypeError('Private Teams origin is attached to an unexpected Task identifier.');
     }
-    return { issuer: `https://login.microsoftonline.com/${tenantId}/v2.0`, subject, tenantId };
+    return { issuer: `https://login.microsoftonline.com/${tenantId}/v2.0`, subject, tenantId, conversationKind: 'private' };
   }
   if (taskId.startsWith('teams-private-')) {
     throw new TypeError('Private Teams Task is missing its immutable server origin.');
@@ -604,7 +607,7 @@ async function readTeamsCallerForTask(
     || subject !== createdByActorId) {
     throw new TypeError('Trusted Teams task caller identity is malformed');
   }
-  return { issuer, subject, tenantId };
+  return { issuer, subject, tenantId, conversationKind: 'channel' };
 }
 
 async function executeTeamsProviderCall(
@@ -622,6 +625,10 @@ async function executeTeamsProviderCall(
   const toolAuthorization = hostBinding?.tools.find(item => item.toolId === tool.id);
   if (!hostBinding || !toolAuthorization) {
     throw new Error('This connector tool has no launcher-owned operation binding');
+  }
+  if (hostBinding.providerId === 'microsoft_graph' && 'conversationKind' in caller
+    && caller.conversationKind !== 'private') {
+    throw new Error('Personal Microsoft 365 data is available only in the owner’s private Teams conversation.');
   }
   if ((binding.providerId !== undefined && binding.providerId !== hostBinding.providerId)
     || (binding.connectionRef !== undefined && binding.connectionRef !== hostBinding.connectionRef)
@@ -651,7 +658,9 @@ async function executeTeamsProviderCall(
   const connectionRef = hostBinding.connectionRef;
   const profileRef = hostBinding.profileRef;
   const operationId = toolAuthorization.operationId;
-  const target = connectorTargetProjection(toolAuthorization.resourceProjection, profileRef, connectionRef, actualArguments);
+  const target = connectorTargetProjection(
+    toolAuthorization.resourceProjection, profileRef, connectionRef, actualArguments, operationId,
+  );
   const resourceRef = `sha256:${sha256(canonicalJson({ providerId, profileRef, operationId, target }))}`;
   const targetDigestSha256 = sha256(canonicalJson({ providerId, profileRef, target }));
   const receiptTarget = `connector-target:${sha256(canonicalJson({ providerId, profileRef, target }))}`;
@@ -908,6 +917,7 @@ function connectorTargetProjection(
   profileRef: string,
   connectionRef: string,
   args: Record<string, JsonValue>,
+  operationId: string,
 ): JsonValue {
   switch (projection) {
     case 'empty':
@@ -964,9 +974,48 @@ function connectorTargetProjection(
       if (args.target === undefined) throw new TypeError('Azure DevOps observation requires an exact source target');
       return { target: args.target };
     case 'microsoft_graph_plan':
-      return pickRequiredFields(args, ['plan_id']);
+      return operationId === 'microsoft_graph.planner.plans.list'
+        ? {}
+        : pickRequiredFields(args, ['plan_id']);
     case 'microsoft_graph_task':
-      return { ...pickRequiredFields(args, ['plan_id']), ...pickRequiredFields(args, ['task_id']) };
+      return {
+        ...pickRequiredFields(args, ['plan_id']),
+        ...(operationId === 'microsoft_graph.planner.task.create'
+          ? {}
+          : pickRequiredFields(args, ['task_id'])),
+      };
+    case 'microsoft_graph_site':
+      return pickRequiredFields(args, ['site_id']);
+    case 'microsoft_graph_list':
+      return { ...pickRequiredFields(args, ['site_id']), ...pickRequiredFields(args, ['list_id']) };
+    case 'microsoft_graph_todo_list':
+      return operationId === 'microsoft_graph.todo.lists.list'
+        ? {}
+        : pickRequiredFields(args, ['task_list_id']);
+    case 'microsoft_graph_todo_task':
+      return {
+        ...pickRequiredFields(args, ['task_list_id']),
+        ...(operationId === 'microsoft_graph.todo.task.create'
+          ? {}
+          : pickRequiredFields(args, ['task_id'])),
+      };
+    case 'microsoft_graph_calendar':
+      return operationId === 'microsoft_graph.calendar.calendars.list'
+        ? {}
+        : pickRequiredFields(args, ['calendar_id']);
+    case 'microsoft_graph_event':
+      return {
+        ...pickRequiredFields(args, ['calendar_id']),
+        ...(operationId === 'microsoft_graph.calendar.event.create'
+          ? pickRequiredFields(args, ['transaction_id'])
+          : pickRequiredFields(args, ['event_id'])),
+      };
+    case 'microsoft_graph_freebusy':
+      return pickRequiredFields(args, ['schedules']);
+    case 'microsoft_graph_drive':
+      return pickRequiredFields(args, ['site_id']);
+    case 'microsoft_graph_drive_item':
+      return { ...pickRequiredFields(args, ['drive_id']), ...pickAvailableFields(args, ['item_id']) };
     default:
       throw new TypeError('Connector binding has an unsupported resource projection');
   }

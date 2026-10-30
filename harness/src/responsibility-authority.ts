@@ -41,7 +41,16 @@ export type ConnectorResourceProjection =
   | 'cloud_operation'
   | 'azure_devops_source'
   | 'microsoft_graph_plan'
-  | 'microsoft_graph_task';
+  | 'microsoft_graph_task'
+  | 'microsoft_graph_site'
+  | 'microsoft_graph_list'
+  | 'microsoft_graph_todo_list'
+  | 'microsoft_graph_todo_task'
+  | 'microsoft_graph_calendar'
+  | 'microsoft_graph_event'
+  | 'microsoft_graph_freebusy'
+  | 'microsoft_graph_drive'
+  | 'microsoft_graph_drive_item';
 
 /** Stable Teams principal resolved from authenticated task state and current Directory policy. */
 export interface ResponsibilityPrincipal {

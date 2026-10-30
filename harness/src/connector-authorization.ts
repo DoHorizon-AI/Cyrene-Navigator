@@ -95,6 +95,11 @@ export interface ProviderOperationResult {
   readonly result: Record<string, JsonValue>;
 }
 
+/** Exchange-only actor proof paired with the credential-free health projection. */
+export interface ExchangeCredentialHealthSnapshot extends Omit<CredentialHealthSnapshot, 'privateOwner'> {
+  readonly externalSubject?: string;
+}
+
 export interface ExchangeConnectorAuthorizationConfig {
   readonly baseUrl: string;
   readonly hmacKeyFile: string;
@@ -367,7 +372,7 @@ export class ExchangeConnectorAuthorizationClient {
     readonly organizationId: string;
     readonly workspaceId: string;
     readonly connectionIds: readonly string[];
-  }, signal: AbortSignal): Promise<readonly CredentialHealthSnapshot[]> {
+  }, signal: AbortSignal): Promise<readonly ExchangeCredentialHealthSnapshot[]> {
     if (input.connectionIds.length < 1 || input.connectionIds.length > 100
       || new Set(input.connectionIds).size !== input.connectionIds.length) {
       throw new TypeError('Credential health snapshot selectors are invalid');
@@ -393,10 +398,12 @@ export class ExchangeConnectorAuthorizationClient {
     const received = new Set<string>();
     return envelope.connections.map((value, index) => {
       const row = object(value, `Exchange authorization health connection ${index}`);
-      if (!exactObjectKeys(row, [
+      const baseKeys = [
         'connectionId', 'provider', 'loginState', 'authorizationState', 'checkedAt',
         'expiresAt', 'generation', 'capabilities', 'reasonCode',
-      ])) {
+      ];
+      const hasExternalSubject = exactObjectKeys(row, [...baseKeys, 'externalSubject']);
+      if (!exactObjectKeys(row, baseKeys) && !hasExternalSubject) {
         throw new TypeError('Exchange returned an unsupported authorization health snapshot');
       }
       const connectionId = safeText(row.connectionId, 'authorization health connection id', 512);
@@ -404,7 +411,25 @@ export class ExchangeConnectorAuthorizationClient {
         throw new TypeError('Exchange returned a duplicate or unrequested authorization health connection');
       }
       received.add(connectionId);
-      const provider = enumText(row.provider, ['hf', 'runpod', 'azure', 'gcp'], 'authorization health provider');
+      const provider = enumText(
+        row.provider, ['hf', 'runpod', 'azure', 'gcp', 'microsoft_graph'], 'authorization health provider',
+      );
+      let externalSubject: string | undefined;
+      if (provider === 'microsoft_graph') {
+        if (!hasExternalSubject) {
+          throw new TypeError('Exchange omitted the Microsoft Graph health actor proof');
+        }
+        const value = safeText(row.externalSubject, 'authorization health externalSubject', 73).toLowerCase();
+        const separator = value.indexOf(':');
+        if (separator < 0 || UUID_PATTERN.test(value.slice(0, separator)) === false
+          || UUID_PATTERN.test(value.slice(separator + 1)) === false
+          || value.indexOf(':', separator + 1) >= 0) {
+          throw new TypeError('Exchange returned an invalid Microsoft Graph health actor proof');
+        }
+        externalSubject = value;
+      } else if (hasExternalSubject) {
+        throw new TypeError('Exchange returned an actor proof for a non-Graph health snapshot');
+      }
       const loginState = enumText(row.loginState, ['PRESENT', 'MISSING', 'UNKNOWN', 'UNAVAILABLE'], 'authorization login state');
       const authorizationState = enumText(
         row.authorizationState,
@@ -447,6 +472,7 @@ export class ExchangeConnectorAuthorizationClient {
         generation: row.generation,
         capabilities,
         reasonCode: nullableSymbolicCode(row.reasonCode, 'authorization health reason code'),
+        ...(externalSubject === undefined ? {} : { externalSubject }),
       };
     });
   }
