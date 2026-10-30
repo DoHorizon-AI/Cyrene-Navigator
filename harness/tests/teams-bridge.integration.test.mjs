@@ -506,6 +506,10 @@ test('actor-scoped Teams context keeps member messages out of the owner model se
     assert.equal(ownerMessage.status, 202, await ownerMessage.text());
     const ownerTasks = await eventually(() => ownerStore.listTasks(), page => page.items.length === 1);
     const ownerTask = await eventually(() => ownerStore.getTask(ownerTasks.items[0].id), task => task?.status === 'completed');
+    assert.ok(
+      ownerTask.sessionId.startsWith('teams-'),
+      'a new actor-scoped thread starts with its current session namespace',
+    );
 
     const memberMessage = await postActivity(server.url, teamsActivity({
       messageId: 'shared-member-first', senderId: MEMBER_ID,
@@ -545,6 +549,142 @@ test('actor-scoped Teams context keeps member messages out of the owner model se
     await app.executor.dispose();
     await app.pluginManager?.dispose();
     await app.ctx.fiber.dispose();
+  }
+});
+
+test('actor-scoped Teams resumes only the matching actor-bound legacy session', async () => {
+  const ownerStore = new InMemoryWorkStateStore(OWNER_ID);
+  const memberStore = new InMemoryWorkStateStore(MEMBER_ID);
+  const exchangeAuthorization = {
+    async mintGrant() { return { token: 'fixture-grant' }; },
+    async sendTeamsMessage() { return { outcome: 'accepted' }; },
+  };
+  const ownerApp = await createExecutorApp({
+    testMode: true,
+    authTokenEnv: 'TEAMS_EXECUTOR_TOKEN',
+    customLlmAdapter: { provider: 'teams-fixture', adapter: new FixtureAdapter() },
+    model: 'fixture-v1',
+    workStateStore: ownerStore,
+    workspaceId: 'legacy-actor-session-workspace',
+    teams: {
+      connectorId: 'teams-v1', tenantId: TENANT_ID, allowedTeamIds: ['team-1'], botAppId: BOT_APP_ID,
+      modelActorSubject: OWNER_ID, taskActorSubjects: [OWNER_ID, MEMBER_ID],
+      ingressSecretEnv: 'TEAMS_TEST_HMAC_KEY', exchangeConnectionRef: 'teams-connection',
+      exchangeProfileRef: 'teams-profile', exchangeAuthorization,
+    },
+  });
+  const ownerServer = await ownerApp.executor.startServer(0, '127.0.0.1');
+  try {
+    const first = await postActivity(ownerServer.url, teamsActivity({
+      messageId: 'legacy-owner-first', senderId: OWNER_ID,
+      text: 'OWNER_ONLY_CONTEXT_legacy should remain in the owner session.', mention: true,
+    }));
+    assert.equal(first.status, 202, await first.text());
+    const ownerTasks = await eventually(() => ownerStore.listTasks(), page => page.items.length === 1);
+    const originalTask = await eventually(
+      () => ownerStore.getTask(ownerTasks.items[0].id),
+      task => task?.status === 'completed',
+    );
+    assert.ok(originalTask.sessionId.startsWith('legacyteams-'));
+
+    const ownerRegistry = {
+      actorIds: () => [OWNER_ID],
+      forActor: actorId => actorId === OWNER_ID ? ownerStore : undefined,
+      tokenEnvForActor: () => 'OWNER_WORK_TOKEN',
+      async resolveTask(taskId) {
+        const task = await ownerStore.getTask(taskId);
+        return task === undefined ? undefined : { actorAadObjectId: OWNER_ID, store: ownerStore, task };
+      },
+      async listOwnedTasks() { return []; },
+    };
+    ownerApp.executor.config.workActorClients = ownerRegistry;
+
+    const ownerFollowup = await postActivity(ownerServer.url, teamsActivity({
+      messageId: 'legacy-owner-followup', senderId: OWNER_ID,
+      text: 'Continue the same owner session without mentioning the bot.',
+    }));
+    assert.equal(ownerFollowup.status, 202, await ownerFollowup.text());
+    const ownerTasksAfter = await eventually(() => ownerStore.listTasks(), page => page.items.length === 2);
+    const resumedTask = await eventually(async () => {
+      const row = ownerTasksAfter.items.find(item => item.id !== originalTask.id);
+      return row === undefined ? undefined : ownerStore.getTask(row.id);
+    }, task => task?.status === 'completed');
+    assert.equal(resumedTask.sessionId, originalTask.sessionId, 'the matching legacy session is reused exactly');
+    assert.match(resumedTask.prompt, /OWNER_ONLY_CONTEXT_legacy/u);
+    assert.match(resumedTask.prompt, /Continue the same owner session/u);
+
+    const ownerThread = await ownerStore.getConnectorThread(
+      'teams-v1', originalTask.metadata.teamsThread.threadId, 20,
+    );
+    let foreignSessionId = originalTask.sessionId;
+    const memberGetConnectorThread = memberStore.getConnectorThread.bind(memberStore);
+    memberStore.getConnectorThread = async () => ({
+      ...ownerThread,
+      sessionId: foreignSessionId,
+    });
+    const memberApp = await createExecutorApp({
+      testMode: true,
+      authTokenEnv: 'TEAMS_EXECUTOR_TOKEN',
+      customLlmAdapter: { provider: 'teams-fixture', adapter: new FixtureAdapter() },
+      model: 'fixture-v1',
+      workStateStore: memberStore,
+      workspaceId: 'legacy-actor-session-workspace',
+      teams: {
+        connectorId: 'teams-v1', tenantId: TENANT_ID, allowedTeamIds: ['team-1'], botAppId: BOT_APP_ID,
+        modelActorSubject: MEMBER_ID, taskActorSubjects: [OWNER_ID, MEMBER_ID],
+        ingressSecretEnv: 'TEAMS_TEST_HMAC_KEY', exchangeConnectionRef: 'teams-connection',
+        exchangeProfileRef: 'teams-profile', exchangeAuthorization,
+      },
+    });
+    const memberServer = await memberApp.executor.startServer(0, '127.0.0.1');
+    memberApp.executor.config.workActorClients = {
+      actorIds: () => [MEMBER_ID],
+      forActor: actorId => actorId === MEMBER_ID ? memberStore : undefined,
+      tokenEnvForActor: () => 'MEMBER_WORK_TOKEN',
+      async resolveTask(taskId) {
+        const task = await memberStore.getTask(taskId);
+        return task === undefined ? undefined : { actorAadObjectId: MEMBER_ID, store: memberStore, task };
+      },
+      async listOwnedTasks() { return []; },
+    };
+    try {
+      const memberFollowup = await postActivity(memberServer.url, teamsActivity({
+        messageId: 'foreign-session-no-mention', senderId: MEMBER_ID,
+        text: 'A foreign owner session must not authorize a continuation.',
+      }));
+      assert.equal(memberFollowup.status, 202, await memberFollowup.text());
+      assert.equal((await memberStore.listTasks()).items.length, 0,
+        'a different actor cannot inherit the owner session to continue a thread');
+
+      foreignSessionId = 'global-thread-wide-session';
+      const memberNewTask = await postActivity(memberServer.url, teamsActivity({
+        messageId: 'foreign-session-mentioned', senderId: MEMBER_ID,
+        text: 'Start a separate actor session.', mention: true,
+      }));
+      assert.equal(memberNewTask.status, 202, await memberNewTask.text());
+      const memberTasks = await eventually(() => memberStore.listTasks(), page => page.items.length === 1);
+      const memberTask = await eventually(
+        () => memberStore.getTask(memberTasks.items[0].id),
+        task => task?.status === 'completed',
+      );
+      assert.ok(memberTask.sessionId.startsWith('teams-'));
+      assert.notEqual(memberTask.sessionId, originalTask.sessionId);
+      assert.doesNotMatch(memberTask.prompt, /OWNER_ONLY_CONTEXT_legacy/u,
+        'context from a foreign actor session is never included');
+      assert.match(memberTask.prompt, /Start a separate actor session/u);
+      const memberThread = await memberGetConnectorThread(
+        'teams-v1', originalTask.metadata.teamsThread.threadId, 20,
+      );
+      assert.equal(memberThread.sessionId, memberTask.sessionId);
+    } finally {
+      await memberApp.executor.dispose();
+      await memberApp.pluginManager?.dispose();
+      await memberApp.ctx.fiber.dispose();
+    }
+  } finally {
+    await ownerApp.executor.dispose();
+    await ownerApp.pluginManager?.dispose();
+    await ownerApp.ctx.fiber.dispose();
   }
 });
 
