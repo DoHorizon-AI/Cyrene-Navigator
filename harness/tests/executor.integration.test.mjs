@@ -2238,13 +2238,15 @@ test('WorkStateClient reads and binds the native session through the active Work
     const body = Buffer.concat(chunks).toString('utf8');
     seen.push({ url: req.url, method: req.method, authorization: req.headers.authorization, body });
     res.setHeader('Content-Type', 'application/json');
-    if (req.method === 'GET' && req.url === '/api/v1/workspaces/acme/work/tasks/task-1/backend-session?backend=codebuddy-acp') {
+    if (req.method === 'GET' && (req.url === '/api/v1/workspaces/acme/work/tasks/task-1/backend-session?backend=codebuddy-acp'
+      || req.url === '/api/v1/workspaces/acme/work/tasks/task-1/backend-session?backend=antigravity-acp')) {
       res.end('null');
       return;
     }
     if (req.method === 'PUT' && req.url === '/api/v1/workspaces/acme/work/tasks/task-1/backend-session') {
+      const request = JSON.parse(body);
       res.end(JSON.stringify({
-        backend: 'codebuddy-acp', sessionId: 'work-session', nativeSessionId: 'native-session',
+        backend: request.backend, sessionId: 'work-session', nativeSessionId: request.nativeSessionId,
       }));
       return;
     }
@@ -2257,11 +2259,18 @@ test('WorkStateClient reads and binds the native session through the active Work
     assert.deepEqual(await client.bindBackendSession('task-1', 'native-session'), {
       backend: 'codebuddy-acp', sessionId: 'work-session', nativeSessionId: 'native-session',
     });
+    assert.equal(await client.getBackendSession('task-1', 'antigravity-acp'), undefined);
+    assert.deepEqual(await client.bindBackendSession('task-1', 'antigravity-native-session', 'antigravity-acp'), {
+      backend: 'antigravity-acp', sessionId: 'work-session', nativeSessionId: 'antigravity-native-session',
+    });
     assert.deepEqual(seen.map(row => [row.method, row.url]), [
       ['GET', '/api/v1/workspaces/acme/work/tasks/task-1/backend-session?backend=codebuddy-acp'],
       ['PUT', '/api/v1/workspaces/acme/work/tasks/task-1/backend-session'],
+      ['GET', '/api/v1/workspaces/acme/work/tasks/task-1/backend-session?backend=antigravity-acp'],
+      ['PUT', '/api/v1/workspaces/acme/work/tasks/task-1/backend-session'],
     ]);
     assert.deepEqual(JSON.parse(seen[1].body), { backend: 'codebuddy-acp', nativeSessionId: 'native-session' });
+    assert.deepEqual(JSON.parse(seen[3].body), { backend: 'antigravity-acp', nativeSessionId: 'antigravity-native-session' });
     assert.ok(seen.every(row => row.authorization === 'Bearer work-test-token'));
   } finally {
     await new Promise(resolve => server.close(resolve));

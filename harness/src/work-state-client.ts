@@ -21,6 +21,7 @@ export type ExecutionStatus =
   | 'awaiting_user_authorization';
 
 export type ExecutionClass = 'foreground' | 'background';
+export type WorkExecutionBackend = 'codebuddy-acp' | 'antigravity-acp';
 
 /** Durable executor record; the Work service is the production authority.  中文：持久化执行器记录；生产环境以 Work service 为准。 */
 export interface TaskRecord {
@@ -57,7 +58,7 @@ export interface TeamsPrivateTaskOrigin {
 
 /** Native process identity stored by the existing Workspace-scoped Work service. */
 export interface BackendSessionRecord {
-  readonly backend: 'codebuddy-acp';
+  readonly backend: WorkExecutionBackend;
   readonly sessionId: string;
   readonly nativeSessionId: string;
 }
@@ -251,8 +252,12 @@ export interface WorkStateStore {
   ): Promise<TaskRecord>;
   verifyContinuationOwnership(sourceTaskId: string): Promise<void>;
   getTask(taskId: string): Promise<TaskRecord | undefined>;
-  getBackendSession(taskId: string): Promise<BackendSessionRecord | undefined>;
-  bindBackendSession(taskId: string, nativeSessionId: string): Promise<BackendSessionRecord>;
+  getBackendSession(taskId: string, backend?: WorkExecutionBackend): Promise<BackendSessionRecord | undefined>;
+  bindBackendSession(
+    taskId: string,
+    nativeSessionId: string,
+    backend?: WorkExecutionBackend,
+  ): Promise<BackendSessionRecord>;
   listTasks(options?: { cursor?: string; limit?: number }): Promise<TaskPage>;
   listOwnedTasks?(options?: { cursor?: string; limit?: number }): Promise<TaskPage>;
   claimTask(taskId: string): Promise<{ claimed: boolean; task: TaskRecord }>;
@@ -420,9 +425,11 @@ function decodeTeamsPrivateTaskOrigin(value: unknown): TeamsPrivateTaskOrigin {
 
 function decodeBackendSession(value: unknown): BackendSessionRecord {
   const row = object(value, 'Work backend session');
-  if (row.backend !== 'codebuddy-acp') throw new TypeError('Invalid Work backend session backend');
+  if (row.backend !== 'codebuddy-acp' && row.backend !== 'antigravity-acp') {
+    throw new TypeError('Invalid Work backend session backend');
+  }
   return {
-    backend: 'codebuddy-acp',
+    backend: row.backend,
     sessionId: stringField(row.sessionId, 'backend sessionId'),
     nativeSessionId: stringField(row.nativeSessionId, 'native sessionId'),
   };
@@ -532,9 +539,12 @@ export class WorkStateClient implements WorkStateStore {
   }
 
   /** Read the native ACP session mapped to the currently running Work Task. */
-  async getBackendSession(taskId: string): Promise<BackendSessionRecord | undefined> {
+  async getBackendSession(
+    taskId: string,
+    backend: WorkExecutionBackend = 'codebuddy-acp',
+  ): Promise<BackendSessionRecord | undefined> {
     const value = await this.request(
-      `/${encodeURIComponent(taskId)}/backend-session?backend=codebuddy-acp`,
+      `/${encodeURIComponent(taskId)}/backend-session?backend=${encodeURIComponent(backend)}`,
       'GET',
     );
     if (value === null) return undefined;
@@ -542,11 +552,15 @@ export class WorkStateClient implements WorkStateStore {
   }
 
   /** Bind one native ACP identity without allowing a Work session mapping to be replaced. */
-  async bindBackendSession(taskId: string, nativeSessionId: string): Promise<BackendSessionRecord> {
+  async bindBackendSession(
+    taskId: string,
+    nativeSessionId: string,
+    backend: WorkExecutionBackend = 'codebuddy-acp',
+  ): Promise<BackendSessionRecord> {
     return decodeBackendSession(await this.request(
       `/${encodeURIComponent(taskId)}/backend-session`,
       'PUT',
-      { backend: 'codebuddy-acp', nativeSessionId },
+      { backend, nativeSessionId },
     ));
   }
 
@@ -1282,24 +1296,31 @@ export class InMemoryWorkStateStore implements WorkStateStore {
 
   async getTask(taskId: string): Promise<TaskRecord | undefined> { return this.records.get(taskId); }
 
-  async getBackendSession(taskId: string): Promise<BackendSessionRecord | undefined> {
+  async getBackendSession(
+    taskId: string,
+    backend: WorkExecutionBackend = 'codebuddy-acp',
+  ): Promise<BackendSessionRecord | undefined> {
     const task = this.records.get(taskId);
     if (!task) throw new WorkStateHttpError(404, 'TASK_NOT_FOUND');
     if (task.status !== 'running') throw new WorkStateHttpError(409, 'WORK_BACKEND_SESSION_TASK_NOT_RUNNING');
-    return this.backendSessions.get(`${task.sessionId}\0codebuddy-acp`);
+    return this.backendSessions.get(`${task.sessionId}\0${backend}`);
   }
 
-  async bindBackendSession(taskId: string, nativeSessionId: string): Promise<BackendSessionRecord> {
+  async bindBackendSession(
+    taskId: string,
+    nativeSessionId: string,
+    backend: WorkExecutionBackend = 'codebuddy-acp',
+  ): Promise<BackendSessionRecord> {
     const task = this.records.get(taskId);
     if (!task) throw new WorkStateHttpError(404, 'TASK_NOT_FOUND');
     if (task.status !== 'running') throw new WorkStateHttpError(409, 'WORK_BACKEND_SESSION_TASK_NOT_RUNNING');
-    const key = `${task.sessionId}\0codebuddy-acp`;
+    const key = `${task.sessionId}\0${backend}`;
     const prior = this.backendSessions.get(key);
     if (prior && prior.nativeSessionId !== nativeSessionId) {
       throw new WorkStateHttpError(409, 'WORK_BACKEND_SESSION_CONFLICT');
     }
     const row: BackendSessionRecord = {
-      backend: 'codebuddy-acp', sessionId: task.sessionId, nativeSessionId,
+      backend, sessionId: task.sessionId, nativeSessionId,
     };
     this.backendSessions.set(key, row);
     return row;

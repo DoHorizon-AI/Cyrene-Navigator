@@ -17,6 +17,12 @@ parameter shapes and bounds exercise Navigator's provider-schema adapter. The
 fixture is used only for registration and validation tests, never to invoke a
 computer provider.
 
+`antigravity-acp-stub.mjs` simulates the official ACP v1 server fields used by
+Navigator for model config options, `_meta.antigravity.enabledTools`, and
+`_meta.mcp` permission identity. It launches the real task-local Navigator
+stdio MCP sidecar against a fake provider tool; it never launches Google's
+binary or contacts Google services.
+
 `runNativeRequest` still launches it through the pinned DeepSeek Harness
 `LocalSubprocessRuntime`; the fixture does not replace or wrap that runtime.
 Each test writes its mode and state-file path to a task-local
@@ -67,3 +73,8 @@ Windows 专属测试在缺少 `native-matrix-host.exe` 时会明确失败，不�
 `computer-provider-schemas.json` 是四个 computer 工具的去标识输入 schema fixture。
 工具 ID 和描述为合成值，参数结构与边界用于覆盖 Navigator 的 provider-schema 适配器；
 fixture 只用于注册与校验测试，不会调用 computer provider。
+
+`antigravity-acp-stub.mjs` 模拟 Navigator 使用的官方 ACP v1 模型选项、
+`_meta.antigravity.enabledTools` 和 `_meta.mcp` 权限身份字段。它会启动真实的任务级
+Navigator stdio MCP sidecar，并调用本地 fake provider tool；不会启动 Google 二进制或访问
+Google 服务。

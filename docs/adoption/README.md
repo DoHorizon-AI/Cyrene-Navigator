@@ -22,19 +22,25 @@ real upstream packages.
   stdio process without a DSH reasoning loop. Navigator retains Work/session
   ownership and exposes only host-authorized Exchange tools through a task-local
   MCP bridge that reuses the existing authorization and receipt path.
+- The separate, opt-in `antigravity-acp` task backend launches Google's official
+  ACP binary and uses the native session's advertised model selector. It keeps
+  provider auth/session state in a private persistent profile, disables built-in
+  tools with the documented native filter, and permits only a current-catalog
+  Navigator MCP call whose official ACP metadata identifies its server and tool.
 
 The native host is launched through `CYRENE_NATIVE_HOST`. It has no external
 Platform tool or source dependency. Its implemented methods are reported by the
 `hello` handshake and remain limited to Navigator-owned operations.
 
-The ACP backend serializes one Work session inside a Navigator process. It does
+The ACP backends serialize one Work session inside a Navigator process. They do
 not yet claim a cross-process session lease, so production must run exactly one
-Navigator process/replica against a given Work SQLite database and CodeBuddy
-profile. Do not overlap rollouts or mount those same state paths into another
-replica. Cross-process session leasing is a separate follow-up. CodeBuddy's
-`HOME` and XDG data paths are rooted at the persistent private
-`CODEBUDDY_CONFIG_DIR/navigator-cli-home`; keep that profile path stable across
-container replacements.
+Navigator process/replica against a given Work SQLite database and each selected
+provider's private profile. Do not overlap rollouts or mount those same state
+paths into another replica. Cross-process session leasing is a separate
+follow-up. CodeBuddy's `HOME` and XDG data paths are rooted at the persistent
+private `CODEBUDDY_CONFIG_DIR/navigator-cli-home`; Antigravity's child `HOME` is
+its `CYRENE_HARNESS_ANTIGRAVITY_ACP_PROFILE`, with XDG paths below it. Keep the
+selected profile path stable across container replacements.
 
 On cancellation, authorization pause, timeout, EOF, or protocol failure, the
 ACP run aborts its task-local tool signal before disposing the child and MCP
@@ -78,6 +84,38 @@ permission denial, bounded child environment, Work receipts, authorization
 pause, cancellation-aware handler cleanup, restart loading, EOF, and
 process-exit behavior. They do not prove CodeBuddy login or model billing.
 
+The official Antigravity ACP backend is selected only with
+`CYRENE_HARNESS_EXECUTION_BACKEND=antigravity-acp`; the default remains `dsh`.
+Production sets the absolute official server path in
+`CYRENE_HARNESS_ANTIGRAVITY_ACP_COMMAND`, installs its adjacent
+`localharness_external` executable, and mounts a private persistent profile at
+`CYRENE_HARNESS_ANTIGRAVITY_ACP_PROFILE`. Linux uses the official registry's
+fixed `--uid=` argv item. The profile root must be process-owned and mode 0700;
+nested XDG directories must remain owner-owned, real directories inside that
+root. The runtime preserves their existing mode bits because the private root
+is the operating-system-user access boundary. It requires
+`agentInfo.name=antigravity-acp`,
+an ACP version with the built-in tool filter; its MCP server uses ACP v1's
+baseline stdio transport. It rejects the profile's global
+`~/.gemini/config/mcp_config.json` so the task-local Navigator server is the
+only custom MCP source.
+
+`CYRENE_HARNESS_ANTIGRAVITY_ACP_MODEL` is optional. When set, it must exactly
+match a value in the native session's model `configOptions`, and the server
+must confirm that current value before prompting. When unset, the runtime uses
+the server's advertised current model; it does not translate legacy model
+variants. A model change during a turn fails that turn. The runtime has no DSH,
+CodeBuddy, or model fallback path; Google owns external entitlement and billing
+behavior. Navigator starts no login flow and forwards no provider credential
+environment variables.
+
+The local fake-ACP integration covers model selection/readback, model drift,
+separate backend session mappings, restart loading, native permission identity,
+one-time catalog approval, denial, cancellation, partial output, profile
+credential isolation, and the DSH persistence-hook boundary. It does not run the
+official binary, authenticate, send a model request, or prove a real connector
+call.
+
 The native supervisor matrix retains cancellation, reaping, protocol-version,
 bounded-output, and credential-isolation checks. Its controlled fault fixture
 only tests the transport; Codex import still crosses the real Navigator Rust host.
@@ -105,7 +143,7 @@ explicit, reviewable adapter; it must not be hidden in an installation script.
 
 原生宿主通过 `CYRENE_NATIVE_HOST` 启动，不依赖外部 Platform 工具或源码。实现的方法由 `hello` 握手报告，范围仅限 Navigator 所有的操作。
 
-ACP backend 只在单个 Navigator 进程内串行处理同一 Work Session，目前没有跨进程 Session lease。因此生产中同一个 Work SQLite 数据库和 CodeBuddy profile 必须只由一个 Navigator 进程/副本使用；不要让滚动部署重叠，也不要把同一状态路径挂载给另一个副本。跨进程 Session lease 后续单独实现。CodeBuddy 的 `HOME` 与 XDG 数据目录固定在持久私有路径 `CODEBUDDY_CONFIG_DIR/navigator-cli-home` 下，容器替换后必须保持 profile 路径稳定。
+ACP backends 只在单个 Navigator 进程内串行处理同一 Work Session，目前没有跨进程 Session lease。因此生产中同一个 Work SQLite 数据库及所选 provider 的私有 profile 必须只由一个 Navigator 进程/副本使用；不要让滚动部署重叠，也不要把同一状态路径挂载给另一个副本。跨进程 Session lease 后续单独实现。CodeBuddy 的 `HOME` 与 XDG 数据目录固定在持久私有路径 `CODEBUDDY_CONFIG_DIR/navigator-cli-home` 下；Antigravity 子进程 HOME 是 `CYRENE_HARNESS_ANTIGRAVITY_ACP_PROFILE`，XDG 路径位于其子目录。Antigravity profile 根目录须由进程拥有且权限为 `0700`；嵌套 XDG 目录须由同一进程拥有、位于该根目录且不是符号链接，运行时保留其已有权限位。容器替换后必须保持所选 profile 路径稳定。
 
 取消、授权暂停、超时、EOF 或协议失败时，ACP run 会先取消任务级工具信号，再回收子进程和 MCP listener。关闭过程会在有界时间内等待宿主拥有的在途工具 handler。provider 忽略取消时，Work Task 会明确报告 cleanup 未完成；进行中的写入回执保持 uncertain，完成独立核对前不得重放。`exchange_operation_read` 可以读取 Exchange operation；模型返回一句确认或无关状态读取都不能把一般 uncertain Work 回执升级为成功。只有现有精确 cloud-operation readback 路径能自动核对匹配的 operation reference；其他 uncertain 回执需要独立权威读取和操作员核对。
 
@@ -118,6 +156,12 @@ Profile 测试使用真实固定版本 Harness CLI、Bundle、Rust host 和本�
 `CYRENE_HARNESS_MODEL_SOURCE` 为兼容旧部署默认 `exchange`，也可选择 `codebuddy` 或 `antigravity`。Antigravity 默认使用 `gemini-3.8-flash-medium`，要求服务 HOME 中存在固定的纯模型 agent profile；若设置 `CYRENE_HARNESS_MODEL`，其值必须属于 allowlist。生产 Docker executor 通过 `node scripts/serve-executor.mjs` 选择该 adapter；独立的 Python local-stack launcher 目前尚未接入。CodeBuddy adapter 默认模型为 `glm-5.3-flash`，并提供 `deepseek-v4.1-flash`。重点 adapter 测试用本地 fake CLI 验证进程参数、DSH 历史序列化、schema 校验、终态检查、超时和取消；这些测试不代表进行了带凭据的真实模型调用。
 
 `CYRENE_HARNESS_EXECUTION_BACKEND` 默认 `dsh`；`codebuddy-acp` 是独立的顶层执行选择，并忽略旧 model-source selector。ACP 要求 `CYRENE_HARNESS_MODEL_SOURCE` 与 `CYRENE_HARNESS_MODEL` 为空、CodeBuddy fallback 为 false，并显式声明 `CYRENE_HARNESS_CODEBUDDY_NO_PAID_TOPUP=true`。供应商 CLI 没有可强制禁止使用已购 credits 的设置，因此该声明不构成扣费保证。本地 stub 测试覆盖 ACP、strict MCP、权限拒绝、子进程环境隔离、Work 回执、授权暂停、在途 handler 取消与清理、重启加载、EOF 和进程退出；不代表完成真实 CodeBuddy 登录或模型计费验收。
+
+官方 Antigravity ACP backend 仅在设置 `CYRENE_HARNESS_EXECUTION_BACKEND=antigravity-acp` 后启用；默认仍为 `dsh`。生产环境通过 `CYRENE_HARNESS_ANTIGRAVITY_ACP_COMMAND` 设置官方 server 绝对路径，在其旁边安装 `localharness_external`，并将私有持久 profile 挂载到 `CYRENE_HARNESS_ANTIGRAVITY_ACP_PROFILE`。Linux 按官方 registry 固定传入 `--uid=`。Runtime 要求 `agentInfo.name=antigravity-acp` 和支持 built-in tool filter 的 ACP 版本；MCP server 使用 ACP v1 基线 stdio transport。若 profile 中存在全局 `~/.gemini/config/mcp_config.json` 则拒绝启动，确保 task-local Navigator server 是唯一自定义 MCP 来源。
+
+`CYRENE_HARNESS_ANTIGRAVITY_ACP_MODEL` 可选。若设置，必须与原生 session model `configOptions` 的 value 完全相同，并且 server 必须在 prompt 前回读确认。若未设置，则使用 server 公布的当前模型；不会转换 legacy model variant。turn 中报告模型变更会让当前 turn 失败。Runtime 不提供 DSH、CodeBuddy 或模型 fallback；Google 管理外部账号 entitlement 和计费。Navigator 不启动登录流程，也不转发 provider credential 环境变量。
+
+本地 fake ACP 集成覆盖模型选择和回读、模型漂移、backend session 隔离、重启续接、原生权限身份、目录匹配工具的一次性授权、拒绝、取消、部分输出、profile 凭据隔离及 DSH persistence hook 边界。它不会运行官方 binary、登录、发出模型请求或证明真实 connector call。
 
 生成的 Profile 清单是 lockfile 组合快照。Profile patch 或上游 pin 变化时必须重新生成，不能把它作为运行成功证据。
 

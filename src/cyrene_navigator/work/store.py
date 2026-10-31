@@ -50,6 +50,7 @@ _PRIVATE_INSTALL_EVENT_RETENTION_MS = 90 * 24 * 60 * 60 * 1_000
 _PRIVATE_INSTALL_EVENT_MAX_PER_WORKSPACE = 10_000
 _CREDENTIAL_CAPABILITY_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 _TERMINAL_TASK_STATES = frozenset({"completed", "failed", "aborted"})
+_NATIVE_SESSION_BACKENDS = frozenset({"codebuddy-acp", "antigravity-acp"})
 _TASK_TRANSITIONS: dict[str, frozenset[str]] = {
     "queued": frozenset({"running", "failed", "aborted", "waiting_approval", "waiting_input"}),
     "running": frozenset(
@@ -408,7 +409,7 @@ class WorkStore:
         task_id = _identifier(task_id, "task id")
         backend = _identifier(backend, "backend")
         actor = _identifier(actor_id, "actorId").lower() if actor_id is not None else None
-        if backend != "codebuddy-acp":
+        if backend not in _NATIVE_SESSION_BACKENDS:
             raise _invalid(
                 "WORK_BACKEND_SESSION_INVALID", "The native execution backend is not supported."
             )
@@ -483,10 +484,10 @@ class WorkStore:
     ) -> JsonObject:
         """Bind a new ACP identity once; never replace another session mapping.
 
-        The task claim and unique workspace/session key make the first binding
+        The task claim and unique workspace/session/backend key make the first binding
         authoritative. Repeated identical writes are idempotent; conflicting
         native ids fail closed to prevent accidental context replacement.
-        中文：同一 Workspace/Work Session 的 ACP ID 只允许首次绑定或原值重放。
+        中文：同一 Workspace/Work Session/backend 的 ACP ID 只允许首次绑定或原值重放。
         """
 
         org, workspace = _scope(organization_id, workspace_id)
@@ -494,7 +495,7 @@ class WorkStore:
         backend = _identifier(backend, "backend")
         native_session_id = _identifier(native_session_id, "native session id")
         actor = _identifier(actor_id, "actorId").lower() if actor_id is not None else None
-        if backend != "codebuddy-acp":
+        if backend not in _NATIVE_SESSION_BACKENDS:
             raise _invalid(
                 "WORK_BACKEND_SESSION_INVALID", "The native execution backend is not supported."
             )

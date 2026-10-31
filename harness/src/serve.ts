@@ -74,6 +74,12 @@ import { PrioritizedModelAdapter, PrioritizedModelGate } from './model-gate.js';
 import { registerSubagents } from './subagents/index.js';
 import type { SubagentAdapterConfig, SubagentAdapterEvent } from './subagents/types.js';
 import { CodeBuddyAcpExecutionBackend, validateCodeBuddyModel } from './codebuddy-acp-execution.js';
+import {
+  AntigravityAcpExecutionBackend,
+  validateAntigravityAcpCommand,
+  validateAntigravityAcpModel,
+  validateAntigravityAcpProfile,
+} from './antigravity-acp-execution.js';
 import type { ConversationExecutionBackend } from './codebuddy-acp-execution.js';
 import { WorkflowsClient } from './workflows/store.js';
 import { registerWorkflowRuntime } from './workflows/runtime.js';
@@ -165,7 +171,7 @@ export interface CreateExecutorAppOptions {
   /** Host-approved repository/action list for owner responsibility commands. */
   readonly responsibilityTargets?: readonly ResponsibilityTargetConfig[];
   /** Test-only override for backend selection; production uses CYRENE_HARNESS_EXECUTION_BACKEND. */
-  readonly executionBackend?: 'dsh' | 'codebuddy-acp';
+  readonly executionBackend?: 'dsh' | 'codebuddy-acp' | 'antigravity-acp';
 }
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -398,6 +404,9 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
   let modelFallbacks: readonly ModelRoute[] = [];
   let codeBuddyAcpModel: string | undefined;
   let codeBuddyAcpCommand = 'codebuddy';
+  let antigravityAcpModel: string | undefined;
+  let antigravityAcpCommand: string | undefined;
+  let antigravityAcpProfile: string | undefined;
   if (executionBackend === 'codebuddy-acp') {
     const modelSource = options.modelSource ?? process.env.CYRENE_HARNESS_MODEL_SOURCE;
     const legacyModel = options.model ?? process.env.CYRENE_HARNESS_MODEL;
@@ -429,6 +438,30 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
     }
     codeBuddyAcpCommand = configuredCommand || 'codebuddy';
     codeBuddyAcpModel = validateCodeBuddyModel(process.env.CYRENE_HARNESS_CODEBUDDY_ACP_MODEL);
+  } else if (executionBackend === 'antigravity-acp') {
+    const modelSource = options.modelSource ?? process.env.CYRENE_HARNESS_MODEL_SOURCE;
+    const legacyModel = options.model ?? process.env.CYRENE_HARNESS_MODEL;
+    if (modelSource !== undefined && modelSource !== '') {
+      throw new Error('CYRENE_HARNESS_MODEL_SOURCE must be unset or empty when CYRENE_HARNESS_EXECUTION_BACKEND=antigravity-acp');
+    }
+    if (legacyModel !== undefined && legacyModel !== '') {
+      throw new Error('CYRENE_HARNESS_MODEL must be unset or empty when CYRENE_HARNESS_EXECUTION_BACKEND=antigravity-acp');
+    }
+    if (options.customLlmAdapter || options.customTestModelAdapters !== undefined || options.enableTestEchoAdapter) {
+      throw new Error('DSH LLM adapters cannot be configured with the Antigravity ACP execution backend');
+    }
+    if (options.modelFallbacks !== undefined) {
+      throw new Error('DSH model fallbacks cannot be configured with the Antigravity ACP execution backend');
+    }
+    if (subagentConfigPath !== undefined) {
+      throw new Error('DSH subagents cannot be configured with the Antigravity ACP execution backend');
+    }
+    antigravityAcpCommand = validateAntigravityAcpCommand(
+      process.env.CYRENE_HARNESS_ANTIGRAVITY_ACP_COMMAND,
+      testMode,
+    );
+    antigravityAcpProfile = validateAntigravityAcpProfile(process.env.CYRENE_HARNESS_ANTIGRAVITY_ACP_PROFILE);
+    antigravityAcpModel = validateAntigravityAcpModel(process.env.CYRENE_HARNESS_ANTIGRAVITY_ACP_MODEL);
   } else {
     // DSH LLM Model Adapter setup
     const exchangeUrl = options.exchangeUrl ?? process.env.CYRENE_EXCHANGE_URL;
@@ -551,7 +584,16 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
       command: codeBuddyAcpCommand,
       model: codeBuddyAcpModel,
     })
-    : undefined;
+    : executionBackend === 'antigravity-acp'
+      ? new AntigravityAcpExecutionBackend({
+        ctx,
+        workState,
+        command: antigravityAcpCommand,
+        profileRoot: antigravityAcpProfile,
+        model: antigravityAcpModel,
+        ...(testMode ? { commandArgsPrefix: [] } : {}),
+      })
+      : undefined;
 
   // Autonomous Cloud Executor Daemon service
   applyExecutor(ctx, {
@@ -1094,16 +1136,16 @@ function parseTaskConcurrency(value: string | undefined): number {
 
 /** Select the top-level task engine independently from the DSH model source. */
 export function resolveExecutionBackend(
-  override: 'dsh' | 'codebuddy-acp' | undefined,
+  override: 'dsh' | 'codebuddy-acp' | 'antigravity-acp' | undefined,
   testMode: boolean,
   environmentValue = process.env.CYRENE_HARNESS_EXECUTION_BACKEND,
-): 'dsh' | 'codebuddy-acp' {
+): 'dsh' | 'codebuddy-acp' | 'antigravity-acp' {
   if (override !== undefined && !testMode) {
     throw new Error('Execution backend overrides are available only in explicit testMode');
   }
   const configured = override ?? (environmentValue === '' ? undefined : environmentValue) ?? 'dsh';
-  if (configured !== 'dsh' && configured !== 'codebuddy-acp') {
-    throw new TypeError('CYRENE_HARNESS_EXECUTION_BACKEND must be dsh or codebuddy-acp');
+  if (configured !== 'dsh' && configured !== 'codebuddy-acp' && configured !== 'antigravity-acp') {
+    throw new TypeError('CYRENE_HARNESS_EXECUTION_BACKEND must be dsh, codebuddy-acp or antigravity-acp');
   }
   return configured;
 }

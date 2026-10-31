@@ -1,7 +1,7 @@
 // ┌─────────────────────────────────────────────────────────────────────┐
 // │  📄 acp-mcp-stdio.ts                                                 │
 // │  Module: harness/acp-mcp-stdio                                       │
-// │  Role: Expose the one Navigator-owned MCP host over child stdio.     │
+// │  Role: Expose the task-local Navigator MCP bridge over child stdio.  │
 // │                                                                      │
 // │  模块职责：通过 stdio 暴露唯一由 Navigator 宿主拥有的 MCP 工具桥。    │
 // └─────────────────────────────────────────────────────────────────────┘

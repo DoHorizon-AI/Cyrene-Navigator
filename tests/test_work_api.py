@@ -2573,8 +2573,10 @@ def test_teams_thread_mapping_keeps_member_messages_as_context_without_admitting
         )
 
 
+@pytest.mark.parametrize("backend", ["codebuddy-acp", "antigravity-acp"])
 def test_verified_teams_task_and_thread_reads_are_actor_scoped_even_for_workspace_owner(
     tmp_path: Path,
+    backend: str,
 ) -> None:
     """Teams provenance hides task output, thread text, events, and ACP mappings cross-actor."""
 
@@ -2714,10 +2716,10 @@ def test_verified_teams_task_and_thread_reads_are_actor_scoped_even_for_workspac
         assert client.post(
             base + "/tasks/teams-owner-private-task/claim", headers=owner_headers
         ).json()["claimed"]
-        mapping_url = base + "/tasks/teams-owner-private-task/backend-session?backend=codebuddy-acp"
+        mapping_url = base + f"/tasks/teams-owner-private-task/backend-session?backend={backend}"
         bound = client.put(
             base + "/tasks/teams-owner-private-task/backend-session",
-            json={"backend": "codebuddy-acp", "nativeSessionId": "owner-native-session"},
+            json={"backend": backend, "nativeSessionId": "owner-native-session"},
             headers=owner_headers,
         )
         assert bound.status_code == 200
@@ -2741,7 +2743,7 @@ def test_verified_teams_task_and_thread_reads_are_actor_scoped_even_for_workspac
         ).json()["claimed"]
         assert (
             client.get(
-                base + "/tasks/member-same-session-task/backend-session?backend=codebuddy-acp",
+                base + f"/tasks/member-same-session-task/backend-session?backend={backend}",
                 headers=member_headers,
             ).status_code
             == 404
@@ -2749,7 +2751,7 @@ def test_verified_teams_task_and_thread_reads_are_actor_scoped_even_for_workspac
         assert (
             client.put(
                 base + "/tasks/member-same-session-task/backend-session",
-                json={"backend": "codebuddy-acp", "nativeSessionId": "attacker-rebind"},
+                json={"backend": backend, "nativeSessionId": "attacker-rebind"},
                 headers=member_headers,
             ).status_code
             == 404

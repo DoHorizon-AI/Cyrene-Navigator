@@ -159,6 +159,11 @@ export function getCodeBuddyAcpToolCatalog(ctx: Context): readonly CodeBuddyAcpT
   return [...registeredExchangeTools, ...authorizedConnectorTools];
 }
 
+/** Return the task-scoped tools shared by native ACP providers. */
+export function getAcpToolCatalog(ctx: Context): readonly CodeBuddyAcpToolSchema[] {
+  return getCodeBuddyAcpToolCatalog(ctx);
+}
+
 /** Run one existing Exchange tool definition with host validation and its existing authorization/receipt body. */
 export async function executeCodeBuddyAcpTool(
   ctx: Context,
@@ -169,6 +174,22 @@ export async function executeCodeBuddyAcpTool(
     readonly sessionId: string;
     readonly signal: AbortSignal;
     readonly readOnly: boolean;
+  },
+): Promise<ToolExecutionResult | undefined> {
+  return executeAcpTool(ctx, { ...input, backend: 'codebuddy-acp' });
+}
+
+/** Run one current-catalog tool for a native ACP provider through the same host authorization path. */
+export async function executeAcpTool(
+  ctx: Context,
+  input: {
+    readonly name: string;
+    readonly arguments: Record<string, unknown>;
+    readonly callId: string;
+    readonly sessionId: string;
+    readonly signal: AbortSignal;
+    readonly readOnly: boolean;
+    readonly backend: 'codebuddy-acp' | 'antigravity-acp';
   },
 ): Promise<ToolExecutionResult | undefined> {
   const declared = getCodeBuddyAcpToolCatalog(ctx).find(item => item.name === input.name);
@@ -185,7 +206,7 @@ export async function executeCodeBuddyAcpTool(
   const agent = {
     id: input.sessionId,
     session: { id: input.sessionId },
-    navigatorExecutionBackend: 'codebuddy-acp',
+    navigatorExecutionBackend: input.backend,
   } as unknown as Agent;
   const callId = input.callId as Parameters<typeof ctx.tools.execute>[0]['callId'];
   try {
