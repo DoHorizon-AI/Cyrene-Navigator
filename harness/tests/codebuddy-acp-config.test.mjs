@@ -34,6 +34,8 @@ const PILOT_ENVIRONMENT_NAMES = [
   'CYRENE_HARNESS_EXECUTION_BACKEND', 'CYRENE_HARNESS_MODEL_SOURCE', 'CYRENE_HARNESS_MODEL',
   'CYRENE_HARNESS_CODEBUDDY_NO_PAID_TOPUP', 'CYRENE_HARNESS_CODEBUDDY_FALLBACK_ENABLED',
   'CYRENE_HARNESS_CODEBUDDY_ACP_COMMAND', 'CYRENE_HARNESS_CODEBUDDY_ACP_MODEL',
+  'CYRENE_HARNESS_ANTIGRAVITY_ACP_COMMAND', 'CYRENE_HARNESS_ANTIGRAVITY_ACP_MODEL',
+  'CYRENE_HARNESS_ANTIGRAVITY_ACP_PROFILE',
   'CYRENE_WORKFLOWS_ENABLED', 'NAVIGATOR_PLUGINS_DIR', 'DSH_HOME',
   'PILOT_OWNER_WORK_TOKEN', 'PILOT_MEMBER_WORK_TOKEN',
 ];
@@ -102,8 +104,9 @@ async function postSignedPilotActivity(baseUrl, activity) {
 test('ACP backend is explicit, ignores empty legacy model selectors, and does not install the DSH loop', async () => {
   assert.equal(resolveExecutionBackend(undefined, false, undefined), 'dsh');
   assert.equal(resolveExecutionBackend(undefined, false, 'codebuddy-acp'), 'codebuddy-acp');
+  assert.equal(resolveExecutionBackend(undefined, false, 'antigravity-acp'), 'antigravity-acp');
   assert.equal(resolveExecutionBackend(undefined, false, ''), 'dsh');
-  assert.throws(() => resolveExecutionBackend(undefined, false, 'unexpected'), /must be dsh or codebuddy-acp/u);
+  assert.throws(() => resolveExecutionBackend(undefined, false, 'unexpected'), /must be dsh, codebuddy-acp or antigravity-acp/u);
   assert.deepEqual(currentResponsibilityModelPolicy(new Context(), 'deepseek-v4.1-flash'), {
     preferredProvider: 'codebuddy',
     preferredModel: 'deepseek-v4.1-flash',
@@ -114,7 +117,9 @@ test('ACP backend is explicit, ignores empty legacy model selectors, and does no
     'CYRENE_HARNESS_EXECUTION_BACKEND', 'CYRENE_HARNESS_MODEL_SOURCE', 'CYRENE_HARNESS_MODEL',
     'CYRENE_HARNESS_CODEBUDDY_NO_PAID_TOPUP', 'CYRENE_HARNESS_CODEBUDDY_FALLBACK_ENABLED',
     'CYRENE_HARNESS_CODEBUDDY_FALLBACK_MODEL', 'CYRENE_HARNESS_CODEBUDDY_ACP_COMMAND',
-    'CYRENE_HARNESS_CODEBUDDY_ACP_MODEL', 'CYRENE_PERSISTENCE_URL', 'CYRENE_WORKSPACE_ID',
+    'CYRENE_HARNESS_CODEBUDDY_ACP_MODEL', 'CYRENE_HARNESS_ANTIGRAVITY_ACP_COMMAND',
+    'CYRENE_HARNESS_ANTIGRAVITY_ACP_MODEL', 'CYRENE_HARNESS_ANTIGRAVITY_ACP_PROFILE',
+    'CYRENE_PERSISTENCE_URL', 'CYRENE_WORKSPACE_ID',
     'CYRENE_SESSION_TOKEN', 'CYRENE_EXECUTOR_TOKEN', 'TEAMS_ENABLED', 'TEAMS_CHAT_ONLY',
     'CYRENE_TEAMS_CHAT_ONLY', 'CYRENE_SUBAGENT_CONFIG', 'CYRENE_CLOUD_PROFILE_CONFIG',
     'CYRENE_CONNECTOR_BINDINGS_FILE', 'CYRENE_CONNECTOR_TOOL_CATALOG_FILE',
@@ -154,6 +159,51 @@ test('ACP backend is explicit, ignores empty legacy model selectors, and does no
       await app.pluginManager?.dispose();
       await app.ctx.fiber.dispose();
     }
+    await rm(pluginsDir, { recursive: true, force: true });
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+});
+
+test('Antigravity ACP is a separate opt-in backend with no DSH model route', async () => {
+  const names = [
+    'CYRENE_HARNESS_MODEL_SOURCE', 'CYRENE_HARNESS_MODEL', 'CYRENE_HARNESS_ANTIGRAVITY_ACP_COMMAND',
+    'CYRENE_HARNESS_ANTIGRAVITY_ACP_MODEL', 'CYRENE_HARNESS_ANTIGRAVITY_ACP_PROFILE',
+    'CYRENE_HARNESS_CODEBUDDY_FALLBACK_ENABLED', 'CYRENE_HARNESS_CODEBUDDY_NO_PAID_TOPUP',
+    'CYRENE_PERSISTENCE_URL', 'CYRENE_WORKSPACE_ID', 'CYRENE_SESSION_TOKEN', 'CYRENE_EXECUTOR_TOKEN',
+    'CYRENE_SUBAGENT_CONFIG', 'CYRENE_WORKFLOWS_ENABLED', 'NAVIGATOR_PLUGINS_DIR', 'DSH_HOME',
+  ];
+  const previous = new Map(names.map(name => [name, process.env[name]]));
+  const profile = await mkdtemp(join(tmpdir(), 'navigator-antigravity-acp-config-'));
+  const pluginsDir = await mkdtemp(join(tmpdir(), 'navigator-antigravity-acp-plugins-'));
+  for (const name of names) delete process.env[name];
+  process.env.CYRENE_HARNESS_ANTIGRAVITY_ACP_COMMAND = process.execPath;
+  process.env.CYRENE_HARNESS_ANTIGRAVITY_ACP_PROFILE = profile;
+  let app;
+  try {
+    assert.equal(resolveExecutionBackend(undefined, false, undefined), 'dsh',
+      'the new backend remains disabled unless explicitly selected');
+    app = await createExecutorApp({
+      testMode: true,
+      executionBackend: 'antigravity-acp',
+      authTokenEnv: 'CYRENE_EXECUTOR_TOKEN',
+      workStateStore: new InMemoryWorkStateStore(),
+      pluginsDir,
+      watchPlugins: false,
+      enableWorkflows: false,
+    });
+    assert.equal(app.executor.config.conversationBackend.name, 'antigravity-acp');
+    assert.equal(app.ctx.get('llm'), undefined);
+    assert.equal(app.ctx.get('agentLoop'), undefined);
+  } finally {
+    if (app) {
+      await app.executor.dispose();
+      await app.pluginManager?.dispose();
+      await app.ctx.fiber.dispose();
+    }
+    await rm(profile, { recursive: true, force: true });
     await rm(pluginsDir, { recursive: true, force: true });
     for (const [name, value] of previous) {
       if (value === undefined) delete process.env[name];

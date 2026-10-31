@@ -1,7 +1,7 @@
 // ┌─────────────────────────────────────────────────────────────────────┐
 // │  📄 acp-mcp-host.ts                                                  │
 // │  Module: harness/acp-mcp-host                                        │
-// │  Role: Serve authorized connector tools to one CodeBuddy ACP task.   │
+// │  Role: Serve authorized connector tools to one native ACP task.      │
 // │                                                                      │
 // │  模块职责：为单个 ACP Work Task 提供受限的本机 MCP connector host。   │
 // └─────────────────────────────────────────────────────────────────────┘
@@ -11,16 +11,34 @@ import { createServer } from 'node:http'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ToolExecutionResult } from '@deepseek-ai/dsh-tools'
-import { executeCodeBuddyAcpTool, getCodeBuddyAcpToolCatalog } from './tool-providers.js'
+import { executeAcpTool, getAcpToolCatalog } from './tool-providers.js'
 import { isJsonObject } from './subagents/wire.js'
 
 const MAX_REQUEST_BYTES = 1_500_000
 const MAX_RESPONSE_BYTES = 2_000_000
 const MCP_HOST_CLOSE_GRACE_MS = 3_000
 
+export interface AcpMcpEnvironmentVariable {
+  readonly name: string;
+  readonly value: string;
+}
+
+export interface AcpMcpBridge {
+  readonly url: string;
+  readonly token: string;
+}
+
+export interface AcpMcpServerStdio {
+  readonly name: string;
+  readonly command: string;
+  readonly args: readonly string[];
+  readonly env: readonly AcpMcpEnvironmentVariable[];
+}
+
 export interface AcpMcpHostOptions {
   readonly ctx: Context;
   readonly sessionId: string;
+  readonly backend?: 'codebuddy-acp' | 'antigravity-acp';
   readonly signal: AbortSignal;
   readonly readOnly: boolean;
   /** Bounded shutdown wait; callers only shorten this in local protocol tests. */
@@ -94,7 +112,7 @@ export class AcpMcpHost {
     }
     if (request.method === 'GET' && request.url === '/tools/list') {
       try {
-        send(response, 200, { tools: getCodeBuddyAcpToolCatalog(this.options.ctx) })
+        send(response, 200, { tools: getAcpToolCatalog(this.options.ctx) })
       } catch {
         send(response, 503, { error: 'tool_catalog_unavailable' })
       }
@@ -138,7 +156,7 @@ export class AcpMcpHost {
       || !isJsonObject(body.arguments)) {
       return mcpError('The connector tool request is invalid.')
     }
-    const catalog = getCodeBuddyAcpToolCatalog(this.options.ctx)
+    const catalog = getAcpToolCatalog(this.options.ctx)
     const declared = catalog.find(item => item.name === body.name)
     if (declared === undefined) {
       return mcpError('Unknown or unauthorized connector tool.')
@@ -156,13 +174,14 @@ export class AcpMcpHost {
 
     let result: ToolExecutionResult | undefined
     try {
-      result = await executeCodeBuddyAcpTool(this.options.ctx, {
+      result = await executeAcpTool(this.options.ctx, {
         name: declared.name,
         arguments: body.arguments,
         callId: body.callId,
         sessionId: this.options.sessionId,
         signal: this.options.signal,
         readOnly: this.options.readOnly,
+        backend: this.options.backend ?? 'codebuddy-acp',
       })
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : 'Connector tool execution failed.'

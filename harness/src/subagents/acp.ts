@@ -187,6 +187,11 @@ export function isAuthRequired(error: unknown): boolean {
   return error instanceof RpcProtocolError && error.code === -32000
 }
 
+/** Return only an ACP JSON-RPC numeric error code; discard vendor messages and data. */
+export function nativeAcpRpcErrorCode(error: unknown): number | undefined {
+  return error instanceof RpcProtocolError ? error.code : undefined
+}
+
 /** Return a fixed diagnostic that does not include child-provided RPC content. */
 export function authUnavailableFailure(): NativeSubagentFailure {
   return new NativeSubagentFailure(

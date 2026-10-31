@@ -14,6 +14,10 @@ Loop 或可写消息历史。
 | --- | --- |
 | `persistence.ts` | Remote Cyrene `SessionPersistence` and ordered live writer / 远程 Cyrene 会话持久化与有序 writer |
 | `persistence-wire.ts` | Authenticated HTTP, handle decoding, and upstream event validation / 认证 HTTP、handle 解码和上游事件校验 |
+| `acp-conversation-execution.ts` | Shared ACP Work task, session, cancellation, and cleanup lifecycle / 共享 ACP Work Task、会话、取消和清理生命周期 |
+| `acp-mcp-host.ts` | Task-local authorized MCP bridge for native ACP tools / 原生 ACP 工具使用的任务级授权 MCP bridge |
+| `codebuddy-acp-execution.ts` | Explicit native CodeBuddy ACP profile / 显式原生 CodeBuddy ACP profile |
+| `antigravity-acp-execution.ts` | Explicit official Antigravity ACP profile and native model readback / 显式官方 Antigravity ACP profile 与原生模型回读 |
 | `codebuddy-adapter.ts` | Restricted CodeBuddy structured-output provider; DSH remains the sole tool executor / 受限 CodeBuddy 结构化输出 provider；DSH 保持唯一工具执行者 |
 | `antigravity-adapter.ts` | Pinned Antigravity model-only structured-output provider; native tools are rejected and DSH remains the sole executor / 固定 Antigravity 纯模型结构化输出 provider；拒绝原生工具并保持 DSH 唯一执行权 |
 | `exchange-adapter.ts` | OpenAI-compatible streaming adapter for Exchange / Exchange 的 OpenAI 兼容流式 adapter |
@@ -118,6 +122,10 @@ credentials are not forwarded. Only DSH catalog tool requests are returned to th
 AgentLoop, which remains the sole business-tool executor. CodeBuddy remains
 registered in Antigravity mode so already-live CodeBuddy Agents can finish.
 
+This section describes the DSH model adapter only. The independent, opt-in
+`antigravity-acp` Work Task backend is documented below and does not install or
+route through that DSH model adapter.
+
 The adapter rejects missing, changed, or unsuccessful terminal results and
 locally validates requested tool names and arguments against the active DSH
 catalog. A recognized provider availability failure can retry the same DSH
@@ -170,6 +178,45 @@ session receives an explicit fresh-context instruction, and its native ID is
 stored before the user prompt. Local protocol-stub tests verify this adapter
 boundary; they do not prove a credentialed CodeBuddy login or model call.
 
+## Official Antigravity ACP execution
+
+`CYRENE_HARNESS_EXECUTION_BACKEND` still defaults to `dsh`; set it explicitly
+to `antigravity-acp` to select Google's official ACP server. This is separate
+from `CYRENE_HARNESS_MODEL_SOURCE`, and the backend rejects DSH model routes,
+fallbacks, adapters, and subagents. Production requires an absolute
+`CYRENE_HARNESS_ANTIGRAVITY_ACP_COMMAND` and a persistent, owner-only
+`CYRENE_HARNESS_ANTIGRAVITY_ACP_PROFILE`. The Linux image uses
+`/usr/local/bin/agy_acp_server.par` with its adjacent executable
+`localharness_external`; the official Linux registry argument `--uid=` is
+passed as a fixed argv item. A missing companion fails startup.
+
+The profile root must be owned by the Navigator process and mode `0700`.
+Nested XDG directories must stay inside that root, be owned by the same process,
+and contain no symlinks; their existing mode bits are preserved because the
+private root blocks access by other operating-system users.
+
+The child HOME is the Antigravity profile, with XDG config/cache/data/state
+directories below it. Native sign-in remains in that profile; Navigator does
+not import CodeBuddy or `agy` CLI tokens, forward provider credentials in the
+child environment, or start a login flow. The profile's global
+`~/.gemini/config/mcp_config.json` is rejected so the task's single Navigator
+MCP server is the only custom server available. `_meta.antigravity.enabledTools`
+is set to `[]`, using the official built-in allowlist filter; native file,
+terminal, and browser tools stay disabled. A permission is allowed once only
+when official ACP metadata marks it as an MCP call, names the `navigator`
+server and an exact current-catalog tool, and reports the native MCP kind.
+Other requests are rejected, even if a title or raw input resembles a catalog
+tool.
+
+Optional `CYRENE_HARNESS_ANTIGRAVITY_ACP_MODEL` must exactly match a model ID
+advertised in the native session's `configOptions`; Navigator sets it and
+checks the returned current value. If unset, the session's advertised native
+default is used; that does not claim a user-preferred model. Missing configured
+IDs and later model changes fail the turn. Navigator has no DSH, CodeBuddy, or
+model fallback route for this backend; provider entitlement and billing remain
+Google-owned. Local fake-ACP tests verify the adapter boundary, not a real
+Antigravity prompt or tool call.
+
 Foreground chat and background responsibilities use separate durable DSH
 Sessions. Foreground work has its own bounded task and model-call lane, while at
 most one background task runs at a time. `CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS`
@@ -200,6 +247,9 @@ permission mode，且只接受一个 `finish` tool step 和成功的 schema 结�
 Antigravity。模型只能返回 DSH catalog 中的工具请求，业务工具仍由
 现有 DSH AgentLoop 唯一执行。Antigravity 模式也会保留 CodeBuddy adapter，以便已运行的 CodeBuddy
 Agent 完成当前 Session。
+
+本节只描述 DSH model adapter。独立且默认关闭的 `antigravity-acp` Work Task backend
+见下文；它不会安装或经过该 DSH model adapter。
 
 适配器拒绝缺失、变更或失败的终态，并根据当前 DSH 工具目录在本地校验工具名和参数。已识别的 provider
 可用性故障可让同一 DSH 模型步骤使用显式配置的备用路由重试；持久化请求和用量事件会记录实际调用的 provider
@@ -235,6 +285,34 @@ computer binding。每次调用仍执行现有 Navigator schema、actor/target �
 Work 或旧 DSH Session ID 代替。旧 DSH 历史不导入、不重放。新 ACP Session 会收到明确的新上下文
 提示，并在发送用户 prompt 前写入原生 ID。本地协议 stub 测试只验证适配器边界，不代表已完成
 CodeBuddy 登录或模型调用。
+
+## 官方 Antigravity ACP 执行
+
+`CYRENE_HARNESS_EXECUTION_BACKEND` 仍默认 `dsh`；只有显式设为
+`antigravity-acp` 才会启动 Google 官方 ACP server。它与
+`CYRENE_HARNESS_MODEL_SOURCE` 分离，并拒绝 DSH 模型路由、fallback、adapter 和 subagent。
+生产环境要求绝对路径 `CYRENE_HARNESS_ANTIGRAVITY_ACP_COMMAND`，以及持久、仅 owner 可读写的
+`CYRENE_HARNESS_ANTIGRAVITY_ACP_PROFILE`。Linux 镜像使用
+`/usr/local/bin/agy_acp_server.par` 和同目录可执行文件 `localharness_external`；按官方
+Linux registry 参数固定传入 `--uid=`。缺少 companion 时启动失败。
+
+profile 根目录必须由 Navigator 进程拥有且权限为 `0700`。嵌套 XDG 目录必须位于
+根目录内、由同一进程拥有且不包含符号链接；由于私有根目录已阻止其他操作系统用户
+访问，运行时保留这些目录现有的权限位。
+
+子进程 HOME 指向 Antigravity profile，XDG config/cache/data/state 目录均放在该 profile 下。
+原生登录状态保存在此处；Navigator 不导入 CodeBuddy 或 `agy` CLI token，不向子进程环境传递
+provider 凭据，也不启动登录流程。若 profile 中存在全局
+`~/.gemini/config/mcp_config.json`，运行会拒绝启动，确保唯一自定义 server 是当前任务的
+Navigator MCP。通过官方 built-in allowlist `_meta.antigravity.enabledTools: []` 禁用原生
+文件、终端和浏览器工具。只有 ACP 官方元数据标记为 MCP call、指定 `navigator` server 和当前
+目录中的精确工具名，且 MCP kind 正确时才会一次性允许；标题或 raw input 看起来像目录工具也不够。
+
+可选的 `CYRENE_HARNESS_ANTIGRAVITY_ACP_MODEL` 必须与原生 session `configOptions` 中公布的
+模型 ID 完全相同；Navigator 设置后校验服务回传的 current value。未设置时采用原生 session
+公布的默认模型，这不表示该模型是用户偏好。配置模型不存在或 session 后续变更模型都会让当前
+turn 失败。此 backend 没有 DSH、CodeBuddy 或模型 fallback；账号 entitlement 与计费由 Google
+管理。本地 fake ACP 测试只验证适配器边界，不代表完成真实 Antigravity prompt 或工具调用。
 
 前台聊天和后台责任任务使用不同的持久 DSH Session。前台任务和模型调用有独立的有界槽位，后台同时最多运行一个任务。
 `CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS` 限制活动任务总数，默认值为 `2`，并且必须至少为 `2`，以便后台槽位繁忙时仍保留一个前台槽位；排队的前台任务优先于排队的后台任务。

@@ -22,6 +22,16 @@ CLI flags, serialized DSH history, canonical tool-call chunks, active-schema
 validation, terminal-result handling, timeout, and cancellation. It does not
 make a credentialed model request or claim real-model inference.
 
+`antigravity-acp-execution.integration.test.mjs` runs a local fake ACP v1
+agent and the real task-local stdio MCP sidecar. It verifies exact native model
+option readback, separate Work mappings, restart loading, profile credential
+isolation, denial of forged/foreign permission identities, one-time approval
+for an exact current-catalog MCP tool, model-drift failure, partial output,
+cancellation, and the persistence hook boundary. It accepts an owner-owned
+0775 XDG directory under the 0700 profile root without changing its mode, and
+rejects permissive and symlinked roots. It does not launch Google's binary,
+authenticate, or claim a real Antigravity model/tool call.
+
 `antigravity-adapter.test.mjs` uses a local fake CLI to verify the exact
 operator-provisioned model-only profile, strict permission mode, finish-only
 steps, split UTF-8 stream decoding, bounded process execution, and DSH catalog
@@ -76,6 +86,13 @@ and interactive GUI evidence.
 `native.integration.test.mjs` 在只调用 Navigator 自有方法的前提下，保留子进程取消、回收、协议版本、输出边界和凭据隔离矩阵。Windows 会编译等价的 Rust fixture，以在真实进程边界验证相同的 supervisor 行为。
 
 `codebuddy-adapter.test.mjs` 使用本地 fake executable 验证受限 CLI 参数、DSH 历史序列化、标准 tool-call block、当前 schema 校验、终态结果处理、超时和取消。它不会发出带凭据的模型请求，也不代表真实模型推理。
+
+`antigravity-acp-execution.integration.test.mjs` 使用本地 fake ACP v1 agent 和真实任务级
+stdio MCP sidecar。它验证原生模型选项精确回读、独立 Work mapping、重启续接、profile 凭据
+隔离、伪造或外部权限身份拒绝、当前目录匹配 MCP 工具的一次性授权、模型漂移失败、部分输出、
+取消和 persistence hook 边界。它会验证 0700 profile 根目录下的 owner-owned 0775 XDG
+目录不经修改即可使用，并拒绝权限开放或符号链接 profile 根目录。它不会启动 Google 二进制、
+执行认证或声称真实 Antigravity 模型/工具调用已成功。
 
 `antigravity-adapter.test.mjs` 使用本地 fake CLI 验证 operator 配置的精确纯模型 profile、strict permission mode、仅允许 `finish` 的步骤、分块 UTF-8 解码、有界进程执行和 DSH catalog 校验。它不使用 Antigravity 凭据，也不代表真实模型推理；ARM64 实时 adapter probe 单独记录。
 

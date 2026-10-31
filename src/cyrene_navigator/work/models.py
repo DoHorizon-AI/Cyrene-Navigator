@@ -36,6 +36,7 @@ TaskStatus = Literal[
     "awaiting_user_authorization",
 ]
 TaskExecutionClass = Literal["foreground", "background"]
+NativeExecutionBackend = Literal["codebuddy-acp", "antigravity-acp"]
 
 
 class TaskCreate(WorkModel):
@@ -111,7 +112,7 @@ class TaskRecord(WorkModel):
 class BackendSessionBind(WorkModel):
     """Bind one Work Task's session to a native execution session. | 绑定原生执行会话。"""
 
-    backend: Literal["codebuddy-acp"]
+    backend: NativeExecutionBackend
     native_session_id: str = Field(min_length=1, max_length=512)
 
 
@@ -121,7 +122,7 @@ class BackendSessionRecord(WorkModel):
     中文：由 Navigator 拥有并按 Workspace 隔离的原生会话标识。
     """
 
-    backend: Literal["codebuddy-acp"]
+    backend: NativeExecutionBackend
     session_id: str
     native_session_id: str
 

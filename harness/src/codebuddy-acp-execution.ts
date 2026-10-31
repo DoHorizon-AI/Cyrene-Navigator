@@ -1,9 +1,9 @@
 // ┌─────────────────────────────────────────────────────────────────────┐
 // │  📄 codebuddy-acp-execution.ts                                       │
 // │  Module: harness/codebuddy-acp-execution                             │
-// │  Role: Run one native CodeBuddy ACP turn under Navigator ownership.  │
+// │  Role: Bind CodeBuddy's native profile to shared ACP task mechanics.  │
 // │                                                                      │
-// │  模块职责：由 Navigator 管理 Work Task 并执行 CodeBuddy 原生 ACP 轮次。│
+// │  模块职责：将 CodeBuddy 专属配置接入共享 ACP Work Task 生命周期。    │
 // └─────────────────────────────────────────────────────────────────────┘
 
 import { randomUUID } from 'node:crypto'
@@ -22,26 +22,23 @@ import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 import type { Context } from '@deepseek-ai/cordis'
-import type { SubprocessHandle, SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
-import { AcpMcpHost } from './acp-mcp-host.js'
+import { AcpConversationExecutionBackend } from './acp-conversation-execution.js'
+import type {
+  AcpConversationExecutionProfile,
+  PreparedAcpConversation,
+  RecordAcpPermissionDiagnostic,
+} from './acp-conversation-execution.js'
 import { getCodeBuddyAcpToolCatalog } from './tool-providers.js'
-import { AcpStdioClient, authUnavailableFailure, isAuthRequired } from './subagents/acp.js'
-import {
-  DEFAULT_DISPOSE_GRACE_MS,
-  DEFAULT_STARTUP_TIMEOUT_MS,
-  DEFAULT_TURN_TIMEOUT_MS,
-  NativeSubagentFailure,
-  disposeNativeChildWithOutcome,
-} from './subagents/common.js'
-import {
-  MAX_NATIVE_OUTPUT_BYTES,
-  isJsonObject,
-  nativeWireDiagnostic,
-  optionalIdentifier,
-  optionalString,
-  requiredIdentifier,
-} from './subagents/wire.js'
+import type { AcpMcpBridge, AcpMcpServerStdio } from './acp-mcp-host.js'
+import { NativeSubagentFailure } from './subagents/common.js'
+import { isJsonObject, optionalString } from './subagents/wire.js'
 import type { WorkStateStore } from './work-state-client.js'
+
+export type {
+  ConversationExecutionBackend,
+  ConversationExecutionInput,
+  ConversationExecutionResult,
+} from './acp-conversation-execution.js'
 
 const CODEBUDDY_MODELS = new Set(['glm-5.3-flash', 'deepseek-v4.1-flash'])
 const CODEBUDDY_MCP_TOOL_PREFIX = 'mcp__navigator__'
@@ -56,34 +53,40 @@ const CODEBUDDY_SETTINGS = JSON.stringify({
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const MCP_SERVER_ENTRYPOINT = join(__dirname, 'acp-mcp-stdio.js')
 
-/** One active Work Task plus the host callbacks for its terminal and tool stream. */
-export interface ConversationExecutionInput {
-  readonly taskId: string;
-  readonly sessionId: string;
-  readonly prompt: string;
-  readonly signal: AbortSignal;
-  readonly authorizationPauseSignal: AbortSignal;
-  readonly readOnly: boolean;
-  readonly onText: (text: string) => void | Promise<void>;
-  readonly onToolCall?: (event: { name: string; callId: string; arguments: string }) => void | Promise<void>;
-  readonly onToolResult?: (event: { name: string; callId: string; result: string; isError: boolean }) => void | Promise<void>;
+interface AcpMcpEnvironmentVariable {
+  readonly name: string;
+  readonly value: string;
 }
 
-/** Only complete native turns become successful conversation results. */
-export interface ConversationExecutionResult {
-  readonly stopReason: 'end_turn' | 'refusal' | 'cancelled';
-  readonly nativeSessionId: string;
-  readonly output: string;
-  readonly pausedForUserAuthorization?: true;
+interface SafeAcpPermissionDiagnostic {
+  readonly type: 'execution.acp_permission_request';
+  readonly diagnosticVersion: 1;
+  readonly method: 'session/request_permission';
+  readonly kind: SafeAcpPermissionKind;
+  readonly serverName: 'navigator' | 'other' | 'missing';
+  readonly toolName: 'catalog_match' | 'unknown' | 'missing';
+  readonly identitySource: PermissionIdentitySource;
+  readonly catalogAvailable: boolean;
+  readonly optionKinds: {
+    readonly allow_once: boolean;
+    readonly reject_once: boolean;
+    readonly otherCount: number;
+  };
+  readonly decision: 'allow_once' | 'reject_once' | 'cancelled';
 }
 
-/** Top-level task execution boundary selected by the Navigator composition root. */
-export interface ConversationExecutionBackend {
-  readonly name: 'codebuddy-acp';
-  execute(input: ConversationExecutionInput): Promise<ConversationExecutionResult>;
+type SafeAcpPermissionKind =
+  | 'read' | 'edit' | 'delete' | 'move' | 'search' | 'execute' | 'think' | 'fetch' | 'switch_mode' | 'other'
+  | 'legacy_mcp' | 'unknown' | 'missing'
+type PermissionIdentitySource = 'codebuddy_metadata' | 'legacy_mcp_raw_input' | 'none'
+
+interface PermissionToolIdentity {
+  readonly serverName: 'navigator' | 'other' | 'missing';
+  readonly toolName: 'catalog_match' | 'unknown' | 'missing';
+  readonly trusted: boolean;
 }
 
-/** Fixed host profile and test seams for one CodeBuddy ACP process. */
+/** CodeBuddy owns process flags and its task-local MCP configuration file. */
 export interface CodeBuddyAcpExecutionOptions {
   readonly ctx: Context;
   readonly workState: WorkStateStore;
@@ -100,382 +103,76 @@ export interface CodeBuddyAcpExecutionOptions {
   readonly mcpCloseGraceMs?: number;
 }
 
-interface AcpMcpEnvironmentVariable {
-  readonly name: string;
-  readonly value: string;
+interface PrivateConfigFile {
+  readonly path: string;
+  readonly cwd: string;
+  readonly childHome: string;
+  readonly profileRoot: string;
+  cleanup(): void;
 }
 
-interface AcpMcpServerStdio {
-  readonly name: string;
-  readonly command: string;
-  readonly args: readonly string[];
-  readonly env: readonly AcpMcpEnvironmentVariable[];
-}
-
-type SafeAcpPermissionKind =
-  | 'read' | 'edit' | 'delete' | 'move' | 'search' | 'execute' | 'think' | 'fetch' | 'switch_mode' | 'other'
-  | 'legacy_mcp' | 'unknown' | 'missing'
-
-type PermissionIdentitySource = 'codebuddy_metadata' | 'legacy_mcp_raw_input' | 'none'
-
-interface SafeAcpPermissionDiagnostic {
-  readonly type: 'execution.acp_permission_request'
-  readonly diagnosticVersion: 1
-  readonly method: 'session/request_permission'
-  readonly kind: SafeAcpPermissionKind
-  readonly serverName: 'navigator' | 'other' | 'missing'
-  readonly toolName: 'catalog_match' | 'unknown' | 'missing'
-  readonly identitySource: PermissionIdentitySource
-  readonly catalogAvailable: boolean
-  readonly optionKinds: {
-    readonly allow_once: boolean
-    readonly reject_once: boolean
-    readonly otherCount: number
-  }
-  readonly decision: 'allow_once' | 'reject_once' | 'cancelled'
-}
-
-interface PermissionToolIdentity {
-  readonly serverName: 'navigator' | 'other' | 'missing'
-  readonly toolName: 'catalog_match' | 'unknown' | 'missing'
-  readonly trusted: boolean
-}
-
-/** Implement a top-level CodeBuddy turn without creating or invoking a DSH Agent. */
-export class CodeBuddyAcpExecutionBackend implements ConversationExecutionBackend {
-  readonly name = 'codebuddy-acp' as const
+/** Provider-specific CodeBuddy setup and permission identity rules. */
+class CodeBuddyAcpProfile implements AcpConversationExecutionProfile {
+  readonly backend = 'codebuddy-acp' as const
+  readonly displayName = 'CodeBuddy'
+  readonly migrationPrompt = migrationAwarePrompt
   private readonly command: string
   private readonly commandArgsPrefix: readonly string[]
   private readonly model: string
   private readonly mcpServerEntrypoint: string
-  private readonly startupTimeoutMs: number
-  private readonly turnTimeoutMs: number
-  private readonly disposeGraceMs: number
-  private readonly mcpCloseGraceMs: number | undefined
 
   constructor(private readonly options: CodeBuddyAcpExecutionOptions) {
     this.command = options.command ?? 'codebuddy'
     this.commandArgsPrefix = options.commandArgsPrefix ?? []
     this.model = validateCodeBuddyModel(options.model)
     this.mcpServerEntrypoint = resolve(options.mcpServerEntrypoint ?? MCP_SERVER_ENTRYPOINT)
-    this.startupTimeoutMs = options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS
-    this.turnTimeoutMs = options.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS
-    this.disposeGraceMs = options.disposeGraceMs ?? DEFAULT_DISPOSE_GRACE_MS
-    this.mcpCloseGraceMs = options.mcpCloseGraceMs
   }
 
-  /** Load or create a native session, then send exactly one user turn. */
-  async execute(input: ConversationExecutionInput): Promise<ConversationExecutionResult> {
-    input.signal.throwIfAborted()
-    const runController = new AbortController()
-    let currentTurn = false
-    let nativeTurnNeedsCancel = false
-    const abortRelays: Array<() => void> = []
-    const relayAbort = (signal: AbortSignal): void => {
-      if (signal.aborted) {
-        if (currentTurn) nativeTurnNeedsCancel = true
-        runController.abort(signal.reason)
-        return
-      }
-      const onAbort = (): void => {
-        if (currentTurn) nativeTurnNeedsCancel = true
-        runController.abort(signal.reason)
-      }
-      signal.addEventListener('abort', onAbort, { once: true })
-      abortRelays.push(() => signal.removeEventListener('abort', onAbort))
+  /** Prepare the isolated CLI profile and stdio MCP configuration for this run. */
+  prepare(bridge: AcpMcpBridge): PreparedAcpConversation {
+    const mcpServer: AcpMcpServerStdio = {
+      name: 'navigator',
+      command: process.execPath,
+      args: [this.mcpServerEntrypoint],
+      env: [
+        { name: 'NAVIGATOR_ACP_BRIDGE_URL', value: bridge.url },
+        { name: 'NAVIGATOR_ACP_BRIDGE_TOKEN', value: bridge.token },
+      ],
     }
-    relayAbort(input.signal)
-    relayAbort(input.authorizationPauseSignal)
-    let prior: Awaited<ReturnType<WorkStateStore['getBackendSession']>>
-    try {
-      runController.signal.throwIfAborted()
-      prior = await this.options.workState.getBackendSession(input.taskId)
-      if (prior !== undefined && (prior.backend !== 'codebuddy-acp' || prior.sessionId !== input.sessionId)) {
-        throw new NativeSubagentFailure(
-          'Navigator returned a mismatched native session mapping',
-          'NATIVE_SESSION_MAPPING_INVALID: Work returned a mapping for a different backend or session.',
-        )
-      }
-    } catch (error: unknown) {
-      for (const release of abortRelays) release()
-      throw error
-    }
-    const mcpHost = new AcpMcpHost({
-      ctx: this.options.ctx,
-      sessionId: input.sessionId,
-      signal: runController.signal,
-      readOnly: input.readOnly,
-      ...(this.mcpCloseGraceMs === undefined ? {} : { closeGraceMs: this.mcpCloseGraceMs }),
-      ...(input.onToolCall === undefined ? {} : { onToolCall: input.onToolCall }),
-      ...(input.onToolResult === undefined ? {} : { onToolResult: input.onToolResult }),
+    const environment = Object.fromEntries(mcpServer.env.map(({ name, value }) => [name, value]))
+    const configFile = createPrivateMcpConfigFile({
+      mcpServers: {
+        navigator: {
+          type: 'stdio',
+          command: mcpServer.command,
+          args: [...mcpServer.args],
+          alwaysLoad: true,
+          defer_loading: false,
+          env: environment,
+        },
+      },
     })
-    let mcpConfigFile: PrivateConfigFile | undefined
-    let child: SubprocessHandle | undefined
-    let peer: AcpStdioClient | undefined
-    let conversationId: string | undefined
-    let output = ''
-    let diagnostic: string | undefined
-    let result: ConversationExecutionResult | undefined
-    let failure: unknown
-    let cleanupFailure: unknown
-    let authorizationPaused = false
-    let permissionDiagnosticRecorded = false
-    const recordPermissionDiagnostic = (event: SafeAcpPermissionDiagnostic, codeBuddyMcpCandidate: boolean): void => {
-      if (permissionDiagnosticRecorded || !codeBuddyMcpCandidate) return
-      permissionDiagnosticRecorded = true
-      // Record one native MCP sample without waiting on Work, so telemetry cannot delay ACP permission. | 异步记录一条原生 MCP 样本，不让诊断写入阻塞 ACP 授权。
-      try {
-        void this.options.workState.appendEvent(input.taskId, { ...event }).catch(() => {
-          // Diagnostics must never change the ACP permission decision. | 诊断写入失败不得改变 ACP 授权决定。
-        })
-      } catch {
-        // Work adapters may throw before returning their promise. | Work 适配器可能在返回 Promise 前抛错。
-      }
-    }
-
-    try {
-      const mcpUrl = await mcpHost.listen()
-      const acpMcpServer = createNavigatorAcpMcpServer(this.mcpServerEntrypoint, mcpUrl, mcpHost.token)
-      mcpConfigFile = createPrivateMcpConfigFile({
-        mcpServers: {
-          navigator: {
-            type: 'stdio',
-            command: acpMcpServer.command,
-            args: acpMcpServer.args,
-            alwaysLoad: true,
-            defer_loading: false,
-            env: Object.fromEntries(acpMcpServer.env.map(({ name, value }) => [name, value])),
-          },
-        },
-      })
-      child = this.spawnChild(
-        mcpConfigFile.cwd, mcpConfigFile.path, mcpConfigFile.childHome, mcpConfigFile.profileRoot,
-      )
-      let peerFailure: Error | undefined
-      peer = new AcpStdioClient(
-        child,
-        new AbortController().signal,
-        (method, params) => {
-          if (method !== 'session/update' || !isJsonObject(params) || !isJsonObject(params.update)) return
-          const updateSessionId = optionalIdentifier(params.sessionId)
-          if (updateSessionId !== undefined && conversationId !== undefined && updateSessionId !== conversationId) return
-          const update = params.update
-          if (update.sessionUpdate !== 'agent_message_chunk' || !isJsonObject(update.content)
-            || update.content.type !== 'text' || typeof update.content.text !== 'string' || !currentTurn) return
-          const text = update.content.text
-          if (Buffer.byteLength(output, 'utf8') + Buffer.byteLength(text, 'utf8') > MAX_NATIVE_OUTPUT_BYTES) {
-            diagnostic = 'NATIVE_OUTPUT_LIMIT: ACP assistant output exceeded the byte limit; valid partial output retained.'
-            peer?.failWith(new Error('Native ACP output exceeded its configured size limit'))
-            return
-          }
-          output += text
-          try {
-            void Promise.resolve(input.onText(text)).catch(() => {
-              peerFailure = new Error('Navigator could not persist ACP assistant output')
-              peer?.failWith(peerFailure)
-            })
-          } catch {
-            peerFailure = new Error('Navigator could not persist ACP assistant output')
-            peer?.failWith(peerFailure)
-          }
-        },
-        async (_requestId, method, params) => {
-          if (method !== 'session/request_permission' || !isJsonObject(params)) {
-            throw new Error('Native ACP client request is unsupported')
-          }
-          return this.answerPermission(params, recordPermissionDiagnostic)
-        },
-        error => { diagnostic ??= safeAcpDiagnostic(error) },
-      )
-
-      const initValue = await withRunDeadline(
-        peer.request('initialize', {
-          protocolVersion: 1,
-          clientInfo: { name: 'cyrene-navigator', version: '0.1.0' },
-          clientCapabilities: {},
-        }),
-        runController,
-        this.startupTimeoutMs,
-        'CodeBuddy ACP initialize',
-      )
-      const init = objectResult(initValue, 'initialize')
-      if (init.protocolVersion !== 1) {
-        throw new NativeSubagentFailure(
-          'CodeBuddy ACP protocol version is unsupported',
-          'NATIVE_PROTOCOL_UNSUPPORTED: ACP protocol version 1 is required.',
-        )
-      }
-      const canLoadSession = isJsonObject(init.agentCapabilities) && init.agentCapabilities.loadSession === true
-      if (prior !== undefined) {
-        if (!canLoadSession) {
-          throw new NativeSubagentFailure(
-            'CodeBuddy ACP cannot restore the stored native session',
-            'NATIVE_SESSION_RESUME_UNSUPPORTED: CodeBuddy ACP did not advertise session/load; prior context was preserved.',
-          )
-        }
-        await withRunDeadline(peer.request('session/load', {
-          sessionId: prior.nativeSessionId,
-          cwd: mcpConfigFile.cwd,
-          mcpServers: [acpMcpServer],
-        }), runController, this.startupTimeoutMs, 'CodeBuddy ACP session load')
-        conversationId = prior.nativeSessionId
-      } else {
-        const createdValue = await withRunDeadline(peer.request('session/new', {
-          cwd: mcpConfigFile.cwd,
-          mcpServers: [acpMcpServer],
-        }), runController, this.startupTimeoutMs, 'CodeBuddy ACP session creation')
-        const created = objectResult(createdValue, 'session/new')
-        conversationId = requiredIdentifier(created.sessionId, 'session id')
-        // Persist before prompting so a process restart never invents a replacement context.
-        const bound = await this.options.workState.bindBackendSession(input.taskId, conversationId)
-        if (bound.sessionId !== input.sessionId || bound.nativeSessionId !== conversationId) {
-          throw new NativeSubagentFailure(
-            'Navigator could not bind the ACP session to this Work session',
-            'NATIVE_SESSION_MAPPING_CONFLICT: Work did not confirm the exact ACP session mapping.',
-          )
-        }
-      }
-      await this.options.workState.appendEvent(input.taskId, {
-        type: 'execution.backend_session',
-        backend: 'codebuddy-acp',
-        resumed: prior !== undefined,
-        legacyDshHistoryImported: false,
-      })
-      currentTurn = true
-      const prompt = prior === undefined
-        ? migrationAwarePrompt(input.prompt)
-        : input.prompt
-      const promptValue = await withRunDeadline(peer.request('session/prompt', {
-        sessionId: conversationId,
-        prompt: [{ type: 'text', text: prompt }],
-      }), runController, this.turnTimeoutMs, 'CodeBuddy ACP prompt')
-      const promptResult = objectResult(promptValue, 'session/prompt')
-      if (peerFailure !== undefined) throw peerFailure
-      switch (promptResult.stopReason) {
-        case 'end_turn':
-        case 'refusal':
-          result = { stopReason: promptResult.stopReason, nativeSessionId: conversationId, output }
-          break
-        case 'cancelled':
-          if (input.signal.aborted) throw abortFailure(input.signal)
-          if (input.authorizationPauseSignal.aborted) {
-            authorizationPaused = true
-            break
-          }
-          throw new NativeSubagentFailure('CodeBuddy ACP cancelled the turn', 'NATIVE_STOP_CANCELLED: CodeBuddy ACP cancelled the task.')
-        case 'max_tokens':
-          throw new NativeSubagentFailure('CodeBuddy ACP reached its output limit', 'NATIVE_STOP_MAX_TOKENS: ACP returned partial output at its token limit.')
-        default:
-          throw new NativeSubagentFailure('CodeBuddy ACP turn failed', 'NATIVE_STOP_ERROR: ACP did not complete the requested turn.')
-      }
-    } catch (error: unknown) {
-      if (currentTurn && conversationId !== undefined) nativeTurnNeedsCancel = true
-      runController.abort(error)
-      authorizationPaused = input.authorizationPauseSignal.aborted && !input.signal.aborted
-      if (!authorizationPaused) {
-        failure = diagnostic === undefined
-          ? safeAcpFailure(error, input.signal)
-          : new NativeSubagentFailure(diagnostic, diagnostic)
-      }
-    } finally {
-      // Stop connector and approval work before reaping the protocol child or MCP listener.
-      runController.abort(new Error('CodeBuddy ACP run is terminating.'))
-      if (peer !== undefined) {
-        if (nativeTurnNeedsCancel && conversationId !== undefined) {
-          await peer.notify('session/cancel', { sessionId: conversationId }).catch(() => undefined)
-        }
-        peer.expectClose()
-        peer.cancelPending()
-      }
-      if (child !== undefined) {
-        try {
-          const exitedBeforeTerminate = await disposeNativeChildWithOutcome(child, this.disposeGraceMs)
-          if (exitedBeforeTerminate) {
-            const outcome = await child.done
-            if (outcome.exitCode !== 0 || outcome.signal !== null) {
-              const exit = outcome.exitCode === null ? `signal ${outcome.signal ?? 'unknown'}` : `code ${outcome.exitCode}`
-              failure = new NativeSubagentFailure(
-                `NATIVE_PROCESS_EXIT: CodeBuddy ACP exited with ${exit}.`,
-                `NATIVE_PROCESS_EXIT: CodeBuddy ACP exited with ${exit}.`,
-              )
-            }
-          }
-        } catch {
-          cleanupFailure = new NativeSubagentFailure(
-            'CodeBuddy ACP process cleanup failed',
-            'NATIVE_PROCESS_CLEANUP_FAILED: Navigator could not confirm CodeBuddy ACP process cleanup.',
-          )
-        }
-      }
-      try {
-        await mcpHost.close()
-      } catch {
-        cleanupFailure ??= new NativeSubagentFailure(
-          'Navigator MCP bridge cleanup is incomplete',
-          'NATIVE_MCP_CLEANUP_INCOMPLETE: An authorized tool handler did not settle after cancellation; cleanup is incomplete.',
-        )
-      }
-      if (mcpConfigFile !== undefined) {
-        try {
-          mcpConfigFile.cleanup()
-        } catch {
-          cleanupFailure ??= new NativeSubagentFailure(
-            'CodeBuddy MCP configuration cleanup failed',
-            'NATIVE_MCP_CONFIG_CLEANUP_FAILED: Navigator could not remove the task-local MCP configuration.',
-          )
-        }
-      }
-      for (const release of abortRelays) release()
-    }
-
-    if (authorizationPaused && conversationId !== undefined) {
-      result = {
-        stopReason: 'cancelled',
-        nativeSessionId: conversationId,
-        output,
-        pausedForUserAuthorization: true,
-      }
-    }
-    if (cleanupFailure !== undefined) {
-      throw new NativeSubagentFailure(
-        'CodeBuddy ACP cleanup is incomplete',
-        failure === undefined
-          ? 'NATIVE_CLEANUP_INCOMPLETE: Navigator could not confirm that all task-local CodeBuddy resources and authorized tool handlers stopped.'
-          : 'NATIVE_CLEANUP_INCOMPLETE: CodeBuddy ACP failed and Navigator could not confirm that every authorized tool handler stopped.',
-      )
-    }
-    if (failure !== undefined) throw failure
-    if (result === undefined) {
-      throw new NativeSubagentFailure('CodeBuddy ACP returned no terminal result', diagnostic ?? 'NATIVE_RESULT_MISSING: ACP returned no terminal result.')
-    }
-    return result
-  }
-
-  private spawnChild(cwd: string, configPath: string, childHome: string, profileRoot: string): SubprocessHandle {
     const args = [
       ...this.commandArgsPrefix,
       '--acp', '--acp-transport', 'stdio', '--agent', 'cli', '--permission-mode', 'default',
-      '--tools', '', '--strict-mcp-config', '--mcp-config', configPath,
+      '--tools', '', '--strict-mcp-config', '--mcp-config', configFile.path,
       '--setting-sources', 'project,local',
       '--settings', CODEBUDDY_SETTINGS,
       '--model', this.model,
     ]
-    const spec: SubprocessSpawnSpec = {
+    return {
+      cwd: configFile.cwd,
       argv: [this.command, ...args],
-      cwd,
-      stdio: { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' },
-      graceMs: this.disposeGraceMs,
-      env: isolatedCodeBuddyEnvironment(childHome, profileRoot),
+      env: isolatedCodeBuddyEnvironment(configFile.childHome, configFile.profileRoot),
+      sessionParameters: { cwd: configFile.cwd, mcpServers: [mcpServer] },
+      cleanup: () => configFile.cleanup(),
     }
-    const child = this.options.ctx.subprocess.spawn(spec)
-    child.stderr?.on('data', () => {})
-    child.done.catch(() => {})
-    return child
   }
 
-  private async answerPermission(
+  /** Deny every untrusted request and permit only a catalog-matched Navigator MCP tool once. */
+  async answerPermission(
     params: Record<string, unknown>,
-    recordDiagnostic: (event: SafeAcpPermissionDiagnostic, codeBuddyMcpCandidate: boolean) => void,
+    recordDiagnostic: RecordAcpPermissionDiagnostic,
   ): Promise<Record<string, unknown>> {
     const toolCall = isJsonObject(params.toolCall) ? params.toolCall : {}
     const kindValue = optionalString(toolCall.kind)
@@ -514,7 +211,7 @@ export class CodeBuddyAcpExecutionBackend implements ConversationExecutionBacken
     const decision = selection === undefined
       ? 'cancelled'
       : identity.trusted && selection === allowOnce ? 'allow_once' : 'reject_once'
-    recordDiagnostic({
+    const event: SafeAcpPermissionDiagnostic = {
       type: 'execution.acp_permission_request',
       diagnosticVersion: 1,
       method: 'session/request_permission',
@@ -529,20 +226,39 @@ export class CodeBuddyAcpExecutionBackend implements ConversationExecutionBacken
         otherCount: options.filter(option => option.kind !== 'allow_once' && option.kind !== 'reject_once').length,
       },
       decision,
-    }, hasCodeBuddyToolName && typeof codeBuddyToolName === 'string' && codeBuddyToolName.startsWith('mcp__'))
+    }
+    recordDiagnostic({ ...event }, hasCodeBuddyToolName
+      && typeof codeBuddyToolName === 'string' && codeBuddyToolName.startsWith('mcp__'))
     if (selection !== undefined) return { outcome: { outcome: 'selected', optionId: selection.optionId } }
     return { outcome: { outcome: 'cancelled' } }
   }
 }
 
-/** Keep ACP tool-kind diagnostics inside the fixed v1 vocabulary. | 仅记录固定 ACP v1 工具类型。 */
+/** CodeBuddy remains the existing named ACP choice; its behavior stays provider-specific. */
+export class CodeBuddyAcpExecutionBackend extends AcpConversationExecutionBackend {
+  declare readonly name: 'codebuddy-acp'
+
+  constructor(options: CodeBuddyAcpExecutionOptions) {
+    super({
+      ctx: options.ctx,
+      workState: options.workState,
+      profile: new CodeBuddyAcpProfile(options),
+      ...(options.startupTimeoutMs === undefined ? {} : { startupTimeoutMs: options.startupTimeoutMs }),
+      ...(options.turnTimeoutMs === undefined ? {} : { turnTimeoutMs: options.turnTimeoutMs }),
+      ...(options.disposeGraceMs === undefined ? {} : { disposeGraceMs: options.disposeGraceMs }),
+      ...(options.mcpCloseGraceMs === undefined ? {} : { mcpCloseGraceMs: options.mcpCloseGraceMs }),
+    })
+  }
+}
+
+/** Keep ACP tool-kind diagnostics inside the fixed v1 vocabulary. */
 function classifyAcpPermissionKind(value: string | undefined): SafeAcpPermissionKind {
   if (value === undefined) return 'missing'
   if (value === 'mcp') return 'legacy_mcp'
   return ACP_TOOL_KINDS.has(value) ? value as SafeAcpPermissionKind : 'unknown'
 }
 
-/** Trust the CodeBuddy extension name only when it resolves to this session's Navigator catalog. | 仅信任解析到本会话 Navigator 目录的 CodeBuddy 扩展名。 */
+/** Trust only CodeBuddy's provider-owned name when it resolves to the live catalog. */
 function codeBuddyMcpToolIdentity(value: unknown, knownTools: ReadonlySet<string>): PermissionToolIdentity {
   if (typeof value !== 'string' || value.length === 0) {
     return { serverName: 'missing', toolName: 'missing', trusted: false }
@@ -551,29 +267,19 @@ function codeBuddyMcpToolIdentity(value: unknown, knownTools: ReadonlySet<string
     const requestedTool = value.slice(CODEBUDDY_MCP_TOOL_PREFIX.length)
     if (requestedTool.length === 0) return { serverName: 'navigator', toolName: 'missing', trusted: false }
     const catalogMatch = knownTools.has(requestedTool)
-    return {
-      serverName: 'navigator',
-      toolName: catalogMatch ? 'catalog_match' : 'unknown',
-      trusted: catalogMatch,
-    }
+    return { serverName: 'navigator', toolName: catalogMatch ? 'catalog_match' : 'unknown', trusted: catalogMatch }
   }
-  if (!value.startsWith('mcp__')) {
-    return { serverName: 'other', toolName: 'unknown', trusted: false }
-  }
+  if (!value.startsWith('mcp__')) return { serverName: 'other', toolName: 'unknown', trusted: false }
   const separator = value.indexOf('__', 'mcp__'.length)
   if (separator < 0) return { serverName: 'other', toolName: 'unknown', trusted: false }
   const serverName = value.slice('mcp__'.length, separator) === 'navigator' ? 'navigator' : 'other'
   const requestedTool = value.slice(separator + 2)
   if (requestedTool.length === 0) return { serverName, toolName: 'missing', trusted: false }
   const catalogMatch = knownTools.has(requestedTool)
-  return {
-    serverName,
-    toolName: catalogMatch ? 'catalog_match' : 'unknown',
-    trusted: serverName === 'navigator' && catalogMatch,
-  }
+  return { serverName, toolName: catalogMatch ? 'catalog_match' : 'unknown', trusted: serverName === 'navigator' && catalogMatch }
 }
 
-/** Preserve the pre-metadata custom ACP shape without trusting it for native CodeBuddy requests. | 兼容旧 custom ACP 形状，不用于原生 CodeBuddy 请求。 */
+/** Preserve the old custom ACP raw-input shape without treating it as native identity. */
 function legacyMcpToolIdentity(
   kind: string | undefined,
   rawInput: Record<string, unknown>,
@@ -586,11 +292,7 @@ function legacyMcpToolIdentity(
     .find(value => typeof value === 'string') as string | undefined
   const serverName = serverValue === undefined ? 'missing' : serverValue === 'navigator' ? 'navigator' : 'other'
   const toolName = toolValue === undefined ? 'missing' : knownTools.has(toolValue) ? 'catalog_match' : 'unknown'
-  return {
-    serverName,
-    toolName,
-    trusted: serverName === 'navigator' && toolName === 'catalog_match',
-  }
+  return { serverName, toolName, trusted: serverName === 'navigator' && toolName === 'catalog_match' }
 }
 
 /** Choose an allowlisted CodeBuddy model; an empty deployment value uses GLM. */
@@ -600,39 +302,6 @@ export function validateCodeBuddyModel(value: string | undefined): string {
     throw new TypeError('CYRENE_HARNESS_CODEBUDDY_ACP_MODEL must be glm-5.3-flash or deepseek-v4.1-flash')
   }
   return model
-}
-
-/** Abort the entire run when an ACP protocol operation exceeds its fixed deadline. */
-async function withRunDeadline<T>(
-  promise: Promise<T>,
-  controller: AbortController,
-  timeoutMs: number,
-  label: string,
-): Promise<T> {
-  const signal = controller.signal
-  signal.throwIfAborted()
-  let timer: ReturnType<typeof setTimeout> | undefined
-  let onAbort: (() => void) | undefined
-  const cancelled = new Promise<never>((_resolve, reject) => {
-    onAbort = () => reject(signal.reason instanceof Error ? signal.reason : new Error(`${label} cancelled`))
-    signal.addEventListener('abort', onAbort, { once: true })
-  })
-  const timedOut = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      const error = new NativeSubagentFailure(
-        `${label} timed out`,
-        'NATIVE_TIMEOUT: CodeBuddy ACP request timed out; task-local tool operations were cancelled and reconciled as uncertain when needed.',
-      )
-      controller.abort(error)
-      reject(error)
-    }, timeoutMs)
-  })
-  try {
-    return await Promise.race([promise, cancelled, timedOut])
-  } finally {
-    if (timer !== undefined) clearTimeout(timer)
-    if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
-  }
 }
 
 /** Preserve only the CodeBuddy profile and basic runtime/network environment. */
@@ -663,23 +332,13 @@ export function isolatedCodeBuddyEnvironment(childHome?: string, profileRoot?: s
   return env
 }
 
-interface PrivateConfigFile {
-  readonly path: string;
-  readonly cwd: string;
-  readonly childHome: string;
-  readonly profileRoot: string;
-  cleanup(): void;
-}
-
 /** Write the bridge capability below CodeBuddy's stable private CWD, never to CLI argv. */
 function createPrivateMcpConfigFile(value: Record<string, unknown>): PrivateConfigFile {
   const encoded = JSON.stringify(value)
   const configuredHome = process.env.CODEBUDDY_CONFIG_DIR
     ?? process.env.CODEBUDDY_HOME
     ?? join(process.env.HOME ?? homedir(), '.codebuddy')
-  if (!isAbsolute(configuredHome)) {
-    throw new Error('Navigator CodeBuddy configuration path must be absolute')
-  }
+  if (!isAbsolute(configuredHome)) throw new Error('Navigator CodeBuddy configuration path must be absolute')
   const configuredRoot = resolve(configuredHome)
   try {
     mkdirSync(configuredRoot, { mode: 0o700, recursive: true })
@@ -720,16 +379,10 @@ function createPrivateMcpConfigFile(value: Record<string, unknown>): PrivateConf
       try { closeSync(descriptor) } catch { /* Preserve only the fixed startup diagnostic. */ }
     }
     if (fileCreated) {
-      try {
-        assertPrivatePath(path, 'file', 0o600)
-        unlinkSync(path)
-      } catch { /* Never follow or remove a replacement path. */ }
+      try { assertPrivatePath(path, 'file', 0o600); unlinkSync(path) } catch { /* Do not follow a replaced path. */ }
     }
     if (directoryCreated) {
-      try {
-        assertPrivatePath(directory, 'directory', 0o700)
-        rmdirSync(directory)
-      } catch { /* Never recursively remove an unexpected directory. */ }
+      try { assertPrivatePath(directory, 'directory', 0o700); rmdirSync(directory) } catch { /* Do not remove a replacement. */ }
     }
     throw new Error('Navigator could not create a private CodeBuddy MCP configuration')
   }
@@ -748,20 +401,22 @@ function createPrivateMcpConfigFile(value: Record<string, unknown>): PrivateConf
   }
 }
 
-/** Create or verify one same-owner directory without following a replaced path. */
+/** Build CodeBuddy's stdio MCP descriptor from the current task capability. */
+function migrationAwarePrompt(prompt: string): string {
+  return [
+    'Navigator created a new CodeBuddy ACP conversation for this Work session. No previous DSH conversation history was imported.',
+    'Do not assume prior conversation context, repeat historical actions, or claim that an earlier operation was completed. Use only the current request and results returned by Navigator tools.',
+    '',
+    'Current user request:',
+    prompt,
+  ].join('\n')
+}
+
 function ensurePrivateDirectory(path: string, diagnostic: string): void {
-  try {
-    mkdirSync(path, { mode: 0o700 })
-  } catch (error: unknown) {
-    if (!(error instanceof Error) || !('code' in error) || error.code !== 'EEXIST') {
-      throw new Error(diagnostic)
-    }
+  try { mkdirSync(path, { mode: 0o700 }) } catch (error: unknown) {
+    if (!(error instanceof Error) || !('code' in error) || error.code !== 'EEXIST') throw new Error(diagnostic)
   }
-  try {
-    assertPrivatePath(path, 'directory', 0o700)
-  } catch {
-    throw new Error(diagnostic)
-  }
+  try { assertPrivatePath(path, 'directory', 0o700) } catch { throw new Error(diagnostic) }
 }
 
 function privateCodeBuddyProfileFailure(): NativeSubagentFailure {
@@ -782,66 +437,4 @@ function assertPrivatePath(path: string, kind: 'file' | 'directory', requiredOwn
   if (resolve(realpathSync(path)) !== resolve(path)) {
     throw new Error('The CodeBuddy MCP configuration path resolved through a symlink')
   }
-}
-
-function objectResult(value: unknown, label: string): Record<string, unknown> {
-  if (!isJsonObject(value)) throw new Error(`CodeBuddy ACP ${label} returned a non-object result`)
-  return value
-}
-
-function safeAcpDiagnostic(error: unknown): string {
-  const wire = nativeWireDiagnostic(error)
-  if (wire !== undefined) return wire
-  if (error instanceof NativeSubagentFailure) return error.diagnostic
-  if (isAuthRequired(error)) return authUnavailableFailure().diagnostic
-  return 'NATIVE_PROTOCOL_UNAVAILABLE: ACP turn failed; partial output retained, native details omitted.'
-}
-
-/** Build the ACP v1 stdio descriptor from this run's loopback bridge capability. */
-function createNavigatorAcpMcpServer(
-  entrypoint: string,
-  bridgeUrl: string,
-  bridgeToken: string,
-): AcpMcpServerStdio {
-  return {
-    name: 'navigator',
-    command: process.execPath,
-    args: [entrypoint],
-    env: [
-      { name: 'NAVIGATOR_ACP_BRIDGE_URL', value: bridgeUrl },
-      { name: 'NAVIGATOR_ACP_BRIDGE_TOKEN', value: bridgeToken },
-    ],
-  }
-}
-
-function safeAcpFailure(error: unknown, signal: AbortSignal): Error {
-  if (signal.aborted) return abortFailure(signal)
-  if (error instanceof NativeSubagentFailure) {
-    return new NativeSubagentFailure(error.diagnostic, error.diagnostic)
-  }
-  if (isAuthRequired(error)) return authUnavailableFailure()
-  const diagnostic = safeAcpDiagnostic(error)
-  if (error instanceof Error && error.message.includes('timed out')) {
-    return new NativeSubagentFailure('NATIVE_TIMEOUT: CodeBuddy ACP request timed out.', 'NATIVE_TIMEOUT: CodeBuddy ACP request timed out.')
-  }
-  return new NativeSubagentFailure(diagnostic, diagnostic)
-}
-
-function abortFailure(signal: AbortSignal): Error {
-  const reason = signal.reason
-  const suffix = reason instanceof Error && /timed out/iu.test(reason.message) ? 'TASK_TIMEOUT' : 'TASK_ABORTED'
-  return new NativeSubagentFailure(
-    suffix === 'TASK_TIMEOUT' ? 'CodeBuddy ACP task timed out' : 'CodeBuddy ACP task was cancelled',
-    `${suffix}: CodeBuddy ACP execution was stopped by Navigator.`,
-  )
-}
-
-function migrationAwarePrompt(prompt: string): string {
-  return [
-    'Navigator created a new CodeBuddy ACP conversation for this Work session. No previous DSH conversation history was imported.',
-    'Do not assume prior conversation context, repeat historical actions, or claim that an earlier operation was completed. Use only the current request and results returned by Navigator tools.',
-    '',
-    'Current user request:',
-    prompt,
-  ].join('\n')
 }

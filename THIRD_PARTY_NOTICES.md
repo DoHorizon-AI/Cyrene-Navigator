@@ -63,6 +63,39 @@ npm publication. It does not describe GitHub repository visibility.
 Harness package manifest 中的 `private: true` 只防止误发布到 npm，不表示 GitHub 仓库
 私有。
 
+## Optional external Antigravity ACP runtime / 可选外部 Antigravity ACP runtime
+
+The opt-in Navigator executor image may download Google's official Antigravity
+ACP Linux x86_64 or ARM64 release `1.4.5` at image build time. Each archive contains two
+required executables that remain adjacent at runtime:
+
+| File | SHA-256 |
+| --- | --- |
+| `agy-acp-server-1.4.5-linux-x86_64.zip` | `923923a0d7dc8073f66cc6f78647a3107e3a7ee2b7e1a24df8b3927b5188013b` |
+| `agy-acp-server-1.4.5-linux-arm64.zip` | `7d64246633ae094f67e3bbcd2d679e89048f91346d5339313336e7483f40f056` |
+| `agy_acp_server.par` from x86_64 archive | `7e7019c8989ca066cbac4d6580552b7a4ad39485dd6b6fd81de9daa9a7b39042` |
+| `localharness_external` from x86_64 archive | `6c6d28b61a704e9bae4351ea8c4ad4b8b0aba7e1f1027bdf1017401b9c6e18c0` |
+
+The release archives are downloaded from Google's official Linux release paths for [x86_64](https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-1.4.5-linux-x86_64.zip) and [ARM64](https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-1.4.5-linux-arm64.zip); see the [ACP Registry entry](https://github.com/agentclientprotocol/registry/blob/main/antigravity-acp/agent.json) for distribution metadata. The extracted-file hashes above were measured from the x86_64 archive only; the ARM64 archive hash is pinned, and its ZIP was checked for the two required sibling executables, but their extracted hashes were not independently measured. Google's terms are at <https://antigravity.google/terms>. The Registry marks the provider distribution proprietary. The binaries are not vendored in this source tree. This provenance notice does not grant redistribution rights or imply account eligibility, service entitlement, or billing behavior.
+
+可选 Navigator executor 镜像可在构建时下载 Google 官方 Antigravity ACP Linux x86_64 或 ARM64 `1.4.5`
+release。每个 archive 均含两个运行时必须保持同目录的可执行文件：
+
+| 文件 | SHA-256 |
+| --- | --- |
+| `agy-acp-server-1.4.5-linux-x86_64.zip` | `923923a0d7dc8073f66cc6f78647a3107e3a7ee2b7e1a24df8b3927b5188013b` |
+| `agy-acp-server-1.4.5-linux-arm64.zip` | `7d64246633ae094f67e3bbcd2d679e89048f91346d5339313336e7483f40f056` |
+| x86_64 archive 中的 `agy_acp_server.par` | `7e7019c8989ca066cbac4d6580552b7a4ad39485dd6b6fd81de9daa9a7b39042` |
+| x86_64 archive 中的 `localharness_external` | `6c6d28b61a704e9bae4351ea8c4ad4b8b0aba7e1f1027bdf1017401b9c6e18c0` |
+
+release archive 来自 Google 官方 Linux 发布地址：[x86_64](https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-1.4.5-linux-x86_64.zip) 和
+[ARM64](https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-1.4.5-linux-arm64.zip)；分发元数据见
+[ACP Registry 条目](https://github.com/agentclientprotocol/registry/blob/main/antigravity-acp/agent.json)。
+上面的解压文件哈希仅从 x86_64 archive 实测；ARM64 archive 哈希已固定，ZIP 中的两个同目录可执行文件已确认存在，
+但未单独测量其解压哈希。Google 服务条款见 <https://antigravity.google/terms>。Registry 将该 provider
+distribution 标记为 proprietary；这些 binary 不纳入本源码树。本来源声明不授予再分发权，也不代表账号资格、
+服务 entitlement 或计费行为。
+
 ## Rust / Rust 依赖
 
 `native/Cargo.toml` directly uses `hex` 0.4.3, `serde` 1.0.229,
