@@ -10,8 +10,10 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -355,6 +357,18 @@ def test_conversation_assistant_flag_reaches_only_the_executor() -> None:
             {"CYRENE_CONVERSATION_ASSISTANT_ENABLED": "yes"},
             workspace_id="round1-workspace",
         )
+
+
+def test_shutdown_stdin_is_opt_in_and_uses_the_launcher_command() -> None:
+    """The explicit launcher flag accepts only shutdown and treats closed stdin as exit."""
+
+    requested = threading.Event()
+    serve_local._watch_shutdown_stdin(requested, io.StringIO("diagnostic\nshutdown\n"))
+    assert requested.is_set()
+
+    closed = threading.Event()
+    serve_local._watch_shutdown_stdin(closed, io.StringIO(""))
+    assert closed.is_set()
 
 
 def test_generated_owner_is_harness_writer_and_custom_owner_must_opt_in(tmp_path: Path) -> None:

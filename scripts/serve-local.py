@@ -120,6 +120,11 @@ def main() -> int:
     )
     parser.add_argument("--startup-timeout", type=float, default=_STARTUP_TIMEOUT_SECONDS)
     parser.add_argument("--shutdown-timeout", type=float, default=_STOP_TIMEOUT_SECONDS)
+    parser.add_argument(
+        "--shutdown-stdin",
+        action="store_true",
+        help="gracefully stop when the launcher writes 'shutdown' or closes stdin",
+    )
     parser.add_argument("--node", default=os.environ.get("NODE", "node"))
     parser.add_argument(
         "--insecure-http",
@@ -216,6 +221,13 @@ def main() -> int:
 
     for signum in (signal.SIGINT, signal.SIGTERM):
         previous_handlers[signum] = signal.signal(signum, request_stop)
+    if args.shutdown_stdin:
+        threading.Thread(
+            target=_watch_shutdown_stdin,
+            args=(stop_requested,),
+            name="navigator-stdin-shutdown",
+            daemon=True,
+        ).start()
 
     try:
         with tempfile.TemporaryDirectory(prefix="principal-", dir=runtime_dir) as temporary:
@@ -397,6 +409,19 @@ def _provider_configuration_is_complete(environment: Mapping[str, str]) -> bool:
 
     names = ("CYRENE_EXCHANGE_URL", "CYRENE_EXCHANGE_TOKEN", "CYRENE_HARNESS_MODEL")
     return all(environment.get(name) for name in names)
+
+
+def _watch_shutdown_stdin(stop_requested: threading.Event, stream: Any = None) -> None:
+    """Honor one launcher shutdown command without treating other stdin as input."""
+
+    input_stream = sys.stdin if stream is None else stream
+    try:
+        for line in input_stream:
+            if line.strip() == "shutdown":
+                stop_requested.set()
+                return
+    finally:
+        stop_requested.set()
 
 
 def _validate_public_url(value: str) -> None:
