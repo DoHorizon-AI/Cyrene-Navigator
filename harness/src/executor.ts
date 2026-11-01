@@ -42,6 +42,10 @@ import type { ConversationExecutionBackend } from './codebuddy-acp-execution.js'
 import type { WorkflowSourceTaskReceipt } from './workflows/store.js';
 import { getConnectorToolCatalog } from './tool-providers.js';
 
+const DEFAULT_PRIVATE_TEAMS_NOTIFICATION_TIMEOUT_MS = 75_000;
+const PRIVATE_TEAMS_NOTIFICATION_CLAIM_LIMIT = 1;
+const PRIVATE_TEAMS_NOTIFICATION_LEASE_SECONDS = 120;
+
 export type TaskStatus = ExecutionStatus;
 export type TaskExecutionClass = 'foreground' | 'background';
 
@@ -207,6 +211,8 @@ export interface TeamsExecutorConfig {
   readonly taskActorSubjectsFile?: string;
   /** Explicit opt-in gate paired with the Teams package's personal-chat setting. */
   readonly personalChatEnabled?: boolean;
+  /** Bounded outer private-send deadline; omitted production config uses 75 seconds. */
+  readonly privateNotificationTimeoutMs?: number;
   /** Host-selected actor allowed to use the existing free-form model entitlement. */
   readonly modelActorSubject?: string;
   readonly ingressSecretEnv: string;
@@ -2564,16 +2570,16 @@ export class NavigatorExecutor {
         && this.config.workState.finishPrivateNotification !== undefined) {
         const privateLeases = await this.config.workState.claimPrivateNotifications({
           workerId: `navigator-teams-private-${process.pid}`,
-          limit: 10,
-          leaseSeconds: 60,
+          limit: PRIVATE_TEAMS_NOTIFICATION_CLAIM_LIMIT,
+          leaseSeconds: PRIVATE_TEAMS_NOTIFICATION_LEASE_SECONDS,
           type: 'teams.message',
           connectorId: config.connectorId,
         });
         for (const lease of privateLeases) await this.deliverTeamsPersonalNotification(lease, config);
         const privateCredentialLeases = await this.config.workState.claimPrivateNotifications({
           workerId: `navigator-graph-credential-private-${process.pid}`,
-          limit: 10,
-          leaseSeconds: 60,
+          limit: PRIVATE_TEAMS_NOTIFICATION_CLAIM_LIMIT,
+          leaseSeconds: PRIVATE_TEAMS_NOTIFICATION_LEASE_SECONDS,
           type: 'teams.credential-health',
           connectorId: config.connectorId,
         });
@@ -2815,6 +2821,7 @@ export class NavigatorExecutor {
       }
       const requestId = `${notification.id}:attempt:${retryCount + 1}`;
       if (requestId.length > 200) throw new TypeError('Private notification request id is too long');
+      const sendSignal = privateTeamsNotificationSignal(config);
       providerCallStarted = true;
       const result = await config.sendPrivateMessage({
         requestId,
@@ -2829,7 +2836,7 @@ export class NavigatorExecutor {
         target_kind: 'owner_private',
         actor_aad_object_id: route.actorAadObjectId,
         text,
-      }, AbortSignal.timeout(15_000));
+      }, sendSignal);
       if (result.outcome === 'rate_limited' && result.retryAfterSeconds !== undefined) {
         await finish.call(this.config.workState, notification.id, lease.leaseToken, 'retry', {
           reasonCode: result.reasonCode ?? 'rate_limited',
@@ -2910,6 +2917,7 @@ export class NavigatorExecutor {
       }
       const requestId = `${notification.id}:attempt:${retryCount + 1}`;
       if (requestId.length > 200) throw new TypeError('Private credential health request id is too long');
+      const sendSignal = privateTeamsNotificationSignal(config);
       providerCallStarted = true;
       const result = await config.sendPrivateMessage({
         requestId,
@@ -2924,7 +2932,7 @@ export class NavigatorExecutor {
         target_kind: 'owner_private',
         actor_aad_object_id: route.actorAadObjectId,
         text,
-      }, AbortSignal.timeout(15_000));
+      }, sendSignal);
       if (result.outcome === 'rate_limited' && result.retryAfterSeconds !== undefined) {
         await finish.call(this.config.workState, notification.id, lease.leaseToken, 'retry', {
           reasonCode: result.reasonCode ?? 'rate_limited',
@@ -4204,6 +4212,15 @@ function validateTeamsRootThreadId(value: unknown): string {
     throw new ExecutorRequestError(400, 'TEAMS_ROOT_THREAD_INVALID', 'Teams root thread ID must be a positive numeric activity ID.');
   }
   return rootThreadId;
+}
+
+/** Bound the private sender's whole grant-plus-message window. | 私聊grant与消息共用外层总预算。 */
+function privateTeamsNotificationSignal(config: TeamsExecutorConfig): AbortSignal {
+  const timeoutMs = config.privateNotificationTimeoutMs ?? DEFAULT_PRIVATE_TEAMS_NOTIFICATION_TIMEOUT_MS;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 120_000) {
+    throw new TypeError('Invalid private Teams notification timeout');
+  }
+  return AbortSignal.timeout(timeoutMs);
 }
 
 function isUncertainConnectorOutcome(error: unknown): boolean {

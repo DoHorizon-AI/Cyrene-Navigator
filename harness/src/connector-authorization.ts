@@ -12,6 +12,7 @@ import type { CredentialHealthSnapshot } from './work-state-client.js';
 
 const GRANT_TTL_MAX_SECONDS = 15;
 const REQUEST_TIMEOUT_MS = 10_000;
+const PRIVATE_TEAMS_MESSAGE_TIMEOUT_MS = 60_000;
 const MAX_RESPONSE_BYTES = 2_000_000;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 /** Keep request deadlines available while a returned response body is consumed. | 响应体读取继续沿用同一请求期限。 */
@@ -125,12 +126,15 @@ export interface ExchangeConnectorAuthorizationConfig {
   readonly hmacKeyId: string;
   readonly audience: string;
   readonly requestTimeoutMs?: number;
+  /** Private Teams message POST+body cap; other Exchange calls keep requestTimeoutMs. */
+  readonly privateTeamsMessageTimeoutMs?: number;
 }
 
 /** Narrow, fail-closed client for Navigator's private Exchange integration facade. */
 export class ExchangeConnectorAuthorizationClient {
   private readonly origin: string;
   private readonly timeoutMs: number;
+  private readonly privateTeamsMessageTimeoutMs: number;
   private keyPromise?: Promise<Buffer>;
 
   constructor(private readonly config: ExchangeConnectorAuthorizationConfig) {
@@ -144,11 +148,16 @@ export class ExchangeConnectorAuthorizationClient {
     }
     this.origin = origin.origin;
     this.timeoutMs = config.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
+    this.privateTeamsMessageTimeoutMs = config.privateTeamsMessageTimeoutMs ?? PRIVATE_TEAMS_MESSAGE_TIMEOUT_MS;
     safeText(config.hmacKeyId, 'Exchange HMAC key id', 128);
     safeText(config.hmacKeyFile, 'Exchange HMAC key file', 2_000);
     safeText(config.audience, 'Exchange Authority audience', 256);
     if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs < 100 || this.timeoutMs > 120_000) {
       throw new TypeError('Invalid Exchange connector request timeout');
+    }
+    if (!Number.isSafeInteger(this.privateTeamsMessageTimeoutMs)
+      || this.privateTeamsMessageTimeoutMs < 100 || this.privateTeamsMessageTimeoutMs > 120_000) {
+      throw new TypeError('Invalid private Teams message request timeout');
     }
   }
 
@@ -345,7 +354,9 @@ export class ExchangeConnectorAuthorizationClient {
         text,
       });
       providerRequestStarted = true;
-      const response = await this.postGrantedResponse('/internal/v1/teams/messages', body, grant, signal, true);
+      const response = await this.postGrantedResponse(
+        '/internal/v1/teams/messages', body, grant, signal, true, this.privateTeamsMessageTimeoutMs,
+      );
       const row = object(await readJson(response), 'Exchange private Teams message result');
       if (row.requestId !== requestId) {
         throw new TypeError('Exchange returned a private Teams result for a different notification');
@@ -557,10 +568,11 @@ export class ExchangeConnectorAuthorizationClient {
     grant: ConnectorGrant,
     signal: AbortSignal,
     acceptRateLimited = false,
+    requestTimeoutMs = this.timeoutMs,
   ): Promise<Response> {
     return this.post(path, body, signal, {
       'X-Cyrene-Connector-Grant-Bin': grant.connectorGrantBin,
-    }, true, acceptRateLimited);
+    }, true, acceptRateLimited, requestTimeoutMs);
   }
 
   private async post(
@@ -570,6 +582,7 @@ export class ExchangeConnectorAuthorizationClient {
     headers: Readonly<Record<string, string>>,
     uncertainOnServerError = false,
     acceptRateLimited = false,
+    requestTimeoutMs = this.timeoutMs,
   ): Promise<Response> {
     if (signal.aborted) {
       throw new ExchangeConnectorRequestError(
@@ -581,7 +594,7 @@ export class ExchangeConnectorAuthorizationClient {
         'EXCHANGE_REQUEST_NOT_SENT',
       );
     }
-    const requestTimeoutSignal = AbortSignal.timeout(this.timeoutMs);
+    const requestTimeoutSignal = AbortSignal.timeout(requestTimeoutMs);
     let response: Response;
     try {
       response = await fetch(this.origin + path, {

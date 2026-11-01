@@ -957,6 +957,7 @@ test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and p
 
   const grantRequests = [];
   const privateBodies = [];
+  const responseTimers = new Set();
   const outcomes = ['accepted', 'accepted', 'uncertain'];
   const exchangeServer = createServer(async (req, res) => {
     const respond = (status, value) => {
@@ -974,14 +975,41 @@ test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and p
       }
       const { arguments: _arguments, ...claimsWithoutArguments } = body;
       const now = Math.floor(Date.now() / 1_000);
-      respond(200, {
+      const grantResponse = {
         connectorGrantBin: 'AQ==', grantRef: `private-grant-${grantRequests.length}`, audience: 'exchange',
         issuedAt: now, expiresAt: now + 10, claims: { ...claimsWithoutArguments, organizationId: 'private-org' },
-      });
+      };
+      if (body.requestId === 'outer-budget-timeout:attempt:1') {
+        const timer = setTimeout(() => {
+          responseTimers.delete(timer);
+          respond(200, grantResponse);
+        }, 50);
+        responseTimers.add(timer);
+        res.once('close', () => {
+          clearTimeout(timer);
+          responseTimers.delete(timer);
+        });
+      } else {
+        respond(200, grantResponse);
+      }
       return;
     }
     if (req.url === '/internal/v1/teams/messages') {
       privateBodies.push({ body, grant: req.headers['x-cyrene-connector-grant-bin'] });
+      if (body.requestId === 'outer-budget-timeout:attempt:1') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.write(`{"requestId":"${body.requestId}","status":"accepted"`);
+        const timer = setTimeout(() => {
+          responseTimers.delete(timer);
+          res.end(',"vendorMessageId":"late-private-delivery"}');
+        }, 400);
+        responseTimers.add(timer);
+        res.once('close', () => {
+          clearTimeout(timer);
+          responseTimers.delete(timer);
+        });
+        return;
+      }
       if (body.requestId === 'accepted-no-id:attempt:1') {
         respond(200, { requestId: body.requestId, status: 'accepted' });
         return;
@@ -1037,11 +1065,14 @@ test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and p
     leaseFor('accepted', ownerId, multilineFinal), leaseFor('accepted-no-id'), leaseFor('uncertain'),
     leaseFor('actor-mismatch', actorIds[1]), leaseFor('grant-no-response'),
     leaseFor('invalid-control', ownerId, 'Private owner\u000bstatus.'), leaseFor('blank-text', ownerId, '\n\t  \r '),
+    leaseFor('outer-budget-timeout'),
   ];
   const privateFinished = [];
   const workStateStore = new InMemoryWorkStateStore();
   let privateClaimCalls = 0;
+  const privateClaimInputs = [];
   workStateStore.claimPrivateNotifications = async input => {
+    privateClaimInputs.push(input);
     if (input.type !== 'teams.message') return [];
     privateClaimCalls += 1;
     return privateLeases.splice(0, 1);
@@ -1056,13 +1087,28 @@ test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and p
     hmacKeyFile: exchangeKeyPath,
     hmacKeyId: 'private-boot-test',
     audience: 'exchange',
+    requestTimeoutMs: 500,
+    privateTeamsMessageTimeoutMs: 300,
   });
+  const mintGrant = exchangeAuthorization.mintGrant.bind(exchangeAuthorization);
+  const sendPrivateTeamsMessage = exchangeAuthorization.sendPrivateTeamsMessage.bind(exchangeAuthorization);
+  let outerGrantSignal;
+  let outerSendSignal;
+  exchangeAuthorization.mintGrant = async (input, signal) => {
+    if (input.requestId === 'outer-budget-timeout:attempt:1') outerGrantSignal = signal;
+    return await mintGrant(input, signal);
+  };
+  exchangeAuthorization.sendPrivateTeamsMessage = async (input, grant, connectionRef, profileRef, signal) => {
+    if (input.requestId === 'outer-budget-timeout:attempt:1') outerSendSignal = signal;
+    return await sendPrivateTeamsMessage(input, grant, connectionRef, profileRef, signal);
+  };
   const teams = {
     connectorId: 'teams-v1', tenantId, allowedTeamIds: ['team-1'],
     botAppId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
     taskActorSubjects: [], taskActorSubjectsFile: directoryPath, personalChatEnabled: true,
     ingressSecretEnv: 'TEAMS_NAVIGATOR_HMAC_KEY', exchangeConnectionRef: '66666666-6666-4666-8666-666666666666',
     exchangeProfileRef: 'teams-private-boot-profile', exchangeAuthorization,
+    privateNotificationTimeoutMs: 150,
   };
   let app;
   try {
@@ -1087,9 +1133,10 @@ test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and p
     await app.executor['drainTeamsNotifications']();
     await app.executor['drainTeamsNotifications']();
     await app.executor['drainTeamsNotifications']();
+    await app.executor['drainTeamsNotifications']();
 
-    assert.equal(grantRequests.length, 5, 'revoked, mismatched, and invalid-text routes fail before grant creation');
-    assert.equal(privateBodies.length, 4);
+    assert.equal(grantRequests.length, 6, 'revoked, mismatched, and invalid-text routes fail before grant creation');
+    assert.equal(privateBodies.length, 5);
     assert.equal(grantRequests.filter(item => item.requestId === 'grant-no-response:attempt:1').length, 1,
       'a grant transport failure is observed once and does not start a second send');
     const grant = grantRequests[1];
@@ -1139,6 +1186,7 @@ test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and p
       ['grant-no-response', 'failed'],
       ['invalid-control', 'failed'],
       ['blank-text', 'failed'],
+      ['outer-budget-timeout', 'uncertain'],
     ]);
     assert.equal(privateFinished[3].result.vendorMessageId, null,
       'an accepted status without a vendor message ID cannot be recorded as delivered');
@@ -1155,6 +1203,26 @@ test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and p
     assert.equal(blankTextFinish.result.code, 'TEAMS_EVENT_INVALID',
       'whitespace-only message text fails before grant or Teams invocation');
     assert.equal(grantRequests.some(item => item.requestId === 'blank-text:attempt:1'), false);
+    assert.deepEqual(privateFinished.at(-1), {
+      id: 'outer-budget-timeout', outcome: 'uncertain', result: { code: 'EXCHANGE_CONNECTOR_ABORTED' },
+    }, 'the bounded outer timeout keeps a late body read uncertain');
+    assert.equal(outerGrantSignal, outerSendSignal, 'one outer signal covers grant and private send');
+    assert.ok(outerGrantSignal instanceof AbortSignal);
+    assert.equal(outerGrantSignal.aborted, true, 'the outer signal expires during response-body consumption');
+    assert.equal(grantRequests.filter(item => item.requestId === 'outer-budget-timeout:attempt:1').length, 1,
+      'the bounded grant-plus-send attempt is never repeated');
+    assert.equal(privateBodies.filter(item => item.body.requestId === 'outer-budget-timeout:attempt:1').length, 1,
+      'the timed-out private send is never replayed');
+    assert.equal(privateClaimCalls, 10);
+    assert.equal(privateClaimInputs.length, 20, 'each private drain claims both private notification types');
+    assert.ok(privateClaimInputs.every(item => item.limit === 1 && item.leaseSeconds === 120),
+      'all private claim calls lease one row for the complete bounded send window');
+    assert.deepEqual(
+      Object.fromEntries(['teams.message', 'teams.credential-health'].map(type => [
+        type, privateClaimInputs.filter(item => item.type === type).length,
+      ])),
+      { 'teams.message': 10, 'teams.credential-health': 10 },
+    );
     assert.ok(workRequests.some(item => item.url?.endsWith('/work/tasks/private-owner-task')
       && item.authorization === `Bearer ${tokens[0]}`));
     assert.ok(workRequests.some(item => item.url?.endsWith('/work/tasks/private-owner-task')
@@ -1162,9 +1230,10 @@ test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and p
 
     app.executor.config.teams.sendPrivateMessage = undefined;
     await app.executor['drainTeamsNotifications']();
-    assert.equal(privateClaimCalls, 9, 'private notices are not claimed if the fixed Exchange sender becomes unavailable');
+    assert.equal(privateClaimCalls, 10, 'private notices are not claimed if the fixed Exchange sender becomes unavailable');
   } finally {
     if (app !== undefined) await disposeApp(app);
+    for (const timer of responseTimers) clearTimeout(timer);
     exchangeServer.closeAllConnections();
     await new Promise(resolve => exchangeServer.close(resolve));
     workServer.closeAllConnections();
@@ -1608,10 +1677,19 @@ test('NavigatorExecutor: Graph credential notices leave the channel outbox and s
   const starts = [];
   const finishes = [];
   const privateSends = [];
+  const privateLeases = [privateLease, {
+    ...privateLease,
+    notification: {
+      ...privateLease.notification,
+      id: 'graph-private-notice-timeout',
+      deduplicationKey: 'graph-private-notice-timeout',
+    },
+    leaseToken: 'graph-private-notice-timeout-lease',
+  }];
   let sharedChannelSends = 0;
   store.claimPrivateNotifications = async input => {
     privateClaims.push(input);
-    return input.type === 'teams.credential-health' ? [privateLease] : [];
+    return input.type === 'teams.credential-health' ? privateLeases.splice(0, 1) : [];
   };
   store.claimNotifications = async input => {
     channelClaims.push(input);
@@ -1635,8 +1713,18 @@ test('NavigatorExecutor: Graph credential notices leave the channel outbox and s
     exchangeConnectionRef: 'teams-chat-connection',
     exchangeProfileRef: 'teams-chat-profile',
     personalChatEnabled: true,
-    sendPrivateMessage: async request => {
+    privateNotificationTimeoutMs: 100,
+    sendPrivateMessage: async (request, signal) => {
       privateSends.push(request);
+      if (privateSends.length === 2) {
+        await new Promise(resolve => {
+          if (signal.aborted) resolve();
+          else signal.addEventListener('abort', resolve, { once: true });
+        });
+        throw new ExchangeConnectorRequestError(
+          'Private Teams send was cancelled.', undefined, true, undefined, undefined, 'EXCHANGE_CONNECTOR_ABORTED',
+        );
+      }
       return { outcome: 'accepted', vendorMessageId: 'graph-private-delivery' };
     },
     credentialNotifications: {
@@ -1674,18 +1762,26 @@ test('NavigatorExecutor: Graph credential notices leave the channel outbox and s
 
   try {
     await executor['drainTeamsNotifications']();
-    assert.equal(privateSends.length, 1);
+    await executor['drainTeamsNotifications']();
+    assert.equal(privateSends.length, 2);
     assert.equal(privateSends[0].target_kind, 'owner_private');
     assert.equal(privateSends[0].actor_aad_object_id, ownerId);
     assert.equal(privateSends[0].conversation.conversation_id, '19:verified-owner-installation');
     assert.match(privateSends[0].text, /Microsoft 365/u);
+    assert.ok(privateClaims.every(item => item.limit === 1 && item.leaseSeconds === 120),
+      'private credential claims use a one-row claim and a lease longer than the bounded send budget');
     assert.equal(sharedChannelSends, 0);
     assert.ok(privateClaims.some(item => item.type === 'teams.credential-health'));
     assert.ok(channelClaims.some(item => item.type === 'teams.credential-health'));
-    assert.deepEqual(starts, [{ notificationId: privateLease.notification.id, leaseToken: privateLease.leaseToken }]);
+    assert.deepEqual(starts, [
+      { notificationId: privateLease.notification.id, leaseToken: privateLease.leaseToken },
+      { notificationId: 'graph-private-notice-timeout', leaseToken: 'graph-private-notice-timeout-lease' },
+    ]);
     assert.deepEqual(finishes.map(item => [item.notificationId, item.outcome]), [
       [privateLease.notification.id, 'delivered'],
+      ['graph-private-notice-timeout', 'uncertain'],
     ]);
+    assert.equal(finishes[1].result.code, 'EXCHANGE_CONNECTOR_ABORTED');
   } finally {
     await disposeApp(app);
   }

@@ -296,7 +296,8 @@ test('owner-private response body deadline is uncertain and never causes a secon
       hmacKeyFile: '/unused-for-provider-grant-fixture',
       hmacKeyId: 'test-key',
       audience: 'exchange',
-      requestTimeoutMs: 100,
+      requestTimeoutMs: 500,
+      privateTeamsMessageTimeoutMs: 100,
     });
     const startedAt = performance.now();
     await assert.rejects(
@@ -310,6 +311,73 @@ test('owner-private response body deadline is uncertain and never causes a secon
     assert.equal(received, 1, 'an incomplete accepted response must not trigger a duplicate send');
   } finally {
     if (responseTimer !== undefined) clearTimeout(responseTimer);
+    server.closeAllConnections();
+    await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
+});
+
+test('private Teams timeout is longer only for private sends; channel sends keep the ordinary cap', async () => {
+  const privateInput = {
+    requestId: 'private-notification-timeout-scope:attempt:1',
+    targetKind: 'owner_private',
+    conversation: privateConversation,
+    text: 'Private owner status.',
+  };
+  const channelInput = {
+    requestId: 'channel-notification-timeout-scope:attempt:1',
+    conversation: route,
+    text: 'The task completed.',
+  };
+  const received = [];
+  const responseTimers = new Set();
+  const server = createServer((request, response) => {
+    const chunks = [];
+    request.on('data', chunk => chunks.push(chunk));
+    request.on('end', () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      received.push(body);
+      const timer = setTimeout(() => {
+        response.end(JSON.stringify({
+          requestId: body.requestId,
+          status: 'accepted',
+          vendorMessageId: 'delayed-fixture-message',
+        }));
+        responseTimers.delete(timer);
+      }, 150);
+      responseTimers.add(timer);
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.once('close', () => {
+        clearTimeout(timer);
+        responseTimers.delete(timer);
+      });
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = server.address();
+    const client = new ExchangeConnectorAuthorizationClient({
+      baseUrl: `http://127.0.0.1:${address.port}`,
+      hmacKeyFile: '/unused-for-provider-grant-fixture',
+      hmacKeyId: 'test-key',
+      audience: 'exchange',
+      requestTimeoutMs: 100,
+      privateTeamsMessageTimeoutMs: 400,
+    });
+    const privateResult = await client.sendPrivateTeamsMessage(
+      privateInput, privateGrantFor(privateInput), connectionRef, profileRef, new AbortController().signal,
+    );
+    assert.deepEqual(privateResult, { outcome: 'accepted', vendorMessageId: 'delayed-fixture-message' });
+    assert.equal(received.length, 1);
+
+    await assert.rejects(
+      client.sendTeamsMessage(
+        channelInput, grantFor(channelInput), connectionRef, profileRef, new AbortController().signal,
+      ), error => error instanceof ExchangeConnectorRequestError
+        && error.outcomeUnknown && error.safeCode === 'EXCHANGE_CONNECTOR_REQUEST_TIMEOUT',
+    );
+    assert.equal(received.length, 2, 'the channel call keeps its ordinary request cap and is never replayed');
+  } finally {
+    for (const timer of responseTimers) clearTimeout(timer);
     server.closeAllConnections();
     await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
   }
@@ -364,7 +432,8 @@ test('owner-private HTTP 408 body timeout keeps its uncertain classification and
       hmacKeyFile: '/unused-for-provider-grant-fixture',
       hmacKeyId: 'test-key',
       audience: 'exchange',
-      requestTimeoutMs: 100,
+      requestTimeoutMs: 500,
+      privateTeamsMessageTimeoutMs: 100,
     });
     const startedAt = performance.now();
     await assert.rejects(
