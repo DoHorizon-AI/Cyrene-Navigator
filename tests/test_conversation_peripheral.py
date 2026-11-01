@@ -23,6 +23,7 @@ from typing import Any
 from uuid import UUID
 
 import httpx
+import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
 
@@ -990,6 +991,138 @@ def test_exchange_http_adapter_mints_grant_and_invokes_only_fixed_internal_paths
     )
     assert invoke_body["request_id"] == grant_body["request_id"]
     assert "keyword" not in json.dumps(seen[0][1])
+
+
+def test_exchange_bilibili_preflight_returns_real_grant_without_consuming_it() -> None:
+    seen: list[tuple[str, dict[str, Any], Mapping[str, str]]] = []
+    grant_bytes = b"signed-directory-proof"
+    encoded_grant = base64.b64encode(grant_bytes).decode("ascii")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        headers = dict(request.headers)
+        seen.append((request.url.path, body, headers))
+        assert "authorization" not in headers
+        if request.url.path == "/internal/v1/bilibili/connections/list":
+            return httpx.Response(
+                200,
+                json={
+                    "connections": [
+                        {
+                            "connectionRef": CONNECTION_REF,
+                            "provider": "bilibili",
+                            "profileRef": PROFILE_REF,
+                            "enabled": True,
+                        }
+                    ]
+                },
+            )
+        if request.url.path == "/internal/v1/connector-operation-grants":
+            return httpx.Response(
+                200,
+                json={
+                    "connectorGrantBin": encoded_grant,
+                    "grantRef": "grant-bili-preflight",
+                    "expiresAt": 1_900_000_000,
+                    "claims": {
+                        "requestId": body["request_id"],
+                        "organizationId": body["organization_id"],
+                        "workspaceId": body["workspace_id"],
+                        "principalSubject": body["principal_subject"],
+                        "connectionRef": body["connection_ref"],
+                        "providerId": body["provider_id"],
+                        "profileRef": body["profile_ref"],
+                        "operationId": body["operation_id"],
+                        "resourceRef": body["resource_ref"],
+                        "argumentsDigestSha256": body["arguments_digest_sha256"],
+                    },
+                },
+            )
+        raise AssertionError(f"preflight must not dispatch: {request.url.path}")
+
+    transport = httpx.MockTransport(handler)
+    async_client = httpx.AsyncClient(transport=transport)
+    port = ExchangeBilibiliHttpClient(
+        "https://exchange.example",
+        _FakeNavigatorHmacSigner(),
+        client=async_client,
+    )
+    arguments = {"peer_user_id": "7654321", "message": "test message"}
+    idempotency_key = "work-operation:55555555-5555-4555-8555-555555555555"
+    try:
+        result = asyncio.run(
+            port.preflight_operation(
+                PRINCIPALS["writer-token"],
+                WORKSPACE,
+                connection_ref=CONNECTION_REF,
+                profile_ref=PROFILE_REF,
+                operation_id="bilibili.dm.send",
+                target={"peer_user_id": "7654321"},
+                arguments=arguments,
+                idempotency_key=idempotency_key,
+            )
+        )
+    finally:
+        asyncio.run(async_client.aclose())
+
+    assert result == {
+        "grantRef": "grant-bili-preflight",
+        "proofDigest": hashlib.sha256(grant_bytes).hexdigest(),
+        "expiresAt": 1_900_000_000_000,
+    }
+    assert "directoryEpoch" not in result
+    assert [path for path, _, _ in seen] == [
+        "/internal/v1/bilibili/connections/list",
+        "/internal/v1/connector-operation-grants",
+    ]
+    grant_body = seen[1][1]
+    assert grant_body["idempotency_key"] == idempotency_key
+    assert grant_body["operation_id"] == "bilibili.dm.send"
+    assert grant_body["resource_ref"].startswith("sha256:")
+    assert grant_body["arguments"] == arguments
+
+
+def test_exchange_bilibili_preflight_rejects_unbound_target_and_write_key() -> None:
+    transport = httpx.MockTransport(
+        lambda _request: (_ for _ in ()).throw(AssertionError("invalid preflight reached Exchange"))
+    )
+    async_client = httpx.AsyncClient(transport=transport)
+    port = ExchangeBilibiliHttpClient(
+        "https://exchange.example",
+        _FakeNavigatorHmacSigner(),
+        client=async_client,
+    )
+    try:
+        with pytest.raises(ExchangeBilibiliHttpError) as missing_key:
+            asyncio.run(
+                port.preflight_operation(
+                    PRINCIPALS["writer-token"],
+                    WORKSPACE,
+                    connection_ref=CONNECTION_REF,
+                    profile_ref=PROFILE_REF,
+                    operation_id="bilibili.dm.send",
+                    target={"peer_user_id": "7654321"},
+                    arguments={"peer_user_id": "7654321", "message": "test"},
+                )
+            )
+        assert missing_key.value.code == "WORK_OPERATION_ID_REQUIRED"
+
+        with pytest.raises(ExchangeBilibiliHttpError) as target_mismatch:
+            asyncio.run(
+                port.preflight_operation(
+                    PRINCIPALS["writer-token"],
+                    WORKSPACE,
+                    connection_ref=CONNECTION_REF,
+                    profile_ref=PROFILE_REF,
+                    operation_id="bilibili.dm.send",
+                    target={"peer_user_id": "another-user"},
+                    arguments={"peer_user_id": "7654321", "message": "test"},
+                    idempotency_key="work-operation:55555555-5555-4555-8555-555555555555",
+                )
+            )
+        assert target_mismatch.value.code == "BILIBILI_PROFILE_TARGET_MISMATCH"
+    finally:
+        asyncio.run(async_client.aclose())
 
 
 def test_exchange_http_adapter_signs_profile_and_qr_routes_without_browser_credentials() -> None:

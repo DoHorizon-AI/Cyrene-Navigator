@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import inspect
 import ipaddress
@@ -270,6 +271,20 @@ class ExchangeBilibiliPort(Protocol):
     ) -> Mapping[str, Any] | Any:
         """Use Exchange's grant and connector dispatcher for one fixed operation."""
 
+    def preflight_operation(
+        self,
+        principal: PersistencePrincipal,
+        workspace_id: str,
+        *,
+        connection_ref: str,
+        profile_ref: str,
+        operation_id: str,
+        target: Mapping[str, Any],
+        arguments: Mapping[str, Any],
+        idempotency_key: str | None = None,
+    ) -> Mapping[str, Any] | Any:
+        """Mint the exact fresh Exchange grant without consuming it."""
+
 
 class ExchangeBilibiliHttpClient:
     """Real HMAC-authenticated Exchange HTTP adapter for conversation surfaces.
@@ -402,6 +417,150 @@ class ExchangeBilibiliHttpClient:
             principal=principal,
             workspace_id=workspace_id,
         )
+
+    async def preflight_operation(
+        self,
+        principal: PersistencePrincipal,
+        workspace_id: str,
+        *,
+        connection_ref: str,
+        profile_ref: str,
+        operation_id: str,
+        target: Mapping[str, Any],
+        arguments: Mapping[str, Any],
+        idempotency_key: str | None = None,
+    ) -> Mapping[str, Any]:
+        """Mint one exact Directory-backed proof without dispatching the provider.
+
+        Writes require the already-issued Work operation key. This method never
+        synthesizes a key or a Directory epoch, and it never calls the provider
+        operation endpoint. The proof digest is computed from the actual signed
+        grant bytes returned by Exchange.
+        """
+
+        if operation_id not in self._READ_OPERATIONS | self._WRITE_OPERATIONS:
+            raise ExchangeBilibiliHttpError("BILIBILI_OPERATION_NOT_FOUND", status_code=404)
+        if (
+            self._UUID.fullmatch(connection_ref) is None
+            or self._UUID.fullmatch(profile_ref) is None
+        ):
+            raise ExchangeBilibiliHttpError("BILIBILI_CONNECTION_NOT_FOUND", status_code=404)
+        normalized_connection = str(UUID(connection_ref))
+        normalized_profile = str(UUID(profile_ref))
+        if operation_id in self._WRITE_OPERATIONS and idempotency_key is None:
+            raise ExchangeBilibiliHttpError("WORK_OPERATION_ID_REQUIRED", status_code=422)
+        if idempotency_key is not None and (
+            not isinstance(idempotency_key, str)
+            or re.fullmatch(
+                r"work-operation:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                r"[0-9a-f]{4}-[0-9a-f]{12}",
+                idempotency_key,
+            )
+            is None
+        ):
+            raise ExchangeBilibiliHttpError("WORK_OPERATION_ID_REQUIRED", status_code=422)
+
+        try:
+            argument_bytes = _canonical_bilibili_json(arguments)
+            target_bytes = _canonical_bilibili_json(target)
+            expected_target = _bilibili_resource_projection(operation_id, arguments)
+            expected_target_bytes = _canonical_bilibili_json(expected_target)
+        except ValueError:
+            raise ExchangeBilibiliHttpError("BILIBILI_ARGUMENTS_INVALID", status_code=422) from None
+        if len(argument_bytes) > 64_000:
+            raise ExchangeBilibiliHttpError("BILIBILI_ARGUMENTS_TOO_LARGE", status_code=413)
+        if target_bytes != expected_target_bytes:
+            raise ExchangeBilibiliHttpError("BILIBILI_PROFILE_TARGET_MISMATCH", status_code=409)
+
+        connection_page = await self.list_owned_connections(principal, workspace_id)
+        rows = connection_page.get("connections")
+        if not isinstance(rows, list):
+            raise PeripheralPortError("EXCHANGE_CONNECTION_RESPONSE_INVALID")
+        connection = next(
+            (
+                row
+                for row in rows
+                if isinstance(row, Mapping)
+                and str(_exchange_value(row, "connection_ref", "connectionRef", "id")).lower()
+                == normalized_connection.lower()
+            ),
+            None,
+        )
+        if (
+            connection is None
+            or connection.get("provider") != "bilibili"
+            or connection.get("enabled") is not True
+        ):
+            raise ExchangeBilibiliHttpError("BILIBILI_CONNECTION_NOT_FOUND", status_code=404)
+        owned_profile = _exchange_value(connection, "profile_ref", "profileRef", "accountLinkRef")
+        if (
+            not isinstance(owned_profile, str)
+            or self._UUID.fullmatch(owned_profile) is None
+            or str(UUID(owned_profile)).lower() != normalized_profile.lower()
+        ):
+            raise ExchangeBilibiliHttpError("BILIBILI_PROFILE_NOT_FOUND", status_code=404)
+
+        resource_ref = _bilibili_resource_ref(normalized_profile, operation_id, expected_target)
+        digest = hashlib.sha256(argument_bytes).hexdigest()
+        request_id = uuid4().hex
+        grant_payload: dict[str, Any] = {
+            "request_id": request_id,
+            "workspace_id": workspace_id,
+            "connection_ref": normalized_connection,
+            "provider_id": "bilibili",
+            "profile_ref": normalized_profile,
+            "operation_id": operation_id,
+            "resource_ref": resource_ref,
+            "arguments": dict(arguments),
+            "arguments_digest_sha256": digest,
+        }
+        if idempotency_key is not None:
+            grant_payload["idempotency_key"] = idempotency_key
+        grant = await self._signed_post(
+            self._GRANT_PATH,
+            grant_payload,
+            principal=principal,
+            workspace_id=workspace_id,
+            request_id=request_id,
+        )
+
+        grant_bin = grant.get("connectorGrantBin")
+        grant_ref = grant.get("grantRef")
+        expires_at = grant.get("expiresAt")
+        claims = grant.get("claims")
+        try:
+            grant_bytes = base64.b64decode(grant_bin, validate=True)
+        except (TypeError, ValueError):
+            raise PeripheralPortError("EXCHANGE_CONNECTOR_GRANT_INVALID") from None
+        if (
+            not grant_bytes
+            or len(grant_bytes) > 64_000
+            or not isinstance(grant_ref, str)
+            or not grant_ref.strip()
+            or len(grant_ref) > 512
+            or isinstance(expires_at, bool)
+            or not isinstance(expires_at, int)
+            or expires_at <= 0
+            or not isinstance(claims, Mapping)
+            or claims.get("requestId") != request_id
+            or claims.get("organizationId") != principal.organization_id
+            or claims.get("workspaceId") != workspace_id
+            or claims.get("principalSubject") != principal.actor_id
+            or claims.get("connectionRef") != normalized_connection
+            or claims.get("providerId") != "bilibili"
+            or claims.get("profileRef") != normalized_profile
+            or claims.get("operationId") != operation_id
+            or claims.get("resourceRef") != resource_ref
+            or claims.get("argumentsDigestSha256") != digest
+        ):
+            raise PeripheralPortError("EXCHANGE_CONNECTOR_GRANT_INVALID")
+        return {
+            "grantRef": grant_ref,
+            "proofDigest": hashlib.sha256(grant_bytes).hexdigest(),
+            # Exchange returns whole Unix seconds; convert conservatively to the
+            # millisecond unit used by the Navigator domain expiry checks.
+            "expiresAt": expires_at * 1000,
+        }
 
     async def invoke_operation(
         self,
