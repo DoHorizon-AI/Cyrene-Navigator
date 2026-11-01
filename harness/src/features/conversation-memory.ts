@@ -11,7 +11,7 @@ export type ConversationVisibility = 'private' | 'conversation' | 'workspace';
 export type ConversationRole = 'user' | 'assistant' | 'tool';
 export type ConversationMemoryKind = 'fact' | 'preference' | 'commitment' | 'episode';
 export type ConversationFeatureId = 'conversation-memory.v1' | 'persona-profile.v1'
-  | 'knowledge-graph-dream.v1' | 'research-work.v1' | 'nous-active.v1';
+  | 'knowledge-graph-dream.v1' | 'research-work.v1' | 'nous-active.v1' | 'conversation-media.v1';
 
 /** Server-derived scope attached to every turn and returned resource. */
 export interface ConversationScope {
