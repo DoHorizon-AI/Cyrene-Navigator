@@ -40,6 +40,15 @@ def test_work_proxy_keeps_credentials_server_side_and_forwards_cursor() -> None:
         assert requests[-1].url == "http://executor.test/api/v1/tasks"
         assert requests[-1].headers["authorization"] == "Bearer executor-private-test"
         assert "private-test" not in result.text
+        conversation_turn = client.post(
+            "/api/v1/conversation-assistant/turns",
+            json={"conversationId": "direct-owner", "text": "Remember this turn."},
+            headers={"X-CSRF-Token": csrf, "Idempotency-Key": "turn-1"},
+        )
+        assert conversation_turn.status_code == 200
+        assert requests[-1].url == "http://executor.test/api/v1/conversation-assistant/turns"
+        assert requests[-1].headers["authorization"] == "Bearer executor-private-test"
+        assert "executor-private-test" not in conversation_turn.text
         assert (
             client.get("/api/v1/tasks/t1/events", headers={"Last-Event-ID": "8"}).status_code == 200
         )

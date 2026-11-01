@@ -264,7 +264,9 @@ def main() -> int:
                 executor_command,
                 cwd=repository,
                 env=executor_env,
-                secrets_to_check=(session_token, executor_token),
+                secrets_to_check=_executor_startup_secrets(
+                    session_token, executor_token, executor_env
+                ),
             )
             services.append(executor)
             executor_banner = _read_startup(executor, args.startup_timeout)
@@ -655,6 +657,24 @@ def _executor_child_environment(
         }
     )
     return environment
+
+
+def _executor_startup_secrets(
+    session_token: str, executor_token: str, environment: Mapping[str, str]
+) -> tuple[str, ...]:
+    """Keep bearer values out of the executor's public readiness line.
+
+    The model-provider token is also checked because the executor receives it
+    directly and its startup envelope must remain safe to publish.
+    """
+
+    values = (
+        session_token,
+        executor_token,
+        environment.get("CYRENE_EXCHANGE_TOKEN", ""),
+        environment.get("CYRENE_EXCHANGE_INTEGRATION_USER_TOKEN", ""),
+    )
+    return tuple(dict.fromkeys(value for value in values if value))
 
 
 def _executor_integration_environment(

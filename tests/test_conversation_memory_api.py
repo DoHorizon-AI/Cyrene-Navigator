@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 from cyrene_navigator.persistence import PersistencePrincipal, create_persistence_app
 from cyrene_navigator.work.conversation_memory.providers import (
     EmbeddingBatch,
+    KnowledgeGraphProvider,
     MemoryProviderHit,
     MemoryProviderScope,
 )
@@ -87,19 +88,30 @@ class FakeMemoryProvider:
         assert len(embedding) == dimensions
         return [
             MemoryProviderHit(memory_id, 0.9, model, dimensions)
-            for (owner, memory_id), (_, _, _, _) in list(self.records.items())[:limit]
+            for (owner, memory_id), (_, _, _, _) in self.records.items()
             if owner == scope.actor_id
-        ]
+        ][:limit]
 
     def delete(self, *, memory_ids: Sequence[str], scope: MemoryProviderScope) -> None:
         for memory_id in memory_ids:
             self.records.pop((scope.actor_id, memory_id), None)
 
 
+class FakeGraphProvider:
+    """Graph fixture used to verify the official persistence composition seam."""
+
+    def apply_changeset(self, **_kwargs: object) -> dict[str, object]:
+        return {"readbackDigest": "0" * 64, "nodeCount": 0, "edgeCount": 0}
+
+    def query(self, **_kwargs: object) -> dict[str, object]:
+        return {"items": []}
+
+
 def _client(
     db_path: Path,
     *,
     with_provider: bool = False,
+    graph_provider: KnowledgeGraphProvider | None = None,
 ) -> TestClient:
     provider = FakeMemoryProvider() if with_provider else None
     return TestClient(
@@ -108,6 +120,7 @@ def _client(
             TOKENS,
             conversation_memory_embedding_client=FakeEmbeddings() if with_provider else None,
             conversation_memory_provider=provider,
+            conversation_graph_provider=graph_provider,
         )
     )
 
@@ -203,6 +216,29 @@ def test_message_event_idempotency_ignores_server_generated_time(tmp_path: Path)
             headers=_headers(),
         )
         assert forged.status_code == 422
+
+
+def test_graph_provider_from_persistence_composition_is_visible_to_work_routes(
+    tmp_path: Path,
+) -> None:
+    """The injected graph provider reaches the route that executes queries and changesets."""
+
+    graph_provider = FakeGraphProvider()
+    with _client(tmp_path / "graph-composition.sqlite3", graph_provider=graph_provider) as client:
+        assert client.app.state.graph_provider is graph_provider
+        response = client.post(
+            BASE + "/graph/query",
+            json={
+                "conversationId": "direct-alice",
+                "conversationKind": "direct",
+                "personaId": "persona-a",
+                "query": "project",
+                "limit": 10,
+            },
+            headers=_headers(),
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["items"] == []
 
 
 def test_exact_message_readback_is_actor_scope_and_lineage_checked(tmp_path: Path) -> None:
@@ -358,6 +394,60 @@ def test_explicit_source_grant_is_scoped_and_revocable(tmp_path: Path) -> None:
         assert no_longer_shared.json()["items"] == []
 
 
+def test_memory_query_merges_owner_scoped_provider_pages_before_global_limit(
+    tmp_path: Path,
+) -> None:
+    """Several authorized owners may each return candidates before the shared limit is applied."""
+
+    with _client(tmp_path / "multi-owner-query.sqlite3", with_provider=True) as client:
+        owners = (
+            ("alice-token", "alice", "direct-alice"),
+            ("bob-token", "bob", "direct-bob"),
+        )
+        for token, actor, conversation_id in owners:
+            for index in range(6):
+                message = _post_message(
+                    client,
+                    token=token,
+                    event_id=f"{actor}-event-{index}",
+                    conversation_id=conversation_id,
+                    visibility="conversation",
+                    content=f"Shared memory {actor} {index}",
+                )["message"]
+                memory = _create_memory(
+                    client,
+                    message["id"],
+                    token=token,
+                    conversation_id=conversation_id,
+                    visibility="workspace",
+                )
+                grant = client.post(
+                    BASE + f"/sources/{message['id']}/grants",
+                    json={
+                        "visibility": "conversation",
+                        "targetConversationId": "group-shared",
+                    },
+                    headers=_headers(token),
+                )
+                assert grant.status_code == 201, grant.text
+                assert memory["indexState"] == "indexed"
+
+        response = client.post(
+            BASE + "/memories/query",
+            json={
+                "conversationId": "group-shared",
+                "conversationKind": "group",
+                "personaId": "persona-a",
+                "query": "shared memory",
+                "limit": 10,
+            },
+            headers=_headers("bob-token"),
+        )
+        assert response.status_code == 200, response.text
+        assert len(response.json()["items"]) == 10
+        assert {item["scope"]["visibility"] for item in response.json()["items"]} == {"workspace"}
+
+
 def test_unconfigured_semantic_provider_fails_closed_and_revoke_invalidates(tmp_path: Path) -> None:
     """No provider is reported unavailable; source revocation removes indexed hits."""
 
@@ -476,6 +566,10 @@ def test_memory_corrections_and_deletion_use_version_cas(tmp_path: Path) -> None
     with _client(tmp_path / "memory-cas.sqlite3", with_provider=True) as client:
         message = _post_message(client)["message"]
         memory = _create_memory(client, message["id"])
+        memory_store = client.app.state.work_conversation_memory
+        active_readback = memory_store.get_memory("org-a", "w1", "alice", memory["id"])
+        assert active_readback is not None
+        assert active_readback["state"] == "active"
         updated = client.patch(
             BASE + f"/memories/{memory['id']}",
             json={"expectedVersion": 1, "text": "Corrected preference."},
@@ -491,9 +585,7 @@ def test_memory_corrections_and_deletion_use_version_cas(tmp_path: Path) -> None
         assert stale_update.status_code == 409
         assert stale_update.json()["code"] == "CONVERSATION_MEMORY_VERSION_CONFLICT"
 
-        missing_version = client.delete(
-            BASE + f"/memories/{memory['id']}", headers=_headers()
-        )
+        missing_version = client.delete(BASE + f"/memories/{memory['id']}", headers=_headers())
         assert missing_version.status_code == 422
         deleted = client.delete(
             BASE + f"/memories/{memory['id']}?expectedVersion=2", headers=_headers()
@@ -506,6 +598,17 @@ def test_memory_corrections_and_deletion_use_version_cas(tmp_path: Path) -> None
         )
         assert repeated.status_code == 200
         assert repeated.json()["duplicate"] is True
+        assert memory_store.get_memory("org-a", "w1", "alice", memory["id"]) is None
+        tombstone = memory_store.get_memory(
+            "org-a", "w1", "alice", memory["id"], include_deleted=True
+        )
+        assert tombstone is not None
+        assert tombstone["state"] == "deleted"
+        assert tombstone["version"] == updated.json()["memory"]["version"]
+        assert (
+            memory_store.get_memory("org-a", "w1", "bob", memory["id"], include_deleted=True)
+            is None
+        )
         stale_delete = client.delete(
             BASE + f"/memories/{memory['id']}?expectedVersion=1", headers=_headers()
         )

@@ -187,6 +187,7 @@ interface InternalTaskState {
     readonly userMessageId: string;
     readonly sourceRefs: readonly ConversationSourceRef[];
     assistantMessageId?: string;
+    assistantEventId?: string;
   };
   conversationDeliveryText?: string;
   conversationDeliveryHoldCode?: string;
@@ -196,6 +197,19 @@ interface InternalTaskState {
   patchChain: Promise<void>;
   patchFailure?: unknown;
   completion?: Promise<TaskOutcome>;
+}
+
+interface ConversationAssistantSourceProof {
+  readonly assistantMessageId: string;
+  readonly assistantEventId: string;
+  readonly conversationId: string;
+  readonly conversationKind: 'direct' | 'group';
+  readonly personaId: string;
+  readonly visibility: 'private' | 'conversation';
+  readonly userEventId: string;
+  readonly contentSha256: string;
+  readonly sourceRefsSha256: string;
+  readonly authorizationEpoch: number;
 }
 
 export interface ExecutorConfig {
@@ -1903,7 +1917,7 @@ export class NavigatorExecutor {
         : isAborted ? abortMessage(task.abortController.signal.reason) : safeErrorMessage(err));
       const durationMs = endedAt - (task.record.startedAt ?? task.record.createdAt);
       if (task.record.status !== 'completed' && task.conversationTurn?.assistantMessageId !== undefined) {
-        await this.revokeUnsentConversationAssistantMessage(task, task.output).catch(() => undefined);
+        await this.revokeUnsentConversationAssistantMessage(task).catch(() => undefined);
       }
       task.output ||= task.agent ? this.extractLatestAssistantText(task.agent.session) : '';
       if (task.conversationTurn !== undefined) {
@@ -2094,7 +2108,14 @@ export class NavigatorExecutor {
         || message.scope.conversationKind !== conversationKind
         || message.scope.personaId !== profile.personaId
         || (message.role !== 'user' && message.role !== 'assistant')) continue;
-      const refs = message.sourceRefs ?? [];
+      const refs: readonly ConversationSourceRef[] = [
+        ...(message.sourceRefs ?? []),
+        {
+          memoryId: null,
+          memoryVersion: null,
+          sourceMessageIds: [message.id],
+        },
+      ];
       if (candidates.length >= 48 || historyCharacters + message.content.length > 16_000) continue;
       const messageSourceCount = refs.reduce((count, ref) => count + ref.sourceMessageIds.length, 0);
       if (candidates.reduce((count, item) => count + item.refs.length, 0) + refs.length > 256
@@ -2245,72 +2266,89 @@ export class NavigatorExecutor {
       return decision.code ?? 'SOURCE_AUTHORIZATION_UNAVAILABLE';
     }
     try {
-      await turn.feature.afterTurn(turn.context, {
+      const receipt = await turn.feature.afterTurn(turn.context, {
         userEventId: turn.userEventId,
         assistantText,
         status: 'completed',
         sourceRefs: turn.sourceRefs,
       });
-      const workState = task.workState ?? this.config.workState;
-      const api = workState.conversationMemoryApiV1?.(turn.context.actorId);
-      if (api === undefined) {
-        throw new ExecutorRequestError(
-          503,
-          'CONVERSATION_MEMORY_API_UNAVAILABLE',
-          'The actor-scoped conversation API disappeared before delivery.',
-        );
-      }
-      const page = await api.listMessages(turn.context, {
-        conversationId: turn.context.conversationId,
-        conversationKind: turn.context.conversationKind,
-        order: 'desc',
-        limit: 10,
-      });
-      const message = page.items.find(item => item.role === 'assistant' && item.content === assistantText
-        && item.scope.conversationId === turn.context.conversationId
-        && item.scope.personaId === turn.context.personaId);
-      if (message === undefined) {
+      if (receipt === undefined || !isConversationMessageId(receipt.assistantMessageId)
+        || typeof receipt.assistantEventId !== 'string' || receipt.assistantEventId.length > 512) {
         throw new ExecutorRequestError(
           502,
           'CONVERSATION_ASSISTANT_MESSAGE_UNAVAILABLE',
-          'The Work API did not return the exact current assistant message after archival.',
+          'Conversation archive did not return its exact assistant message receipt.',
         );
       }
-      turn.assistantMessageId = message.id;
+      turn.assistantMessageId = receipt.assistantMessageId;
+      turn.assistantEventId = receipt.assistantEventId;
+      const workState = task.workState ?? this.config.workState;
+      const api = workState.conversationMemoryApiV1?.(turn.context.actorId);
+      const exactRead = workState.getConversationMemoryMessage;
+      if (api === undefined || exactRead === undefined) {
+        throw new ExecutorRequestError(
+          503,
+          'CONVERSATION_MEMORY_API_UNAVAILABLE',
+          'The actor-scoped exact-message API disappeared before delivery.',
+        );
+      }
+      const message = await exactRead.call(workState, {
+        messageId: receipt.assistantMessageId,
+        conversationId: turn.context.conversationId,
+        conversationKind: turn.context.conversationKind,
+        personaId: turn.context.personaId,
+      }, turn.context.signal);
+      if (message === undefined || message.id !== receipt.assistantMessageId
+        || message.eventId !== receipt.assistantEventId || message.status !== 'active'
+        || message.role !== 'assistant' || message.content !== assistantText
+        || !conversationSourceRefsCover(message.sourceRefs ?? [], turn.sourceRefs)) {
+        throw new ExecutorRequestError(
+          409,
+          'CONVERSATION_ASSISTANT_MESSAGE_MISMATCH',
+          'Exact Work message readback differs from the completed assistant response.',
+        );
+      }
       const finalDecision = await turn.feature.beforeDelivery(turn.context, {
         text: assistantText,
         sourceRefs: turn.sourceRefs,
+        assistantEventId: receipt.assistantEventId,
       });
       if (finalDecision.decision !== 'allow') {
         await api.revokeSource(turn.context, message.id);
         turn.assistantMessageId = undefined;
+        turn.assistantEventId = undefined;
         return finalDecision.code ?? 'SOURCE_AUTHORIZATION_UNAVAILABLE';
       }
+      await workState.appendEvent(task.id, {
+        type: 'conversation-assistant-source.v1',
+        assistantMessageId: receipt.assistantMessageId,
+        assistantEventId: receipt.assistantEventId,
+        conversationId: turn.context.conversationId,
+        conversationKind: turn.context.conversationKind,
+        personaId: turn.context.personaId,
+        visibility: turn.context.visibility,
+        userEventId: turn.userEventId,
+        contentSha256: sha256(assistantText),
+        sourceRefsSha256: sha256(canonicalJson(message.sourceRefs ?? [])),
+        authorizationEpoch: finalDecision.authorizationEpoch,
+      });
       return 'allow';
     } catch (error: unknown) {
-      await this.revokeUnsentConversationAssistantMessage(task, assistantText);
+      await this.revokeUnsentConversationAssistantMessage(task);
       throw error;
     }
   }
 
-  private async revokeUnsentConversationAssistantMessage(task: InternalTaskState, assistantText: string): Promise<void> {
+  private async revokeUnsentConversationAssistantMessage(task: InternalTaskState): Promise<void> {
     const turn = task.conversationTurn;
-    if (turn === undefined) return;
+    if (turn === undefined || turn.assistantMessageId === undefined) return;
     const workState = task.workState ?? this.config.workState;
     const api = workState.conversationMemoryApiV1?.(turn.context.actorId);
     if (api === undefined) return;
     try {
-      const messageId = turn.assistantMessageId ?? (await api.listMessages(turn.context, {
-        conversationId: turn.context.conversationId,
-        conversationKind: turn.context.conversationKind,
-        order: 'desc',
-        limit: 10,
-      })).items.find(item => item.role === 'assistant' && item.content === assistantText
-        && item.scope.conversationId === turn.context.conversationId
-        && item.scope.personaId === turn.context.personaId)?.id;
-      if (messageId !== undefined) await api.revokeSource(turn.context, messageId);
+      await api.revokeSource(turn.context, turn.assistantMessageId);
     } catch {
-      // The task remains held; a later source-authorization pass fails closed if cleanup is unavailable.
+      // The task remains held; the exact source id is preserved for controlled reconciliation.
     }
   }
 
@@ -3635,40 +3673,70 @@ export class NavigatorExecutor {
         'Current conversation source authorization is unavailable at Teams delivery.',
       );
     }
-    const metadata = task.metadata ?? {};
-    const isGroup = metadata.teamsThread !== undefined;
-    const conversationKind = isGroup ? 'group' as const : 'direct' as const;
-    const visibility = isGroup ? 'conversation' as const : 'private' as const;
     const profile = this.config.conversationAssistant;
     const signal = AbortSignal.timeout(10_000);
+    const proof = await this.readConversationAssistantSourceProof(task.id, workState);
+    if (proof === undefined || proof.contentSha256 !== sha256(text)
+      || proof.personaId !== profile.personaId) {
+      throw new ExecutorRequestError(
+        409,
+        'CONVERSATION_ASSISTANT_RESPONSE_SOURCE_MISSING',
+        'The exact assistant response has no durable Task source proof.',
+      );
+    }
+    const metadata = task.metadata ?? {};
+    const origin = metadata.navigatorConversationOrigin;
+    const originRow = origin !== null && typeof origin === 'object' && !Array.isArray(origin)
+      ? origin as Record<string, unknown>
+      : undefined;
+    const isGroup = originRow?.kind === 'teams_channel' && originRow.conversationKind === 'group';
+    const conversationKind = isGroup ? 'group' as const : 'direct' as const;
+    const visibility = isGroup ? 'conversation' as const : 'private' as const;
+    const expectedConversationId = originRow?.kind === 'web' && typeof originRow.conversationId === 'string'
+      ? originRow.conversationId
+      : task.sessionId;
+    if (proof.conversationId !== expectedConversationId || proof.conversationKind !== conversationKind
+      || proof.visibility !== visibility) {
+      throw new ExecutorRequestError(
+        409,
+        'CONVERSATION_ASSISTANT_SCOPE_MISMATCH',
+        'Task receipt is outside its authenticated Web or Teams conversation scope.',
+      );
+    }
     const context: TrustedTurnContext = {
       taskId: task.id,
       sessionId: task.sessionId,
       workspaceId: this.config.workspaceId,
       actorId,
-      conversationId: task.sessionId,
+      conversationId: proof.conversationId,
       conversationKind,
-      personaId: profile.personaId,
+      personaId: proof.personaId,
       visibility,
       authorizationEpoch: overview.authorizationEpoch,
       signal,
     };
-    const page = await api.listMessages(context, {
-      conversationId: context.conversationId,
+    const exactRead = workState.getConversationMemoryMessage;
+    if (exactRead === undefined) {
+      throw new ExecutorRequestError(
+        503,
+        'CONVERSATION_MEMORY_API_UNAVAILABLE',
+        'Exact message readback is unavailable at Teams delivery.',
+      );
+    }
+    const response = await exactRead.call(workState, {
+      messageId: proof.assistantMessageId,
+      conversationId: proof.conversationId,
       conversationKind,
-      order: 'desc',
-      limit: 20,
-    });
-    const response = page.items.find(message => message.role === 'assistant' && message.content === text
-      && message.scope.conversationId === context.conversationId
-      && message.scope.conversationKind === conversationKind
-      && message.scope.personaId === profile.personaId
-      && message.scope.visibility === visibility);
-    if (response === undefined) {
+      personaId: proof.personaId,
+    }, signal);
+    if (response === undefined || response.id !== proof.assistantMessageId
+      || response.eventId !== proof.assistantEventId || response.status !== 'active'
+      || response.role !== 'assistant' || sha256(response.content) !== proof.contentSha256
+      || sha256(canonicalJson(response.sourceRefs ?? [])) !== proof.sourceRefsSha256) {
       throw new ExecutorRequestError(
         409,
-        'CONVERSATION_ASSISTANT_RESPONSE_SOURCE_MISSING',
-        'The exact assistant response has no active Work source record.',
+        'CONVERSATION_ASSISTANT_SOURCE_MISSING',
+        'The exact assistant source is no longer active or differs from its Task receipt.',
       );
     }
     const authorization = await api.authorizeSources(context, {
@@ -3685,6 +3753,68 @@ export class NavigatorExecutor {
         'CONVERSATION_ASSISTANT_SOURCE_REVOKED',
         'Conversation sources changed before the Teams reply could be sent.',
       );
+    }
+  }
+
+  /** Read the one immutable assistant source receipt without searching by reply text. */
+  private async readConversationAssistantSourceProof(
+    taskId: string,
+    workState: WorkStateStore,
+  ): Promise<ConversationAssistantSourceProof | undefined> {
+    let cursor = 0;
+    let proof: ConversationAssistantSourceProof | undefined;
+    for (;;) {
+      const page = await workState.getEvents(taskId, cursor);
+      for (const row of page.events) {
+        if (row.event.type !== 'conversation-assistant-source.v1') continue;
+        const value = row.event;
+        const keys = [
+          'assistantMessageId', 'assistantEventId', 'conversationId', 'conversationKind', 'personaId',
+          'visibility', 'userEventId', 'contentSha256', 'sourceRefsSha256', 'authorizationEpoch', 'type',
+        ].sort();
+        if (Object.keys(value).sort().join('\0') !== keys.join('\0')
+          || value.type !== 'conversation-assistant-source.v1'
+          || typeof value.assistantMessageId !== 'string' || !isConversationMessageId(value.assistantMessageId)
+          || typeof value.assistantEventId !== 'string' || value.assistantEventId.length < 1 || value.assistantEventId.length > 512
+          || typeof value.conversationId !== 'string' || value.conversationId.length < 1 || value.conversationId.length > 512
+          || (value.conversationKind !== 'direct' && value.conversationKind !== 'group')
+          || typeof value.personaId !== 'string' || value.personaId.length < 1 || value.personaId.length > 512
+          || (value.visibility !== 'private' && value.visibility !== 'conversation')
+          || typeof value.userEventId !== 'string' || value.userEventId.length < 1 || value.userEventId.length > 512
+          || typeof value.contentSha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(value.contentSha256)
+          || typeof value.sourceRefsSha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(value.sourceRefsSha256)
+          || typeof value.authorizationEpoch !== 'number' || !Number.isSafeInteger(value.authorizationEpoch)
+          || value.authorizationEpoch < 0) {
+          throw new ExecutorRequestError(
+            409,
+            'CONVERSATION_ASSISTANT_RECEIPT_INVALID',
+            'The durable assistant source receipt has an invalid shape.',
+          );
+        }
+        const candidate: ConversationAssistantSourceProof = {
+          assistantMessageId: value.assistantMessageId,
+          assistantEventId: value.assistantEventId,
+          conversationId: value.conversationId,
+          conversationKind: value.conversationKind,
+          personaId: value.personaId,
+          visibility: value.visibility,
+          userEventId: value.userEventId,
+          contentSha256: value.contentSha256,
+          sourceRefsSha256: value.sourceRefsSha256,
+          authorizationEpoch: value.authorizationEpoch,
+        };
+        if (proof !== undefined && canonicalJson(proof) !== canonicalJson(candidate)) {
+          throw new ExecutorRequestError(
+            409,
+            'CONVERSATION_ASSISTANT_RECEIPT_CONFLICT',
+            'Task contains conflicting assistant source receipts.',
+          );
+        }
+        proof = candidate;
+      }
+      const last = page.events.at(-1)?.seq;
+      if (last === undefined || last <= cursor) return proof;
+      cursor = last;
     }
   }
 
@@ -4554,6 +4684,29 @@ function isTrustedConversationAssistantTask(record: TaskRecord): boolean {
     return origin.conversationKind === 'group' && record.metadata?.teamsThread !== undefined;
   }
   return false;
+}
+
+/** Ensure the persisted assistant lineage covers every host-retained context reference. */
+function conversationSourceRefsCover(
+  actual: readonly ConversationSourceRef[],
+  expected: readonly ConversationSourceRef[],
+): boolean {
+  const idsByLineage = new Map<string, Set<string>>();
+  for (const reference of actual) {
+    const key = `${reference.memoryId ?? ''}\0${reference.memoryVersion ?? ''}`;
+    const ids = idsByLineage.get(key) ?? new Set<string>();
+    for (const messageId of reference.sourceMessageIds) ids.add(messageId);
+    idsByLineage.set(key, ids);
+  }
+  return expected.every(reference => {
+    const key = `${reference.memoryId ?? ''}\0${reference.memoryVersion ?? ''}`;
+    const actualIds = idsByLineage.get(key);
+    return actualIds !== undefined && reference.sourceMessageIds.every(messageId => actualIds.has(messageId));
+  });
+}
+
+function isConversationMessageId(value: string): boolean {
+  return /^[a-f0-9]{32}$/u.test(value);
 }
 
 /** Treat an explicit persisted marker or server-reserved ID prefix as read-only. */

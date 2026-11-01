@@ -37,6 +37,11 @@ def work_proxy_targets(
             bearer_token=executor_token,
             timeout_seconds=600,
         ),
+        "/api/v1/conversation-assistant/turns": ProxyTarget(
+            executor_url.rstrip("/") + "/api/v1/conversation-assistant/turns",
+            bearer_token=executor_token,
+            timeout_seconds=600,
+        ),
         workspace_path: ProxyTarget(
             persistence_url.rstrip("/") + workspace_path,
             bearer_token=persistence_token,

@@ -328,6 +328,7 @@ def mount_work_routes(
     app.state.work_memory_embedding_client = embedding_client
     app.state.work_memory_provider = memory_provider
     app.state.work_graph_provider = graph_provider
+    app.state.graph_provider = graph_provider
     app.state.work_conversation_summarizer_available = summarizer_available
     app.state.work_connector_bridges = bridges
     app.state.work_private_conversation_policy = private_conversation_policy
@@ -438,9 +439,9 @@ def mount_work_routes(
                 conversation_domains.export_actor_backup(
                     principal.organization_id
                     or "legacy-"
-                    + hashlib.sha256(
-                        f"{workspace_id}\0{principal.actor_id}".encode()
-                    ).hexdigest()[:32],
+                    + hashlib.sha256(f"{workspace_id}\0{principal.actor_id}".encode()).hexdigest()[
+                        :32
+                    ],
                     workspace_id,
                     principal.actor_id,
                 )
@@ -799,19 +800,15 @@ def mount_work_routes(
                     raise
                 prior_task = None
             if prior_task is None:
-                if (
-                    job.get("state") != "queued"
-                    or metadata.get("jobVersion") != job.get("version")
-                ):
+                if job.get("state") != "queued" or metadata.get("jobVersion") != job.get("version"):
                     raise PersistenceError(
                         "WORK_TASK_BACKGROUND_PROVENANCE_REQUIRED",
                         409,
                         "A new maintenance Task must match the queued job version.",
                     )
-            elif (
-                prior_task.get("createdByActorId") != principal.actor_id
-                or prior_task.get("metadata") != dict(metadata)
-            ):
+            elif prior_task.get("createdByActorId") != principal.actor_id or prior_task.get(
+                "metadata"
+            ) != dict(metadata):
                 raise PersistenceError(
                     "WORK_TASK_BACKGROUND_PROVENANCE_REQUIRED",
                     409,
@@ -1351,9 +1348,7 @@ def mount_work_routes(
                 "unavailable",
             )
         try:
-            batch: EmbeddingBatch = embeddings.embed(
-                [str(current["text"])], purpose="document"
-            )
+            batch: EmbeddingBatch = embeddings.embed([str(current["text"])], purpose="document")
             if len(batch.vectors) != 1:
                 raise provider_unavailable(
                     "MEMORY_EMBEDDING_RESPONSE_INVALID",
@@ -1475,7 +1470,14 @@ def mount_work_routes(
             conversation_kind=conversation_kind,
             persona_id=persona_id,
         )
-        return receipt["message"]
+        message = receipt.get("message")
+        if not isinstance(message, dict):
+            raise PersistenceError(
+                "CONVERSATION_MEMORY_MESSAGE_INVALID",
+                500,
+                "The conversation store returned an invalid message view.",
+            )
+        return message
 
     @app.post(conversation_base + "/messages", status_code=201)
     def create_conversation_message(
@@ -1587,6 +1589,11 @@ def mount_work_routes(
                     scope=scope,
                     limit=per_owner_limit,
                 )
+                if len(owner_hits) > per_owner_limit:
+                    raise provider_unavailable(
+                        "MEMORY_PROVIDER_RESPONSE_INVALID",
+                        "A memory provider returned more candidates than requested for one owner.",
+                    )
                 all_hits.extend(owner_hits)
             hits = all_hits
         except PersistenceError:
@@ -1595,24 +1602,19 @@ def mount_work_routes(
             raise provider_unavailable(
                 "MEMORY_PROVIDER_UNAVAILABLE", "Semantic memory search is unavailable."
             ) from exc
-        if len(hits) > body.limit:
-            raise provider_unavailable(
-                "MEMORY_PROVIDER_RESPONSE_INVALID",
-                "The memory provider returned more candidates than requested.",
-            )
         hit_by_id: dict[str, MemoryProviderHit] = {}
-        for hit in hits:
+        for provider_hit in hits:
             if (
-                hit.model != batch.model
-                or hit.dimensions != batch.dimensions
-                or not isinstance(hit.score, (int, float))
-                or not math.isfinite(hit.score)
+                provider_hit.model != batch.model
+                or provider_hit.dimensions != batch.dimensions
+                or not isinstance(provider_hit.score, (int, float))
+                or not math.isfinite(provider_hit.score)
             ):
                 raise provider_unavailable(
                     "MEMORY_PROVIDER_RESPONSE_INVALID",
                     "The memory provider returned an incompatible model or score.",
                 )
-            hit_by_id.setdefault(hit.memory_id, hit)
+            hit_by_id.setdefault(provider_hit.memory_id, provider_hit)
         current = conversation_memory.overview(
             principal.organization_id, workspace_id, principal.actor_id
         )
@@ -1627,8 +1629,8 @@ def mount_work_routes(
         )
         result_items: list[dict[str, Any]] = []
         for memory in candidates:
-            hit = hit_by_id.get(str(memory["id"]))
-            if hit is None:
+            memory_hit = hit_by_id.get(str(memory["id"]))
+            if memory_hit is None:
                 continue
             result_items.append(
                 {
@@ -1638,7 +1640,7 @@ def mount_work_routes(
                     "sourceMessageIds": memory["sourceMessageIds"],
                     "sourceRefs": memory["sourceRefs"],
                     "version": memory["version"],
-                    "score": float(hit.score),
+                    "score": float(memory_hit.score),
                     "stale": False,
                     "scope": memory["scope"],
                 }

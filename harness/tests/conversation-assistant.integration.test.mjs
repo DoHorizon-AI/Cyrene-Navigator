@@ -31,7 +31,11 @@ class ConversationAdapter extends LlmAdapter {
     const content = options.messages?.at(-1)?.content?.[0]?.text ?? '';
     this.prompts.push(content);
     const currentMessage = content.split('Current user message:\n').at(-1) ?? content;
-    const reply = isSummary ? `Durable summary: ${currentMessage.slice(0, 500)}` : `Answer for ${currentMessage}`;
+    const reply = isSummary
+      ? `Durable summary: ${currentMessage.slice(0, 500)}`
+      : currentMessage.includes('Repeat the earlier marker.')
+        ? 'Earlier assistant-only finding: RESPONSE-SIDE-ALDER-92'
+        : `Answer for ${currentMessage}`;
     yield { type: 'block-start', index: 0, blockType: 'text' };
     yield { type: 'text-delta', index: 0, text: reply };
     yield { type: 'block-end', index: 0, block: { type: 'text', text: reply } };
@@ -49,6 +53,11 @@ function installConversationApi(store, { denyDelivery = false } = {}) {
     authorizationEpoch: 7,
     counts: { messages: 0, memories: 0, sources: 0 },
   });
+  store.getConversationMemoryMessage = async input => messages.find(message =>
+    message.id === input.messageId && message.status === 'active'
+      && message.scope.conversationId === input.conversationId
+      && message.scope.conversationKind === input.conversationKind
+      && message.scope.personaId === input.personaId);
   store.conversationMemoryApiV1 = actorId => {
     assert.equal(actorId, ACTOR_ID);
     return {
@@ -56,7 +65,7 @@ function installConversationApi(store, { denyDelivery = false } = {}) {
       async createMessage(context, input) {
         calls.push(`message:${input.role}`);
         const message = {
-          id: `message-${messages.length + 1}`,
+          id: String(messages.length + 1).toString(16).padStart(32, '0'),
           eventId: input.eventId,
           role: input.role,
           content: input.content,
@@ -205,7 +214,6 @@ test('conversation assistant persists the user turn and emits text only after th
       'message:assistant',
       'list-memories',
       'list-messages',
-      'list-messages',
       'authorize:3',
     ]);
     const textEvents = emitted.filter(event => event.type === 'text-delta');
@@ -342,6 +350,47 @@ test('a revoked prior conversation source is absent from the next temporary DSH 
     ));
     assert.equal(second.status, 'completed');
     assert.doesNotMatch(adapter.prompts.at(-1), /CERULEAN-PINE-47/u);
+  } finally {
+    await app.executor.dispose();
+    await app.pluginManager?.dispose();
+    await app.ctx.fiber.dispose();
+  }
+});
+
+test('revoking an injected assistant reply invalidates a later turn derived from that exact reply', async () => {
+  const { app, messages, adapter, revokeSource } = await makeApp(false);
+  try {
+    const first = await app.executor.executeTask(webTurn(
+      'conversation-lineage-first',
+      'web-lineage-session',
+      'The private marker is ALDER-QUARTZ-92.',
+    ));
+    assert.equal(first.status, 'completed');
+    const firstAssistant = messages.find(message => message.role === 'assistant');
+    assert.ok(firstAssistant);
+
+    const second = await app.executor.executeTask(webTurn(
+      'conversation-lineage-second',
+      'web-lineage-session',
+      'Repeat the earlier marker.',
+    ));
+    assert.equal(second.status, 'completed');
+    const secondAssistant = messages.filter(message => message.role === 'assistant').at(-1);
+    assert.ok(secondAssistant);
+    assert.ok(secondAssistant.sourceRefs.some(reference =>
+      reference.memoryId === null && reference.sourceMessageIds.includes(firstAssistant.id)));
+
+    revokeSource(firstAssistant.id);
+    assert.equal(firstAssistant.status, 'revoked');
+    assert.equal(secondAssistant.status, 'revoked');
+
+    const third = await app.executor.executeTask(webTurn(
+      'conversation-lineage-third',
+      'web-lineage-session',
+      'What was the earlier marker?',
+    ));
+    assert.equal(third.status, 'completed');
+    assert.doesNotMatch(adapter.prompts.at(-1), /RESPONSE-SIDE-ALDER-92/u);
   } finally {
     await app.executor.dispose();
     await app.pluginManager?.dispose();

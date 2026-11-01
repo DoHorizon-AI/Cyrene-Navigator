@@ -1395,8 +1395,7 @@ class ConversationMemoryStore:
             conn.execute("BEGIN")
             for index, (table, actor_column) in enumerate(table_scopes):
                 columns = [
-                    str(row[1])
-                    for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                    str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
                 ]
                 query = (
                     f"SELECT * FROM {table} WHERE organization_id=? AND workspace_id=? "
@@ -1467,15 +1466,37 @@ class ConversationMemoryStore:
         workspace_id: str,
         actor_id: str,
         memory_id: str,
-    ) -> JsonObject:
-        """Read one active actor-scoped memory with its exact lineage revision."""
+        *,
+        include_deleted: bool = False,
+    ) -> JsonObject | None:
+        """Read one actor-scoped memory, optionally including its tombstone state.
 
-        return self.get_memory_for_index(
-            organization_id,
-            workspace_id,
-            actor_id,
-            memory_id,
-        )
+        Migration recovery may verify a rollback using the same canonical store
+        view. Tombstones remain hidden by default and are never read across actor
+        scope. 迁移恢复通过权威存储读取 tombstone；默认视图仍只返回 active。
+        """
+
+        if type(include_deleted) is not bool:
+            raise _invalid(
+                "CONVERSATION_MEMORY_INVALID_TOMBSTONE_READ",
+                "include_deleted must be a boolean.",
+            )
+        org, workspace, actor = _scope(organization_id, workspace_id, actor_id)
+        identifier = _identifier(memory_id, "memoryId")
+        with self._connect() as conn:
+            if include_deleted:
+                row = conn.execute(
+                    """SELECT * FROM conversation_memory_items WHERE organization_id=?
+                       AND workspace_id=? AND actor_id=? AND memory_id=?""",
+                    (org, workspace, actor, identifier),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """SELECT * FROM conversation_memory_items WHERE organization_id=?
+                       AND workspace_id=? AND actor_id=? AND memory_id=? AND state='active'""",
+                    (org, workspace, actor, identifier),
+                ).fetchone()
+        return None if row is None else self._memory_view(row)
 
     def _validate_source_ids(
         self,
@@ -1577,9 +1598,7 @@ class ConversationMemoryStore:
         owner = str(row["actor_id"])
         if owner == actor:
             visibility = str(row["visibility"])
-            if (
-                visibility == "private" and conversation_kind != "direct"
-            ) or (
+            if (visibility == "private" and conversation_kind != "direct") or (
                 visibility == "conversation"
                 and (
                     str(row["conversation_id"]) != conversation
@@ -1602,6 +1621,7 @@ class ConversationMemoryStore:
                 (org, workspace, owner, source_id, _unix_ms(), conversation),
             ).fetchone()
             return grant is not None
+        return False
 
     def _can_access_memory(
         self,

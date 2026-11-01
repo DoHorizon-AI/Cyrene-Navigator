@@ -121,6 +121,25 @@ def test_executor_profile_environment_contains_only_declared_references(tmp_path
     assert "CYRENE_SUBAGENT_CONFIG" not in web_environment
 
 
+def test_executor_startup_redaction_includes_exchange_bearers() -> None:
+    """Executor readiness checks the model and delegated Product bearer values."""
+
+    secrets = serve_local._executor_startup_secrets(
+        "session-private",
+        "executor-private",
+        {
+            "CYRENE_EXCHANGE_TOKEN": "model-provider-private",
+            "CYRENE_EXCHANGE_INTEGRATION_USER_TOKEN": "delegated-user-private",
+        },
+    )
+    assert secrets == (
+        "session-private",
+        "executor-private",
+        "model-provider-private",
+        "delegated-user-private",
+    )
+
+
 def test_executor_profile_environment_fails_closed_for_malformed_config(tmp_path: Path) -> None:
     """Invalid JSON never reaches the executor as a partially loaded profile."""
 

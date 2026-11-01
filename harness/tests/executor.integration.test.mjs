@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 import { createExecutorApp } from '../dist/serve.js';
 import { parseCredentialNotificationsConfig } from '../dist/executor.js';
 import { InMemoryWorkStateStore, WorkStateClient, WorkStateHttpError } from '../dist/work-state-client.js';
@@ -21,6 +22,8 @@ import { ExchangeConnectorAuthorizationClient, ExchangeConnectorRequestError, ca
 import { disposeWithin } from '../../scripts/serve-executor.mjs';
 import { LlmAdapter, ToolCallId } from '@deepseek-ai/dsh-llm';
 import { defineTool } from '@deepseek-ai/dsh-tools';
+
+const SERVE_EXECUTOR_SCRIPT = fileURLToPath(new URL('../../scripts/serve-executor.mjs', import.meta.url));
 
 const TEST_BEARER = 'executor-test-token';
 process.env.CYRENE_EXECUTOR_TOKEN = TEST_BEARER;
@@ -1913,7 +1916,7 @@ test('serve-executor SIGTERM drain timeout exits nonzero within its cleanup boun
   skip: process.platform === 'win32' ? 'Windows terminates a child on SIGTERM instead of running the POSIX handler.' : false,
 }, async () => {
   const child = spawn(process.execPath, [
-    'scripts/serve-executor.mjs', '--port=0', '--host=127.0.0.1', '--test-mode', '--test-echo-adapter',
+    SERVE_EXECUTOR_SCRIPT, '--port=0', '--host=127.0.0.1', '--test-mode', '--test-echo-adapter',
     '--drain-timeout-ms=0', '--abort-cleanup-timeout-ms=500',
   ], {
     cwd: process.cwd(),
