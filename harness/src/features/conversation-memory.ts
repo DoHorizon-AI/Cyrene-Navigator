@@ -136,6 +136,7 @@ export interface ConversationMemoryApiV1 {
       readonly conversationKind: ConversationKind;
       readonly personaId: string | null;
       readonly state: 'active';
+      readonly memoryIds?: readonly string[];
       readonly limit: number;
     },
   ): Promise<{ readonly items: readonly ConversationMemory[]; readonly authorizationEpoch: number }>;
@@ -245,13 +246,16 @@ export interface ConversationAfterTurnInput {
 export interface ConversationDeliveryInput {
   readonly text: string;
   readonly sourceRefs: readonly ConversationSourceRef[];
+  /** Host message identity so proactive cooldown checks can exclude this pending response. */
+  readonly assistantEventId?: string;
 }
 
 /** Fail-closed result consumed before the host performs connector delivery. */
 export interface ConversationDeliveryDecision {
   readonly decision: 'allow' | 'hold';
   readonly code?: 'SOURCE_AUTHORIZATION_REVOKED' | 'SOURCE_AUTHORIZATION_EPOCH_CHANGED'
-    | 'SOURCE_AUTHORIZATION_UNAVAILABLE' | 'SOURCE_PROOF_MISSING';
+    | 'SOURCE_AUTHORIZATION_UNAVAILABLE' | 'SOURCE_PROOF_MISSING'
+    | 'PROACTIVE_POLICY_BLOCKED' | 'PROACTIVE_QUIET_HOURS' | 'PROACTIVE_COOLDOWN' | 'PROACTIVE_PROOF_MISSING';
   readonly authorizationEpoch: number;
 }
 
@@ -277,7 +281,10 @@ export interface ConversationMemoryFeature {
   beforeContext(context: TrustedTurnContext, input: ConversationContextInput): Promise<{
     readonly contributions: readonly ContextContribution[];
   }>;
-  afterTurn(context: TrustedTurnContext, input: ConversationAfterTurnInput): Promise<void>;
+  afterTurn(context: TrustedTurnContext, input: ConversationAfterTurnInput): Promise<{
+    readonly assistantMessageId: string;
+    readonly assistantEventId: string;
+  } | undefined>;
   beforeDelivery(context: TrustedTurnContext, input: ConversationDeliveryInput): Promise<ConversationDeliveryDecision>;
   correctMemory(context: TrustedTurnContext, memoryId: string, text: string): Promise<ConversationMemory>;
   deleteMemory(context: TrustedTurnContext, memoryId: string): Promise<{
@@ -395,18 +402,19 @@ export function createConversationMemoryFeature(options: ConversationMemoryFeatu
       assertTrustedScope(context);
       const expectedSources = pendingSourcesByTurn.get(turnKey(context))?.get(CONVERSATION_MEMORY_FEATURE_ID);
       context.signal.throwIfAborted();
-      if (!enabled || input.status !== 'completed') return;
+      if (!enabled || input.status !== 'completed') return undefined;
       const assistantText = boundedText(input.assistantText, MAX_MESSAGE_LENGTH);
       const userEventId = boundedText(input.userEventId, 512);
-      if (!assistantText || !userEventId) return;
+      if (!assistantText || !userEventId) return undefined;
       if (expectedSources === undefined || !isSourceRefsWellFormed(input.sourceRefs)
         || !containsAllSourceRefs(input.sourceRefs, expectedSources)) {
         throw new ConversationFeatureError('INVALID_SOURCE_PROOF', 'Completed turn omitted a context source reference');
       }
 
       // The ingress event is already persisted; this deterministic event id makes host retries safe.
-      await options.api.createMessage(context, {
-        eventId: deterministicId('assistant-turn', context, [userEventId]),
+      const assistantEventId = deterministicId('assistant-turn', context, [userEventId]);
+      const createdAssistant = await options.api.createMessage(context, {
+        eventId: assistantEventId,
         conversationId: context.conversationId,
         conversationKind: context.conversationKind,
         personaId: context.personaId,
@@ -416,103 +424,125 @@ export function createConversationMemoryFeature(options: ConversationMemoryFeatu
         sourceRefs: normalizeSourceRefs(input.sourceRefs),
         relatedEventIds: [userEventId],
       });
-
-      const activeMemories = await options.api.listMemories(context, {
-        conversationId: context.conversationId,
-        conversationKind: context.conversationKind,
-        personaId: context.personaId,
-        state: 'active',
-        limit: DEFAULT_MEMORY_LIST_LIMIT,
-      });
-      context.signal.throwIfAborted();
-
-      const archivedIds = new Set<string>();
-      for (const memory of activeMemories.items) {
-        if (!matchesScope(memory, context) || memory.state !== 'active' || memory.kind !== 'episode') continue;
-        for (const id of memory.sourceMessageIds) archivedIds.add(id);
+      const assistantMessageId = createdAssistant.message.id;
+      if (!isIdentifier(assistantMessageId)) {
+        throw new ConversationFeatureError('MEMORY_API_UNAVAILABLE', 'Conversation API returned no assistant message identity');
       }
-      if (activeMemories.authorizationEpoch !== context.authorizationEpoch) return;
-      const scannedMessages: ConversationMessage[] = [];
-      const scannedMessageIds = new Set<string>();
-      const seenCursors = new Set<string>();
-      let cursor: string | undefined;
-      let scannedPending = 0;
-      for (let pageIndex = 0; pageIndex < maximumHistoryScanPages && scannedPending < historyLimit; pageIndex += 1) {
-        context.signal.throwIfAborted();
-        const page = await options.api.listMessages(context, {
+      try {
+        const activeMemories = await options.api.listMemories(context, {
           conversationId: context.conversationId,
           conversationKind: context.conversationKind,
-          order: 'desc',
-          ...(cursor === undefined ? {} : { cursor }),
-          limit: 100,
+          personaId: context.personaId,
+          state: 'active',
+          limit: DEFAULT_MEMORY_LIST_LIMIT,
         });
-        if (page.items.length > 100) {
-          throw new ConversationFeatureError('MEMORY_API_UNAVAILABLE', 'Conversation page exceeded its requested limit');
-        }
-        if (page.items.length === 0) break;
-        const unseen = page.items.filter(message => !scannedMessageIds.has(message.id));
-        for (const message of unseen) scannedMessageIds.add(message.id);
-        scannedMessages.push(...unseen);
-        scannedPending += unseen.filter(message => (message.role === 'user' || message.role === 'assistant')
-          && message.status === 'active' && matchesScope(message, context) && !archivedIds.has(message.id)).length;
-        if (page.nextCursor === null) break;
-        if (seenCursors.has(page.nextCursor) || page.nextCursor === cursor) {
-          throw new ConversationFeatureError('MEMORY_API_UNAVAILABLE', 'Conversation page cursor did not advance');
-        }
-        seenCursors.add(page.nextCursor);
-        cursor = page.nextCursor;
-      }
-      const pending = scannedMessages
-        .filter(message => message.role === 'user' || message.role === 'assistant')
-        .filter(message => message.status === 'active' && matchesScope(message, context) && !archivedIds.has(message.id))
-        .sort(compareMessages)
-        .slice(-historyLimit);
-      const characterCount = pending.reduce((total, message) => total + message.content.length, 0);
-      if (pending.length < minimumMessages || characterCount < minimumCharacters) return;
+        context.signal.throwIfAborted();
 
-      for (const message of pending) {
-        if (message.sourceRefs !== undefined && !isSourceRefsWellFormed(message.sourceRefs)) {
-          throw new ConversationFeatureError('INVALID_SOURCE_PROOF', 'Stored message source lineage is invalid');
+        const archivedIds = new Set<string>();
+        for (const memory of activeMemories.items) {
+          if (!matchesScope(memory, context) || memory.state !== 'active' || memory.kind !== 'episode') continue;
+          for (const id of memory.sourceMessageIds) archivedIds.add(id);
         }
-      }
-      const inheritedSourceIds = pending.flatMap(message => (message.sourceRefs ?? []).flatMap(ref => ref.sourceMessageIds));
-      const sourceMessageIds = stableUnique([...pending.map(message => message.id), ...inheritedSourceIds], MAX_TOTAL_SOURCE_IDS);
-      if (sourceMessageIds.length < minimumMessages) return;
-      const sourceRefs = normalizeSourceRefs([
-        ...pending.flatMap(message => message.sourceRefs ?? []),
-        ...splitSourceRefs(null, null, stableUnique(pending.map(message => message.id), MAX_TOTAL_SOURCE_IDS)),
-      ], MAX_SUMMARY_SOURCE_INPUTS);
-      const proof = await authorizeConversationSourcesV1(options.api, context, sourceRefs);
-      if (!proof.allowed || proof.currentAuthorizationEpoch !== context.authorizationEpoch) return;
-      context.signal.throwIfAborted();
-      let summary: string;
-      try {
-        if (summaryProvider === undefined) {
-          throw new ConversationFeatureError('MODEL_UNAVAILABLE', 'A configured summary provider v1 is required');
+        if (activeMemories.authorizationEpoch !== context.authorizationEpoch) {
+          throw new ConversationFeatureError('MEMORY_API_UNAVAILABLE', 'Authorization changed while reading conversation history');
         }
-        summary = boundedText(await summaryProvider.summarize({
-          scope: scopeOf(context),
-          messages: pending.map(({ id, role, content, occurredAt }) => ({ id, role, content, occurredAt })),
-          signal: context.signal,
-        }), MAX_MEMORY_LENGTH);
+        const scannedMessages: ConversationMessage[] = [];
+        const scannedMessageIds = new Set<string>();
+        const seenCursors = new Set<string>();
+        let cursor: string | undefined;
+        let scannedPending = 0;
+        for (let pageIndex = 0; pageIndex < maximumHistoryScanPages && scannedPending < historyLimit; pageIndex += 1) {
+          context.signal.throwIfAborted();
+          const page = await options.api.listMessages(context, {
+            conversationId: context.conversationId,
+            conversationKind: context.conversationKind,
+            order: 'desc',
+            ...(cursor === undefined ? {} : { cursor }),
+            limit: 100,
+          });
+          if (page.items.length > 100) {
+            throw new ConversationFeatureError('MEMORY_API_UNAVAILABLE', 'Conversation page exceeded its requested limit');
+          }
+          if (page.items.length === 0) break;
+          const unseen = page.items.filter(message => !scannedMessageIds.has(message.id));
+          for (const message of unseen) scannedMessageIds.add(message.id);
+          scannedMessages.push(...unseen);
+          scannedPending += unseen.filter(message => (message.role === 'user' || message.role === 'assistant')
+            && message.status === 'active' && matchesScope(message, context) && !archivedIds.has(message.id)).length;
+          if (page.nextCursor === null) break;
+          if (seenCursors.has(page.nextCursor) || page.nextCursor === cursor) {
+            throw new ConversationFeatureError('MEMORY_API_UNAVAILABLE', 'Conversation page cursor did not advance');
+          }
+          seenCursors.add(page.nextCursor);
+          cursor = page.nextCursor;
+        }
+        const pending = scannedMessages
+          .filter(message => message.role === 'user' || message.role === 'assistant')
+          .filter(message => message.status === 'active' && matchesScope(message, context) && !archivedIds.has(message.id))
+          .sort(compareMessages)
+          .slice(-historyLimit);
+        const characterCount = pending.reduce((total, message) => total + message.content.length, 0);
+        if (pending.length < minimumMessages || characterCount < minimumCharacters) {
+          return { assistantMessageId, assistantEventId };
+        }
+
+        for (const message of pending) {
+          if (message.sourceRefs !== undefined && !isSourceRefsWellFormed(message.sourceRefs)) {
+            throw new ConversationFeatureError('INVALID_SOURCE_PROOF', 'Stored message source lineage is invalid');
+          }
+        }
+        const inheritedSourceIds = pending.flatMap(message => (message.sourceRefs ?? []).flatMap(ref => ref.sourceMessageIds));
+        const sourceMessageIds = stableUnique([...pending.map(message => message.id), ...inheritedSourceIds], MAX_TOTAL_SOURCE_IDS);
+        if (sourceMessageIds.length < minimumMessages) return { assistantMessageId, assistantEventId };
+        const sourceRefs = normalizeSourceRefs([
+          ...pending.flatMap(message => message.sourceRefs ?? []),
+          ...splitSourceRefs(null, null, stableUnique(pending.map(message => message.id), MAX_TOTAL_SOURCE_IDS)),
+        ], MAX_SUMMARY_SOURCE_INPUTS);
+        const proof = await authorizeConversationSourcesV1(options.api, context, sourceRefs);
+        if (proof.unavailable || !proof.allowed || proof.currentAuthorizationEpoch !== context.authorizationEpoch) {
+          throw new ConversationFeatureError('INVALID_SOURCE_PROOF', 'Conversation summary sources are no longer authorized');
+        }
+        context.signal.throwIfAborted();
+        let summary: string;
+        try {
+          if (summaryProvider === undefined) {
+            throw new ConversationFeatureError('MODEL_UNAVAILABLE', 'A configured summary provider v1 is required');
+          }
+          summary = boundedText(await summaryProvider.summarize({
+            scope: scopeOf(context),
+            messages: pending.map(({ id, role, content, occurredAt }) => ({ id, role, content, occurredAt })),
+            signal: context.signal,
+          }), MAX_MEMORY_LENGTH);
+        } catch (error: unknown) {
+          if (context.signal.aborted) throw error;
+          throw new ConversationFeatureError('MODEL_UNAVAILABLE', 'Configured summary provider failed');
+        }
+        if (!summary) throw new ConversationFeatureError('MODEL_UNAVAILABLE', 'Configured summary provider returned an empty summary');
+
+        context.signal.throwIfAborted();
+        await options.api.createMemory(context, {
+          idempotencyKey: deterministicId('summary', context, sourceMessageIds),
+          conversationId: context.conversationId,
+          conversationKind: context.conversationKind,
+          personaId: context.personaId,
+          kind: 'episode',
+          text: summary,
+          sourceMessageIds,
+          sourceRefs,
+          visibility: context.visibility,
+        });
+        return { assistantMessageId, assistantEventId };
       } catch (error: unknown) {
-        if (context.signal.aborted) throw error;
-        throw new ConversationFeatureError('MODEL_UNAVAILABLE', 'Configured summary provider failed');
+        if (!createdAssistant.duplicate) {
+          try {
+            const cleanupContext = { ...context, signal: new AbortController().signal };
+            await options.api.revokeSource(cleanupContext, assistantMessageId);
+          } catch {
+            throw new ConversationFeatureError('MEMORY_API_UNAVAILABLE', 'Failed to invalidate an assistant message after incomplete turn archival');
+          }
+        }
+        throw error;
       }
-      if (!summary) throw new ConversationFeatureError('MODEL_UNAVAILABLE', 'Configured summary provider returned an empty summary');
-
-      context.signal.throwIfAborted();
-      await options.api.createMemory(context, {
-        idempotencyKey: deterministicId('summary', context, sourceMessageIds),
-        conversationId: context.conversationId,
-        conversationKind: context.conversationKind,
-        personaId: context.personaId,
-        kind: 'episode',
-        text: summary,
-        sourceMessageIds,
-        sourceRefs,
-        visibility: context.visibility,
-      });
     },
 
     async beforeDelivery(context, input) {
