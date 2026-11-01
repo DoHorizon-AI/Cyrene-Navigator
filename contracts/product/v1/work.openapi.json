@@ -7301,7 +7301,8 @@
               "edited",
               "imported",
               "rolled_back",
-              "reviewed"
+              "reviewed",
+              "daily_review"
             ],
             "title": "Eventtype",
             "type": "string"
@@ -7336,7 +7337,7 @@
               ]
             },
             "maxItems": 256,
-            "minItems": 1,
+            "minItems": 0,
             "title": "Sourcerefs",
             "type": "array"
           },
@@ -7429,7 +7430,8 @@
               "edited",
               "imported",
               "rolled_back",
-              "reviewed"
+              "reviewed",
+              "daily_review"
             ],
             "title": "Eventtype",
             "type": "string"

@@ -861,6 +861,52 @@ def test_graph_provider_readback_is_persisted_and_query_results_reauthorize_sour
     assert [item["id"] for item in query.json()["items"]] == ["visible"]
 
 
+def test_daily_review_event_allows_empty_lineage_only_with_exact_report_scope(
+    domain_api: tuple[TestClient, ConversationDomainStore, list[tuple[object, ...]]],
+) -> None:
+    """A no-message review stores only its verified report pointer and exact chat scope."""
+
+    client, _, _ = domain_api
+    base = "/api/v1/workspaces/workspace-a/work/review-events"
+    body = {
+        "idempotencyKey": "daily-review-empty-window",
+        "eventType": "daily_review",
+        "summary": json.dumps(
+            {"report": {"artifactId": "review-artifact-1", "sha256": "a" * 64, "sizeBytes": 128}},
+            separators=(",", ":"),
+        ),
+        "sourceRefs": [],
+        "conversationId": "conversation-1",
+        "conversationKind": "direct",
+        "personaId": "conversation-assistant",
+    }
+    created = client.post(base, json=body, headers=_write_headers())
+    assert created.status_code == 201, created.text
+    event = created.json()["event"]
+    assert event["eventType"] == "daily_review"
+    assert event["sourceRefs"] == []
+    assert event["conversationId"] == "conversation-1"
+    assert event["personaId"] == "conversation-assistant"
+
+    duplicate = client.post(base, json=body, headers=_write_headers())
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json()["event"]["id"] == event["id"]
+
+    no_report = client.post(
+        base,
+        json={**body, "idempotencyKey": "daily-review-missing-report", "summary": "No report."},
+        headers=_write_headers(),
+    )
+    assert no_report.status_code == 422
+
+    ordinary_empty = client.post(
+        base,
+        json={**body, "idempotencyKey": "reviewed-empty", "eventType": "reviewed"},
+        headers=_write_headers(),
+    )
+    assert ordinary_empty.status_code == 422
+
+
 def test_import_responses_only_return_counts_and_digest(
     domain_api: tuple[TestClient, ConversationDomainStore, list[tuple[object, ...]]],
 ) -> None:

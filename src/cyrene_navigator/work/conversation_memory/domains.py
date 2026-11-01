@@ -2176,12 +2176,20 @@ class ConversationDomainStore:
         event_type = _choice(
             payload["eventType"],
             "eventType",
-            {"approved", "rejected", "edited", "imported", "rolled_back", "reviewed"},
+            {
+                "approved",
+                "rejected",
+                "edited",
+                "imported",
+                "rolled_back",
+                "reviewed",
+                "daily_review",
+            },
         )
         summary = _text(payload["summary"], "summary", maximum=2_000)
         conversation_id, conversation_kind, persona_id = _source_context(payload)
         decision = _optional_text(payload.get("decision"), "decision", maximum=240)
-        sources = _source_refs(payload["sourceRefs"])
+        sources = _source_refs(payload["sourceRefs"], allow_empty=event_type == "daily_review")
         digest = _digest(
             {
                 "conversationId": conversation_id,

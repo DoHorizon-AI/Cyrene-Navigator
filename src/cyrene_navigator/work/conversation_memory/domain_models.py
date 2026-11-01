@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Literal
 
@@ -681,9 +682,11 @@ class ReviewEventCreate(DomainModel):
     """Append one idempotent sourced review event."""
 
     idempotency_key: str = Field(min_length=1, max_length=200)
-    event_type: Literal["approved", "rejected", "edited", "imported", "rolled_back", "reviewed"]
+    event_type: Literal[
+        "approved", "rejected", "edited", "imported", "rolled_back", "reviewed", "daily_review"
+    ]
     summary: str = Field(min_length=1, max_length=2_000)
-    source_refs: list[DomainSourceRefInput] = Field(min_length=1, max_length=256)
+    source_refs: list[DomainSourceRefInput] = Field(min_length=0, max_length=256)
     conversation_id: str | None = Field(default=None, max_length=200)
     conversation_kind: ConversationKind | None = None
     persona_id: str | None = Field(default=None, max_length=200)
@@ -691,6 +694,19 @@ class ReviewEventCreate(DomainModel):
 
     @model_validator(mode="after")
     def validate_source_context(self) -> ReviewEventCreate:
+        if self.event_type == "daily_review":
+            if (
+                self.conversation_id is None
+                or self.conversation_kind is None
+                or self.persona_id is None
+            ):
+                raise ValueError("daily_review requires exact conversation and persona scope")
+            if not self._has_verified_report_reference():
+                raise ValueError(
+                    "daily_review summary requires a verified report artifact reference"
+                )
+        elif not self.source_refs:
+            raise ValueError("sourceRefs must not be empty for sourced review events")
         if self.conversation_id is not None and self.conversation_kind is None:
             raise ValueError("conversationKind is required with conversationId")
         if self.conversation_id is None:
@@ -700,6 +716,30 @@ class ReviewEventCreate(DomainModel):
                 raise ValueError("workspace review events cannot bind a conversation persona")
         return self
 
+    def _has_verified_report_reference(self) -> bool:
+        """Require an artifact id and content digest in a source-free daily report row."""
+
+        try:
+            summary = json.loads(self.summary)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(summary, dict):
+            return False
+        report = summary.get("report")
+        if not isinstance(report, dict):
+            return False
+        artifact_id = report.get("artifactId")
+        digest = report.get("sha256")
+        size_bytes = report.get("sizeBytes")
+        return (
+            isinstance(artifact_id, str)
+            and 1 <= len(artifact_id) <= 512
+            and isinstance(digest, str)
+            and re.fullmatch(r"[a-f0-9]{64}", digest) is not None
+            and type(size_bytes) is int
+            and 1 <= size_bytes <= 10_000_000
+        )
+
 
 class ReviewEventView(DomainModel):
     """Immutable review audit event."""
@@ -707,7 +747,9 @@ class ReviewEventView(DomainModel):
     id: str
     idempotency_key: str
     conversation_id: str | None = None
-    event_type: Literal["approved", "rejected", "edited", "imported", "rolled_back", "reviewed"]
+    event_type: Literal[
+        "approved", "rejected", "edited", "imported", "rolled_back", "reviewed", "daily_review"
+    ]
     conversation_kind: ConversationKind | None = None
     persona_id: str | None = None
     summary: str
