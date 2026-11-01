@@ -21,6 +21,12 @@ the same supervisor behavior is checked across the real process boundary.
 CLI flags, serialized DSH history, canonical tool-call chunks, active-schema
 validation, terminal-result handling, timeout, and cancellation. It does not
 make a credentialed model request or claim real-model inference.
+It also checks that the prompt distinguishes successful evidence from failed
+observations, requires explicit ancestry evidence, and discourages mechanical
+retries. `tool-providers.test.mjs` verifies that constraints omitted from DSH's
+enforced JSON Schema subset remain visible as hints while the host still
+rejects invalid arguments. These tests do not prove that a real model always
+follows the guidance.
 
 `antigravity-acp-execution.integration.test.mjs` runs a local fake ACP v1
 agent and the real task-local stdio MCP sidecar. It verifies exact native model
@@ -86,6 +92,7 @@ and interactive GUI evidence.
 `native.integration.test.mjs` 在只调用 Navigator 自有方法的前提下，保留子进程取消、回收、协议版本、输出边界和凭据隔离矩阵。Windows 会编译等价的 Rust fixture，以在真实进程边界验证相同的 supervisor 行为。
 
 `codebuddy-adapter.test.mjs` 使用本地 fake executable 验证受限 CLI 参数、DSH 历史序列化、标准 tool-call block、当前 schema 校验、终态结果处理、超时和取消。它不会发出带凭据的模型请求，也不代表真实模型推理。
+该测试还检查 prompt 会区分成功证据与失败观察、要求提交祖先关系提供明确证据，并避免机械重试。`tool-providers.test.mjs` 验证 DSH 强制执行的 JSON Schema 子集未包含的约束仍作为提示暴露给模型，同时由宿主拒绝无效参数。这些测试不能证明真实模型总会遵守提示。
 
 `antigravity-acp-execution.integration.test.mjs` 使用本地 fake ACP v1 agent 和真实任务级
 stdio MCP sidecar。它验证原生模型选项精确回读、独立 Work mapping、重启续接、profile 凭据
