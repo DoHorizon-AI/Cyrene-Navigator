@@ -137,6 +137,8 @@ function makeHarness({ messages = [message('message-2', now - 5_000, 'assistant'
         name: input.name,
         sha256: createHash('sha256').update(bytes).digest('hex'),
         sizeBytes: bytes.byteLength,
+        scopeDigest: createHash('sha256').update(canonicalJson(input.scope)).digest('hex'),
+        sourceRefsDigest: createHash('sha256').update(canonicalJson(input.sourceRefs)).digest('hex'),
       };
       artifactByKey.set(input.idempotencyKey, receipt);
       artifactById.set(receipt.id, { ...receipt, bytes });
@@ -167,7 +169,7 @@ function makeHarness({ messages = [message('message-2', now - 5_000, 'assistant'
       assert.equal(request.metadata.source, 'conversation-maintenance');
       const result = await operation({}, signal, async update => {
         calls.checkpoints.push(update);
-        if (failNextCheckpoint) {
+        if (failNextCheckpoint && calls.checkpoints.length === 2) {
           failNextCheckpoint = false;
           throw new Error('simulated checkpoint response loss');
         }
@@ -244,6 +246,14 @@ function makeJob(id, cursor, input) {
     createdAt: now,
     updatedAt: now,
   };
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
 }
 
 test('daily review reads, authorizes, models and independently reads back its actor-private report', async () => {

@@ -74,6 +74,8 @@ export interface ConversationReviewArtifactV1 {
   readonly name: string;
   readonly sha256: string;
   readonly sizeBytes: number;
+  readonly scopeDigest: string;
+  readonly sourceRefsDigest: string;
 }
 
 export interface ConversationReviewArtifactReadbackV1 extends ConversationReviewArtifactV1 {
@@ -84,6 +86,13 @@ export interface ConversationReviewArtifactReadbackV1 extends ConversationReview
 export interface ConversationReviewArtifactPortV1 {
   write(input: {
     readonly context: Pick<TrustedTurnContext, 'workspaceId' | 'actorId'>;
+    readonly scope: {
+      readonly conversationId: string;
+      readonly conversationKind: TrustedTurnContext['conversationKind'];
+      readonly personaId: string | null;
+      readonly visibility: TrustedTurnContext['visibility'];
+    };
+    readonly sourceRefs: readonly ConversationSourceRef[];
     readonly idempotencyKey: string;
     readonly mimeType: string;
     readonly name: string;
@@ -168,6 +177,7 @@ interface ReviewPageReceiptV1 {
   readonly sha256: string;
   readonly sizeBytes: number;
   readonly sourceDigest: string;
+  readonly scopeDigest: string;
 }
 
 interface ReviewCheckpointV1 {
@@ -368,6 +378,17 @@ async function executeReview(input: {
   const gaps = [...checkpoint.gaps];
   let reachedWindowStart = false;
 
+  // Mark this bounded job retryable before the first read, model call or artifact write.
+  if (input.job.details.dailyReviewV1 === undefined) {
+    const initial = nextCheckpoint(window, [], sourceRefsByKey, processedCount, [], false);
+    await input.checkpoint({
+      cursor: input.job.cursor,
+      processedCount,
+      checkpointDigest: rollingDigest,
+      details: { dailyReviewV1: initial, retryable: true },
+    });
+  }
+
   // Restore every page artifact independently. No checkpoint cursor is trusted without artifact readback.
   for (const receipt of pageReceipts) {
     input.signal.throwIfAborted();
@@ -377,7 +398,7 @@ async function executeReview(input: {
     if (page.pageIndex !== receipt.index) fail('DAILY_REVIEW_CHECKPOINT_INVALID', 409, false, 'Stored review page index changed');
     void bytes;
   }
-  if (sourceRefsByKey.size !== checkpoint.sourceCount
+  if (sourceRefsByKey.size !== checkpoint.sourceCount || checkpoint.messageCount !== processedCount
     || hashText(canonicalJson([...sourceRefsByKey.values()])) !== checkpoint.sourceRefsDigest) {
     fail('DAILY_REVIEW_CHECKPOINT_INVALID', 409, false, 'Stored review source index does not match its artifact readbacks');
   }
@@ -475,6 +496,8 @@ async function executeReview(input: {
         idempotencyKey: artifactKey,
         name: `conversation-review-${input.job.id}-${pageIndex + 1}.json`,
         bytes,
+        scope: reviewScope(input.context),
+        sourceRefs: refs,
         signal: input.signal,
       });
     }
@@ -488,6 +511,7 @@ async function executeReview(input: {
       sha256: artifact.sha256,
       sizeBytes: artifact.sizeBytes,
       sourceDigest,
+      scopeDigest: artifact.scopeDigest,
     };
     pageReceipts.push(receipt);
     if (pageReceipts.length > MAX_ARTIFACTS) fail('DAILY_REVIEW_PAGE_LIMIT', 422, false, 'Daily review exceeded the stored artifact bound');
@@ -524,6 +548,7 @@ async function executeReview(input: {
       conversationId: input.context.conversationId,
       conversationKind: input.context.conversationKind,
       personaId: input.context.personaId,
+      visibility: input.context.visibility,
     },
     window,
     generatedAt: window.endAt,
@@ -553,6 +578,8 @@ async function executeReview(input: {
     idempotencyKey: manifestKey,
     name: `conversation-review-${input.job.id}.json`,
     bytes: reportBytes,
+    scope: reviewScope(input.context),
+    sourceRefs: uniqueRefs,
     signal: input.signal,
   });
   const verifiedManifestBytes = await readVerifiedArtifact(input.artifacts, input.context, reportArtifact, input.signal);
@@ -649,6 +676,7 @@ function parseReviewCheckpoint(value: unknown, cursor: ReviewCursorV1 | undefine
       || typeof receipt.idempotencyKey !== 'string' || !receipt.idempotencyKey
       || typeof receipt.sha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(receipt.sha256)
       || typeof receipt.sourceDigest !== 'string' || !/^[a-f0-9]{64}$/u.test(receipt.sourceDigest)
+      || typeof receipt.scopeDigest !== 'string' || !/^[a-f0-9]{64}$/u.test(receipt.scopeDigest)
       || !Number.isSafeInteger(receipt.sizeBytes) || Number(receipt.sizeBytes) < 0) {
       fail('DAILY_REVIEW_CHECKPOINT_INVALID', 409, false, 'Review artifact receipt fields are invalid');
     }
@@ -677,6 +705,8 @@ function parseOptionalArtifact(value: unknown): ConversationReviewArtifactV1 | u
   if (typeof row.id !== 'string' || typeof row.idempotencyKey !== 'string'
     || row.mimeType !== ARTIFACT_MIME || typeof row.name !== 'string'
     || typeof row.sha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(row.sha256)
+    || typeof row.scopeDigest !== 'string' || !/^[a-f0-9]{64}$/u.test(row.scopeDigest)
+    || typeof row.sourceRefsDigest !== 'string' || !/^[a-f0-9]{64}$/u.test(row.sourceRefsDigest)
     || !Number.isSafeInteger(row.sizeBytes) || Number(row.sizeBytes) < 0) {
     fail('DAILY_REVIEW_CHECKPOINT_INVALID', 409, false, 'Report artifact receipt fields are invalid');
   }
@@ -718,7 +748,19 @@ function encodeCursor(cursor: ReviewCursorV1): string {
 async function writeAndVerifyArtifact(
   port: ConversationReviewArtifactPortV1,
   context: TrustedTurnContext,
-  input: { readonly idempotencyKey: string; readonly name: string; readonly bytes: Uint8Array; readonly signal: AbortSignal },
+  input: {
+    readonly idempotencyKey: string;
+    readonly name: string;
+    readonly bytes: Uint8Array;
+    readonly scope: {
+      readonly conversationId: string;
+      readonly conversationKind: TrustedTurnContext['conversationKind'];
+      readonly personaId: string | null;
+      readonly visibility: TrustedTurnContext['visibility'];
+    };
+    readonly sourceRefs: readonly ConversationSourceRef[];
+    readonly signal: AbortSignal;
+  },
 ): Promise<ConversationReviewArtifactV1> {
   input.signal.throwIfAborted();
   const existing = await port.findByIdempotencyKey({
@@ -731,6 +773,8 @@ async function writeAndVerifyArtifact(
     try {
       artifact = await port.write({
         context: { workspaceId: context.workspaceId, actorId: context.actorId },
+        scope: input.scope,
+        sourceRefs: input.sourceRefs,
         idempotencyKey: input.idempotencyKey,
         mimeType: ARTIFACT_MIME,
         name: input.name,
@@ -749,8 +793,11 @@ async function writeAndVerifyArtifact(
     }
   }
   const expectedDigest = sha256(input.bytes);
+  const expectedScopeDigest = hashText(canonicalJson(input.scope));
+  const expectedSourceRefsDigest = hashText(canonicalJson(input.sourceRefs));
   if (artifact.idempotencyKey !== input.idempotencyKey || artifact.mimeType !== ARTIFACT_MIME
-    || artifact.name !== input.name || artifact.sha256 !== expectedDigest || artifact.sizeBytes !== input.bytes.byteLength) {
+    || artifact.name !== input.name || artifact.sha256 !== expectedDigest || artifact.sizeBytes !== input.bytes.byteLength
+    || artifact.scopeDigest !== expectedScopeDigest || artifact.sourceRefsDigest !== expectedSourceRefsDigest) {
     fail('DAILY_REVIEW_ARTIFACT_WRITE_MISMATCH', 409, false, 'Work artifact receipt does not match the requested report');
   }
   const readback = await port.read({
@@ -796,7 +843,10 @@ async function readVerifiedPageArtifact(
   });
   if (artifact.id !== receipt.artifactId || artifact.idempotencyKey !== receipt.idempotencyKey
     || artifact.mimeType !== ARTIFACT_MIME || artifact.sha256 !== receipt.sha256
-    || artifact.sizeBytes !== receipt.sizeBytes || sha256(artifact.bytes) !== receipt.sha256) {
+    || artifact.sizeBytes !== receipt.sizeBytes || artifact.scopeDigest !== receipt.scopeDigest
+    || artifact.scopeDigest !== hashText(canonicalJson(reviewScope(context)))
+    || artifact.sourceRefsDigest !== receipt.sourceDigest
+    || sha256(artifact.bytes) !== receipt.sha256) {
     fail('DAILY_REVIEW_ARTIFACT_READBACK_MISMATCH', 409, false, 'Stored page report failed independent Work readback');
   }
   const row = parseJson(artifact.bytes, 'DAILY_REVIEW_ARTIFACT_INVALID') as Record<string, unknown>;
@@ -812,6 +862,10 @@ async function readVerifiedPageArtifact(
   const window = normalizeWindow(row.window as ConversationReviewWindow);
   const sourceMessageIds = row.sourceMessageIds.map(value => identifier(value, 'source message id'));
   if (canonicalJson(refs) !== canonicalJson(row.sourceRefs)) fail('DAILY_REVIEW_ARTIFACT_INVALID', 409, false, 'Stored page sources are not canonical');
+  if (artifact.sourceRefsDigest !== hashText(canonicalJson(refs))
+    || row.sourceDigest !== artifact.sourceRefsDigest) {
+    fail('DAILY_REVIEW_ARTIFACT_INVALID', 409, false, 'Stored page provenance digest differs from its attachment metadata');
+  }
   return {
     page: {
       schema: 'cyrene.conversation-review-page.v1',
@@ -835,13 +889,15 @@ function artifactReceipt(artifact: ConversationReviewArtifactV1, index: number, 
     sha256: artifact.sha256,
     sizeBytes: artifact.sizeBytes,
     sourceDigest,
+    scopeDigest: artifact.scopeDigest,
   };
 }
 
 function verifyArtifactMetadata(actual: ConversationReviewArtifactReadbackV1, expected: ConversationReviewArtifactV1): void {
   if (actual.id !== expected.id || actual.idempotencyKey !== expected.idempotencyKey
     || actual.mimeType !== expected.mimeType || actual.name !== expected.name
-    || actual.sha256 !== expected.sha256 || actual.sizeBytes !== expected.sizeBytes) {
+    || actual.sha256 !== expected.sha256 || actual.sizeBytes !== expected.sizeBytes
+    || actual.scopeDigest !== expected.scopeDigest || actual.sourceRefsDigest !== expected.sourceRefsDigest) {
     fail('DAILY_REVIEW_ARTIFACT_READBACK_MISMATCH', 409, false, 'Work artifact metadata differs from its receipt');
   }
 }
@@ -956,6 +1012,20 @@ function scopeOf(context: TrustedTurnContext): ConversationScope {
     personaId: context.personaId,
     visibility: context.visibility,
     authorizationEpoch: context.authorizationEpoch,
+  };
+}
+
+function reviewScope(context: TrustedTurnContext): {
+  readonly conversationId: string;
+  readonly conversationKind: TrustedTurnContext['conversationKind'];
+  readonly personaId: string | null;
+  readonly visibility: TrustedTurnContext['visibility'];
+} {
+  return {
+    conversationId: context.conversationId,
+    conversationKind: context.conversationKind,
+    personaId: context.personaId,
+    visibility: context.visibility,
   };
 }
 
