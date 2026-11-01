@@ -300,6 +300,7 @@ test('daily review reads, authorizes, models and independently reads back its ac
   assert.ok(harness.calls.artifactReads.length >= 4, 'every artifact receives independent readback');
   assert.equal(harness.calls.events.length, 1);
   assert.equal(harness.calls.events[0].eventType, 'daily_review');
+  assert.equal(harness.calls.events[0].taskId, outcome.taskId, 'ledger write is bound to the exact running maintenance DSH Task');
   assert.deepEqual(harness.calls.events[0].sourceRefs, [
     { memoryId: null, memoryVersion: null, sourceMessageIds: ['message-2'] },
     { memoryId: null, memoryVersion: null, sourceMessageIds: ['message-1'] },

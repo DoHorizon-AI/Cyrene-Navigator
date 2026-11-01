@@ -115,6 +115,8 @@ export interface ConversationReviewArtifactPortV1 {
 export interface ConversationReviewLedgerPortV1 {
   create(input: {
     readonly context: TrustedTurnContext;
+    /** Exact running actor-private DSH Work Task executing this review job. */
+    readonly taskId: string;
     readonly idempotencyKey: string;
     readonly eventType: 'daily_review';
     readonly summary: string;
@@ -360,6 +362,7 @@ export function createConversationDailyReviewFeature(options: ConversationDailyR
         ledger: ledger!,
         model: model!,
         context: withSignal(context, signal),
+        taskId,
         job,
         agent,
         checkpoint,
@@ -394,6 +397,7 @@ async function executeReview(input: {
   readonly ledger: ConversationReviewLedgerPortV1;
   readonly model: ConversationDailyReviewModelV1;
   readonly context: TrustedTurnContext;
+  readonly taskId: string;
   readonly job: ConversationMaintenanceJob;
   readonly agent: Agent;
   readonly checkpoint: (value: { readonly cursor: string | null; readonly processedCount: number; readonly checkpointDigest: string; readonly details: Readonly<Record<string, unknown>> }) => Promise<void>;
@@ -637,6 +641,7 @@ async function executeReview(input: {
   const eventKey = `daily-review-event-${hashText(`${input.context.conversationId}\u0000${window.startAt}\u0000${window.endAt}\u0000${reportArtifact.sha256}`).slice(0, 40)}`;
   const ledgerResult = await input.ledger.create({
     context: input.context,
+    taskId: input.taskId,
     idempotencyKey: eventKey,
     eventType: 'daily_review',
     summary,
