@@ -498,3 +498,66 @@ test('conversation assistant summaries use the active DSH model route and persis
     await app.ctx.fiber.dispose();
   }
 });
+
+test('projectConversationAssistantTaskRead projects safe error codes and falls back to CONVERSATION_ASSISTANT_NOT_DELIVERED', async () => {
+  const { app, store } = await makeApp(false);
+  const server = await app.executor.startServer(0, '127.0.0.1');
+  try {
+    const origin = { kind: 'web', conversationKind: 'direct', conversationId: 'conv-safe-err' };
+
+    const taskSafe = await store.createTask({
+      id: 'task-safe-err-1',
+      sessionId: 'session-safe-1',
+      prompt: 'Top secret prompt 1',
+      executionClass: 'foreground',
+      metadata: { navigatorConversationOrigin: origin },
+    });
+    await store.patchTask(taskSafe.id, { status: 'failed', error: 'MEMORY_PROVIDER_UNAVAILABLE' });
+
+    const taskEmbedded = await store.createTask({
+      id: 'task-safe-err-2',
+      sessionId: 'session-safe-2',
+      prompt: 'Top secret prompt 2',
+      executionClass: 'foreground',
+      metadata: { navigatorConversationOrigin: origin },
+    });
+    await store.patchTask(taskEmbedded.id, { status: 'failed', error: 'task aborted with code=EXECUTION_FAILED internally' });
+
+    const taskUnsafe = await store.createTask({
+      id: 'task-unsafe-err-3',
+      sessionId: 'session-safe-3',
+      prompt: 'Top secret prompt 3',
+      executionClass: 'foreground',
+      metadata: { navigatorConversationOrigin: origin },
+    });
+    await store.patchTask(taskUnsafe.id, { status: 'failed', error: 'unhandled exception at /internal/secrets/crypto.ts:88 with sensitive token dump' });
+
+    const read = async id => (await fetch(`${server.url}/api/v1/tasks/${id}`, {
+      headers: { Authorization: `Bearer ${EXECUTOR_TOKEN}` },
+    })).json();
+
+    const readSafe = await read(taskSafe.id);
+    assert.equal(readSafe.status, 'failed');
+    assert.equal(readSafe.error, 'MEMORY_PROVIDER_UNAVAILABLE');
+    assert.equal(readSafe.prompt, '');
+    assert.equal(readSafe.output, '');
+    assert.equal(readSafe.reasoning, '');
+    assert.deepEqual(readSafe.metadata, {});
+
+    const readEmbedded = await read(taskEmbedded.id);
+    assert.equal(readEmbedded.status, 'failed');
+    assert.equal(readEmbedded.error, 'EXECUTION_FAILED');
+    assert.equal(readEmbedded.prompt, '');
+
+    const readUnsafe = await read(taskUnsafe.id);
+    assert.equal(readUnsafe.status, 'failed');
+    assert.equal(readUnsafe.error, 'CONVERSATION_ASSISTANT_NOT_DELIVERED');
+    assert.equal(readUnsafe.prompt, '');
+    assert.equal(readUnsafe.output, '');
+    assert.equal(readUnsafe.reasoning, '');
+  } finally {
+    await app.executor.dispose();
+    await app.pluginManager?.dispose();
+    await app.ctx.fiber.dispose();
+  }
+});

@@ -1766,6 +1766,12 @@ export class NavigatorExecutor {
         this.installAgentModelSelection(agentCtx, selectionRef, sessionId);
       };
 
+      // Volatile conversation assistant turns use a dedicated unique session id prefix
+      // (VOLATILE_CONVERSATION_SESSION_PREFIX) and are never resumed from persistent storage,
+      // which isolates each turn's Agent lifecycle. When DSH Schedule is mounted at the host
+      // root, ScheduleService attaches per-agent tools (schedule_create, etc.) into the newly
+      // created agent's agent.ctx; ensuring volatile turns own their unique handle prevents
+      // colliding duplicate tool registrations across concurrent or sequential turn creations.
       const existing = volatileConversationTurn ? undefined : agents.get(sessionId);
       let agent: Agent;
       if (existing) agent = existing;

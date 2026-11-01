@@ -751,3 +751,147 @@ def test_actor_backup_is_private_and_contains_only_the_current_actor(tmp_path: P
             headers=_headers("bob-token"),
         )
         assert denied.status_code == 404
+
+
+def test_list_messages_filters_by_persona_id(tmp_path: Path) -> None:
+    """list_messages with personaId includes matching and global messages but excludes others."""
+
+    with _client(tmp_path / "persona-filter.sqlite3") as client:
+        msg_a = _post_message(
+            client,
+            event_id="evt-a",
+            conversation_id="conv-p",
+            persona_id="persona-a",
+            content="Message for persona A",
+        )["message"]
+        msg_b = _post_message(
+            client,
+            event_id="evt-b",
+            conversation_id="conv-p",
+            persona_id="persona-b",
+            content="Message for persona B",
+        )["message"]
+        msg_none = _post_message(
+            client,
+            event_id="evt-none",
+            conversation_id="conv-p",
+            persona_id=None,
+            content="Message without persona",
+        )["message"]
+
+        res_a = client.get(
+            BASE + "/messages?conversationId=conv-p&conversationKind=direct&personaId=persona-a",
+            headers=_headers(),
+        )
+        assert res_a.status_code == 200, res_a.text
+        items_a = res_a.json()["items"]
+        ids_a = {item["id"] for item in items_a}
+        assert msg_a["id"] in ids_a
+        assert msg_none["id"] in ids_a
+        assert msg_b["id"] not in ids_a
+
+        res_b = client.get(
+            BASE + "/messages?conversationId=conv-p&conversationKind=direct&personaId=persona-b",
+            headers=_headers(),
+        )
+        assert res_b.status_code == 200, res_b.text
+        items_b = res_b.json()["items"]
+        ids_b = {item["id"] for item in items_b}
+        assert msg_b["id"] in ids_b
+        assert msg_none["id"] in ids_b
+        assert msg_a["id"] not in ids_b
+
+
+def test_invalidate_source_dependents_multi_memory_placeholder_and_cycle(tmp_path: Path) -> None:
+    """Revoking a source with multiple derived memories avoids SQL placeholder count mismatch."""
+
+    with _client(tmp_path / "multi-memory-revoke.sqlite3") as client:
+        msg1 = _post_message(client, event_id="root-event", content="Root source fact")["message"]
+
+        ref_msg1 = [{"memoryId": None, "memoryVersion": None, "sourceMessageIds": [msg1["id"]]}]
+
+        # Derive 2 distinct memories from msg1 (triggers placeholders != len(affected_sources))
+        resp1 = client.post(
+            BASE + "/memories",
+            json={
+                "idempotencyKey": "mem-multi-1",
+                "conversationId": "direct-alice",
+                "conversationKind": "direct",
+                "personaId": "persona-a",
+                "kind": "preference",
+                "text": "Fact 1",
+                "sourceMessageIds": [msg1["id"]],
+                "sourceRefs": ref_msg1,
+            },
+            headers=_headers(),
+        )
+        assert resp1.status_code == 201, resp1.text
+        mem1 = resp1.json()["memory"]
+        ref_mem1 = [{"memoryId": mem1["id"], "memoryVersion": 1, "sourceMessageIds": [msg1["id"]]}]
+
+        resp2 = client.post(
+            BASE + "/memories",
+            json={
+                "idempotencyKey": "mem-multi-2",
+                "conversationId": "direct-alice",
+                "conversationKind": "direct",
+                "personaId": "persona-a",
+                "kind": "fact",
+                "text": "Fact 2",
+                "sourceMessageIds": [msg1["id"]],
+                "sourceRefs": ref_msg1,
+            },
+            headers=_headers(),
+        )
+        assert resp2.status_code == 201, resp2.text
+        mem2 = resp2.json()["memory"]
+        assert mem1["id"] != mem2["id"]
+
+        # Derive msg2 citing mem1
+        resp_msg2 = client.post(
+            BASE + "/messages",
+            json={
+                "eventId": "child-event",
+                "conversationId": "direct-alice",
+                "conversationKind": "direct",
+                "personaId": "persona-a",
+                "visibility": "private",
+                "role": "assistant",
+                "content": "Child fact citing mem1",
+                "sourceRefs": ref_mem1,
+            },
+            headers=_headers(),
+        )
+        assert resp_msg2.status_code == 201, resp_msg2.text
+        msg2 = resp_msg2.json()["message"]
+
+        # Derive mem3 citing msg2
+        resp3 = client.post(
+            BASE + "/memories",
+            json={
+                "idempotencyKey": "mem-multi-3",
+                "conversationId": "direct-alice",
+                "conversationKind": "direct",
+                "personaId": "persona-a",
+                "kind": "commitment",
+                "text": "Fact 3",
+                "sourceMessageIds": [msg2["id"]],
+                "sourceRefs": ref_mem1,
+            },
+            headers=_headers(),
+        )
+        assert resp3.status_code == 201, resp3.text
+        mem3 = resp3.json()["memory"]
+
+        # Revoke msg1 - must not throw sqlite3.ProgrammingError or infinite loop
+        revoke_res = client.post(BASE + f"/sources/{msg1['id']}/revoke", headers=_headers())
+        assert revoke_res.status_code == 200, revoke_res.text
+        receipt = revoke_res.json()
+        assert receipt["sourceId"] == msg1["id"]
+        assert msg2["id"] in receipt["invalidatedMessageIds"]
+        assert mem1["id"] in receipt["invalidatedMemoryIds"]
+        assert mem2["id"] in receipt["invalidatedMemoryIds"]
+        assert mem3["id"] in receipt["invalidatedMemoryIds"]
+        msg_query = "?conversationId=direct-alice&conversationKind=direct"
+        check_msg = client.get(BASE + f"/messages/{msg1['id']}{msg_query}", headers=_headers())
+        assert check_msg.status_code == 404
