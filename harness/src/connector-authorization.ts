@@ -14,6 +14,26 @@ const GRANT_TTL_MAX_SECONDS = 15;
 const REQUEST_TIMEOUT_MS = 10_000;
 const MAX_RESPONSE_BYTES = 2_000_000;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+/** Keep request deadlines available while a returned response body is consumed. | 响应体读取继续沿用同一请求期限。 */
+const responseDeadlines = new WeakMap<Response, {
+  readonly callerSignal: AbortSignal;
+  readonly requestTimeoutSignal: AbortSignal;
+}>();
+
+export type ExchangeConnectorSafeErrorCode =
+  | 'EXCHANGE_CONNECTOR_ABORTED'
+  | 'EXCHANGE_CONNECTOR_NO_RESPONSE'
+  | 'EXCHANGE_CONNECTOR_REQUEST_TIMEOUT'
+  | 'EXCHANGE_GRANT_ABORTED'
+  | 'EXCHANGE_GRANT_FAILED'
+  | 'EXCHANGE_GRANT_NO_RESPONSE'
+  | 'EXCHANGE_GRANT_TIMEOUT'
+  | 'EXCHANGE_PRIVATE_TEAMS_RESPONSE_INVALID'
+  | 'EXCHANGE_RESPONSE_BODY_INCOMPLETE'
+  | 'EXCHANGE_RESPONSE_BODY_TIMEOUT'
+  | 'EXCHANGE_REQUEST_NOT_SENT'
+  | 'TEAMS_PRIVATE_SEND_NOT_STARTED'
+  | `EXCHANGE_GRANT_HTTP_${number}`;
 
 export interface ConnectorGrantRequest {
   readonly requestId: string;
@@ -286,84 +306,102 @@ export class ExchangeConnectorAuthorizationClient {
     profileRef: string,
     signal: AbortSignal,
   ): Promise<TeamsMessageDeliveryOutcome> {
-    const conversation = validateTeamsPrivateConversation(input.conversation);
-    const requestId = safeText(input.requestId, 'private Teams request id', 200);
-    if (input.targetKind !== 'owner_private') throw new TypeError('Invalid private Teams target kind');
-    const text = safeText(input.text, 'private Teams message text', 24_000);
-    if (grant.request.principalSubject.toLowerCase() !== conversation.actorAadObjectId
-      || grant.request.principalIssuer !== `https://login.microsoftonline.com/${conversation.tenantId}/v2.0`) {
-      throw new TypeError('Private Teams grant actor does not match the Work-resolved route');
-    }
-    const argumentsValue: Readonly<Record<string, JsonValue>> = {
-      targetKind: 'owner_private',
-      conversation: {
-        tenantId: conversation.tenantId,
-        botAppId: conversation.botAppId,
-        actorAadObjectId: conversation.actorAadObjectId,
-        conversationId: conversation.conversationId,
-        serviceUrl: conversation.serviceUrl,
-      },
-      text,
-    };
-    const resourceRef = teamsPrivateResourceRef(conversation);
-    assertGrantBinding(grant, {
-      requestId,
-      connectionRef,
-      profileRef,
-      providerId: 'msteams',
-      operationId: 'msteams.message.reply',
-      resourceRef,
-      arguments: argumentsValue,
-    });
-    assertGrantFresh(grant);
-    const body = JSON.stringify({
-      requestId,
-      providerId: 'msteams',
-      targetKind: 'owner_private',
-      conversation,
-      text,
-    });
-    const response = await this.postGrantedResponse('/internal/v1/teams/messages', body, grant, signal, true);
-    const row = object(await readJson(response), 'Exchange private Teams message result');
-    if (row.requestId !== requestId) {
-      throw new TypeError('Exchange returned a private Teams result for a different notification');
-    }
-    const outcome = row.status;
-    if (outcome !== 'accepted' && outcome !== 'rejected'
-      && outcome !== 'rate_limited' && outcome !== 'uncertain') {
-      throw new TypeError('Exchange returned an unknown private Teams message result');
-    }
-    if (response.status === 429) {
-      const retryAfterSeconds = boundedRetryAfter(response.headers.get('retry-after'));
-      if (outcome !== 'rate_limited' || retryAfterSeconds === undefined) {
-        throw new ExchangeConnectorRequestError(
-          'Exchange returned a 429 without a confirmed private Teams rate-limit outcome',
-          429,
-          false,
-        );
+    let providerRequestStarted = false;
+    try {
+      const conversation = validateTeamsPrivateConversation(input.conversation);
+      const requestId = safeText(input.requestId, 'private Teams request id', 200);
+      if (input.targetKind !== 'owner_private') throw new TypeError('Invalid private Teams target kind');
+      const text = validateTeamsMessageText(input.text, 'private Teams message text', 20_000);
+      if (grant.request.principalSubject.toLowerCase() !== conversation.actorAadObjectId
+        || grant.request.principalIssuer !== `https://login.microsoftonline.com/${conversation.tenantId}/v2.0`) {
+        throw new TypeError('Private Teams grant actor does not match the Work-resolved route');
+      }
+      const argumentsValue: Readonly<Record<string, JsonValue>> = {
+        targetKind: 'owner_private',
+        conversation: {
+          tenantId: conversation.tenantId,
+          botAppId: conversation.botAppId,
+          actorAadObjectId: conversation.actorAadObjectId,
+          conversationId: conversation.conversationId,
+          serviceUrl: conversation.serviceUrl,
+        },
+        text,
+      };
+      const resourceRef = teamsPrivateResourceRef(conversation);
+      assertGrantBinding(grant, {
+        requestId,
+        connectionRef,
+        profileRef,
+        providerId: 'msteams',
+        operationId: 'msteams.message.reply',
+        resourceRef,
+        arguments: argumentsValue,
+      });
+      assertGrantFresh(grant);
+      const body = JSON.stringify({
+        requestId,
+        providerId: 'msteams',
+        targetKind: 'owner_private',
+        conversation,
+        text,
+      });
+      providerRequestStarted = true;
+      const response = await this.postGrantedResponse('/internal/v1/teams/messages', body, grant, signal, true);
+      const row = object(await readJson(response), 'Exchange private Teams message result');
+      if (row.requestId !== requestId) {
+        throw new TypeError('Exchange returned a private Teams result for a different notification');
+      }
+      const outcome = row.status;
+      if (outcome !== 'accepted' && outcome !== 'rejected'
+        && outcome !== 'rate_limited' && outcome !== 'uncertain') {
+        throw new TypeError('Exchange returned an unknown private Teams message result');
+      }
+      if (response.status === 429) {
+        const retryAfterSeconds = boundedRetryAfter(response.headers.get('retry-after'));
+        if (outcome !== 'rate_limited' || retryAfterSeconds === undefined) {
+          throw new ExchangeConnectorRequestError(
+            'Exchange returned a 429 without a confirmed private Teams rate-limit outcome',
+            429,
+            false,
+          );
+        }
+        return {
+          outcome,
+          ...(typeof row.reasonCode === 'string' ? { reasonCode: row.reasonCode } : {}),
+          retryAfterSeconds,
+        };
+      }
+      if (outcome === 'rate_limited') {
+        throw new TypeError('Exchange returned rate_limited without an HTTP 429 response');
+      }
+      if (outcome === 'uncertain') {
+        return {
+          outcome,
+          ...(typeof row.reasonCode === 'string' ? { reasonCode: row.reasonCode } : {}),
+        };
       }
       return {
         outcome,
+        ...(typeof row.vendorMessageId === 'string' ? { vendorMessageId: row.vendorMessageId } : {}),
         ...(typeof row.reasonCode === 'string' ? { reasonCode: row.reasonCode } : {}),
-        retryAfterSeconds,
+        ...(boundedRetryAfter(row.retryAfterSeconds) === undefined
+          ? {} : { retryAfterSeconds: boundedRetryAfter(row.retryAfterSeconds) }),
       };
+    } catch (error: unknown) {
+      if (error instanceof ExchangeConnectorRequestError) throw error;
+      throw new ExchangeConnectorRequestError(
+        providerRequestStarted
+          ? 'Exchange private Teams response could not be validated'
+          : 'Private Teams request was rejected before Exchange invocation',
+        undefined,
+        providerRequestStarted,
+        undefined,
+        undefined,
+        providerRequestStarted
+          ? 'EXCHANGE_PRIVATE_TEAMS_RESPONSE_INVALID'
+          : 'TEAMS_PRIVATE_SEND_NOT_STARTED',
+      );
     }
-    if (outcome === 'rate_limited') {
-      throw new TypeError('Exchange returned rate_limited without an HTTP 429 response');
-    }
-    if (outcome === 'uncertain') {
-      return {
-        outcome,
-        ...(typeof row.reasonCode === 'string' ? { reasonCode: row.reasonCode } : {}),
-      };
-    }
-    return {
-      outcome,
-      ...(typeof row.vendorMessageId === 'string' ? { vendorMessageId: row.vendorMessageId } : {}),
-      ...(typeof row.reasonCode === 'string' ? { reasonCode: row.reasonCode } : {}),
-      ...(boundedRetryAfter(row.retryAfterSeconds) === undefined
-        ? {} : { retryAfterSeconds: boundedRetryAfter(row.retryAfterSeconds) }),
-    };
   }
 
   /** Read only the selected Exchange-owned authorization snapshots for one fixed Workspace. */
@@ -521,20 +559,39 @@ export class ExchangeConnectorAuthorizationClient {
     uncertainOnServerError = false,
     acceptRateLimited = false,
   ): Promise<Response> {
-    signal.throwIfAborted();
+    if (signal.aborted) {
+      throw new ExchangeConnectorRequestError(
+        'Exchange connector request was aborted before dispatch',
+        undefined,
+        false,
+        undefined,
+        undefined,
+        'EXCHANGE_REQUEST_NOT_SENT',
+      );
+    }
+    const requestTimeoutSignal = AbortSignal.timeout(this.timeoutMs);
     let response: Response;
     try {
       response = await fetch(this.origin + path, {
         method: 'POST',
         headers: { accept: 'application/json', 'content-type': 'application/json', ...headers },
         body,
-        signal: AbortSignal.any([signal, AbortSignal.timeout(this.timeoutMs)]),
+        signal: AbortSignal.any([signal, requestTimeoutSignal]),
         redirect: 'error',
       });
     } catch (error: unknown) {
-      if (signal.aborted) throw signal.reason;
-      throw new ExchangeConnectorRequestError('Exchange connector call did not return a response', undefined, true, error);
+      const safeCode = signal.aborted ? 'EXCHANGE_CONNECTOR_ABORTED'
+        : requestTimeoutSignal.aborted ? 'EXCHANGE_CONNECTOR_REQUEST_TIMEOUT' : 'EXCHANGE_CONNECTOR_NO_RESPONSE';
+      throw new ExchangeConnectorRequestError(
+        'Exchange connector call did not return a complete response',
+        undefined,
+        true,
+        undefined,
+        undefined,
+        safeCode,
+      );
     }
+    responseDeadlines.set(response, { callerSignal: signal, requestTimeoutSignal });
     if (!response.ok && !(acceptRateLimited && response.status === 429)) {
       const errorBody = await readJson(response).catch(() => ({}));
       const code = errorBody && typeof errorBody === 'object' && !Array.isArray(errorBody)
@@ -569,6 +626,7 @@ export class ExchangeConnectorRequestError extends Error {
     readonly outcomeUnknown = false,
     cause?: unknown,
     readonly retryAfterSeconds?: number,
+    readonly safeCode?: ExchangeConnectorSafeErrorCode,
   ) {
     super(message, cause === undefined ? undefined : { cause });
     this.name = 'ExchangeConnectorRequestError';
@@ -785,6 +843,15 @@ function safeText(value: unknown, label: string, limit: number): string {
   return value;
 }
 
+/** Validate bounded Teams body text while preserving ordinary multiline formatting. | 保留正文换行和制表符，拒绝其他控制字符。 */
+export function validateTeamsMessageText(value: unknown, label: string, limit: number): string {
+  if (typeof value !== 'string' || value.length < 1 || value.length > limit
+    || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)) {
+    throw new TypeError(`Invalid ${label}`);
+  }
+  return value;
+}
+
 function safeDigest(value: unknown, label: string): string {
   if (typeof value !== 'string' || !/^[0-9a-f]{64}$/u.test(value)) throw new TypeError(`Invalid ${label}`);
   return value;
@@ -816,7 +883,24 @@ function base64Field(value: unknown, label: string): string {
 }
 
 async function readJson(response: Response): Promise<unknown> {
-  const bytes = Buffer.from(await response.arrayBuffer());
+  let bytes: Buffer;
+  try {
+    bytes = Buffer.from(await response.arrayBuffer());
+  } catch {
+    const deadline = responseDeadlines.get(response);
+    const safeCode = deadline?.requestTimeoutSignal.aborted
+      ? 'EXCHANGE_RESPONSE_BODY_TIMEOUT'
+      : deadline?.callerSignal.aborted ? 'EXCHANGE_CONNECTOR_ABORTED' : 'EXCHANGE_RESPONSE_BODY_INCOMPLETE';
+    const outcomeUnknown = response.ok || response.status === 429 || response.status >= 500;
+    throw new ExchangeConnectorRequestError(
+      'Exchange response body was incomplete',
+      response.status,
+      outcomeUnknown,
+      undefined,
+      undefined,
+      safeCode,
+    );
+  }
   if (bytes.byteLength > MAX_RESPONSE_BYTES) throw new TypeError('Exchange response exceeds its configured size limit');
   const text = bytes.toString('utf8');
   try { return text ? JSON.parse(text) as unknown : {}; }

@@ -66,7 +66,7 @@ function privateGrantFor(input, principalSubject = privateActorId) {
   const argumentsValue = {
     targetKind: 'owner_private',
     conversation: privateConversation,
-    text: 'Private owner status.',
+    text: input.text,
   };
   const request = {
     requestId: input.requestId,
@@ -150,7 +150,7 @@ test('sends only the Work-resolved owner-private route through the existing Team
     requestId: 'private-notification-1:attempt:1',
     targetKind: 'owner_private',
     conversation: privateConversation,
-    text: 'Private owner status.',
+    text: 'Private owner status.\n\n**Final:** complete\r\n- first\titem',
   };
   await withHttpResponse(200, {}, {
     requestId: input.requestId, status: 'accepted', vendorMessageId: 'private-message-1',
@@ -179,20 +179,34 @@ test('owner-private send rejects actor or grant route mismatch before Exchange i
     text: 'Private owner status.',
   };
   await withHttpResponse(200, {}, { requestId: input.requestId, status: 'accepted' }, async (client, received) => {
-    await assert.rejects(client.sendPrivateTeamsMessage(
-      input,
-      privateGrantFor(input, '33333333-3333-4333-8333-333333333333'),
-      connectionRef,
-      profileRef,
-      new AbortController().signal,
-    ), /grant actor does not match/u);
-    await assert.rejects(client.sendPrivateTeamsMessage(
-      { ...input, conversation: { ...privateConversation, serviceUrl: 'https://smba.trafficmanager.net/amer/' } },
-      privateGrantFor(input),
-      connectionRef,
-      profileRef,
-      new AbortController().signal,
-    ), /does not match the exact provider call/u);
+    await assert.rejects(
+      client.sendPrivateTeamsMessage(
+        input,
+        privateGrantFor(input, '33333333-3333-4333-8333-333333333333'),
+        connectionRef,
+        profileRef,
+        new AbortController().signal,
+      ), error => error instanceof ExchangeConnectorRequestError
+        && !error.outcomeUnknown && error.safeCode === 'TEAMS_PRIVATE_SEND_NOT_STARTED',
+    );
+    await assert.rejects(
+      client.sendPrivateTeamsMessage(
+        { ...input, conversation: { ...privateConversation, serviceUrl: 'https://smba.trafficmanager.net/amer/' } },
+        privateGrantFor(input),
+        connectionRef,
+        profileRef,
+        new AbortController().signal,
+      ), error => error instanceof ExchangeConnectorRequestError
+        && !error.outcomeUnknown && error.safeCode === 'TEAMS_PRIVATE_SEND_NOT_STARTED',
+    );
+    const invalidTextInput = { ...input, text: 'Private owner\u000bstatus.' };
+    await assert.rejects(
+      client.sendPrivateTeamsMessage(
+        invalidTextInput, privateGrantFor(invalidTextInput), connectionRef, profileRef,
+        new AbortController().signal,
+      ), error => error instanceof ExchangeConnectorRequestError
+        && !error.outcomeUnknown && error.safeCode === 'TEAMS_PRIVATE_SEND_NOT_STARTED',
+    );
     assert.equal(received.length, 0);
   });
 });
@@ -213,6 +227,56 @@ test('owner-private send preserves Exchange uncertain receipts without treating 
     assert.deepEqual(result, { outcome: 'uncertain', reasonCode: 'teams_delivery_outcome_unknown' });
     assert.equal(received.length, 1);
   });
+});
+
+test('owner-private response body deadline is uncertain and never causes a second send', async () => {
+  const input = {
+    requestId: 'private-notification-body-timeout:attempt:1',
+    targetKind: 'owner_private',
+    conversation: privateConversation,
+    text: 'Private owner status.',
+  };
+  let received = 0;
+  let responseTimer;
+  const server = createServer((request, response) => {
+    const chunks = [];
+    request.on('data', chunk => chunks.push(chunk));
+    request.on('end', () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      received += 1;
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.write(`{"requestId":"${body.requestId}","status":"accepted",`);
+      response.once('close', () => {
+        if (responseTimer !== undefined) clearTimeout(responseTimer);
+      });
+      responseTimer = setTimeout(() => response.end('"vendorMessageId":"late-message"}'), 500);
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = server.address();
+    const client = new ExchangeConnectorAuthorizationClient({
+      baseUrl: `http://127.0.0.1:${address.port}`,
+      hmacKeyFile: '/unused-for-provider-grant-fixture',
+      hmacKeyId: 'test-key',
+      audience: 'exchange',
+      requestTimeoutMs: 100,
+    });
+    const startedAt = performance.now();
+    await assert.rejects(
+      client.sendPrivateTeamsMessage(input, privateGrantFor(input), connectionRef, profileRef,
+        new AbortController().signal),
+      error => error instanceof ExchangeConnectorRequestError
+        && error.outcomeUnknown
+        && error.safeCode === 'EXCHANGE_RESPONSE_BODY_TIMEOUT',
+    );
+    assert.ok(performance.now() - startedAt < 350, 'body reading must remain inside the bounded request deadline');
+    assert.equal(received, 1, 'an incomplete accepted response must not trigger a duplicate send');
+  } finally {
+    if (responseTimer !== undefined) clearTimeout(responseTimer);
+    server.closeAllConnections();
+    await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
 });
 
 test('retries only an explicit HTTP 429 rate-limit response with bounded Retry-After', async () => {

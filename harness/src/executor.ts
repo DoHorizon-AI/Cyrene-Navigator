@@ -27,6 +27,7 @@ import {
   canonicalJson,
   sha256,
   teamsThreadResourceRef,
+  validateTeamsMessageText,
   validateTeamsServiceUrl,
 } from './connector-authorization.ts';
 import type { ConnectorGrantRequest, TeamsMessageRoute } from './connector-authorization.ts';
@@ -2844,7 +2845,7 @@ export class NavigatorExecutor {
         : result.outcome === 'uncertain' ? 'uncertain' : 'failed';
       await finish.call(this.config.workState, notification.id, lease.leaseToken, outcome, {
         reasonCode: result.reasonCode ?? null,
-        vendorMessageId: result.vendorMessageId ?? null,
+        vendorMessageId: result.outcome === 'accepted' ? result.vendorMessageId ?? null : null,
       });
     } catch (error: unknown) {
       if (!started) return;
@@ -4207,7 +4208,12 @@ function isUncertainConnectorOutcome(error: unknown): boolean {
 }
 
 function safeErrorCode(error: unknown): string {
-  if (error instanceof ExchangeConnectorRequestError && error.status !== undefined) return `EXCHANGE_HTTP_${error.status}`;
+  if (error instanceof ExchangeConnectorRequestError) {
+    if (error.safeCode !== undefined) return error.safeCode;
+    if (error.status !== undefined) return `EXCHANGE_HTTP_${error.status}`;
+    return error.outcomeUnknown ? 'EXCHANGE_CONNECTOR_OUTCOME_UNKNOWN' : 'EXCHANGE_CONNECTOR_FAILED';
+  }
+  if (error instanceof ExecutorRequestError) return error.code.slice(0, 128);
   if (error instanceof WorkStateHttpError) return error.code.slice(0, 128);
   return 'TEAMS_DELIVERY_FAILED';
 }
@@ -4242,12 +4248,11 @@ function boundedText(value: unknown, label: string, maximum: number): string {
 }
 
 function boundedTeamsMessageText(value: unknown, label: string, maximum: number): string {
-  // Match the store's NUL/length guards while allowing LF, CRLF, and TAB in message text.
-  if (typeof value !== 'string' || value.length === 0 || value.length > maximum
-    || value.includes('\u0000')) {
+  try {
+    return validateTeamsMessageText(value, label, maximum);
+  } catch {
     throw new ExecutorRequestError(400, 'TEAMS_EVENT_INVALID', `${label} is invalid.`);
   }
-  return value;
 }
 
 function uuidText(value: unknown, label: string): string {

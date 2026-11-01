@@ -957,7 +957,7 @@ test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and p
 
   const grantRequests = [];
   const privateBodies = [];
-  const outcomes = ['accepted', 'uncertain'];
+  const outcomes = ['accepted', 'accepted', 'uncertain'];
   const exchangeServer = createServer(async (req, res) => {
     const respond = (status, value) => {
       res.writeHead(status, { 'content-type': 'application/json' });
@@ -968,6 +968,10 @@ test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and p
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
     if (req.url === '/internal/v1/connector-operation-grants') {
       grantRequests.push(body);
+      if (body.requestId === 'grant-no-response:attempt:1') {
+        req.socket.destroy();
+        return;
+      }
       const { arguments: _arguments, ...claimsWithoutArguments } = body;
       const now = Math.floor(Date.now() / 1_000);
       respond(200, {
@@ -982,7 +986,9 @@ test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and p
       respond(200, {
         requestId: body.requestId,
         status,
-        ...(status === 'accepted' ? { vendorMessageId: 'private-delivery-1' } : { reasonCode: 'teams_delivery_outcome_unknown' }),
+        ...(status === 'accepted'
+          ? { vendorMessageId: 'private-delivery-1' }
+          : { vendorMessageId: 'must-not-be-recorded', reasonCode: 'teams_delivery_outcome_unknown' }),
       });
       return;
     }
@@ -990,10 +996,29 @@ test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and p
   });
   await new Promise(resolve => exchangeServer.listen(0, '127.0.0.1', resolve));
 
-  const leaseFor = (id, actorAadObjectId = ownerId) => ({
+  const multilineFinal = [
+    '# Delivery result',
+    '',
+    'The selected change is merged into the integration branch, and I read the live remote branch after merge. The merge commit matches the expected result for this task.',
+    '',
+    '## Verification',
+    '- The pull request title and number match an independent read.',
+    '- The selected source commit is integrated into the target branch.',
+    '- The post-merge check is attached to that exact target commit.',
+    '- The owner-private route remains the one supplied by the current Work lease.',
+    '',
+    '## Limits',
+    'This proves the selected pull request state and remote merge read-back. It does not prove that a desktop branch was deleted, and it makes no claim about changes outside the checked repository.',
+    '',
+    '## Next step',
+    'No separate action is needed for this check. The exact Markdown body is passed through the authorization digest and Exchange message request so the owner can compare the delivered content with the result above.',
+  ].join('\n');
+  assert.ok(multilineFinal.length > 800, 'the regression fixture exercises a full-length multiline final');
+  const multilineAck = 'I have the request and will check it.\n\nI will post the verified result here.';
+  const leaseFor = (id, actorAadObjectId = ownerId, text = 'Private workflow update.') => ({
     notification: {
       id, deduplicationKey: `private-dedupe-${id}`, type: 'teams.message',
-      payload: { text: 'Private workflow update.' }, taskId: 'private-owner-task',
+      payload: { text }, taskId: 'private-owner-task',
       connectorId: 'teams-v1', recipient: 'teams:owner-private', status: 'leased', result: { retryCount: 0 },
     },
     leaseToken: `private-lease-${id}`,
@@ -1004,7 +1029,10 @@ test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and p
     },
   });
   const privateLeases = [
-    leaseFor('accepted'), leaseFor('revoked'), leaseFor('uncertain'), leaseFor('actor-mismatch', actorIds[1]),
+    leaseFor('ack-multiline', ownerId, multilineAck), leaseFor('revoked'),
+    leaseFor('accepted', ownerId, multilineFinal), leaseFor('uncertain'),
+    leaseFor('actor-mismatch', actorIds[1]), leaseFor('grant-no-response'),
+    leaseFor('invalid-control', ownerId, 'Private owner\u000bstatus.'),
   ];
   const privateFinished = [];
   const workStateStore = new InMemoryWorkStateStore();
@@ -1050,10 +1078,15 @@ test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and p
     await writeFile(directoryPath, JSON.stringify({ schemaVersion: 1, workspaceId, issuer, subjects: actorIds }));
     await app.executor['drainTeamsNotifications']();
     await app.executor['drainTeamsNotifications']();
+    await app.executor['drainTeamsNotifications']();
+    await app.executor['drainTeamsNotifications']();
+    await app.executor['drainTeamsNotifications']();
 
-    assert.equal(grantRequests.length, 2, 'revoked and task-owner-mismatched routes fail before grant creation');
-    assert.equal(privateBodies.length, 2);
-    const grant = grantRequests[0];
+    assert.equal(grantRequests.length, 4, 'revoked, mismatched, and invalid-text routes fail before grant creation');
+    assert.equal(privateBodies.length, 3);
+    assert.equal(grantRequests.filter(item => item.requestId === 'grant-no-response:attempt:1').length, 1,
+      'a grant transport failure is observed once and does not start a second send');
+    const grant = grantRequests[1];
     const route = {
       tenantId,
       botAppId: teams.botAppId,
@@ -1061,7 +1094,7 @@ test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and p
       conversationId: '19:private-owner-conversation',
       serviceUrl: 'https://smba.trafficmanager.net/emea/',
     };
-    const argumentsValue = { targetKind: 'owner_private', conversation: route, text: 'Private workflow update.' };
+    const argumentsValue = { targetKind: 'owner_private', conversation: route, text: multilineFinal };
     assert.equal(grant.principalSubject, ownerId, 'fresh Exchange grant uses the original Work Task actor');
     assert.equal(grant.principalIssuer, issuer);
     assert.equal(grant.connectionRef, teams.exchangeConnectionRef);
@@ -1070,20 +1103,42 @@ test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and p
     assert.equal(grant.operationId, 'msteams.message.reply');
     assert.equal(grant.resourceRef, `msteams-personal:${createHash('sha256').update(canonicalJson(route)).digest('hex')}`);
     assert.deepEqual(grant.arguments, argumentsValue);
+    assert.equal(grant.arguments.text, multilineFinal, 'the authorization digest binds the original multiline final');
+    assert.equal(grantRequests[0].arguments.text, multilineAck, 'the authorization digest binds the multiline ACK');
     assert.deepEqual(privateBodies[0].body, {
+      requestId: 'ack-multiline:attempt:1',
+      providerId: 'msteams',
+      targetKind: 'owner_private',
+      conversation: route,
+      text: multilineAck,
+    });
+    assert.deepEqual(privateBodies[1].body, {
       requestId: 'accepted:attempt:1',
       providerId: 'msteams',
       targetKind: 'owner_private',
       conversation: route,
-      text: 'Private workflow update.',
+      text: multilineFinal,
     });
+    assert.equal(privateFinished[0].result.vendorMessageId, 'private-delivery-1');
+    assert.equal(privateFinished[2].result.vendorMessageId, 'private-delivery-1');
     assert.ok(privateBodies.every(item => item.grant === 'AQ=='));
     assert.deepEqual(privateFinished.map(item => [item.id, item.outcome]), [
-      ['accepted', 'delivered'],
+      ['ack-multiline', 'delivered'],
       ['revoked', 'failed'],
+      ['accepted', 'delivered'],
       ['uncertain', 'uncertain'],
       ['actor-mismatch', 'failed'],
+      ['grant-no-response', 'failed'],
+      ['invalid-control', 'failed'],
     ]);
+    assert.equal(privateFinished[3].result.vendorMessageId, null,
+      'an uncertain receipt cannot persist a provider message ID as an accepted finish');
+    assert.equal(privateFinished.find(item => item.id === 'grant-no-response').result.code, 'EXCHANGE_GRANT_NO_RESPONSE',
+      'a lost authorization-grant response is known to precede Teams invocation');
+    assert.equal(privateFinished.at(-1).id, 'invalid-control');
+    assert.equal(privateFinished.at(-1).result.code, 'TEAMS_EVENT_INVALID',
+      'invalid message controls fail before grant or Teams invocation');
+    assert.equal(grantRequests.some(item => item.requestId === 'invalid-control:attempt:1'), false);
     assert.ok(workRequests.some(item => item.url?.endsWith('/work/tasks/private-owner-task')
       && item.authorization === `Bearer ${tokens[0]}`));
     assert.ok(workRequests.some(item => item.url?.endsWith('/work/tasks/private-owner-task')
@@ -1091,7 +1146,7 @@ test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and p
 
     app.executor.config.teams.sendPrivateMessage = undefined;
     await app.executor['drainTeamsNotifications']();
-    assert.equal(privateClaimCalls, 4, 'private notices are not claimed if the fixed Exchange sender becomes unavailable');
+    assert.equal(privateClaimCalls, 7, 'private notices are not claimed if the fixed Exchange sender becomes unavailable');
   } finally {
     if (app !== undefined) await disposeApp(app);
     exchangeServer.closeAllConnections();
