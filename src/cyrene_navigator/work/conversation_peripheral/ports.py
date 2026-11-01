@@ -863,15 +863,6 @@ def _bilibili_resource_ref(profile_ref: str, operation_id: str, target: Mapping[
     return "sha256:" + hashlib.sha256(_canonical_bilibili_json(payload)).hexdigest()
 
 
-class BackupPort(Protocol):
-    """Core-owned domain backup export; this port owns serialized data content."""
-
-    def create_backup(
-        self, *, principal: PersistencePrincipal, workspace_id: str
-    ) -> tuple[str, str, bytes] | Any:
-        """Return `(filename, media_type, bytes)` for one bounded backup artifact."""
-
-
 class ArtifactCallerVerifier(Protocol):
     """Configured verifier that checks signed tool payload and fixed binding scope."""
 
@@ -938,7 +929,6 @@ class PeripheralPorts:
     media: FixedToolBinding | None = None
     speech: SpeechProviderPort | None = None
     bilibili_exchange: ExchangeBilibiliPort | None = None
-    backup: BackupPort | None = None
     artifact_bridge: ArtifactBridgeConfig | None = None
 
 
@@ -946,7 +936,6 @@ __all__ = [
     "ArtifactBridgeBinding",
     "ArtifactBridgeConfig",
     "ArtifactCallerVerifier",
-    "BackupPort",
     "ExchangeBilibiliHttpClient",
     "ExchangeBilibiliHttpError",
     "ExchangeBilibiliPort",

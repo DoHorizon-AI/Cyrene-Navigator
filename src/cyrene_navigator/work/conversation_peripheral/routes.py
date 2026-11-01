@@ -48,7 +48,6 @@ from cyrene_navigator.work.store import WorkStore
 
 from .identity import bilibili_operation_idempotency_key
 from .models import (
-    BackupReceipt,
     BilibiliAccount,
     BilibiliAccountList,
     BilibiliConnection,
@@ -83,7 +82,6 @@ from .ports import (
 )
 
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
-_MEDIA_TYPE = re.compile(r"[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+\Z")
 _MAX_ATTACHMENT_BYTES = 10_000_000
 _MAX_BILIBILI_RESULT_BYTES = 1_500_000
 _IMAGE_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
@@ -1174,45 +1172,6 @@ def mount_peripheral_routes(
             "operation": updated,
             "resultArtifact": None,
             "duplicate": update_duplicate,
-        }
-
-    @app.post(base + "/backups", response_model=BackupReceipt, status_code=201)
-    async def create_backup(
-        workspace_id: str, _body: PeripheralEmptyRequest, request: Request
-    ) -> dict[str, Any]:
-        principal = principal_for(request, workspace_id, write=True)
-        port = _require_port(ports.backup, "CONVERSATION_BACKUP_UNAVAILABLE")
-        result = await invoke_port(
-            port.create_backup, principal=principal, workspace_id=workspace_id
-        )
-        if not isinstance(result, tuple) or len(result) != 3:
-            raise _provider_payload_error("CONVERSATION_BACKUP_INVALID_PAYLOAD")
-        name, media_type, data = result
-        if (
-            not isinstance(name, str)
-            or not isinstance(media_type, str)
-            or not _MEDIA_TYPE.fullmatch(media_type)
-            or not isinstance(data, bytes)
-            or not data
-            or len(data) > _MAX_ATTACHMENT_BYTES
-        ):
-            raise PersistenceError(
-                "WORK_ATTACHMENT_INVALID_SIZE", 413, "Backup attachment exceeds 10 MB."
-            )
-        attachment = store.put_attachment(
-            principal.organization_id,
-            workspace_id,
-            name,
-            media_type,
-            data,
-            actor_id=principal.actor_id,
-            actor_private_scope=True,
-        )
-        return {
-            "attachment": attachment,
-            "downloadPath": _workspace_route_path(
-                base, workspace_id, f"/backups/attachments/{attachment['sha256']}"
-            ),
         }
 
     @app.get(base + "/backups/attachments/{digest}", response_model=None)

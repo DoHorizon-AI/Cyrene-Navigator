@@ -283,13 +283,6 @@ class BackupCreate(WorkModel):
     """Create a bounded backup attachment through the configured host port."""
 
 
-class BackupReceipt(WorkModel):
-    """Backup bytes are returned only as an authorized Work attachment reference."""
-
-    attachment: AttachmentRecord
-    download_path: str
-
-
 class PeripheralError(WorkModel):
     """Stable error shape returned by configured optional capability ports."""
 
@@ -299,7 +292,6 @@ class PeripheralError(WorkModel):
 
 __all__ = [
     "BackupCreate",
-    "BackupReceipt",
     "BilibiliAccount",
     "BilibiliAccountList",
     "BilibiliConnection",

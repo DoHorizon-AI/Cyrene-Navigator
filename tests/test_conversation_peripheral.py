@@ -336,13 +336,6 @@ class _FakeSpeech:
         }
 
 
-class _FakeBackup:
-    """Return a bounded archive for actor-private attachment delivery."""
-
-    def create_backup(self, **_: Any) -> tuple[str, str, bytes]:
-        return "conversation-backup.json", "application/json", b'{"schemaVersion":1}'
-
-
 class _FakeExchangeBilibili:
     """Model the typed Exchange boundary and capture writes for idempotency tests."""
 
@@ -1204,19 +1197,26 @@ def test_bilibili_http_rejection_is_definite_and_post_dispatch_loss_is_uncertain
     assert "private DM text" not in json.dumps(uncertain.json())
 
 
-def test_backup_attachment_is_owner_private_and_download_digest_is_verified(tmp_path: Path) -> None:
-    client, _ = _app(tmp_path, PeripheralPorts(backup=_FakeBackup()))
+def test_canonical_backup_attachment_is_owner_private_and_download_digest_is_verified(
+    tmp_path: Path,
+) -> None:
+    client, _ = _app(tmp_path, PeripheralPorts())
     with client:
         created = client.post(
             f"{BASE.format(workspace_id=WORKSPACE)}/backups", headers=_headers(), json={}
         )
         receipt = created.json()
-        download = client.get(receipt["downloadPath"], headers=_headers())
-        other_actor = client.get(receipt["downloadPath"], headers=_headers("reader-token"))
+        download_path = (
+            f"{BASE.format(workspace_id=WORKSPACE)}/backups/attachments/{receipt['sha256']}"
+        )
+        download = client.get(download_path, headers=_headers())
+        other_actor = client.get(download_path, headers=_headers("reader-token"))
 
     assert created.status_code == 201
-    assert download.content == b'{"schemaVersion":1}'
-    assert download.headers["x-content-sha256"] == receipt["attachment"]["sha256"]
+    assert download.status_code == 200
+    assert hashlib.sha256(download.content).hexdigest() == receipt["sha256"]
+    assert download.headers["x-content-sha256"] == receipt["sha256"]
+    assert len(download.content) == receipt["size"]
     assert other_actor.status_code == 404
 
 
