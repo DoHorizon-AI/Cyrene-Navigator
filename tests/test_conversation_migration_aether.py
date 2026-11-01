@@ -13,18 +13,29 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import re
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from cyrene_navigator.work.conversation_memory.domains import ConversationDomainStore
+from cyrene_navigator.work.conversation_memory.store import ConversationMemoryStore
+from cyrene_navigator.work.conversation_migration import (
+    ActorScope,
+    AuthorizedConversationContext,
+    MigrationSettings,
+    build_conversation_migration_host,
+)
 from cyrene_navigator.work.conversation_migration.aether_convert import (
     AetherConversionError,
     convert_aether_platform_message_history,
     main,
 )
 from cyrene_navigator.work.conversation_migration.jsonl import JsonLinesMigrationSource
-from cyrene_navigator.work.conversation_migration.models import MigrationSettings
+from cyrene_navigator.work.conversation_migration.ports import AuthorizationDecision
+from cyrene_navigator.work.store import WorkStore
 
 _NAMESPACE = "synthetic-aether-namespace-01"
 
@@ -71,6 +82,105 @@ def _jsonl(rows: list[object]) -> bytes:
     return b"".join(
         json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode() + b"\n" for row in rows
     )
+
+
+class _AetherImportAuthorization:
+    """Test-only host authorization mapping one opaque source conversation."""
+
+    def __init__(
+        self,
+        memory: ConversationMemoryStore,
+        *,
+        scope: ActorScope,
+        artifact_id: str,
+        artifact_digest: str,
+        target: AuthorizedConversationContext,
+    ) -> None:
+        self.memory = memory
+        self.scope = scope
+        self.artifact_id = artifact_id
+        self.artifact_digest = artifact_digest
+        self.target = target
+
+    def authorize_artifact(self, scope: ActorScope, artifact_id: str, sha256: str) -> bool:
+        return (
+            scope == self.scope
+            and artifact_id == self.artifact_id
+            and sha256 == self.artifact_digest
+        )
+
+    def resolve_conversation_context(
+        self,
+        scope: ActorScope,
+        *,
+        artifact_id: str,
+        source_conversation_id: str,
+        source_conversation_kind: str,
+        source_persona_id: str | None,
+    ) -> AuthorizedConversationContext | None:
+        del source_persona_id
+        if (
+            scope == self.scope
+            and artifact_id == self.artifact_id
+            and re.fullmatch(r"aether-conversation-[a-f0-9]{64}", source_conversation_id)
+            and source_conversation_kind == "direct"
+        ):
+            return self.target
+        return None
+
+    def authorize_staged_record(
+        self,
+        scope: ActorScope,
+        *,
+        artifact_id: str,
+        artifact_sha256: str,
+        record: object,
+    ) -> AuthorizationDecision:
+        del record
+        overview = self.memory.overview(scope.organization_id, scope.workspace_id, scope.actor_id)
+        return AuthorizationDecision(
+            self.authorize_artifact(scope, artifact_id, artifact_sha256),
+            int(overview["authorizationEpoch"]),
+        )
+
+    def authorize_source_refs(
+        self,
+        scope: ActorScope,
+        *,
+        conversation_id: str,
+        conversation_kind: str,
+        persona_id: str | None,
+        source_refs: Sequence[Mapping[str, object]],
+    ) -> AuthorizationDecision:
+        del conversation_id, conversation_kind, persona_id, source_refs
+        overview = self.memory.overview(scope.organization_id, scope.workspace_id, scope.actor_id)
+        return AuthorizationDecision(scope == self.scope, int(overview["authorizationEpoch"]))
+
+    def approve_profile_activation(
+        self, scope: ActorScope, approval_ref: str | None, record_digest: str
+    ) -> bool:
+        del scope, approval_ref, record_digest
+        return False
+
+    def approve_graph_projection(
+        self, scope: ActorScope, approval_ref: str | None, record_digest: str
+    ) -> bool:
+        del scope, approval_ref, record_digest
+        return False
+
+    def approve_import(self, scope: ActorScope, approval_ref: str | None, plan_sha256: str) -> bool:
+        return (
+            scope == self.scope
+            and approval_ref == "synthetic-import-approved"
+            and len(plan_sha256) == 64
+        )
+
+    def approve_rollback(self, scope: ActorScope, batch_id: str, plan_sha256: str) -> bool:
+        return (
+            scope == self.scope
+            and batch_id.startswith("conversation-migration-")
+            and len(plan_sha256) == 64
+        )
 
 
 def test_converts_user_and_bot_rows_to_verified_canonical_jsonl() -> None:
@@ -269,3 +379,146 @@ def test_namespace_must_be_an_opaque_stable_alias() -> None:
     with pytest.raises(AetherConversionError) as error:
         convert_aether_platform_message_history(io.BytesIO(b""), source_namespace="user-123")
     assert error.value.code == "SOURCE_NAMESPACE_INVALID"
+
+
+def test_converted_aether_message_import_restarts_and_rolls_back_in_fresh_sqlite(
+    tmp_path: Path,
+) -> None:
+    """Project one synthetic Aether row through real stores, restart, and compensate."""
+
+    source_row = _source_row()
+    raw = _jsonl([source_row])
+    converted = convert_aether_platform_message_history(
+        io.BytesIO(raw), source_namespace=_NAMESPACE
+    )
+    scope = ActorScope("synthetic-org", "synthetic-workspace", "synthetic-actor")
+    target = AuthorizedConversationContext("target-current-conversation", "direct", None)
+    artifact_id = "synthetic-aether-artifact"
+    task_id = "synthetic-aether-migration-task"
+    database = tmp_path / "aether-import.sqlite"
+
+    def host_for_current_process() -> tuple[object, ConversationMemoryStore, WorkStore]:
+        memory = ConversationMemoryStore(database)
+        domains = ConversationDomainStore(database)
+        work = WorkStore(database)
+        authorization = _AetherImportAuthorization(
+            memory,
+            scope=scope,
+            artifact_id=artifact_id,
+            artifact_digest=converted.sha256,
+            target=target,
+        )
+        host = build_conversation_migration_host(
+            memory_store=memory,
+            domain_store=domains,
+            work_store=work,
+            authorization=authorization,  # type: ignore[arg-type]
+        )
+        return host, memory, work
+
+    host, memory, work = host_for_current_process()
+    work.create_task(
+        scope.organization_id,
+        scope.workspace_id,
+        {"id": task_id, "sessionId": "synthetic-session", "prompt": "offline import"},
+        actor_id=scope.actor_id,
+        actor_private_scope=True,
+    )
+    work.claim_task(
+        scope.organization_id,
+        scope.workspace_id,
+        task_id,
+        actor_id=scope.actor_id,
+        actor_private_scope=True,
+    )
+    source = JsonLinesMigrationSource(
+        io.BytesIO(converted.content),
+        artifact_id=artifact_id,
+        expected_sha256=converted.sha256,
+    )
+    preview = host.service.preview(scope, source)
+    assert preview.record_count == 1
+    assert preview.accepted_count == 1
+    assert preview.accepted_by_kind == {"message": 1}
+    applied = host.service.apply(
+        scope,
+        task_id=task_id,
+        source=source,
+        preview=preview,
+        approval_ref="synthetic-import-approved",
+    )
+    assert applied.status == "applied"
+    imported = memory.list_messages(
+        scope.organization_id,
+        scope.workspace_id,
+        scope.actor_id,
+        target.conversation_id,
+        conversation_kind=target.conversation_kind,
+        order="asc",
+        limit=10,
+    )["items"]
+    assert len(imported) == 1
+    imported_id = str(imported[0]["id"])
+    assert imported[0]["content"] == "Synthetic fixture text."
+
+    restarted, restarted_memory, _ = host_for_current_process()
+    replay_source = JsonLinesMigrationSource(
+        io.BytesIO(converted.content),
+        artifact_id=artifact_id,
+        expected_sha256=converted.sha256,
+    )
+    replay_preview = restarted.service.preview(scope, replay_source)
+    replay = restarted.service.apply(
+        scope,
+        task_id=task_id,
+        source=replay_source,
+        preview=replay_preview,
+        approval_ref="synthetic-import-approved",
+    )
+    assert replay.status == "applied"
+    reread = restarted_memory.list_messages(
+        scope.organization_id,
+        scope.workspace_id,
+        scope.actor_id,
+        target.conversation_id,
+        conversation_kind=target.conversation_kind,
+        order="asc",
+        limit=10,
+    )["items"]
+    assert len(reread) == 1
+    assert reread[0]["id"] == imported_id
+
+    rolled_back = restarted.service.rollback(
+        scope,
+        task_id=task_id,
+        source=replay_source,
+        preview=replay_preview,
+    )
+    assert rolled_back.status == "rolled_back"
+    after_restart, after_restart_memory, _ = host_for_current_process()
+    rollback_source = JsonLinesMigrationSource(
+        io.BytesIO(converted.content),
+        artifact_id=artifact_id,
+        expected_sha256=converted.sha256,
+    )
+    rollback_preview = after_restart.service.preview(scope, rollback_source)
+    rollback_replay = after_restart.service.rollback(
+        scope,
+        task_id=task_id,
+        source=rollback_source,
+        preview=rollback_preview,
+    )
+    assert rollback_replay.status == "rolled_back"
+    revoked = after_restart_memory.list_messages(
+        scope.organization_id,
+        scope.workspace_id,
+        scope.actor_id,
+        target.conversation_id,
+        conversation_kind=target.conversation_kind,
+        order="asc",
+        limit=10,
+        include_revoked=True,
+    )["items"]
+    assert len(revoked) == 1
+    assert revoked[0]["id"] == imported_id
+    assert revoked[0]["status"] == "revoked"
