@@ -12,6 +12,7 @@ import type { CredentialHealthSnapshot } from './work-state-client.js';
 
 const GRANT_TTL_MAX_SECONDS = 15;
 const REQUEST_TIMEOUT_MS = 10_000;
+const GITHUB_PROVIDER_OPERATION_TIMEOUT_MS = 60_000;
 const PRIVATE_TEAMS_MESSAGE_TIMEOUT_MS = 60_000;
 const MAX_RESPONSE_BYTES = 2_000_000;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
@@ -126,6 +127,8 @@ export interface ExchangeConnectorAuthorizationConfig {
   readonly hmacKeyId: string;
   readonly audience: string;
   readonly requestTimeoutMs?: number;
+  /** GitHub provider operation POST+body cap; grants and other providers keep requestTimeoutMs. */
+  readonly githubProviderOperationTimeoutMs?: number;
   /** Private Teams message POST+body cap; other Exchange calls keep requestTimeoutMs. */
   readonly privateTeamsMessageTimeoutMs?: number;
 }
@@ -134,6 +137,7 @@ export interface ExchangeConnectorAuthorizationConfig {
 export class ExchangeConnectorAuthorizationClient {
   private readonly origin: string;
   private readonly timeoutMs: number;
+  private readonly githubProviderOperationTimeoutMs: number;
   private readonly privateTeamsMessageTimeoutMs: number;
   private keyPromise?: Promise<Buffer>;
 
@@ -148,12 +152,18 @@ export class ExchangeConnectorAuthorizationClient {
     }
     this.origin = origin.origin;
     this.timeoutMs = config.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
+    this.githubProviderOperationTimeoutMs = config.githubProviderOperationTimeoutMs
+      ?? GITHUB_PROVIDER_OPERATION_TIMEOUT_MS;
     this.privateTeamsMessageTimeoutMs = config.privateTeamsMessageTimeoutMs ?? PRIVATE_TEAMS_MESSAGE_TIMEOUT_MS;
     safeText(config.hmacKeyId, 'Exchange HMAC key id', 128);
     safeText(config.hmacKeyFile, 'Exchange HMAC key file', 2_000);
     safeText(config.audience, 'Exchange Authority audience', 256);
     if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs < 100 || this.timeoutMs > 120_000) {
       throw new TypeError('Invalid Exchange connector request timeout');
+    }
+    if (!Number.isSafeInteger(this.githubProviderOperationTimeoutMs)
+      || this.githubProviderOperationTimeoutMs < 100 || this.githubProviderOperationTimeoutMs > 120_000) {
+      throw new TypeError('Invalid GitHub provider operation timeout');
     }
     if (!Number.isSafeInteger(this.privateTeamsMessageTimeoutMs)
       || this.privateTeamsMessageTimeoutMs < 100 || this.privateTeamsMessageTimeoutMs > 120_000) {
@@ -212,7 +222,10 @@ export class ExchangeConnectorAuthorizationClient {
       arguments: input.arguments,
     });
     const path = `/internal/v1/connector-operations/${encodeURIComponent(input.connectionRef)}`;
-    const response = await this.postGranted(path, body, grant, signal);
+    const requestTimeoutMs = input.providerId === 'github'
+      ? this.githubProviderOperationTimeoutMs
+      : this.timeoutMs;
+    const response = await this.postGranted(path, body, grant, signal, requestTimeoutMs);
     if (response.requestId !== input.requestId
       || !['verified', 'pending', 'uncertain', 'failed'].includes(String(response.outcome))) {
       throw new TypeError('Exchange returned an invalid provider operation envelope');
@@ -557,8 +570,9 @@ export class ExchangeConnectorAuthorizationClient {
     body: string,
     grant: ConnectorGrant,
     signal: AbortSignal,
+    requestTimeoutMs = this.timeoutMs,
   ): Promise<Record<string, JsonValue>> {
-    const response = await this.postGrantedResponse(path, body, grant, signal);
+    const response = await this.postGrantedResponse(path, body, grant, signal, false, requestTimeoutMs);
     return object(await readJson(response), 'Exchange connector result') as Record<string, JsonValue>;
   }
 
