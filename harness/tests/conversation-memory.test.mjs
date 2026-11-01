@@ -157,6 +157,7 @@ test('beforeDelivery rechecks source authorization and fails closed on revocatio
   });
   const feature = createConversationMemoryFeature({ api, summaryProvider: summaryProvider() });
   const context = trustedContext();
+  await feature.beforeContext(context, { query: '' });
   const delivery = {
     text: 'The user prefers concise updates.',
     sourceRefs: [{ memoryId: 'memory-1', memoryVersion: 1, sourceMessageIds: ['message-1'] }],
@@ -254,10 +255,34 @@ test('delivery authorization receives every source reference beyond the old 64-r
     },
   });
   const feature = createConversationMemoryFeature({ api, summaryProvider: summaryProvider() });
+  const context = trustedContext();
+  await feature.beforeContext(context, { query: '' });
 
-  const decision = await feature.beforeDelivery(trustedContext(), { text: 'answer', sourceRefs: allReferences });
+  const decision = await feature.beforeDelivery(context, { text: 'answer', sourceRefs: allReferences });
   assert.equal(calls.authorizations[0].input.sourceRefs.length, 65);
   assert.deepEqual(decision, { decision: 'hold', code: 'SOURCE_AUTHORIZATION_REVOKED', authorizationEpoch: 3 });
+});
+
+test('delivery without a context-hook proof fails closed even when sourceRefs is empty', async () => {
+  const { api, calls } = baseApi();
+  const feature = createConversationMemoryFeature({ api, summaryProvider: summaryProvider() });
+  const decision = await feature.beforeDelivery(trustedContext(), { text: 'answer', sourceRefs: [] });
+  assert.deepEqual(decision, { decision: 'hold', code: 'SOURCE_PROOF_MISSING', authorizationEpoch: 3 });
+  assert.equal(calls.authorizations.length, 0);
+});
+
+test('evicted turn proofs fail closed instead of becoming an empty source set', async () => {
+  const { api } = baseApi({
+    async queryMemories(context) { return { items: [memory()], authorizationEpoch: context.authorizationEpoch }; },
+  });
+  const feature = createConversationMemoryFeature({ api, summaryProvider: summaryProvider() });
+  const original = trustedContext();
+  await feature.beforeContext(original, { query: 'preference' });
+  for (let index = 0; index < 2_049; index += 1) {
+    await feature.beforeContext(trustedContext(), { query: '' });
+  }
+  const decision = await feature.beforeDelivery(original, { text: 'answer', sourceRefs: [] });
+  assert.deepEqual(decision, { decision: 'hold', code: 'SOURCE_PROOF_MISSING', authorizationEpoch: 3 });
 });
 
 test('completed turns use the configured summarizer and archive only unarchived scoped messages idempotently', async () => {
@@ -281,7 +306,13 @@ test('completed turns use the configured summarizer and archive only unarchived 
     },
     async listMemories(context, input) {
       calls.listMemories.push({ context, input });
-      return { items: [memory({ memoryId: 'prior-summary', sourceMessageIds: ['message-00'] })], authorizationEpoch: context.authorizationEpoch };
+      return {
+        items: [
+          memory({ memoryId: 'prior-summary', kind: 'episode', sourceMessageIds: ['message-00'] }),
+          memory({ memoryId: 'user-fact', kind: 'fact', sourceMessageIds: ['message-01'] }),
+        ],
+        authorizationEpoch: context.authorizationEpoch,
+      };
     },
   });
   const model = summaryProvider();
@@ -299,7 +330,9 @@ test('completed turns use the configured summarizer and archive only unarchived 
     sourceRefs: [{ memoryId: 'memory-used', memoryVersion: 2, sourceMessageIds: ['source-original'] }],
   };
 
+  await feature.beforeContext(context, { query: '' });
   await feature.afterTurn(context, turn);
+  await feature.beforeContext(context, { query: '' });
   await feature.afterTurn(context, turn);
 
   assert.equal(calls.createMessages.length, 2);
@@ -308,10 +341,12 @@ test('completed turns use the configured summarizer and archive only unarchived 
   assert.deepEqual(calls.createMessages[0].input.relatedEventIds, [turn.userEventId]);
   assert.equal(model.calls.length, 2, 'the provider runs for each retry; Work API idempotency absorbs duplicate writes');
   assert.ok(model.calls[0].messages.every(item => item.id !== 'message-00'), 'previously archived source is excluded');
+  assert.ok(model.calls[0].messages.some(item => item.id === 'message-01'), 'ordinary facts do not suppress episode archival');
   assert.equal(calls.createMemories.length, 2);
   assert.equal(calls.createMemories[0].input.idempotencyKey, calls.createMemories[1].input.idempotencyKey);
   assert.equal(calls.createMemories[0].input.kind, 'episode');
-  assert.deepEqual(calls.createMemories[0].input.sourceRefs, turn.sourceRefs);
+  assert.ok(calls.createMemories[0].input.sourceRefs.some(ref => ref.memoryId === 'memory-used' && ref.memoryVersion === 2));
+  assert.ok(calls.createMemories[0].input.sourceRefs.some(ref => ref.memoryId === null && ref.sourceMessageIds.length >= 8));
   assert.equal(calls.createMemories[0].input.visibility, 'private');
   assert.ok(calls.createMemories[0].input.sourceMessageIds.length >= 8);
   assert.ok(calls.createMemories[0].input.sourceMessageIds.includes('source-original'), 'derived summaries retain transitive source dependencies');
@@ -352,8 +387,10 @@ test('summary archival refuses lineage overflow instead of persisting a truncate
     minimumCharacters: 200,
   });
 
+  const context = trustedContext();
+  await feature.beforeContext(context, { query: '' });
   await assert.rejects(
-    feature.afterTurn(trustedContext(), {
+    feature.afterTurn(context, {
       userEventId: 'user-event-2', assistantText: 'Completed response.', status: 'completed', sourceRefs: [],
     }),
     error => error.code === 'INVALID_SOURCE_PROOF',
@@ -384,14 +421,14 @@ test('disabled memory preserves stored data, skips retrieval and writes, and sti
   const feature = createConversationMemoryFeature({ api, enabled: false });
   const context = trustedContext();
   assert.deepEqual(await feature.beforeContext(context, { query: 'remembered fact' }), { contributions: [] });
-  await feature.afterTurn(context, {
-    userEventId: 'event-disabled', assistantText: 'reply', status: 'completed', sourceRefs: [],
-  });
   const delivery = await feature.beforeDelivery(context, {
     text: 'reply',
     sourceRefs: [{ memoryId: 'memory-old', memoryVersion: 1, sourceMessageIds: ['source-old'] }],
   });
   assert.deepEqual(delivery, { decision: 'allow', authorizationEpoch: 3 });
+  await feature.afterTurn(context, {
+    userEventId: 'event-disabled', assistantText: 'reply', status: 'completed', sourceRefs: [],
+  });
   assert.equal(calls.queries.length, 0);
   assert.equal(calls.createMessages.length, 0);
   assert.equal(calls.createMemories.length, 0);
