@@ -23,7 +23,7 @@ import { maintenanceWorkTaskId, type DshWorkTaskExecutionPortV1 } from './conver
 import { conversationScheduleMarker, type ConversationDshScheduler } from './conversation-schedule.ts';
 
 const FEATURE_ID = 'conversation-daily-review.v1';
-const PAGE_SIZE = 16;
+const PAGE_SIZE = 1;
 const MAX_SCAN_PAGES = 24;
 const MAX_REPORT_PAGES = 16;
 const MAX_MESSAGE_CHARACTERS = 12_000;
@@ -145,6 +145,10 @@ export interface ConversationDailyReviewFeature {
     readonly window?: ConversationReviewWindow;
   }): Promise<{ readonly job: ConversationMaintenanceJob; readonly duplicate: boolean }>;
   recoverQueued(context: TrustedTurnContext): Promise<number>;
+  continuePartial(context: TrustedTurnContext, jobId: string, expectedVersion: number): Promise<{
+    readonly job: ConversationMaintenanceJob;
+    readonly duplicate: boolean;
+  }>;
   retryFailed(context: TrustedTurnContext, jobId: string, expectedVersion: number): Promise<{
     readonly job: ConversationMaintenanceJob;
     readonly duplicate: boolean;
@@ -153,6 +157,7 @@ export interface ConversationDailyReviewFeature {
     readonly job: ConversationMaintenanceJob;
     readonly taskId: string;
     readonly taskStatus: string;
+    readonly continuationJobId?: string;
   }>;
   cancel(context: TrustedTurnContext, jobId: string, expectedVersion: number): Promise<{
     readonly job: ConversationMaintenanceJob;
@@ -168,6 +173,7 @@ interface ReviewCursorV1 {
   readonly messageCursor: string | null;
   readonly scannedPages: number;
   readonly reportPages: number;
+  readonly previousReport?: { readonly artifactId: string; readonly sha256: string };
 }
 
 interface ReviewPageReceiptV1 {
@@ -177,6 +183,7 @@ interface ReviewPageReceiptV1 {
   readonly sha256: string;
   readonly sizeBytes: number;
   readonly sourceDigest: string;
+  readonly sourceRefsDigest: string;
   readonly scopeDigest: string;
 }
 
@@ -191,6 +198,7 @@ interface ReviewCheckpointV1 {
   readonly completed: boolean;
   readonly reportArtifact?: ConversationReviewArtifactV1;
   readonly ledgerEventId?: string;
+  readonly continuationCursor?: string;
 }
 
 interface ParsedPageArtifactV1 {
@@ -254,7 +262,7 @@ export function createConversationDailyReviewFeature(options: ConversationDailyR
       context.signal.throwIfAborted();
       if (!enabled) return 0;
       let scheduled = 0;
-      for (const state of ['queued', 'running'] as const) {
+      for (const state of ['queued', 'running', 'completed'] as const) {
         let cursor: string | undefined;
         const seen = new Set<string>();
         while (true) {
@@ -268,6 +276,14 @@ export function createConversationDailyReviewFeature(options: ConversationDailyR
           for (const job of page.items) {
             context.signal.throwIfAborted();
             if (!belongsToTrustedReview(job, context)) continue;
+            if (state === 'completed') {
+              const continuationCursor = continuationCursorFromJob(job);
+              if (continuationCursor !== undefined) {
+                await createContinuationJob(options, context, job, continuationCursor, now);
+                scheduled += 1;
+              }
+              continue;
+            }
             const result = await options.scheduler.ensureOneShot(
               conversationScheduleMarker('maintenance', job.id),
               now() + 1_000,
@@ -284,6 +300,19 @@ export function createConversationDailyReviewFeature(options: ConversationDailyR
         }
       }
       return scheduled;
+    },
+
+    async continuePartial(context, jobId, expectedVersion) {
+      context.signal.throwIfAborted();
+      requireEnabled(enabled);
+      const { job } = await options.api.getMaintenanceJob(context, jobId);
+      if (!belongsToTrustedReview(job, context) || job.state !== 'completed') {
+        fail('DAILY_REVIEW_CONTINUATION_UNAVAILABLE', 409, false, 'Only a completed partial report can be continued');
+      }
+      if (job.version !== expectedVersion) fail('DAILY_REVIEW_JOB_CONFLICT', 409, false, 'Review job version changed');
+      const cursor = continuationCursorFromJob(job);
+      if (cursor === undefined) fail('DAILY_REVIEW_CONTINUATION_UNAVAILABLE', 409, false, 'Review window has no remaining messages');
+      return createContinuationJob(options, context, job, cursor, now);
     },
 
     async retryFailed(context, jobId, expectedVersion) {
@@ -336,7 +365,12 @@ export function createConversationDailyReviewFeature(options: ConversationDailyR
         checkpoint,
         signal,
       }), context.signal);
-      return { job, taskId, taskStatus: outcome.status };
+      if (outcome.status !== 'completed') return { job, taskId, taskStatus: outcome.status };
+      const latestJob = (await options.api.getMaintenanceJob(context, job.id)).job;
+      const continuationCursor = continuationCursorFromJob(latestJob);
+      if (continuationCursor === undefined) return { job: latestJob, taskId, taskStatus: outcome.status };
+      const continuation = await createContinuationJob(options, context, latestJob, continuationCursor, now);
+      return { job: latestJob, taskId, taskStatus: outcome.status, continuationJobId: continuation.job.id };
     },
 
     async cancel(context, jobId, expectedVersion) {
@@ -368,6 +402,10 @@ async function executeReview(input: {
   const cursor = input.job.cursor === null ? undefined : decodeCursor(input.job.cursor);
   const checkpoint = parseReviewCheckpoint(input.job.details.dailyReviewV1, cursor);
   const window = checkpoint.window;
+  const previousReport = cursor?.previousReport;
+  if (previousReport !== undefined) {
+    await readPreviousReviewReport(input.artifacts, input.api, input.context, previousReport, window, input.signal);
+  }
   let pageCursor = cursor?.messageCursor ?? null;
   let scannedPages = cursor?.scannedPages ?? 0;
   let reportPages = cursor?.reportPages ?? checkpoint.pages.length;
@@ -427,10 +465,13 @@ async function executeReview(input: {
     if (ordered.length === 0) {
       pageCursor = nextMessageCursor;
       rollingDigest = hashText(`${rollingDigest}\nscan:${scannedPages}:${pageCursor ?? 'end'}`);
+      if (scannedPages >= MAX_SCAN_PAGES && nextMessageCursor !== null) {
+        gaps.push(`This report chunk stopped after ${MAX_SCAN_PAGES} history pages; a continuation will resume at the saved cursor.`);
+      }
       const state = nextCheckpoint(window, pageReceipts, sourceRefsByKey, processedCount, gaps, false, checkpoint.reportArtifact, checkpoint.ledgerEventId);
       const done = reachedWindowStart || nextMessageCursor === null || scannedPages >= MAX_SCAN_PAGES;
       await input.checkpoint({
-        cursor: encodeCursor({ version: 1, ...window, messageCursor: pageCursor, scannedPages, reportPages }),
+        cursor: encodeCursor({ version: 1, ...window, messageCursor: pageCursor, scannedPages, reportPages, ...(cursor?.previousReport === undefined ? {} : { previousReport: cursor.previousReport }) }),
         processedCount,
         checkpointDigest: rollingDigest,
         details: { dailyReviewV1: { ...state, ...(done ? { completed: true } : {}) }, retryable: true },
@@ -444,11 +485,11 @@ async function executeReview(input: {
       fail('DAILY_REVIEW_MESSAGE_LIMIT', 422, false, 'Conversation page contains content beyond the review input bound');
     }
     if (sourceRefsByKey.size + refs.filter(ref => !sourceRefsByKey.has(sourceRefKey(ref))).length > MAX_SOURCE_REFS) {
-      gaps.push('Review stopped because the exact source-reference budget was reached.');
-      reachedWindowStart = true;
+      gaps.push('This report chunk reached its exact source-reference budget; a continuation will resume at the current message.');
       break;
     }
-    const sourceDigest = hashText(canonicalJson(refs));
+    const sourceMessageIds = stableUnique(ordered.map(message => message.id));
+    const sourceDigest = hashText(canonicalJson({ sourceRefs: refs, sourceMessageIds }));
     const pageIndex = reportPages;
     const artifactKey = `daily-review-page-${hashText(`${input.context.conversationId}\u0000${window.startAt}\u0000${window.endAt}\u0000${pageIndex}\u0000${sourceDigest}`).slice(0, 40)}`;
     const existing = await input.artifacts.findByIdempotencyKey({
@@ -479,7 +520,6 @@ async function executeReview(input: {
         signal: input.signal,
       }));
       await requireCurrentSources(input.api, input.context, refs, 'DAILY_REVIEW_SOURCE_REVOKED');
-      const sourceMessageIds = stableUnique(ordered.map(message => message.id));
       const reportPage: ParsedPageArtifactV1 & { readonly sourceDigest: string } = {
         schema: 'cyrene.conversation-review-page.v1',
         pageIndex,
@@ -511,6 +551,7 @@ async function executeReview(input: {
       sha256: artifact.sha256,
       sizeBytes: artifact.sizeBytes,
       sourceDigest,
+      sourceRefsDigest: artifact.sourceRefsDigest,
       scopeDigest: artifact.scopeDigest,
     };
     pageReceipts.push(receipt);
@@ -520,11 +561,11 @@ async function executeReview(input: {
     pageCursor = nextMessageCursor;
     rollingDigest = hashText(`${rollingDigest}\n${artifact.sha256}\n${pageCursor ?? 'end'}`);
     const atWindowEnd = reachedWindowStart || pageCursor === null || reportPages >= MAX_REPORT_PAGES || scannedPages >= MAX_SCAN_PAGES;
-    if (reportPages >= MAX_REPORT_PAGES && pageCursor !== null) gaps.push(`Review stopped at ${MAX_REPORT_PAGES} report pages; older messages in the window remain unreviewed.`);
-    if (scannedPages >= MAX_SCAN_PAGES && pageCursor !== null) gaps.push(`Review stopped after ${MAX_SCAN_PAGES} history pages; older messages in the window remain unreviewed.`);
+    if (reportPages >= MAX_REPORT_PAGES && pageCursor !== null) gaps.push(`This report chunk reached ${MAX_REPORT_PAGES} pages; a continuation will resume at the saved cursor.`);
+    if (scannedPages >= MAX_SCAN_PAGES && pageCursor !== null) gaps.push(`This report chunk reached ${MAX_SCAN_PAGES} history pages; a continuation will resume at the saved cursor.`);
     const state = nextCheckpoint(window, pageReceipts, sourceRefsByKey, processedCount, gaps, atWindowEnd, checkpoint.reportArtifact, checkpoint.ledgerEventId);
     await input.checkpoint({
-      cursor: encodeCursor({ version: 1, ...window, messageCursor: pageCursor, scannedPages, reportPages }),
+      cursor: encodeCursor({ version: 1, ...window, messageCursor: pageCursor, scannedPages, reportPages, ...(cursor?.previousReport === undefined ? {} : { previousReport: cursor.previousReport }) }),
       processedCount,
       checkpointDigest: rollingDigest,
       details: { dailyReviewV1: state, retryable: true },
@@ -550,6 +591,7 @@ async function executeReview(input: {
       personaId: input.context.personaId,
       visibility: input.context.visibility,
     },
+    previousReport: previousReport ?? null,
     window,
     generatedAt: window.endAt,
     coverage: {
@@ -603,9 +645,20 @@ async function executeReview(input: {
   if (ledgerResult.event.eventType !== 'daily_review' || ledgerResult.event.summary !== summary) {
     fail('DAILY_REVIEW_LEDGER_READBACK_MISMATCH', 409, false, 'Review ledger did not return the exact report receipt');
   }
-  const finalCheckpoint = nextCheckpoint(window, pageReceipts, sourceRefsByKey, processedCount, gaps, true, reportArtifact, ledgerResult.event.id);
+  const continuationCursor = pageCursor === null ? undefined : encodeCursor({
+    version: 1,
+    ...window,
+    messageCursor: pageCursor,
+    scannedPages: 0,
+    reportPages: 0,
+    previousReport: { artifactId: reportArtifact.id, sha256: reportArtifact.sha256 },
+  });
+  const finalCheckpoint: ReviewCheckpointV1 = {
+    ...nextCheckpoint(window, pageReceipts, sourceRefsByKey, processedCount, gaps, true, reportArtifact, ledgerResult.event.id),
+    ...(continuationCursor === undefined ? {} : { continuationCursor }),
+  };
   await input.checkpoint({
-    cursor: encodeCursor({ version: 1, ...window, messageCursor: pageCursor, scannedPages, reportPages }),
+    cursor: encodeCursor({ version: 1, ...window, messageCursor: pageCursor, scannedPages, reportPages, ...(cursor?.previousReport === undefined ? {} : { previousReport: cursor.previousReport }) }),
     processedCount,
     checkpointDigest: hashText(`${rollingDigest}\n${reportArtifact.sha256}\n${ledgerResult.event.id}`),
     details: { dailyReviewV1: finalCheckpoint, retryable: true },
@@ -676,6 +729,7 @@ function parseReviewCheckpoint(value: unknown, cursor: ReviewCursorV1 | undefine
       || typeof receipt.idempotencyKey !== 'string' || !receipt.idempotencyKey
       || typeof receipt.sha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(receipt.sha256)
       || typeof receipt.sourceDigest !== 'string' || !/^[a-f0-9]{64}$/u.test(receipt.sourceDigest)
+      || typeof receipt.sourceRefsDigest !== 'string' || !/^[a-f0-9]{64}$/u.test(receipt.sourceRefsDigest)
       || typeof receipt.scopeDigest !== 'string' || !/^[a-f0-9]{64}$/u.test(receipt.scopeDigest)
       || !Number.isSafeInteger(receipt.sizeBytes) || Number(receipt.sizeBytes) < 0) {
       fail('DAILY_REVIEW_CHECKPOINT_INVALID', 409, false, 'Review artifact receipt fields are invalid');
@@ -684,6 +738,17 @@ function parseReviewCheckpoint(value: unknown, cursor: ReviewCursorV1 | undefine
   });
   const reportArtifact = parseOptionalArtifact(row.reportArtifact);
   const ledgerEventId = row.ledgerEventId === undefined ? undefined : identifier(row.ledgerEventId, 'ledger event id');
+  const continuationCursor = row.continuationCursor === undefined ? undefined : row.continuationCursor;
+  if (continuationCursor !== undefined) {
+    if (typeof continuationCursor !== 'string' || reportArtifact === undefined) {
+      fail('DAILY_REVIEW_CHECKPOINT_INVALID', 409, false, 'Continuation checkpoint is malformed or missing its report artifact');
+    }
+    const decoded = decodeCursor(continuationCursor);
+    if (decoded.messageCursor === null || decoded.previousReport?.artifactId !== reportArtifact.id
+      || decoded.previousReport.sha256 !== reportArtifact.sha256) {
+      fail('DAILY_REVIEW_CHECKPOINT_INVALID', 409, false, 'Continuation cursor is not linked to the verified report artifact');
+    }
+  }
   return {
     version: 1,
     window,
@@ -695,6 +760,7 @@ function parseReviewCheckpoint(value: unknown, cursor: ReviewCursorV1 | undefine
     completed: row.completed,
     ...(reportArtifact === undefined ? {} : { reportArtifact }),
     ...(ledgerEventId === undefined ? {} : { ledgerEventId }),
+    ...(continuationCursor === undefined ? {} : { continuationCursor }),
   };
 }
 
@@ -729,6 +795,18 @@ function decodeCursor(value: string): ReviewCursorV1 {
     || !Number.isSafeInteger(object.reportPages) || Number(object.reportPages) < 0) {
     fail('DAILY_REVIEW_CURSOR_INVALID', 409, false, 'Daily review cursor fields are invalid');
   }
+  let previousReport: ReviewCursorV1['previousReport'];
+  if (object.previousReport !== undefined) {
+    if (typeof object.previousReport !== 'object' || object.previousReport === null || Array.isArray(object.previousReport)) {
+      fail('DAILY_REVIEW_CURSOR_INVALID', 409, false, 'Previous report pointer is malformed');
+    }
+    const pointer = object.previousReport as Record<string, unknown>;
+    if (typeof pointer.artifactId !== 'string' || !pointer.artifactId
+      || typeof pointer.sha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(pointer.sha256)) {
+      fail('DAILY_REVIEW_CURSOR_INVALID', 409, false, 'Previous report pointer is malformed');
+    }
+    previousReport = { artifactId: pointer.artifactId, sha256: pointer.sha256 };
+  }
   const window = normalizeWindow({ startAt: Number(object.startAt), endAt: Number(object.endAt) });
   return {
     version: 1,
@@ -736,6 +814,7 @@ function decodeCursor(value: string): ReviewCursorV1 {
     messageCursor: object.messageCursor as string | null,
     scannedPages: Number(object.scannedPages),
     reportPages: Number(object.reportPages),
+    ...(previousReport === undefined ? {} : { previousReport }),
   };
 }
 
@@ -830,6 +909,38 @@ async function readVerifiedArtifact(
   return readback.bytes;
 }
 
+async function readPreviousReviewReport(
+  port: ConversationReviewArtifactPortV1,
+  api: ConversationDomainApiV1,
+  context: TrustedTurnContext,
+  pointer: { readonly artifactId: string; readonly sha256: string },
+  window: ConversationReviewWindow,
+  signal: AbortSignal,
+): Promise<void> {
+  const artifact = await port.read({
+    context: { workspaceId: context.workspaceId, actorId: context.actorId },
+    artifactId: pointer.artifactId,
+    signal,
+  });
+  if (artifact.id !== pointer.artifactId || artifact.mimeType !== ARTIFACT_MIME
+    || artifact.sha256 !== pointer.sha256 || sha256(artifact.bytes) !== pointer.sha256
+    || artifact.scopeDigest !== hashText(canonicalJson(reviewScope(context)))) {
+    fail('DAILY_REVIEW_PREVIOUS_REPORT_INVALID', 409, false, 'Previous report failed actor/scope and digest readback');
+  }
+  const manifest = parseJson(artifact.bytes, 'DAILY_REVIEW_PREVIOUS_REPORT_INVALID') as Record<string, unknown>;
+  if (manifest.schema !== 'cyrene.conversation-daily-review.v1'
+    || canonicalJson(manifest.scope) !== canonicalJson(reviewScope(context))
+    || canonicalJson(manifest.window) !== canonicalJson(window)
+    || !Array.isArray(manifest.sourceRefs)) {
+    fail('DAILY_REVIEW_PREVIOUS_REPORT_INVALID', 409, false, 'Previous report belongs to another window or conversation');
+  }
+  const sourceRefs = normalizeRefs(manifest.sourceRefs);
+  if (artifact.sourceRefsDigest !== hashText(canonicalJson(sourceRefs))) {
+    fail('DAILY_REVIEW_PREVIOUS_REPORT_INVALID', 409, false, 'Previous report provenance metadata does not match its content');
+  }
+  await requireCurrentSources(api, context, sourceRefs, 'DAILY_REVIEW_SOURCE_REVOKED');
+}
+
 async function readVerifiedPageArtifact(
   port: ConversationReviewArtifactPortV1,
   context: TrustedTurnContext,
@@ -845,7 +956,7 @@ async function readVerifiedPageArtifact(
     || artifact.mimeType !== ARTIFACT_MIME || artifact.sha256 !== receipt.sha256
     || artifact.sizeBytes !== receipt.sizeBytes || artifact.scopeDigest !== receipt.scopeDigest
     || artifact.scopeDigest !== hashText(canonicalJson(reviewScope(context)))
-    || artifact.sourceRefsDigest !== receipt.sourceDigest
+    || artifact.sourceRefsDigest !== receipt.sourceRefsDigest
     || sha256(artifact.bytes) !== receipt.sha256) {
     fail('DAILY_REVIEW_ARTIFACT_READBACK_MISMATCH', 409, false, 'Stored page report failed independent Work readback');
   }
@@ -862,8 +973,9 @@ async function readVerifiedPageArtifact(
   const window = normalizeWindow(row.window as ConversationReviewWindow);
   const sourceMessageIds = row.sourceMessageIds.map(value => identifier(value, 'source message id'));
   if (canonicalJson(refs) !== canonicalJson(row.sourceRefs)) fail('DAILY_REVIEW_ARTIFACT_INVALID', 409, false, 'Stored page sources are not canonical');
-  if (artifact.sourceRefsDigest !== hashText(canonicalJson(refs))
-    || row.sourceDigest !== artifact.sourceRefsDigest) {
+  if (artifact.sourceRefsDigest !== receipt.sourceRefsDigest
+    || artifact.sourceRefsDigest !== hashText(canonicalJson(refs))
+    || row.sourceDigest !== hashText(canonicalJson({ sourceRefs: refs, sourceMessageIds }))) {
     fail('DAILY_REVIEW_ARTIFACT_INVALID', 409, false, 'Stored page provenance digest differs from its attachment metadata');
   }
   return {
@@ -889,6 +1001,7 @@ function artifactReceipt(artifact: ConversationReviewArtifactV1, index: number, 
     sha256: artifact.sha256,
     sizeBytes: artifact.sizeBytes,
     sourceDigest,
+    sourceRefsDigest: artifact.sourceRefsDigest,
     scopeDigest: artifact.scopeDigest,
   };
 }
@@ -989,6 +1102,41 @@ function normalizeWindow(value: ConversationReviewWindow): ConversationReviewWin
     fail('DAILY_REVIEW_WINDOW_INVALID', 422, false, 'Review window must be positive and no longer than seven days');
   }
   return { startAt: value.startAt, endAt: value.endAt };
+}
+
+function continuationCursorFromJob(job: ConversationMaintenanceJob): string | undefined {
+  const cursor = job.cursor === null ? undefined : decodeCursor(job.cursor);
+  const checkpoint = parseReviewCheckpoint(job.details.dailyReviewV1, cursor);
+  return checkpoint.continuationCursor;
+}
+
+async function createContinuationJob(
+  options: ConversationDailyReviewOptions,
+  context: TrustedTurnContext,
+  parent: ConversationMaintenanceJob,
+  cursor: string,
+  now: () => number,
+): Promise<{ readonly job: ConversationMaintenanceJob; readonly duplicate: boolean }> {
+  const decoded = decodeCursor(cursor);
+  if (decoded.messageCursor === null || decoded.previousReport === undefined) {
+    fail('DAILY_REVIEW_CONTINUATION_INVALID', 409, false, 'Continuation cursor lacks an unread page or previous report');
+  }
+  const idempotencyKey = `daily-review-continuation-${hashText(`${parent.id}\u0000${cursor}`).slice(0, 40)}`;
+  const created = await options.api.createMaintenanceJob(context, {
+    idempotencyKey,
+    kind: 'daily_review',
+    conversationId: context.conversationId,
+    conversationKind: context.conversationKind,
+    personaId: context.personaId,
+    cursor,
+  });
+  if (!belongsToTrustedReview(created.job, context) || created.job.cursor !== cursor) {
+    fail('DAILY_REVIEW_CONTINUATION_READBACK_MISMATCH', 409, false, 'Work returned a continuation job with different scope or cursor');
+  }
+  await options.scheduler.ensureOneShot(conversationScheduleMarker('maintenance', created.job.id), now() + 1_000, {
+    signal: context.signal,
+  });
+  return created;
 }
 
 function belongsToTrustedReview(job: ConversationMaintenanceJob, context: TrustedTurnContext): boolean {
