@@ -528,6 +528,8 @@ class ExchangeBilibiliHttpClient:
         grant_ref = grant.get("grantRef")
         expires_at = grant.get("expiresAt")
         claims = grant.get("claims")
+        if not isinstance(grant_bin, str) or len(grant_bin) > 90_000:
+            raise PeripheralPortError("EXCHANGE_CONNECTOR_GRANT_INVALID")
         try:
             grant_bytes = base64.b64decode(grant_bin, validate=True)
         except (TypeError, ValueError):
