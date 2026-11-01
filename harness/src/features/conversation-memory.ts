@@ -110,12 +110,20 @@ export interface ConversationMemoryApiV1 {
   ): Promise<{ readonly message: ConversationMessage; readonly duplicate: boolean }>;
   listMessages(
     context: TrustedTurnContext,
-    input: { readonly conversationId: string; readonly cursor?: string; readonly limit: number; readonly includeRevoked?: boolean },
+    input: {
+      readonly conversationId: string;
+      readonly conversationKind: ConversationKind;
+      readonly order: 'desc';
+      readonly cursor?: string;
+      readonly limit: number;
+      readonly includeRevoked?: boolean;
+    },
   ): Promise<ConversationPage<ConversationMessage>>;
   listMemories(
     context: TrustedTurnContext,
     input: {
       readonly conversationId: string;
+      readonly conversationKind: ConversationKind;
       readonly personaId: string | null;
       readonly state: 'active';
       readonly limit: number;
@@ -125,6 +133,7 @@ export interface ConversationMemoryApiV1 {
     context: TrustedTurnContext,
     input: {
       readonly conversationId: string;
+      readonly conversationKind: ConversationKind;
       readonly personaId: string | null;
       readonly query: string;
       readonly limit: number;
@@ -149,7 +158,9 @@ export interface ConversationMemoryApiV1 {
     context: TrustedTurnContext,
     input: {
       readonly conversationId: string;
+      readonly conversationKind: ConversationKind;
       readonly authorizationEpoch: number;
+      readonly personaId: string | null;
       readonly sourceRefs: readonly ConversationSourceRef[];
     },
   ): Promise<{
@@ -234,11 +245,16 @@ export interface ConversationMemoryFeature {
 const DEFAULT_MINIMUM_MESSAGES = 8;
 const DEFAULT_MINIMUM_CHARACTERS = 3_200;
 const DEFAULT_HISTORY_LIMIT = 96;
+const DEFAULT_HISTORY_SCAN_PAGES = 8;
+const DEFAULT_MEMORY_LIST_LIMIT = 500;
 const DEFAULT_RETRIEVAL_LIMIT = 8;
 const DEFAULT_CONTRIBUTION_CHARACTER_LIMIT = 8_000;
 const MAX_MESSAGE_LENGTH = 32_000;
 const MAX_MEMORY_LENGTH = 8_000;
-const MAX_SOURCE_IDS = 128;
+const MAX_SOURCE_IDS_PER_REF = 128;
+const MAX_TOTAL_SOURCE_IDS = 32_768;
+const MAX_SOURCE_REFS = 256;
+const MAX_SUMMARY_SOURCE_INPUTS = 25_600;
 const pendingSourcesByTurn = new Map<string, readonly ConversationSourceRef[]>();
 const abortCleanupKeysBySignal = new WeakMap<AbortSignal, Set<string>>();
 
@@ -256,9 +272,10 @@ export function createConversationMemoryFeature(options: ConversationMemoryFeatu
     throw new ConversationFeatureError('MODEL_UNAVAILABLE', 'A configured summary provider v1 is required');
   }
 
-  const historyLimit = boundedInteger(options.historyLimit ?? DEFAULT_HISTORY_LIMIT, 8, 200);
+  const historyLimit = boundedInteger(options.historyLimit ?? DEFAULT_HISTORY_LIMIT, 8, 100);
+  const minimumMessages = boundedInteger(options.minimumMessages ?? DEFAULT_MINIMUM_MESSAGES, 2, 100);
+  const maximumHistoryScanPages = DEFAULT_HISTORY_SCAN_PAGES;
   const retrievalLimit = boundedInteger(options.retrievalLimit ?? DEFAULT_RETRIEVAL_LIMIT, 1, 32);
-  const minimumMessages = boundedInteger(options.minimumMessages ?? DEFAULT_MINIMUM_MESSAGES, 2, 200);
   const minimumCharacters = boundedInteger(options.minimumCharacters ?? DEFAULT_MINIMUM_CHARACTERS, 200, 100_000);
   const contributionCharacterLimit = boundedInteger(
     options.contributionCharacterLimit ?? DEFAULT_CONTRIBUTION_CHARACTER_LIMIT,
@@ -279,6 +296,7 @@ export function createConversationMemoryFeature(options: ConversationMemoryFeatu
       if (typeof input.query !== 'string' || input.query.trim().length === 0) return { contributions: [] };
       const result = await options.api.queryMemories(context, {
         conversationId: context.conversationId,
+        conversationKind: context.conversationKind,
         personaId: context.personaId,
         query: input.query.slice(0, MAX_MESSAGE_LENGTH),
         limit: Math.min(retrievalLimit, boundedInteger(input.maximumContributions ?? retrievalLimit, 1, 32)),
@@ -296,7 +314,7 @@ export function createConversationMemoryFeature(options: ConversationMemoryFeatu
         const text = boundedText(memory.text, MAX_MEMORY_LENGTH);
         let sourceMessageIds: string[];
         try {
-          sourceMessageIds = stableUnique(memory.sourceMessageIds, MAX_SOURCE_IDS);
+          sourceMessageIds = stableUnique(memory.sourceMessageIds, MAX_TOTAL_SOURCE_IDS);
         } catch {
           continue;
         }
@@ -306,12 +324,12 @@ export function createConversationMemoryFeature(options: ConversationMemoryFeatu
         contributions.push({
           feature: 'conversation-memory.v1',
           content,
-          sourceRefs: [{ memoryId: memory.memoryId, memoryVersion: memory.version, sourceMessageIds }],
+          sourceRefs: splitSourceRefs(memory.memoryId, memory.version, sourceMessageIds),
         });
         totalCharacters += content.length;
       }
       const sourceRefs = normalizeSourceRefs(contributions.flatMap(item => item.sourceRefs));
-      const proof = await authorizeCurrentSources(options.api, context, sourceRefs);
+      const proof = await authorizeConversationSourcesV1(options.api, context, sourceRefs);
       if (!proof.allowed || proof.currentAuthorizationEpoch !== context.authorizationEpoch) {
         rememberPendingSources(context, []);
         return { contributions: [] };
@@ -323,7 +341,6 @@ export function createConversationMemoryFeature(options: ConversationMemoryFeatu
     async afterTurn(context, input) {
       assertTrustedScope(context);
       const expectedSources = pendingSourcesByTurn.get(turnKey(context));
-      clearPendingSources(context);
       context.signal.throwIfAborted();
       if (!enabled || input.status !== 'completed') return;
       const assistantText = boundedText(input.assistantText, MAX_MESSAGE_LENGTH);
@@ -347,15 +364,13 @@ export function createConversationMemoryFeature(options: ConversationMemoryFeatu
         relatedEventIds: [userEventId],
       });
 
-      const [messagePage, activeMemories] = await Promise.all([
-        options.api.listMessages(context, { conversationId: context.conversationId, limit: historyLimit }),
-        options.api.listMemories(context, {
-          conversationId: context.conversationId,
-          personaId: context.personaId,
-          state: 'active',
-          limit: historyLimit,
-        }),
-      ]);
+      const activeMemories = await options.api.listMemories(context, {
+        conversationId: context.conversationId,
+        conversationKind: context.conversationKind,
+        personaId: context.personaId,
+        state: 'active',
+        limit: DEFAULT_MEMORY_LIST_LIMIT,
+      });
       context.signal.throwIfAborted();
 
       const archivedIds = new Set<string>();
@@ -364,7 +379,37 @@ export function createConversationMemoryFeature(options: ConversationMemoryFeatu
         for (const id of memory.sourceMessageIds) archivedIds.add(id);
       }
       if (activeMemories.authorizationEpoch !== context.authorizationEpoch) return;
-      const pending = messagePage.items
+      const scannedMessages: ConversationMessage[] = [];
+      const scannedMessageIds = new Set<string>();
+      const seenCursors = new Set<string>();
+      let cursor: string | undefined;
+      let scannedPending = 0;
+      for (let pageIndex = 0; pageIndex < maximumHistoryScanPages && scannedPending < historyLimit; pageIndex += 1) {
+        context.signal.throwIfAborted();
+        const page = await options.api.listMessages(context, {
+          conversationId: context.conversationId,
+          conversationKind: context.conversationKind,
+          order: 'desc',
+          ...(cursor === undefined ? {} : { cursor }),
+          limit: 100,
+        });
+        if (page.items.length > 100) {
+          throw new ConversationFeatureError('MEMORY_API_UNAVAILABLE', 'Conversation page exceeded its requested limit');
+        }
+        if (page.items.length === 0) break;
+        const unseen = page.items.filter(message => !scannedMessageIds.has(message.id));
+        for (const message of unseen) scannedMessageIds.add(message.id);
+        scannedMessages.push(...unseen);
+        scannedPending += unseen.filter(message => (message.role === 'user' || message.role === 'assistant')
+          && message.status === 'active' && matchesScope(message, context) && !archivedIds.has(message.id)).length;
+        if (page.nextCursor === null) break;
+        if (seenCursors.has(page.nextCursor) || page.nextCursor === cursor) {
+          throw new ConversationFeatureError('MEMORY_API_UNAVAILABLE', 'Conversation page cursor did not advance');
+        }
+        seenCursors.add(page.nextCursor);
+        cursor = page.nextCursor;
+      }
+      const pending = scannedMessages
         .filter(message => message.role === 'user' || message.role === 'assistant')
         .filter(message => message.status === 'active' && matchesScope(message, context) && !archivedIds.has(message.id))
         .sort(compareMessages)
@@ -378,13 +423,13 @@ export function createConversationMemoryFeature(options: ConversationMemoryFeatu
         }
       }
       const inheritedSourceIds = pending.flatMap(message => (message.sourceRefs ?? []).flatMap(ref => ref.sourceMessageIds));
-      const sourceMessageIds = stableUnique([...pending.map(message => message.id), ...inheritedSourceIds], MAX_SOURCE_IDS);
+      const sourceMessageIds = stableUnique([...pending.map(message => message.id), ...inheritedSourceIds], MAX_TOTAL_SOURCE_IDS);
       if (sourceMessageIds.length < minimumMessages) return;
       const sourceRefs = normalizeSourceRefs([
         ...pending.flatMap(message => message.sourceRefs ?? []),
-        { memoryId: null, memoryVersion: null, sourceMessageIds: stableUnique(pending.map(message => message.id), MAX_SOURCE_IDS) },
-      ]);
-      const proof = await authorizeCurrentSources(options.api, context, sourceRefs);
+        ...splitSourceRefs(null, null, stableUnique(pending.map(message => message.id), MAX_TOTAL_SOURCE_IDS)),
+      ], MAX_SUMMARY_SOURCE_INPUTS);
+      const proof = await authorizeConversationSourcesV1(options.api, context, sourceRefs);
       if (!proof.allowed || proof.currentAuthorizationEpoch !== context.authorizationEpoch) return;
       context.signal.throwIfAborted();
       let summary: string;
@@ -434,7 +479,9 @@ export function createConversationMemoryFeature(options: ConversationMemoryFeatu
       try {
         const proof = await options.api.authorizeSources(context, {
           conversationId: context.conversationId,
+          conversationKind: context.conversationKind,
           authorizationEpoch: context.authorizationEpoch,
+          personaId: context.personaId,
           sourceRefs,
         });
         if (!proof.allowed) {
@@ -454,7 +501,8 @@ export function createConversationMemoryFeature(options: ConversationMemoryFeatu
 }
 
 /** Recheck retrieval provenance before any memory text is added to a model context. */
-async function authorizeCurrentSources(
+/** Authorize exact versioned sources for other built-in conversation features. */
+export async function authorizeConversationSourcesV1(
   api: ConversationMemoryApiV1,
   context: TrustedTurnContext,
   sourceRefs: readonly ConversationSourceRef[],
@@ -462,7 +510,9 @@ async function authorizeCurrentSources(
   try {
     return await api.authorizeSources(context, {
       conversationId: context.conversationId,
+      conversationKind: context.conversationKind,
       authorizationEpoch: context.authorizationEpoch,
+      personaId: context.personaId,
       sourceRefs,
     });
   } catch (error: unknown) {
@@ -515,8 +565,32 @@ function scopeOf(context: ConversationScope): ConversationScope {
   };
 }
 
-function normalizeSourceRefs(sourceRefs: readonly ConversationSourceRef[]): ConversationSourceRef[] {
-  if (!isSourceRefsWellFormed(sourceRefs)) {
+function splitSourceRefs(
+  memoryId: string | null,
+  memoryVersion: number | null,
+  sourceMessageIds: readonly string[],
+): ConversationSourceRef[] {
+  if ((memoryId === null) !== (memoryVersion === null)
+    || (memoryId !== null && (!isIdentifier(memoryId) || !Number.isSafeInteger(memoryVersion) || (memoryVersion ?? 0) < 1))) {
+    throw new ConversationFeatureError('INVALID_SOURCE_PROOF', 'Memory source revision is invalid');
+  }
+  const uniqueIds = stableUnique(sourceMessageIds, MAX_TOTAL_SOURCE_IDS);
+  const references: ConversationSourceRef[] = [];
+  for (let offset = 0; offset < uniqueIds.length; offset += MAX_SOURCE_IDS_PER_REF) {
+    references.push({
+      memoryId,
+      memoryVersion,
+      sourceMessageIds: uniqueIds.slice(offset, offset + MAX_SOURCE_IDS_PER_REF),
+    });
+  }
+  return references;
+}
+
+function normalizeSourceRefs(
+  sourceRefs: readonly ConversationSourceRef[],
+  maximumInputRefs = MAX_SOURCE_REFS,
+): ConversationSourceRef[] {
+  if (!isSourceRefsWellFormed(sourceRefs, maximumInputRefs)) {
     throw new ConversationFeatureError('INVALID_SOURCE_PROOF', 'Source reference list is invalid or exceeds its limit');
   }
   const byMemory = new Map<string, {
@@ -524,18 +598,17 @@ function normalizeSourceRefs(sourceRefs: readonly ConversationSourceRef[]): Conv
     readonly memoryVersion: number | null;
     readonly ids: Set<string>;
   }>();
+  const allSourceIds = new Set<string>();
   for (const ref of sourceRefs) {
     const key = ref.memoryId === null
-      ? `source:${[...ref.sourceMessageIds].sort().join('\u0000')}`
+      ? 'source:raw-messages'
       : `memory:${ref.memoryId}:v${ref.memoryVersion}`;
     const existing = byMemory.get(key);
     const ids = existing?.ids ?? new Set<string>();
     for (const id of ref.sourceMessageIds) {
       if (!isIdentifier(id)) throw new ConversationFeatureError('INVALID_SOURCE_PROOF', 'Source reference contains an invalid message id');
       ids.add(id);
-      if (ids.size > MAX_SOURCE_IDS) {
-        throw new ConversationFeatureError('INVALID_SOURCE_PROOF', 'Source reference exceeds its message limit');
-      }
+      allSourceIds.add(id);
     }
     if (ids.size > 0) {
       byMemory.set(key, {
@@ -545,19 +618,32 @@ function normalizeSourceRefs(sourceRefs: readonly ConversationSourceRef[]): Conv
       });
     }
   }
-  if (byMemory.size > 256) {
+  if (allSourceIds.size > MAX_TOTAL_SOURCE_IDS) {
+    throw new ConversationFeatureError('INVALID_SOURCE_PROOF', 'Source lineage exceeds its message limit');
+  }
+  const normalized: ConversationSourceRef[] = [];
+  for (const { memoryId, memoryVersion, ids } of byMemory.values()) {
+    const sorted = [...ids].sort();
+    for (let offset = 0; offset < sorted.length; offset += MAX_SOURCE_IDS_PER_REF) {
+      normalized.push({
+        memoryId: memoryId ?? null,
+        memoryVersion,
+        sourceMessageIds: sorted.slice(offset, offset + MAX_SOURCE_IDS_PER_REF),
+      });
+    }
+  }
+  if (normalized.length > MAX_SOURCE_REFS) {
     throw new ConversationFeatureError('INVALID_SOURCE_PROOF', 'Source reference list exceeds its limit');
   }
-  return [...byMemory.values()].map(({ memoryId, memoryVersion, ids }) => ({
-    memoryId: memoryId ?? null,
-    memoryVersion,
-    sourceMessageIds: [...ids].sort(),
-  }));
+  return normalized;
 }
 
-function isSourceRefsWellFormed(sourceRefs: readonly ConversationSourceRef[]): boolean {
+function isSourceRefsWellFormed(
+  sourceRefs: readonly ConversationSourceRef[],
+  maximumRefs = MAX_SOURCE_REFS,
+): boolean {
   return Array.isArray(sourceRefs)
-    && sourceRefs.length <= 256
+    && sourceRefs.length <= maximumRefs
     && sourceRefs.every(isSourceRefWellFormed);
 }
 
@@ -570,7 +656,7 @@ function isSourceRefWellFormed(value: unknown): value is ConversationSourceRef {
   return memoryValid
     && Array.isArray(ref.sourceMessageIds)
     && ref.sourceMessageIds.length > 0
-    && ref.sourceMessageIds.length <= MAX_SOURCE_IDS
+    && ref.sourceMessageIds.length <= MAX_SOURCE_IDS_PER_REF
     && ref.sourceMessageIds.every(isIdentifier);
 }
 
@@ -607,12 +693,6 @@ function rememberPendingSources(context: TrustedTurnContext, sourceRefs: readonl
     if (oldest === undefined) break;
     keys.delete(oldest);
   }
-}
-
-function clearPendingSources(context: TrustedTurnContext): void {
-  const key = turnKey(context);
-  pendingSourcesByTurn.delete(key);
-  abortCleanupKeysBySignal.get(context.signal)?.delete(key);
 }
 
 function turnKey(context: TrustedTurnContext): string {
