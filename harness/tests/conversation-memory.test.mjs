@@ -139,6 +139,8 @@ test('retrieval contributes only same-actor API results with matching persona an
 
   const result = await feature.beforeContext(trustedContext(), { query: 'What response style does the user prefer?' });
   assert.equal(calls.queries[0].context.actorId, 'actor-1', 'the authenticated actor stays in the host context');
+  assert.equal(calls.queries[0].input.conversationKind, 'direct');
+  assert.equal(calls.queries[0].input.personaId, 'persona-1');
   assert.equal(calls.authorizations.length, 1, 'retrieved sources are rechecked before entering model context');
   assert.equal(calls.authorizations[0].input.sourceRefs[0].memoryId, 'memory-1');
   assert.equal(calls.authorizations[0].input.sourceRefs[0].memoryVersion, 1);
@@ -285,6 +287,44 @@ test('evicted turn proofs fail closed instead of becoming an empty source set', 
   assert.deepEqual(decision, { decision: 'hold', code: 'SOURCE_PROOF_MISSING', authorizationEpoch: 3 });
 });
 
+test('summary paging reaches new turns after the first 100 older messages', async () => {
+  const older = Array.from({ length: 100 }, (_, index) => message(`older-${index}`, index % 2 === 0 ? 'user' : 'assistant'));
+  const newer = Array.from({ length: 8 }, (_, index) => message(`newer-${index}`, index % 2 === 0 ? 'user' : 'assistant'));
+  const { api, calls } = baseApi({
+    async listMessages(context, input) {
+      calls.listMessages.push({ context, input });
+      return input.cursor === undefined
+        ? { items: older, nextCursor: 'cursor-older' }
+        : { items: newer, nextCursor: null };
+    },
+    async listMemories(context, input) {
+      calls.listMemories.push({ context, input });
+      return {
+        items: [memory({ memoryId: 'older-episode', kind: 'episode', sourceMessageIds: older.map(item => item.id) })],
+        authorizationEpoch: context.authorizationEpoch,
+      };
+    },
+  });
+  const feature = createConversationMemoryFeature({
+    api,
+    summaryProvider: summaryProvider(),
+    minimumMessages: 8,
+    minimumCharacters: 200,
+  });
+  const context = trustedContext();
+  await feature.beforeContext(context, { query: '' });
+  await feature.afterTurn(context, {
+    userEventId: 'newest-user-event', assistantText: 'Latest reply.', status: 'completed', sourceRefs: [],
+  });
+
+  assert.equal(calls.listMessages.length, 2);
+  assert.equal(calls.listMessages[0].input.order, 'desc');
+  assert.equal(calls.listMessages[1].input.cursor, 'cursor-older');
+  assert.equal(calls.createMemories.length, 1);
+  assert.ok(calls.createMemories[0].input.sourceMessageIds.includes('newer-0'));
+  assert.ok(!calls.createMemories[0].input.sourceMessageIds.includes('older-0'));
+});
+
 test('completed turns use the configured summarizer and archive only unarchived scoped messages idempotently', async () => {
   const existingMessages = Array.from({ length: 8 }, (_, index) => message(`message-${String(index).padStart(2, '0')}`, index % 2 === 0 ? 'user' : 'assistant'));
   const messagesByEvent = new Map();
@@ -332,6 +372,8 @@ test('completed turns use the configured summarizer and archive only unarchived 
 
   await feature.beforeContext(context, { query: '' });
   await feature.afterTurn(context, turn);
+  const delivery = await feature.beforeDelivery(context, { text: turn.assistantText, sourceRefs: turn.sourceRefs });
+  assert.deepEqual(delivery, { decision: 'allow', authorizationEpoch: context.authorizationEpoch });
   await feature.beforeContext(context, { query: '' });
   await feature.afterTurn(context, turn);
 
@@ -364,7 +406,11 @@ test('failed and aborted turns do not create assistant messages or summaries', a
 });
 
 test('summary archival refuses lineage overflow instead of persisting a truncated dependency set', async () => {
-  const inherited = Array.from({ length: 127 }, (_, index) => `source-${index}`);
+  const inherited = Array.from({ length: 256 }, (_, memoryIndex) => ({
+    memoryId: `memory-${memoryIndex}`,
+    memoryVersion: 1,
+    sourceMessageIds: Array.from({ length: 128 }, (_, sourceIndex) => `source-${memoryIndex}-${sourceIndex}`),
+  }));
   const { api, calls } = baseApi({
     async listMessages(context, input) {
       calls.listMessages.push({ context, input });
@@ -372,7 +418,7 @@ test('summary archival refuses lineage overflow instead of persisting a truncate
         items: [
           message('message-1', 'user', {
             content: 'x'.repeat(150),
-            sourceRefs: [{ memoryId: 'memory-parent', memoryVersion: 1, sourceMessageIds: inherited }],
+            sourceRefs: inherited,
           }),
           message('message-2', 'assistant', { content: 'y'.repeat(150) }),
         ],
