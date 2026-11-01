@@ -1706,7 +1706,9 @@ class ConversationMemoryStore:
         if row is None or str(row["status"]) != "active":
             return False
         source_persona = row["persona_id"]
-        if source_persona is not None and source_persona != persona_id:
+        # An explicit persona read stays inside that persona. An owner read without a persona
+        # is the host-bound conversation scope, which must still return its own messages.
+        if persona_id is not None and source_persona is not None and source_persona != persona_id:
             return False
         owner = str(row["actor_id"])
         if owner == actor:
@@ -1772,7 +1774,8 @@ class ConversationMemoryStore:
         if owner != requester_actor and visibility == "private":
             return False
         memory_persona = row["persona_id"]
-        if memory_persona is not None and memory_persona != persona_id:
+        # Same rule as message lineage: only an explicit persona narrows the read scope.
+        if persona_id is not None and memory_persona is not None and memory_persona != persona_id:
             return False
         source_ids = json.loads(str(row["source_message_ids_json"]))
         if not all(

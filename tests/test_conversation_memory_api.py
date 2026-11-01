@@ -895,3 +895,28 @@ def test_invalidate_source_dependents_multi_memory_placeholder_and_cycle(tmp_pat
         msg_query = "?conversationId=direct-alice&conversationKind=direct"
         check_msg = client.get(BASE + f"/messages/{msg1['id']}{msg_query}", headers=_headers())
         assert check_msg.status_code == 404
+
+
+def test_owner_message_list_without_persona_returns_persona_scoped_rows(tmp_path: Path) -> None:
+    """An omitted persona is the host-bound conversation scope, not an empty persona filter."""
+
+    with _client(tmp_path / "message-persona-scope.sqlite3") as client:
+        message = _post_message(client)["message"]
+        query = "?conversationId=direct-alice&conversationKind=direct&limit=100"
+        unfiltered = client.get(BASE + "/messages" + query, headers=_headers())
+        assert unfiltered.status_code == 200, unfiltered.text
+        assert [item["id"] for item in unfiltered.json()["items"]] == [message["id"]]
+
+        explicit = client.get(
+            BASE + "/messages?conversationId=direct-alice&conversationKind=direct&personaId=persona-a&limit=100",
+            headers=_headers(),
+        )
+        assert explicit.status_code == 200, explicit.text
+        assert [item["id"] for item in explicit.json()["items"]] == [message["id"]]
+
+        denied = client.get(
+            BASE + "/messages?conversationId=direct-alice&conversationKind=direct&personaId=persona-b&limit=100",
+            headers=_headers(),
+        )
+        assert denied.status_code == 200, denied.text
+        assert denied.json()["items"] == []
