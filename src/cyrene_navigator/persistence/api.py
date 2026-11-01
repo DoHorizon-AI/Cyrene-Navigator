@@ -47,6 +47,11 @@ from cyrene_navigator.work.api import (
     TeamsPrivateConversationPolicy,
     mount_work_routes,
 )
+from cyrene_navigator.work.conversation_memory.providers import (
+    EmbeddingClient,
+    KnowledgeGraphProvider,
+    MemoryProvider,
+)
 
 _SESSIONS_PATH = "/api/v1/harness/workspaces/{workspace_id}/sessions"
 
@@ -61,6 +66,10 @@ def create_persistence_app(
     work_attachment_root: Path | None = None,
     work_connector_bridges: Mapping[tuple[str | None, str, str], ConnectorBridge] | None = None,
     private_conversation_policy: TeamsPrivateConversationPolicy | None = None,
+    conversation_memory_embedding_client: EmbeddingClient | None = None,
+    conversation_memory_provider: MemoryProvider | None = None,
+    conversation_graph_provider: KnowledgeGraphProvider | None = None,
+    conversation_memory_summarizer_available: bool = False,
 ) -> FastAPI:
     """Build the authoritative Harness persistence HTTP service. | 创建持久化 HTTP 服务。"""
 
@@ -428,5 +437,9 @@ def create_persistence_app(
         attachment_root=work_attachment_root,
         connector_bridges=work_connector_bridges,
         private_conversation_policy=private_conversation_policy,
+        embedding_client=conversation_memory_embedding_client,
+        memory_provider=conversation_memory_provider,
+        graph_provider=conversation_graph_provider,
+        summarizer_available=conversation_memory_summarizer_available,
     )
     return app

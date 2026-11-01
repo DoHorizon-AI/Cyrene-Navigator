@@ -114,8 +114,13 @@ class WorkStore:
         description = _optional_text(body.get("description"), "description", 20_000)
         metadata = _json_object(body.get("metadata", {}), "metadata")
         _task_notification_descriptor(metadata)
-        _validate_task_execution_metadata(execution_class, metadata)
         created_by_actor_id = _identifier(actor_id, "actorId") if actor_id else ""
+        _validate_task_execution_metadata(
+            execution_class,
+            metadata,
+            actor_id=created_by_actor_id,
+            workspace_id=workspace,
+        )
         create_digest = _digest(
             {
                 "sessionId": session_id,
@@ -3562,7 +3567,7 @@ class WorkStore:
             )
         with self._read() as conn:
             row = None
-            if actor_private_scope:
+            if actor is not None:
                 row = conn.execute(
                     """SELECT * FROM work_private_attachments WHERE organization_id=?
                        AND workspace_id=? AND actor_id=? AND sha256=?""",
@@ -8490,7 +8495,13 @@ def _task_notification_descriptor(metadata: Mapping[str, Any]) -> JsonObject | N
     }
 
 
-def _validate_task_execution_metadata(execution_class: object, metadata: Mapping[str, Any]) -> None:
+def _validate_task_execution_metadata(
+    execution_class: object,
+    metadata: Mapping[str, Any],
+    *,
+    actor_id: str,
+    workspace_id: str,
+) -> None:
     """Keep background task authority host-generated and bound to a v2 responsibility.
 
     Args:
@@ -8499,13 +8510,48 @@ def _validate_task_execution_metadata(execution_class: object, metadata: Mapping
     Raises:
         PersistenceError: If a background task has no verifiable workflow provenance.
 
-    中文：后台任务必须携带责任、发生实例和 owner Teams 线程引用，不能由普通任务冒充。
+    中文：后台任务必须携带已验证的工作流或对话维护来源，不能由普通任务冒充。
     """
 
     if execution_class == "foreground":
         return
     if execution_class != "background":
         raise _invalid("WORK_TASK_INVALID_EXECUTION_CLASS", "executionClass is not supported")
+    if metadata.get("source") == "conversation-maintenance":
+        required = {
+            "source",
+            "maintenanceJobId",
+            "kind",
+            "workspaceId",
+            "actorId",
+            "idempotencyKey",
+            "jobVersion",
+        }
+        allowed_kinds = {"dream", "forget", "daily_review", "backup", "import"}
+        if set(metadata) != required:
+            raise _invalid(
+                "WORK_TASK_BACKGROUND_PROVENANCE_REQUIRED",
+                "Conversation maintenance task provenance has unsupported or missing fields",
+            )
+        _identifier(metadata.get("maintenanceJobId"), "metadata.maintenanceJobId")
+        _identifier(metadata.get("idempotencyKey"), "metadata.idempotencyKey")
+        if _nonnegative_integer(metadata.get("jobVersion"), "metadata.jobVersion") < 1:
+            raise _invalid(
+                "WORK_TASK_BACKGROUND_PROVENANCE_REQUIRED",
+                "Conversation maintenance jobVersion must be positive",
+            )
+        if metadata.get("kind") not in allowed_kinds:
+            raise _invalid(
+                "WORK_TASK_BACKGROUND_PROVENANCE_REQUIRED",
+                "Conversation maintenance task kind is not supported",
+            )
+        if metadata.get("actorId") != actor_id or metadata.get("workspaceId") != workspace_id:
+            raise PersistenceError(
+                "WORK_TASK_ACTOR_SCOPE_MISMATCH",
+                403,
+                "Conversation maintenance task provenance does not match its Work principal.",
+            )
+        return
     if metadata.get("source") != "workflow":
         raise _invalid(
             "WORK_TASK_BACKGROUND_PROVENANCE_REQUIRED",

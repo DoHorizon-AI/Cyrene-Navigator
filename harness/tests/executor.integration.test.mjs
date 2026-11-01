@@ -1794,6 +1794,34 @@ test('NavigatorExecutor: an admitted task can be cancelled before the dispatcher
   }
 });
 
+test('NavigatorExecutor: recovered actor-owned task cancellation uses its actor Work client', async () => {
+  const ownerStore = new InMemoryWorkStateStore();
+  const actorStore = new InMemoryWorkStateStore();
+  const actorId = '11111111-1111-4111-8111-111111111111';
+  const task = await actorStore.createTask({
+    id: 'actor-cancel-after-restart',
+    sessionId: 'actor-cancel-session',
+    prompt: 'Cancel through the owner-scoped Work client',
+  });
+  await actorStore.claimTask(task.id);
+  const { executor, ctx } = await createTestApp(new TestMockAdapter(), { workStateStore: ownerStore });
+  executor.config.workActorClients = {
+    async resolveTask(taskId) {
+      if (taskId !== task.id) return undefined;
+      return { actorAadObjectId: actorId, store: actorStore, task: await actorStore.getTask(taskId) };
+    },
+  };
+  try {
+    assert.equal(await executor.cancelTask(task.id), true);
+    assert.equal((await actorStore.getTask(task.id)).status, 'aborted');
+    assert.equal(await ownerStore.getTask(task.id), undefined);
+    const events = await actorStore.getEvents(task.id, 0);
+    assert.ok(events.events.some(row => row.event.code === 'TASK_ABORTED'));
+  } finally {
+    await disposeApp({ executor, ctx });
+  }
+});
+
 test('NavigatorExecutor: recovery adopts safe queued rows and fails uncertain or human-gated rows', async () => {
   const store = new InMemoryWorkStateStore();
   const queued = await store.createTask({ id: 'recover-queued', sessionId: 'session-queued', prompt: 'Safe to start' });

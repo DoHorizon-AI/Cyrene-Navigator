@@ -17,8 +17,16 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { SessionId, SessionSeq } from '@deepseek-ai/dsh-session';
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
 import type { DynamicPluginManager } from './plugin-manager.js';
-import { WorkStateHttpError } from './work-state-client.js';
-import type { CredentialHealthSnapshot, ExecutionStatus, NotificationLease, TaskRecord, WorkStateStore } from './work-state-client.js';
+import { WorkStateClient, WorkStateHttpError } from './work-state-client.js';
+import type {
+  ConversationMaintenanceCheckpoint,
+  ConversationMaintenanceJobRecord,
+  CredentialHealthSnapshot,
+  ExecutionStatus,
+  NotificationLease,
+  TaskRecord,
+  WorkStateStore,
+} from './work-state-client.js';
 import type { WorkActorClientRegistry } from './work-state-client.js';
 import type { ExchangeAuthorizationWaitReceipt } from './integrations/exchange-authorization.js';
 import {
@@ -90,6 +98,31 @@ export interface TaskOutcome {
   readonly reasoning: string;
   readonly error?: string;
   readonly durationMs: number;
+}
+
+export interface DshWorkTaskRequestV1 {
+  readonly taskId: string;
+  readonly sessionId: string;
+  readonly prompt: string;
+  readonly metadata: Readonly<Record<string, unknown>>;
+}
+
+export interface DshWorkTaskExecutionPortV1 {
+  run<T>(
+    context: { readonly workspaceId: string; readonly actorId: string },
+    request: DshWorkTaskRequestV1,
+    operation: (
+      agent: Agent,
+      signal: AbortSignal,
+      checkpoint: (value: ConversationMaintenanceCheckpoint) => Promise<void>,
+    ) => Promise<string>,
+    signal: AbortSignal,
+  ): Promise<TaskOutcome>;
+  cancel(
+    context: { readonly workspaceId: string; readonly actorId: string },
+    taskId: string,
+    signal: AbortSignal,
+  ): Promise<boolean>;
 }
 
 /** Provider-reported usage aggregated by the actual provider/model route. */
@@ -457,6 +490,26 @@ export class NavigatorExecutor {
     this.taskLimiter = new TaskConcurrencyLimiter(config.maxConcurrentTasks ?? 2);
     this.setupStreamListeners();
     this.ready = this.recoverInterruptedTasks();
+  }
+
+  /** Expose maintenance execution through this executor's durable Work Tasks and DSH Agent. */
+  dshWorkTaskExecutionPortV1(): DshWorkTaskExecutionPortV1 {
+    const port: DshWorkTaskExecutionPortV1 = {
+      run: <T>(
+        context: { readonly workspaceId: string; readonly actorId: string },
+        request: DshWorkTaskRequestV1,
+        operation: (
+          agent: Agent,
+          signal: AbortSignal,
+          checkpoint: (value: ConversationMaintenanceCheckpoint) => Promise<void>,
+        ) => Promise<string>,
+        signal: AbortSignal,
+      ) =>
+        this.runConversationMaintenanceTask(context, request, operation, signal),
+      cancel: (context, taskId, signal) =>
+        this.cancelConversationMaintenanceTask(context, taskId, signal),
+    };
+    return Object.freeze(port);
   }
 
   /** Stop new claims and cancel limiter waiters while leaving durable admission open. */
@@ -967,6 +1020,183 @@ export class NavigatorExecutor {
     return task.completion;
   }
 
+  private async runConversationMaintenanceTask<T>(
+    context: { readonly workspaceId: string; readonly actorId: string },
+    request: DshWorkTaskRequestV1,
+    operation: (
+      agent: Agent,
+      signal: AbortSignal,
+      checkpoint: (value: ConversationMaintenanceCheckpoint) => Promise<void>,
+    ) => Promise<string>,
+    signal: AbortSignal,
+  ): Promise<TaskOutcome> {
+    await this.ready;
+    signal.throwIfAborted();
+    if (context.workspaceId !== this.config.workspaceId) {
+      throw new ExecutorRequestError(403, 'CONVERSATION_WORKSPACE_MISMATCH', 'Conversation task is outside the configured Workspace.');
+    }
+    const actorId = uuidText(context.actorId, 'conversation task actor id');
+    const actorWorkState = this.config.workActorClients?.forActor(actorId);
+    if (!(actorWorkState instanceof WorkStateClient)) {
+      throw new ExecutorRequestError(503, 'CONVERSATION_ACTOR_WORK_UNAVAILABLE', 'An actor-private Harness Work principal is unavailable.');
+    }
+    const metadata = objectValue(request.metadata, 'conversation maintenance Task metadata');
+    const metadataKeys = [
+      'actorId', 'idempotencyKey', 'jobVersion', 'kind', 'maintenanceJobId', 'source', 'workspaceId',
+    ];
+    if (!isExactObjectKeys(metadata, metadataKeys)
+      || metadata.source !== 'conversation-maintenance'
+      || metadata.actorId !== actorId
+      || metadata.workspaceId !== context.workspaceId
+      || !['dream', 'forget', 'daily_review', 'backup', 'import'].includes(String(metadata.kind))) {
+      throw new ExecutorRequestError(403, 'CONVERSATION_TASK_PROVENANCE_INVALID', 'Conversation maintenance Task metadata is invalid.');
+    }
+    const jobId = boundedText(metadata.maintenanceJobId, 'maintenance job id', 200);
+    const idempotencyKey = boundedText(metadata.idempotencyKey, 'maintenance idempotency key', 200);
+    const jobVersion = maintenanceSafeInteger(metadata.jobVersion, 'maintenance queued version', 1);
+    const taskId = conversationMaintenanceTaskId(context.workspaceId, actorId, jobId);
+    if (request.taskId !== taskId || request.sessionId !== taskId
+      || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/u.test(request.taskId)) {
+      throw new ExecutorRequestError(409, 'CONVERSATION_TASK_IDENTITY_INVALID', 'Task identity does not match its durable job scope.');
+    }
+    const job = await actorWorkState.getConversationMaintenanceJob(jobId, signal);
+    if (job === undefined
+      || job.id !== jobId
+      || job.idempotencyKey !== idempotencyKey
+      || job.kind !== metadata.kind
+      || job.queuedVersion !== jobVersion) {
+      throw new ExecutorRequestError(409, 'CONVERSATION_TASK_JOB_MISMATCH', 'Task provenance does not match the actor-owned maintenance job.');
+    }
+    if (job.state === 'cancelled' || job.state === 'completed' || job.state === 'failed') {
+      const prior = await actorWorkState.getTask(taskId);
+      if (prior === undefined || !TERMINAL_STATUSES.has(prior.status)) {
+        throw new ExecutorRequestError(409, 'CONVERSATION_JOB_NOT_RUNNABLE', 'A terminal maintenance job has no matching terminal Work Task.');
+      }
+    } else if (job.state === 'running') {
+      const prior = await actorWorkState.getTask(taskId);
+      if (prior === undefined) {
+        throw new ExecutorRequestError(409, 'CONVERSATION_JOB_TASK_MISSING', 'A running maintenance job has no durable Work Task to reconcile.');
+      }
+    }
+
+    const expectedMetadata = Object.freeze({ ...metadata });
+    const reportCheckpoint = async (value: ConversationMaintenanceCheckpoint): Promise<void> => {
+      signal.throwIfAborted();
+      const checkpoint = validateConversationMaintenanceCheckpoint(value);
+      if (checkpoint.details.state !== undefined && checkpoint.details.state !== 'running') {
+        throw new ExecutorRequestError(400, 'CONVERSATION_CHECKPOINT_STATE_INVALID', 'Only the host may set a terminal maintenance state.');
+      }
+      const current = await actorWorkState.getConversationMaintenanceJob(jobId, signal);
+      if (current === undefined || current.state !== 'running') {
+        throw new ExecutorRequestError(409, 'CONVERSATION_JOB_NOT_RUNNING', 'Maintenance job is no longer running.');
+      }
+      await actorWorkState.checkpointConversationMaintenanceJob(
+        jobId,
+        current.version,
+        { ...checkpoint, details: { ...checkpoint.details, state: 'running' } },
+        signal,
+      );
+    };
+
+    if (signal.aborted) signal.throwIfAborted();
+    const onAbort = (): void => { void this.cancelTask(taskId).catch(() => undefined); };
+    signal.addEventListener('abort', onAbort, { once: true });
+    try {
+      const outcome = await this.executeFixedToolTask(
+        {
+          taskId,
+          sessionId: taskId,
+          prompt: boundedText(request.prompt, 'maintenance task prompt', 20_000),
+          metadata: expectedMetadata,
+        },
+        async (agent, taskSignal) => {
+          let current = await actorWorkState.getConversationMaintenanceJob(jobId, taskSignal);
+          if (current === undefined) throw new Error('Conversation maintenance job disappeared.');
+          if (current.state === 'queued') {
+            const startDigest = current.checkpointDigest
+              ?? sha256(`conversation-maintenance-start-v1\0${jobId}\0${current.version}`);
+            current = await actorWorkState.checkpointConversationMaintenanceJob(
+              jobId,
+              current.version,
+              {
+                cursor: current.cursor,
+                processedCount: current.processedCount,
+                checkpointDigest: startDigest,
+                details: { state: 'running', phase: 'started', taskId },
+              },
+              taskSignal,
+            );
+          }
+          if (current.state !== 'running') {
+            throw new Error('Conversation maintenance job is not in a runnable state.');
+          }
+          return operation(agent, taskSignal, reportCheckpoint);
+        },
+        actorId,
+        actorWorkState,
+      );
+
+      const finalState = outcome.status === 'completed'
+        ? 'completed'
+        : outcome.status === 'failed'
+          ? 'failed'
+            : undefined;
+      if (outcome.status === 'aborted') return outcome;
+      if (finalState === undefined) {
+        throw new ExecutorRequestError(409, 'CONVERSATION_TASK_NOT_TERMINAL', 'DSH maintenance Task did not reach a terminal state.');
+      }
+      const current = await actorWorkState.getConversationMaintenanceJob(jobId).catch(() => undefined);
+      if (current === undefined) {
+        throw new ExecutorRequestError(503, 'CONVERSATION_JOB_READBACK_FAILED', 'Maintenance job status could not be read back.');
+      }
+      if (current.state === finalState) {
+        const outputDigest = sha256(outcome.output);
+        if (current.details.taskId !== taskId || current.details.taskOutputSha256 !== outputDigest) {
+          throw new ExecutorRequestError(409, 'CONVERSATION_JOB_RECEIPT_MISMATCH', 'Terminal job state does not match the durable DSH Task output.');
+        }
+        return outcome;
+      }
+      if (current.state === 'completed' || current.state === 'failed' || current.state === 'cancelled') {
+        throw new ExecutorRequestError(409, 'CONVERSATION_JOB_STATE_CONFLICT', 'Maintenance job reached a different terminal state.');
+      }
+      const outputDigest = sha256(outcome.output);
+      const terminalCheckpoint: ConversationMaintenanceCheckpoint = {
+        cursor: current.cursor,
+        processedCount: current.processedCount,
+        checkpointDigest: outputDigest,
+        details: { state: finalState, taskId, taskOutputSha256: outputDigest },
+      };
+      await actorWorkState.checkpointConversationMaintenanceJob(
+        jobId,
+        current.version,
+        terminalCheckpoint,
+      );
+      return outcome;
+    } finally {
+      signal.removeEventListener('abort', onAbort);
+    }
+  }
+
+  private async cancelConversationMaintenanceTask(
+    context: { readonly workspaceId: string; readonly actorId: string },
+    taskId: string,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    signal.throwIfAborted();
+    if (context.workspaceId !== this.config.workspaceId) return false;
+    const actorId = uuidText(context.actorId, 'conversation task actor id');
+    const actorTask = await this.config.workActorClients?.resolveTask(taskId);
+    if (actorTask === undefined
+      || actorTask.actorAadObjectId.toLowerCase() !== actorId
+      || actorTask.task.metadata?.source !== 'conversation-maintenance'
+      || actorTask.task.metadata.actorId !== actorId
+      || actorTask.task.metadata.workspaceId !== context.workspaceId) {
+      return false;
+    }
+    signal.throwIfAborted();
+    return this.cancelTask(taskId);
+  }
+
   /** Admit a task asynchronously for the task-control API and return its durable queued record.  中文：供任务控制 API 异步接收任务并返回持久排队记录。 */
   async startTask(params: ExecuteTaskParams): Promise<TaskRecord> {
     await this.ready;
@@ -1063,6 +1293,7 @@ export class NavigatorExecutor {
       - Number(recordExecutionClass(left.task) === 'foreground'));
     for (const { task: record, workState, actorAadObjectId } of queued) {
       if (this.drainToken !== undefined) return started;
+      if (record.metadata?.source === 'conversation-maintenance') continue;
       // V3 fixed-tool source tasks are resumed by their durable Schedule row only;
       // adopting them here as freeform Agent tasks would cross the no-LLM boundary.
       const authorizationRef = record.metadata?.authorizationRef;
@@ -1701,23 +1932,24 @@ export class NavigatorExecutor {
     const task = this.tasks.get(taskId);
     const message = `Task ${taskId} was cancelled by caller`;
     if (!task) {
-      const record = await this.getTask(taskId);
+      const workState = await this.resolveTaskWorkState(taskId);
+      const record = await workState.getTask(taskId);
       if (!record || TERMINAL_STATUSES.has(record.status)) return false;
       const endedAt = Date.now();
       const durationMs = endedAt - (record.startedAt ?? record.createdAt);
       try {
-        await this.config.workState.patchTask(taskId, {
+        await workState.patchTask(taskId, {
           status: 'aborted', error: message,
         });
-        await this.config.workState.appendEvent(taskId, {
+        await workState.appendEvent(taskId, {
           type: 'error', taskId, message, code: 'TASK_ABORTED', timestamp: endedAt,
         });
-        await this.config.workState.appendEvent(taskId, {
+        await workState.appendEvent(taskId, {
           type: 'finish', taskId, status: 'aborted', output: record.output, durationMs, timestamp: endedAt,
         });
         return true;
       } catch {
-        return (await this.getTask(taskId))?.status === 'aborted';
+        return (await workState.getTask(taskId))?.status === 'aborted';
       }
     }
     if (TERMINAL_STATUSES.has(task.record.status)) return false;
@@ -4231,6 +4463,43 @@ function parseTeamsJsonObject(value: string, label: string): Record<string, unkn
 
 function isExactObjectKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
   return Object.keys(value).length === expected.length && expected.every(key => Object.hasOwn(value, key));
+}
+
+function conversationMaintenanceTaskId(workspaceId: string, actorId: string, jobId: string): string {
+  const digest = sha256(`cyrene-maintenance-v1\0${workspaceId}\0${actorId}\0${jobId}`).slice(0, 32);
+  return `maintenance-${digest}`;
+}
+
+function maintenanceSafeInteger(value: unknown, label: string, minimum: number): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < minimum) {
+    throw new ExecutorRequestError(400, 'CONVERSATION_TASK_METADATA_INVALID', `${label} is invalid.`);
+  }
+  return value;
+}
+
+function validateConversationMaintenanceCheckpoint(
+  value: ConversationMaintenanceCheckpoint,
+): ConversationMaintenanceCheckpoint {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)
+    || !isExactObjectKeys(value as unknown as Record<string, unknown>, [
+      'cursor', 'processedCount', 'checkpointDigest', 'details',
+    ])) {
+    throw new ExecutorRequestError(400, 'CONVERSATION_CHECKPOINT_INVALID', 'Maintenance checkpoint shape is invalid.');
+  }
+  const cursor = value.cursor;
+  if (cursor !== null && (typeof cursor !== 'string' || cursor.length > 1_024
+    || /[\u0000-\u001f\u007f]/u.test(cursor))) {
+    throw new ExecutorRequestError(400, 'CONVERSATION_CHECKPOINT_INVALID', 'Maintenance cursor is invalid.');
+  }
+  const processedCount = maintenanceSafeInteger(value.processedCount, 'processedCount', 0);
+  if (typeof value.checkpointDigest !== 'string' || !/^[0-9a-f]{64}$/u.test(value.checkpointDigest)) {
+    throw new ExecutorRequestError(400, 'CONVERSATION_CHECKPOINT_INVALID', 'Maintenance digest is invalid.');
+  }
+  const details = objectValue(value.details, 'maintenance checkpoint details');
+  if (Buffer.byteLength(JSON.stringify(details), 'utf8') > 8_192) {
+    throw new ExecutorRequestError(400, 'CONVERSATION_CHECKPOINT_INVALID', 'Maintenance details exceed their safe bound.');
+  }
+  return { cursor, processedCount, checkpointDigest: value.checkpointDigest, details };
 }
 
 function boundedText(value: unknown, label: string, maximum: number): string {

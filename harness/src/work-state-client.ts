@@ -237,6 +237,80 @@ export interface UnresolvedOperationSummary {
   readonly evidence: Readonly<Record<string, unknown>>;
 }
 
+/** Opaque content-addressed attachment metadata returned by Work. */
+export interface WorkAttachmentRecord {
+  readonly artifactId: string;
+  readonly sha256: string;
+  readonly name: string;
+  readonly mimeType: string;
+  readonly size: number;
+}
+
+/** Bounded attachment bytes resolved only through the active Work principal. */
+export interface WorkAttachmentBytes extends WorkAttachmentRecord {
+  readonly bytes: Uint8Array;
+}
+
+/** Server decision for reading an attachment cited by the current conversation turn. */
+export interface WorkConversationArtifactAuthorization {
+  readonly artifactId: string;
+  readonly conversationId: string;
+  readonly conversationKind: 'direct' | 'group' | 'channel';
+  readonly personaId: string | null;
+  readonly authorizationEpoch: number;
+  readonly sourceRefs: readonly {
+    readonly memoryId: string | null;
+    readonly memoryVersion: number | null;
+    readonly sourceMessageIds: readonly string[];
+  }[];
+}
+
+/** Current source authorization and safe content metadata for one artifact. */
+export interface WorkConversationArtifactAuthorizationReceipt {
+  readonly allowed: boolean;
+  readonly currentAuthorizationEpoch: number;
+  readonly artifact?: WorkAttachmentRecord;
+}
+
+export type ConversationMaintenanceState = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+
+export interface ConversationMaintenanceJobRecord {
+  readonly id: string;
+  readonly idempotencyKey: string;
+  readonly kind: 'dream' | 'forget' | 'daily_review' | 'backup' | 'import';
+  readonly conversationId: string | null;
+  readonly conversationKind: 'direct' | 'group' | 'channel' | null;
+  readonly personaId: string | null;
+  readonly state: ConversationMaintenanceState;
+  readonly cursor: string | null;
+  readonly processedCount: number;
+  readonly checkpointDigest: string | null;
+  readonly details: Readonly<Record<string, unknown>>;
+  readonly queuedVersion: number;
+  readonly version: number;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface ConversationMaintenanceCheckpoint {
+  readonly cursor: string | null;
+  readonly processedCount: number;
+  readonly checkpointDigest: string;
+  readonly details: Readonly<Record<string, unknown>>;
+}
+
+/** Artifact resolver bound to one authenticated Work principal and task actor. */
+export interface MediaArtifactResolver {
+  readonly expectedSubject: string;
+  read(artifactId: string, signal?: AbortSignal): Promise<WorkAttachmentBytes>;
+  write(
+    bytes: Uint8Array,
+    mimeType: string,
+    metadata: { readonly name: string },
+    signal?: AbortSignal,
+  ): Promise<WorkAttachmentRecord>;
+}
+
 /** Narrow storage contract shared by the HTTP service and explicit test store.  中文：HTTP 服务和显式测试存储共用的最小存储契约。 */
 export interface WorkStateStore {
   createTask(input: {
@@ -307,6 +381,17 @@ export interface WorkStateStore {
     result?: Readonly<Record<string, unknown>>,
     retryAfterSeconds?: number,
   ): Promise<void>;
+  readAttachment?(artifactId: string, signal?: AbortSignal): Promise<WorkAttachmentBytes>;
+  writeAttachment?(
+    bytes: Uint8Array,
+    mimeType: string,
+    name: string,
+    signal?: AbortSignal,
+  ): Promise<WorkAttachmentRecord>;
+  authorizeConversationArtifact?(
+    request: WorkConversationArtifactAuthorization,
+    signal?: AbortSignal,
+  ): Promise<WorkConversationArtifactAuthorizationReceipt>;
 }
 
 export interface WorkStateConnection {
@@ -316,6 +401,42 @@ export interface WorkStateConnection {
   /** Separate Work principal scoped to Teams private installation/notification bridge operations. */
   readonly privateBridgeTokenEnv?: string;
   readonly requestTimeoutMs?: number;
+}
+
+const WORK_ATTACHMENT_LIMIT_BYTES = 10_000_000;
+const WORK_IMAGE_MIME_TYPES = new Set(['image/gif', 'image/jpeg', 'image/png', 'image/webp']);
+
+/** A task-local resolver; its WorkStateStore must already be actor-token scoped. */
+export class WorkMediaArtifactResolver implements MediaArtifactResolver {
+  constructor(
+    private readonly workState: WorkStateStore,
+    readonly expectedSubject: string,
+  ) {
+    if (!expectedSubject.trim() || expectedSubject.length > 512) {
+      throw new TypeError('A verified Work Task subject is required for media artifacts');
+    }
+  }
+
+  /** Resolve an opaque digest only through the bound Work authorization. */
+  async read(artifactId: string, signal?: AbortSignal): Promise<WorkAttachmentBytes> {
+    if (this.workState.readAttachment === undefined) {
+      throw new WorkStateHttpError(503, 'WORK_ATTACHMENT_RESOLVER_UNAVAILABLE');
+    }
+    return this.workState.readAttachment(artifactId, signal);
+  }
+
+  /** Write bounded image output into this actor's Work attachment scope. */
+  async write(
+    bytes: Uint8Array,
+    mimeType: string,
+    metadata: { readonly name: string },
+    signal?: AbortSignal,
+  ): Promise<WorkAttachmentRecord> {
+    if (this.workState.writeAttachment === undefined) {
+      throw new WorkStateHttpError(503, 'WORK_ATTACHMENT_RESOLVER_UNAVAILABLE');
+    }
+    return this.workState.writeAttachment(bytes, mimeType, metadata.name, signal);
+  }
 }
 
 function object(value: unknown, label: string): Record<string, unknown> {
@@ -345,6 +466,69 @@ function countField(value: unknown, key: string): number {
     throw new TypeError(`Invalid Work credential health ${key}`);
   }
   return value;
+}
+
+function decodeWorkAttachment(value: unknown): WorkAttachmentRecord {
+  const row = object(value, 'Work attachment');
+  const artifactId = stringField(row.artifactId, 'artifactId');
+  const sha256 = stringField(row.sha256, 'sha256');
+  const name = stringField(row.name, 'name');
+  const mimeType = stringField(row.mimeType, 'mimeType').toLowerCase();
+  const size = countField(row.size, 'size');
+  if (!/^[0-9a-f]{64}$/u.test(artifactId) || artifactId !== sha256
+    || !WORK_IMAGE_MIME_TYPES.has(mimeType) || size < 1 || size > WORK_ATTACHMENT_LIMIT_BYTES) {
+    throw new TypeError('Invalid authorized Work attachment metadata');
+  }
+  return { artifactId, sha256, name, mimeType, size };
+}
+
+function decodeConversationMaintenanceJob(value: unknown): ConversationMaintenanceJobRecord {
+  const row = object(value, 'Conversation maintenance job');
+  const states: ConversationMaintenanceState[] = ['queued', 'running', 'completed', 'failed', 'cancelled'];
+  const kinds = ['dream', 'forget', 'daily_review', 'backup', 'import'] as const;
+  const conversations = ['direct', 'group', 'channel'] as const;
+  if (!states.includes(row.state as ConversationMaintenanceState)
+    || !kinds.includes(row.kind as typeof kinds[number])) {
+    throw new TypeError('Invalid conversation maintenance job state or kind');
+  }
+  const conversationKind = row.conversationKind === null
+    ? null
+    : row.conversationKind as typeof conversations[number];
+  if (conversationKind !== null && !conversations.includes(conversationKind)) {
+    throw new TypeError('Invalid conversation maintenance conversation kind');
+  }
+  const conversationId = row.conversationId === null
+    ? null
+    : stringField(row.conversationId, 'conversationId');
+  const personaId = row.personaId === null
+    ? null
+    : stringField(row.personaId, 'personaId');
+  const cursor = row.cursor === null ? null : stringField(row.cursor, 'cursor', true);
+  const checkpointDigest = row.checkpointDigest === null
+    ? null
+    : stringField(row.checkpointDigest, 'checkpointDigest');
+  const queuedVersion = countField(row.queuedVersion, 'queuedVersion');
+  const version = countField(row.version, 'version');
+  if (queuedVersion !== 1 || version < queuedVersion) {
+    throw new TypeError('Invalid conversation maintenance version');
+  }
+  return {
+    id: stringField(row.id, 'id'),
+    idempotencyKey: stringField(row.idempotencyKey, 'idempotencyKey'),
+    kind: row.kind as ConversationMaintenanceJobRecord['kind'],
+    conversationId,
+    conversationKind,
+    personaId,
+    state: row.state as ConversationMaintenanceState,
+    cursor,
+    processedCount: countField(row.processedCount, 'processedCount'),
+    checkpointDigest,
+    details: object(row.details, 'maintenance details'),
+    queuedVersion,
+    version,
+    createdAt: timeField(row.createdAt, 'createdAt')!,
+    updatedAt: timeField(row.updatedAt, 'updatedAt')!,
+  };
 }
 
 function decodeTask(value: unknown): TaskRecord {
@@ -487,6 +671,176 @@ export class WorkStateClient implements WorkStateStore {
     if (!connection.workspaceId.trim()) throw new Error('A configured workspace is required');
     this.workUrl = `${base.href.replace(/\/$/, '')}/api/v1/workspaces/${encodeURIComponent(connection.workspaceId)}/work`;
     this.tasksUrl = `${this.workUrl}/tasks`;
+  }
+
+  /** Read image bytes after Work authorizes the exact attachment digest for this principal. */
+  async readAttachment(artifactId: string, signal?: AbortSignal): Promise<WorkAttachmentBytes> {
+    if (!/^[0-9a-f]{64}$/u.test(artifactId)) throw new TypeError('Invalid Work attachment id');
+    const tokenEnv = this.connection.tokenEnv ?? 'CYRENE_SESSION_TOKEN';
+    const token = process.env[tokenEnv];
+    if (!token) throw new Error(`Missing persistence credential in ${tokenEnv}`);
+    const url = `${this.workUrl}/attachments/${encodeURIComponent(artifactId)}`;
+    const timeout = AbortSignal.timeout(this.connection.requestTimeoutMs ?? 10_000);
+    const requestSignal = signal === undefined ? timeout : AbortSignal.any([signal, timeout]);
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${token}`, Accept: [...WORK_IMAGE_MIME_TYPES].join(', ') },
+      signal: requestSignal,
+      redirect: 'error',
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      let value: unknown;
+      try { value = text.length === 0 ? {} : JSON.parse(text); } catch { value = {}; }
+      throw new WorkStateHttpError(response.status, errorCode(value));
+    }
+    const mimeType = (response.headers.get('content-type') ?? '').split(';', 1)[0]!.trim().toLowerCase();
+    if (!WORK_IMAGE_MIME_TYPES.has(mimeType)) throw new WorkStateHttpError(415, 'WORK_ATTACHMENT_MEDIA_TYPE_UNSUPPORTED');
+    const declaredLength = Number(response.headers.get('content-length'));
+    if (Number.isFinite(declaredLength) && declaredLength > WORK_ATTACHMENT_LIMIT_BYTES) {
+      throw new WorkStateHttpError(413, 'WORK_ATTACHMENT_INVALID_SIZE');
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength === 0 || bytes.byteLength > WORK_ATTACHMENT_LIMIT_BYTES) {
+      throw new WorkStateHttpError(413, 'WORK_ATTACHMENT_INVALID_SIZE');
+    }
+    const digest = createHash('sha256').update(bytes).digest('hex');
+    if (digest !== artifactId) throw new WorkStateHttpError(502, 'WORK_ATTACHMENT_DIGEST_MISMATCH');
+    return {
+      artifactId,
+      sha256: digest,
+      name: artifactId,
+      mimeType,
+      size: bytes.byteLength,
+      bytes,
+    };
+  }
+
+  /** Store generated PNG bytes through the same actor-bound Work API. */
+  async writeAttachment(
+    bytes: Uint8Array,
+    mimeType: string,
+    name: string,
+    signal?: AbortSignal,
+  ): Promise<WorkAttachmentRecord> {
+    const normalizedMimeType = mimeType.trim().toLowerCase();
+    if (normalizedMimeType !== 'image/png' || !WORK_IMAGE_MIME_TYPES.has(normalizedMimeType)) {
+      throw new WorkStateHttpError(415, 'WORK_ATTACHMENT_MEDIA_TYPE_UNSUPPORTED');
+    }
+    if (bytes.byteLength === 0 || bytes.byteLength > WORK_ATTACHMENT_LIMIT_BYTES) {
+      throw new WorkStateHttpError(413, 'WORK_ATTACHMENT_INVALID_SIZE');
+    }
+    const safeName = boundedString(name, 'attachment name', 512);
+    const result = object(await this.requestAt(
+      `${this.workUrl}/attachments`,
+      'POST',
+      { name: safeName, mediaType: normalizedMimeType, contentBase64: Buffer.from(bytes).toString('base64') },
+      undefined,
+      {},
+      undefined,
+      signal,
+    ), 'Work attachment record');
+    const artifactId = stringField(result.id, 'attachment id');
+    const sha256 = stringField(result.sha256, 'attachment sha256');
+    const returnedName = stringField(result.name, 'attachment name');
+    const returnedMime = stringField(result.mediaType, 'attachment media type').toLowerCase();
+    const size = countField(result.size, 'attachment size');
+    const digest = createHash('sha256').update(bytes).digest('hex');
+    if (artifactId !== digest || sha256 !== digest || size !== bytes.byteLength || returnedMime !== normalizedMimeType) {
+      throw new WorkStateHttpError(502, 'WORK_ATTACHMENT_WRITE_READBACK_MISMATCH');
+    }
+    return { artifactId, sha256, name: returnedName, mimeType: returnedMime, size };
+  }
+
+  /** Recheck current source, persona, conversation, and authorization epoch for media bytes. */
+  async authorizeConversationArtifact(
+    request: WorkConversationArtifactAuthorization,
+    signal?: AbortSignal,
+  ): Promise<WorkConversationArtifactAuthorizationReceipt> {
+    const value = object(await this.requestAt(
+      `${this.workUrl}/conversation-memory/artifacts/authorize`,
+      'POST',
+      request,
+      undefined,
+      {},
+      undefined,
+      signal,
+    ), 'Conversation artifact authorization');
+    const allowed = value.allowed;
+    const currentAuthorizationEpoch = timeField(
+      value.currentAuthorizationEpoch,
+      'currentAuthorizationEpoch',
+    )!;
+    if (typeof allowed !== 'boolean') throw new TypeError('Invalid conversation artifact authorization');
+    if (!allowed) return { allowed, currentAuthorizationEpoch };
+    const artifact = object(value.artifact, 'authorized Work attachment');
+    const record = decodeWorkAttachment(artifact);
+    if (record.artifactId !== request.artifactId) {
+      throw new TypeError('Authorized Work attachment does not match the requested artifact');
+    }
+    return { allowed, currentAuthorizationEpoch, artifact: record };
+  }
+
+  /** Read one actor-owned maintenance job for trusted DSH recovery and CAS. */
+  async getConversationMaintenanceJob(
+    jobId: string,
+    signal?: AbortSignal,
+  ): Promise<ConversationMaintenanceJobRecord | undefined> {
+    const safeJobId = encodeURIComponent(boundedString(jobId, 'maintenance job id', 200));
+    try {
+      const value = await this.requestAt(
+        `${this.workUrl}/conversation-memory/maintenance/jobs/${safeJobId}`,
+        'GET',
+        undefined,
+        undefined,
+        {},
+        undefined,
+        signal,
+      );
+      return decodeConversationMaintenanceJob(value);
+    } catch (error) {
+      if (error instanceof WorkStateHttpError && error.status === 404) return undefined;
+      throw error;
+    }
+  }
+
+  /** Persist one DSH worker checkpoint using the current actor-scoped writer credential. */
+  async checkpointConversationMaintenanceJob(
+    jobId: string,
+    expectedVersion: number,
+    checkpoint: ConversationMaintenanceCheckpoint,
+    signal?: AbortSignal,
+  ): Promise<ConversationMaintenanceJobRecord> {
+    const safeJobId = encodeURIComponent(boundedString(jobId, 'maintenance job id', 200));
+    const receipt = object(await this.requestAt(
+      `${this.workUrl}/conversation-memory/maintenance/jobs/${safeJobId}/checkpoint`,
+      'PATCH',
+      { expectedVersion, checkpoint },
+      undefined,
+      {},
+      undefined,
+      signal,
+    ), 'Conversation maintenance checkpoint receipt');
+    return decodeConversationMaintenanceJob(receipt.job);
+  }
+
+  /** Cancel an actor-owned queued or running maintenance job with version CAS. */
+  async cancelConversationMaintenanceJob(
+    jobId: string,
+    expectedVersion: number,
+    signal?: AbortSignal,
+  ): Promise<ConversationMaintenanceJobRecord> {
+    const safeJobId = encodeURIComponent(boundedString(jobId, 'maintenance job id', 200));
+    const receipt = object(await this.requestAt(
+      `${this.workUrl}/conversation-memory/maintenance/jobs/${safeJobId}/cancel`,
+      'POST',
+      { expectedVersion },
+      undefined,
+      {},
+      undefined,
+      signal,
+    ), 'Conversation maintenance cancellation receipt');
+    return decodeConversationMaintenanceJob(receipt.job);
   }
 
   /** Create one durable task. The server binds organization and workspace from the bearer principal.  中文：创建持久任务；服务端从 bearer principal 绑定组织和 Workspace。 */
@@ -892,11 +1246,14 @@ export class WorkStateClient implements WorkStateStore {
     timeoutMs?: number,
     extraHeaders: Readonly<Record<string, string>> = {},
     tokenEnvOverride?: string,
+    signal?: AbortSignal,
   ): Promise<unknown> {
     const tokenEnv = tokenEnvOverride ?? this.connection.tokenEnv ?? 'CYRENE_SESSION_TOKEN';
     const token = process.env[tokenEnv];
     if (!token) throw new Error(`Missing persistence credential in ${tokenEnv}`);
     const requestTimeoutMs = timeoutMs ?? this.connection.requestTimeoutMs ?? 10_000;
+    const timeoutSignal = AbortSignal.timeout(requestTimeoutMs);
+    const requestSignal = signal === undefined ? timeoutSignal : AbortSignal.any([signal, timeoutSignal]);
     const response = await fetch(url, {
       method,
       headers: {
@@ -906,7 +1263,7 @@ export class WorkStateClient implements WorkStateStore {
         ...extraHeaders,
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      signal: AbortSignal.timeout(requestTimeoutMs),
+      signal: requestSignal,
       redirect: 'error',
     });
     const text = await response.text();

@@ -622,6 +622,327 @@ class MemoryQuery(WorkModel):
     include_stale: bool = False
 
 
+ConversationKind = Literal["direct", "group", "channel"]
+ConversationVisibility = Literal["private", "conversation", "workspace"]
+ConversationMemoryKind = Literal["fact", "preference", "commitment", "episode"]
+
+
+class ConversationMemoryScope(WorkModel):
+    """Conversation and visibility boundary attached to every memory projection."""
+
+    conversation_id: str = Field(min_length=1, max_length=512)
+    conversation_kind: ConversationKind
+    persona_id: str | None = None
+    visibility: ConversationVisibility
+
+
+class ConversationMemorySourceRef(WorkModel):
+    """Original messages and exact memory revisions supporting derived content."""
+
+    memory_id: str | None = None
+    memory_version: int | None = Field(default=None, ge=1)
+    source_message_ids: list[str] = Field(default_factory=list, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_memory_revision(self) -> ConversationMemorySourceRef:
+        """Require a version whenever a parent memory is referenced."""
+
+        if (self.memory_id is None) != (self.memory_version is None):
+            raise ValueError("memoryId and memoryVersion must be supplied together")
+        if self.memory_id is None and not self.source_message_ids:
+            raise ValueError("a source reference must contain a memory or message id")
+        return self
+
+
+class ConversationMemoryAttachmentRef(WorkModel):
+    """Opaque Work attachment metadata attached to a trusted message source."""
+
+    artifact_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    mime_type: Literal["image/png", "image/jpeg", "image/webp", "image/gif"]
+    size: int = Field(ge=1, le=10_000_000)
+
+    @model_validator(mode="after")
+    def digest_matches_id(self) -> ConversationMemoryAttachmentRef:
+        """Bind the artifact id to the content digest returned by Work."""
+
+        if self.artifact_id != self.sha256:
+            raise ValueError("artifactId and sha256 must match")
+        return self
+
+
+class ConversationMemoryMessageCreate(WorkModel):
+    """Append one host-recorded conversation message without caller-owned identity."""
+
+    event_id: str = Field(min_length=1, max_length=512)
+    conversation_id: str = Field(min_length=1, max_length=512)
+    conversation_kind: ConversationKind
+    persona_id: str | None = Field(default=None, max_length=512)
+    visibility: ConversationVisibility = "private"
+    role: Literal["user", "assistant", "tool"]
+    content: str = Field(min_length=1, max_length=100_000)
+    occurred_at: int | None = Field(default=None, ge=0)
+    related_event_ids: list[str] = Field(default_factory=list, max_length=16)
+    source_refs: list[ConversationMemorySourceRef] = Field(default_factory=list, max_length=256)
+    attachments: list[ConversationMemoryAttachmentRef] = Field(default_factory=list, max_length=32)
+
+    @model_validator(mode="after")
+    def validate_message_lineage(self) -> ConversationMemoryMessageCreate:
+        """Prevent user-origin events from asserting model-derived provenance."""
+
+        if self.role == "user" and (self.source_refs or self.related_event_ids):
+            raise ValueError("user messages cannot assert derived source references")
+        if self.role != "assistant" and self.related_event_ids:
+            raise ValueError("only assistant messages may reference a related turn event")
+        return self
+
+
+class ConversationMemoryMessage(WorkModel):
+    """Persisted message projection with privacy-safe scope and provenance."""
+
+    id: str
+    event_id: str
+    role: Literal["user", "assistant", "tool"]
+    content: str
+    occurred_at: int
+    status: Literal["active", "revoked"]
+    revoked_at: int | None = None
+    source_refs: list[ConversationMemorySourceRef]
+    attachments: list[ConversationMemoryAttachmentRef]
+    scope: ConversationMemoryScope
+
+
+class ConversationMemoryMessages(WorkModel):
+    """One bounded page of conversation events."""
+
+    items: list[ConversationMemoryMessage]
+    next_cursor: str | None = None
+
+
+class ConversationMemoryCreate(WorkModel):
+    """Create an evidence-backed memory candidate or active projection."""
+
+    idempotency_key: str = Field(min_length=1, max_length=512)
+    conversation_id: str = Field(min_length=1, max_length=512)
+    conversation_kind: ConversationKind
+    persona_id: str | None = Field(default=None, max_length=512)
+    kind: ConversationMemoryKind
+    text: str = Field(min_length=1, max_length=20_000)
+    source_message_ids: list[str] = Field(min_length=1, max_length=32_768)
+    source_refs: list[ConversationMemorySourceRef] = Field(default_factory=list, max_length=256)
+    visibility: ConversationVisibility = "private"
+    valid_until: int | None = Field(default=None, ge=0)
+
+
+class ConversationMemoryPatch(WorkModel):
+    """Correct memory text or freshness while preserving the original evidence."""
+
+    expected_version: int = Field(ge=1)
+    text: str | None = Field(default=None, min_length=1, max_length=20_000)
+    valid_until: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def require_change(self) -> ConversationMemoryPatch:
+        """Reject empty edits instead of recording no-op revisions."""
+
+        if self.text is None and self.valid_until is None:
+            raise ValueError("at least one mutable memory field is required")
+        return self
+
+
+class ConversationMemoryRecord(WorkModel):
+    """Current memory record and its honest semantic-index state."""
+
+    id: str
+    kind: ConversationMemoryKind
+    text: str
+    source_message_ids: list[str]
+    source_refs: list[ConversationMemorySourceRef]
+    version: int
+    state: Literal["active", "invalidated", "deleted"]
+    index_state: Literal["pending", "indexed", "unavailable", "failed"]
+    authorization_epoch: int
+    created_at: int
+    updated_at: int
+    valid_until: int | None = None
+    scope: ConversationMemoryScope
+
+
+class ConversationMemoryReceipt(WorkModel):
+    """Memory write receipt that distinguishes duplicate idempotent requests."""
+
+    memory: ConversationMemoryRecord
+    duplicate: bool = False
+
+
+class ConversationMemoryDeleteReceipt(WorkModel):
+    """Deletion receipt with workspace authorization epoch and replay state."""
+
+    deleted: bool
+    authorization_epoch: int
+    duplicate: bool = False
+
+
+class ConversationMemoryList(WorkModel):
+    """Bounded memory records for the authorized actor and conversation."""
+
+    items: list[ConversationMemoryRecord]
+    authorization_epoch: int
+
+
+class ConversationMemoryQuery(WorkModel):
+    """Semantic search request; model and vector provider are server selected."""
+
+    conversation_id: str = Field(min_length=1, max_length=512)
+    conversation_kind: ConversationKind
+    persona_id: str | None = Field(default=None, max_length=512)
+    query: str = Field(min_length=1, max_length=2_000)
+    limit: int = Field(default=20, ge=1, le=100)
+
+
+class ConversationMemoryHit(WorkModel):
+    """Authorized semantic hit with the exact revision that was retrieved."""
+
+    memory_id: str
+    kind: ConversationMemoryKind
+    text: str
+    source_message_ids: list[str]
+    source_refs: list[ConversationMemorySourceRef]
+    version: int
+    score: float
+    stale: bool
+    scope: ConversationMemoryScope
+
+
+class ConversationMemoryQueryResult(WorkModel):
+    """Provider hits filtered by current Navigator provenance and freshness."""
+
+    items: list[ConversationMemoryHit]
+    authorization_epoch: int
+
+
+class ConversationMemorySources(WorkModel):
+    """Source audit records limited to the authorized actor and conversation."""
+
+    items: list[ConversationMemorySource]
+
+
+class ConversationMemorySourceGrantCreate(WorkModel):
+    """Explicitly share one source with a conversation or Workspace."""
+
+    visibility: Literal["conversation", "workspace"]
+    target_conversation_id: str | None = Field(default=None, max_length=512)
+    expires_at: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_target(self) -> ConversationMemorySourceGrantCreate:
+        """Require an exact conversation target and forbid ambiguous workspace targets."""
+
+        if self.visibility == "conversation" and not self.target_conversation_id:
+            raise ValueError("conversation grants require targetConversationId")
+        if self.visibility == "workspace" and self.target_conversation_id is not None:
+            raise ValueError("workspace grants cannot include targetConversationId")
+        return self
+
+
+class ConversationMemorySourceGrant(WorkModel):
+    """Current explicit grant for one message source."""
+
+    id: str
+    source_id: str
+    visibility: Literal["conversation", "workspace"]
+    target_conversation_id: str | None = None
+    expires_at: int | None = None
+    created_at: int
+    status: Literal["active", "revoked", "expired"]
+
+
+class ConversationMemorySource(WorkModel):
+    """Source audit record and owner-managed grants without actor identifiers."""
+
+    id: str
+    event_id: str
+    kind: Literal["conversation_message"]
+    role: Literal["user", "assistant", "tool"]
+    status: Literal["active", "revoked"]
+    revoked_at: int | None = None
+    authorization_epoch: int
+    created_at: int
+    can_manage_grants: bool
+    scope: ConversationMemoryScope
+    grants: list[ConversationMemorySourceGrant]
+
+
+class ConversationMemorySourceGrantReceipt(WorkModel):
+    """Acknowledgement for one explicit source grant."""
+
+    grant: ConversationMemorySourceGrant
+    authorization_epoch: int
+    duplicate: bool = False
+
+
+class ConversationMemorySourceGrantRevocation(WorkModel):
+    """Acknowledgement for an idempotent grant revocation."""
+
+    revoked: bool
+    authorization_epoch: int
+
+
+class ConversationMemorySourceAuthorization(WorkModel):
+    """Request an authoritative source and revision check before context or delivery."""
+
+    conversation_id: str = Field(min_length=1, max_length=512)
+    conversation_kind: ConversationKind
+    persona_id: str | None = Field(default=None, max_length=512)
+    authorization_epoch: int = Field(ge=0)
+    source_refs: list[ConversationMemorySourceRef] = Field(max_length=256)
+
+
+class ConversationMemorySourceAuthorizationReceipt(WorkModel):
+    """Fail-closed result of a current-epoch source check."""
+
+    allowed: bool
+    current_authorization_epoch: int
+    denied_source_ids: list[str]
+
+
+class ConversationMemoryArtifactAuthorization(WorkModel):
+    """Authorize one opaque attachment against current source lineage."""
+
+    artifact_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    conversation_id: str = Field(min_length=1, max_length=512)
+    conversation_kind: ConversationKind
+    persona_id: str | None = Field(default=None, max_length=512)
+    authorization_epoch: int = Field(ge=0)
+    source_refs: list[ConversationMemorySourceRef] = Field(max_length=256)
+
+
+class ConversationMemoryArtifactAuthorizationReceipt(WorkModel):
+    """Current authorization decision and safe metadata for an opaque artifact."""
+
+    allowed: bool
+    current_authorization_epoch: int
+    artifact: ConversationMemoryAttachmentRef | None = None
+
+
+class ConversationMemorySourceRevocationReceipt(WorkModel):
+    """Audit receipt for one source revocation and its recursive descendants."""
+
+    source_id: str
+    authorization_epoch: int
+    invalidated_count: int
+    invalidated_message_ids: list[str]
+    invalidated_memory_ids: list[str]
+
+
+class ConversationMemoryOverview(WorkModel):
+    """Product status without synthetic provider health claims."""
+
+    authorization_epoch: int
+    counts: dict[str, int]
+    capabilities: dict[str, Literal["ready", "unavailable"]]
+
+
 class SourceFactInput(WorkModel):
     """One fact from a paginated source inventory. | 分页来源清单中的一项事实。"""
 

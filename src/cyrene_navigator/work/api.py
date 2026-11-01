@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import inspect
 import json
 import logging
+import math
 import re
-from collections.abc import Awaitable, Callable, Mapping
+import time
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +28,22 @@ from fastapi.responses import FileResponse
 
 from cyrene_navigator.persistence.errors import WORKSPACE_FORBIDDEN, PersistenceError
 from cyrene_navigator.persistence.store import PersistencePrincipal
+from cyrene_navigator.work.conversation_memory import ConversationMemoryStore
+from cyrene_navigator.work.conversation_memory.domain_api import mount_domain_routes
+from cyrene_navigator.work.conversation_memory.domain_models import ActorBackupReceipt, EmptyRequest
+from cyrene_navigator.work.conversation_memory.domains import (
+    ConversationDomainStore,
+    maintenance_task_id,
+)
+from cyrene_navigator.work.conversation_memory.providers import (
+    EmbeddingBatch,
+    EmbeddingClient,
+    KnowledgeGraphProvider,
+    MemoryProvider,
+    MemoryProviderHit,
+    MemoryProviderScope,
+    provider_unavailable,
+)
 from cyrene_navigator.work.models import (
     ApprovalCreate,
     ApprovalReceipt,
@@ -45,6 +64,26 @@ from cyrene_navigator.work.models import (
     ConnectorList,
     ConnectorRecord,
     ConnectorStatusUpdate,
+    ConversationKind,
+    ConversationMemoryArtifactAuthorization,
+    ConversationMemoryArtifactAuthorizationReceipt,
+    ConversationMemoryCreate,
+    ConversationMemoryDeleteReceipt,
+    ConversationMemoryList,
+    ConversationMemoryMessageCreate,
+    ConversationMemoryMessages,
+    ConversationMemoryOverview,
+    ConversationMemoryPatch,
+    ConversationMemoryQuery,
+    ConversationMemoryQueryResult,
+    ConversationMemoryReceipt,
+    ConversationMemorySourceAuthorization,
+    ConversationMemorySourceAuthorizationReceipt,
+    ConversationMemorySourceGrantCreate,
+    ConversationMemorySourceGrantReceipt,
+    ConversationMemorySourceGrantRevocation,
+    ConversationMemorySourceRevocationReceipt,
+    ConversationMemorySources,
     CredentialHealthSnapshotBatch,
     CredentialHealthSnapshotReceipt,
     ExperimentPut,
@@ -260,6 +299,10 @@ def mount_work_routes(
     attachment_root: Path | None = None,
     connector_bridges: Mapping[tuple[str | None, str, str], ConnectorBridge] | None = None,
     private_conversation_policy: TeamsPrivateConversationPolicy | None = None,
+    embedding_client: EmbeddingClient | None = None,
+    memory_provider: MemoryProvider | None = None,
+    graph_provider: KnowledgeGraphProvider | None = None,
+    summarizer_available: bool = False,
 ) -> WorkStore:
     """Mount authenticated Work routes on an existing persistence app.
 
@@ -269,13 +312,26 @@ def mount_work_routes(
     """
 
     store = WorkStore(db_path, attachment_root)
+    conversation_memory = ConversationMemoryStore(
+        Path(f"{db_path}.conversation-memory.sqlite3").absolute()
+    )
+    conversation_domains = ConversationDomainStore(
+        Path(f"{db_path}.conversation-domains.sqlite3").absolute()
+    )
     bridges = dict(connector_bridges or {})
     for organization_id, workspace_id, binding_id in bridges:
         store.seed_connector_binding(organization_id, workspace_id, binding_id)
     app.state.work_store = store
+    app.state.work_conversation_memory = conversation_memory
+    app.state.work_conversation_domains = conversation_domains
+    app.state.work_memory_embedding_client = embedding_client
+    app.state.work_memory_provider = memory_provider
+    app.state.work_graph_provider = graph_provider
+    app.state.work_conversation_summarizer_available = summarizer_available
     app.state.work_connector_bridges = bridges
     app.state.work_private_conversation_policy = private_conversation_policy
     base = "/api/v1/workspaces/{workspace_id}/work"
+    conversation_base = base + "/conversation-memory"
     mount_work_tool_routes(app, authenticate, bridges)
 
     def principal_for(
@@ -291,6 +347,145 @@ def mount_work_routes(
                 "A trusted Workspace writer principal is required for Work mutations.",
             )
         return principal
+
+    def validate_domain_sources(
+        organization_id: str | None,
+        workspace_id: str,
+        actor_id: str,
+        conversation_id: str | None,
+        conversation_kind: str | None,
+        persona_id: str | None,
+        source_ids: Sequence[str],
+    ) -> None:
+        """Validate every domain source in current actor, conversation, and persona scope."""
+
+        conversation_memory.validate_source_message_ids(
+            organization_id,
+            workspace_id,
+            actor_id,
+            conversation_id,
+            conversation_kind,
+            persona_id,
+            source_ids,
+        )
+
+    def validate_domain_source_refs(
+        organization_id: str | None,
+        workspace_id: str,
+        actor_id: str,
+        conversation_id: str | None,
+        conversation_kind: str | None,
+        persona_id: str | None,
+        source_refs: Sequence[Mapping[str, object]],
+    ) -> None:
+        """Reauthorize full message and memory-version lineage at the current epoch."""
+
+        if not source_refs:
+            return
+        if conversation_id is None or conversation_kind not in {"direct", "group", "channel"}:
+            raise PersistenceError(
+                "CONVERSATION_DOMAIN_SOURCE_UNAVAILABLE",
+                409,
+                "Derived source references require a trusted conversation scope.",
+            )
+        current = conversation_memory.overview(organization_id, workspace_id, actor_id)
+        decision = conversation_memory.authorize_sources(
+            organization_id,
+            workspace_id,
+            actor_id,
+            conversation_id,
+            int(current["authorizationEpoch"]),
+            list(source_refs),
+            conversation_kind=conversation_kind,
+            persona_id=persona_id,
+        )
+        if decision.get("allowed") is not True:
+            raise PersistenceError(
+                "CONVERSATION_DOMAIN_SOURCE_UNAVAILABLE",
+                409,
+                "A derived record source is revoked, stale, or outside its authorized scope.",
+            )
+
+    mount_domain_routes(
+        app,
+        conversation_base,
+        principal_for,
+        conversation_domains,
+        validate_source_refs=validate_domain_source_refs,
+    )
+
+    @app.post(
+        conversation_base + "/backups",
+        response_model=ActorBackupReceipt,
+        status_code=201,
+    )
+    def create_conversation_memory_backup(
+        workspace_id: str,
+        _body: EmptyRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        """Create a bounded actor-private export of both conversation stores."""
+
+        principal = principal_for(request, workspace_id, write=True)
+        try:
+            memory_export = json.loads(
+                conversation_memory.export_actor_backup(
+                    principal.organization_id, workspace_id, principal.actor_id
+                )
+            )
+            domain_export = json.loads(
+                conversation_domains.export_actor_backup(
+                    principal.organization_id
+                    or "legacy-"
+                    + hashlib.sha256(
+                        f"{workspace_id}\0{principal.actor_id}".encode()
+                    ).hexdigest()[:32],
+                    workspace_id,
+                    principal.actor_id,
+                )
+            )
+        except PersistenceError:
+            raise
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PersistenceError(
+                "CONVERSATION_MEMORY_BACKUP_INVALID",
+                500,
+                "An actor backup component returned invalid JSON.",
+            ) from exc
+        payload = {
+            "schemaVersion": 1,
+            "createdAt": int(time.time() * 1_000),
+            "scopeDigest": hashlib.sha256(
+                json.dumps(
+                    [principal.organization_id or "", workspace_id, principal.actor_id],
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "conversationMemory": memory_export,
+            "conversationDomains": domain_export,
+        }
+        content = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if not content or len(content) > 10_000_000:
+            raise PersistenceError(
+                "CONVERSATION_MEMORY_BACKUP_TOO_LARGE",
+                413,
+                "Combined actor backup exceeds 10 MB.",
+            )
+        attachment = store.put_attachment(
+            principal.organization_id,
+            workspace_id,
+            "conversation-memory-backup.json",
+            "application/json",
+            content,
+            actor_id=principal.actor_id,
+            actor_private_scope=True,
+        )
+        return {
+            "artifactId": attachment["id"],
+            "sha256": attachment["sha256"],
+            "size": attachment["size"],
+            "mimeType": "application/json",
+        }
 
     def require_private_work_owner(request: Request, workspace_id: str) -> PersistencePrincipal:
         """Require owner authority and an organization for private Work indexes.
@@ -548,6 +743,79 @@ def mount_work_routes(
         workspace_id: str, body: TaskCreate, request: Request, response: Response
     ) -> dict[str, Any]:
         principal = principal_for(request, workspace_id, write=True)
+        if (
+            body.execution_class == "background"
+            and body.metadata.get("source") == "conversation-maintenance"
+        ):
+            if (
+                not principal.can_write_harness
+                or not principal.actor_private_scope
+                or principal.organization_id is None
+            ):
+                raise PersistenceError(
+                    WORKSPACE_FORBIDDEN,
+                    403,
+                    "A trusted actor-private Harness worker principal is required for "
+                    "conversation maintenance tasks.",
+                )
+            metadata = body.metadata
+            job_id = metadata.get("maintenanceJobId")
+            task_id = maintenance_task_id(workspace_id, principal.actor_id, str(job_id))
+            if body.id != task_id or body.session_id != task_id:
+                raise PersistenceError(
+                    "WORK_TASK_BACKGROUND_PROVENANCE_REQUIRED",
+                    409,
+                    "Conversation maintenance Task identity must derive from its durable job.",
+                )
+            job = conversation_domains.get_maintenance_job(
+                principal.organization_id,
+                workspace_id,
+                principal.actor_id,
+                str(job_id),
+            )
+            if (
+                job.get("taskId") != task_id
+                or metadata.get("workspaceId") != workspace_id
+                or metadata.get("actorId") != principal.actor_id
+                or metadata.get("kind") != job.get("kind")
+                or metadata.get("idempotencyKey") != job.get("idempotencyKey")
+            ):
+                raise PersistenceError(
+                    "WORK_TASK_BACKGROUND_PROVENANCE_REQUIRED",
+                    403,
+                    "Conversation maintenance Task does not match the durable actor job.",
+                )
+            try:
+                prior_task = store.get_task(
+                    principal.organization_id,
+                    workspace_id,
+                    task_id,
+                    actor_id=principal.actor_id,
+                    actor_private_scope=True,
+                )
+            except PersistenceError as exc:
+                if exc.status != 404 or exc.code != "WORK_TASK_NOT_FOUND":
+                    raise
+                prior_task = None
+            if prior_task is None:
+                if (
+                    job.get("state") != "queued"
+                    or metadata.get("jobVersion") != job.get("version")
+                ):
+                    raise PersistenceError(
+                        "WORK_TASK_BACKGROUND_PROVENANCE_REQUIRED",
+                        409,
+                        "A new maintenance Task must match the queued job version.",
+                    )
+            elif (
+                prior_task.get("createdByActorId") != principal.actor_id
+                or prior_task.get("metadata") != dict(metadata)
+            ):
+                raise PersistenceError(
+                    "WORK_TASK_BACKGROUND_PROVENANCE_REQUIRED",
+                    409,
+                    "Existing maintenance Task provenance does not match this request.",
+                )
         record, duplicate = store.create_task(
             principal.organization_id,
             workspace_id,
@@ -1061,6 +1329,508 @@ def mount_work_routes(
                 actor_private_scope=principal.actor_private_scope,
             )
         }
+
+    def index_conversation_memory(
+        workspace_id: str, principal: PersistencePrincipal, memory_id: str
+    ) -> dict[str, Any]:
+        """Index a durable product record through the configured real providers."""
+
+        current = conversation_memory.get_memory_for_index(
+            principal.organization_id, workspace_id, principal.actor_id, memory_id
+        )
+        provider = memory_provider
+        embeddings = embedding_client
+        if provider is None or embeddings is None:
+            return conversation_memory.set_index_state(
+                principal.organization_id,
+                workspace_id,
+                principal.actor_id,
+                memory_id,
+                int(current["version"]),
+                "unavailable",
+            )
+        try:
+            batch: EmbeddingBatch = embeddings.embed([str(current["text"])])
+            if len(batch.vectors) != 1:
+                raise provider_unavailable(
+                    "MEMORY_EMBEDDING_RESPONSE_INVALID",
+                    "The configured embedding provider returned an unexpected vector count.",
+                )
+            scope = current["scope"]
+            if not isinstance(scope, Mapping):
+                raise provider_unavailable(
+                    "MEMORY_RECORD_INVALID", "The stored memory scope is unavailable."
+                )
+            provider.upsert(
+                memory_id=memory_id,
+                text=str(current["text"]),
+                embedding=batch.vectors[0],
+                model=batch.model,
+                dimensions=batch.dimensions,
+                scope=MemoryProviderScope(
+                    organization_id=principal.organization_id,
+                    workspace_id=workspace_id,
+                    actor_id=principal.actor_id,
+                    conversation_id=str(scope["conversationId"]),
+                    conversation_kind=str(scope["conversationKind"]),
+                    persona_id=str(scope["personaId"]) if scope["personaId"] is not None else None,
+                    visibility=str(scope["visibility"]),
+                ),
+                authorization_epoch=int(current["authorizationEpoch"]),
+            )
+        except PersistenceError:
+            conversation_memory.set_index_state(
+                principal.organization_id,
+                workspace_id,
+                principal.actor_id,
+                memory_id,
+                int(current["version"]),
+                "failed",
+            )
+            raise
+        except Exception as exc:
+            conversation_memory.set_index_state(
+                principal.organization_id,
+                workspace_id,
+                principal.actor_id,
+                memory_id,
+                int(current["version"]),
+                "failed",
+            )
+            raise provider_unavailable(
+                "MEMORY_PROVIDER_UNAVAILABLE",
+                "The configured memory provider could not index this record.",
+            ) from exc
+        return conversation_memory.set_index_state(
+            principal.organization_id,
+            workspace_id,
+            principal.actor_id,
+            memory_id,
+            int(current["version"]),
+            "indexed",
+        )
+
+    @app.get(conversation_base + "/overview", response_model=ConversationMemoryOverview)
+    def conversation_memory_overview(workspace_id: str, request: Request) -> dict[str, Any]:
+        principal = principal_for(request, workspace_id)
+        overview = conversation_memory.overview(
+            principal.organization_id, workspace_id, principal.actor_id
+        )
+        overview["capabilities"] = {
+            "memoryProvider": "ready"
+            if memory_provider is not None and embedding_client is not None
+            else "unavailable",
+            "summarizer": "ready" if summarizer_available else "unavailable",
+        }
+        return overview
+
+    @app.get(conversation_base + "/messages", response_model=ConversationMemoryMessages)
+    def list_conversation_messages(
+        workspace_id: str,
+        request: Request,
+        conversation_id: str = Query(alias="conversationId", min_length=1, max_length=512),
+        conversation_kind: ConversationKind = Query(alias="conversationKind"),  # noqa: B008
+        persona_id: str | None = Query(default=None, alias="personaId", max_length=512),
+        order: str = Query(default="desc", pattern="^(asc|desc)$"),
+        limit: int = Query(default=50, ge=1, le=100),
+        cursor: str | None = Query(default=None, max_length=600),
+        include_revoked: bool = Query(default=False, alias="includeRevoked"),
+    ) -> dict[str, Any]:
+        principal = principal_for(request, workspace_id)
+        return conversation_memory.list_messages(
+            principal.organization_id,
+            workspace_id,
+            principal.actor_id,
+            conversation_id,
+            conversation_kind=conversation_kind,
+            persona_id=persona_id,
+            order=order,
+            limit=limit,
+            cursor=cursor,
+            include_revoked=include_revoked,
+        )
+
+    @app.post(conversation_base + "/messages", status_code=201)
+    def create_conversation_message(
+        workspace_id: str,
+        body: ConversationMemoryMessageCreate,
+        request: Request,
+        response: Response,
+    ) -> dict[str, Any]:
+        principal = principal_for(request, workspace_id, write=True)
+        receipt = conversation_memory.create_message(
+            principal.organization_id,
+            workspace_id,
+            principal.actor_id,
+            body.model_dump(by_alias=True),
+        )
+        if receipt["duplicate"]:
+            response.status_code = 200
+        return receipt
+
+    @app.get(conversation_base + "/memories", response_model=ConversationMemoryList)
+    def list_conversation_memories(
+        workspace_id: str,
+        request: Request,
+        conversation_id: str = Query(alias="conversationId", min_length=1, max_length=512),
+        conversation_kind: ConversationKind = Query(alias="conversationKind"),  # noqa: B008
+        persona_id: str | None = Query(default=None, alias="personaId", max_length=512),
+        state: str = Query(default="active", max_length=32),
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict[str, Any]:
+        principal = principal_for(request, workspace_id)
+        result = conversation_memory.list_memories(
+            principal.organization_id,
+            workspace_id,
+            principal.actor_id,
+            conversation_id,
+            conversation_kind=conversation_kind,
+            persona_id=persona_id,
+            state=state,
+            limit=limit,
+        )
+        result["authorizationEpoch"] = conversation_memory.overview(
+            principal.organization_id, workspace_id, principal.actor_id
+        )["authorizationEpoch"]
+        return result
+
+    @app.post(
+        conversation_base + "/memories",
+        response_model=ConversationMemoryReceipt,
+        status_code=201,
+    )
+    def create_conversation_memory(
+        workspace_id: str,
+        body: ConversationMemoryCreate,
+        request: Request,
+        response: Response,
+    ) -> dict[str, Any]:
+        principal = principal_for(request, workspace_id, write=True)
+        receipt = conversation_memory.create_memory(
+            principal.organization_id,
+            workspace_id,
+            principal.actor_id,
+            body.model_dump(by_alias=True),
+        )
+        if receipt["duplicate"]:
+            response.status_code = 200
+        memory = index_conversation_memory(workspace_id, principal, str(receipt["memory"]["id"]))
+        return {"memory": memory, "duplicate": receipt["duplicate"]}
+
+    @app.post(conversation_base + "/memories/query", response_model=ConversationMemoryQueryResult)
+    def query_conversation_memories(
+        workspace_id: str, body: ConversationMemoryQuery, request: Request
+    ) -> dict[str, Any]:
+        principal = principal_for(request, workspace_id)
+        if embedding_client is None or memory_provider is None:
+            raise provider_unavailable(
+                "MEMORY_PROVIDER_UNAVAILABLE",
+                "Semantic memory search requires configured embedding and memory providers.",
+            )
+        try:
+            batch = embedding_client.embed([body.query])
+            if len(batch.vectors) != 1:
+                raise provider_unavailable(
+                    "MEMORY_EMBEDDING_RESPONSE_INVALID",
+                    "The configured embedding provider returned an unexpected vector count.",
+                )
+            owner_ids = conversation_memory.query_owners(
+                principal.organization_id,
+                workspace_id,
+                principal.actor_id,
+                body.conversation_id,
+            )
+            per_owner_limit = max(1, min(body.limit, 100 // len(owner_ids)))
+            all_hits: list[MemoryProviderHit] = []
+            for owner_id in owner_ids:
+                scope = MemoryProviderScope(
+                    organization_id=principal.organization_id,
+                    workspace_id=workspace_id,
+                    actor_id=owner_id,
+                    conversation_id=None,
+                    conversation_kind=body.conversation_kind,
+                    persona_id=body.persona_id,
+                    visibility=None,
+                )
+                owner_hits: Sequence[MemoryProviderHit] = memory_provider.query(
+                    text=body.query,
+                    embedding=batch.vectors[0],
+                    model=batch.model,
+                    dimensions=batch.dimensions,
+                    scope=scope,
+                    limit=per_owner_limit,
+                )
+                all_hits.extend(owner_hits)
+            hits = all_hits
+        except PersistenceError:
+            raise
+        except Exception as exc:
+            raise provider_unavailable(
+                "MEMORY_PROVIDER_UNAVAILABLE", "Semantic memory search is unavailable."
+            ) from exc
+        if len(hits) > body.limit:
+            raise provider_unavailable(
+                "MEMORY_PROVIDER_RESPONSE_INVALID",
+                "The memory provider returned more candidates than requested.",
+            )
+        hit_by_id: dict[str, MemoryProviderHit] = {}
+        for hit in hits:
+            if (
+                hit.model != batch.model
+                or hit.dimensions != batch.dimensions
+                or not isinstance(hit.score, (int, float))
+                or not math.isfinite(hit.score)
+            ):
+                raise provider_unavailable(
+                    "MEMORY_PROVIDER_RESPONSE_INVALID",
+                    "The memory provider returned an incompatible model or score.",
+                )
+            hit_by_id.setdefault(hit.memory_id, hit)
+        current = conversation_memory.overview(
+            principal.organization_id, workspace_id, principal.actor_id
+        )
+        candidates = conversation_memory.query_candidates(
+            principal.organization_id,
+            workspace_id,
+            principal.actor_id,
+            body.conversation_id,
+            conversation_kind=body.conversation_kind,
+            persona_id=body.persona_id,
+            memory_ids=list(hit_by_id),
+        )
+        result_items: list[dict[str, Any]] = []
+        for memory in candidates:
+            hit = hit_by_id.get(str(memory["id"]))
+            if hit is None:
+                continue
+            result_items.append(
+                {
+                    "memoryId": memory["id"],
+                    "kind": memory["kind"],
+                    "text": memory["text"],
+                    "sourceMessageIds": memory["sourceMessageIds"],
+                    "sourceRefs": memory["sourceRefs"],
+                    "version": memory["version"],
+                    "score": float(hit.score),
+                    "stale": False,
+                    "scope": memory["scope"],
+                }
+            )
+        result_items.sort(key=lambda item: (-float(item["score"]), str(item["memoryId"])))
+        return {
+            "items": result_items[: body.limit],
+            "authorizationEpoch": current["authorizationEpoch"],
+        }
+
+    @app.patch(
+        conversation_base + "/memories/{memory_id}",
+        response_model=ConversationMemoryReceipt,
+    )
+    def update_conversation_memory(
+        workspace_id: str,
+        memory_id: str,
+        body: ConversationMemoryPatch,
+        request: Request,
+    ) -> dict[str, Any]:
+        principal = principal_for(request, workspace_id, write=True)
+        update = conversation_memory.update_memory(
+            principal.organization_id,
+            workspace_id,
+            principal.actor_id,
+            memory_id,
+            body.model_dump(by_alias=True, exclude_unset=True),
+        )
+        if memory_provider is not None and update["invalidatedMemoryIds"]:
+            try:
+                memory_provider.delete(
+                    memory_ids=update["invalidatedMemoryIds"],
+                    scope=MemoryProviderScope(
+                        organization_id=principal.organization_id,
+                        workspace_id=workspace_id,
+                        actor_id=principal.actor_id,
+                        conversation_id=None,
+                        conversation_kind=None,
+                        persona_id=None,
+                        visibility=None,
+                    ),
+                )
+            except Exception:
+                _LOGGER.warning(
+                    "Invalidated memory vectors remain filtered by Navigator provenance state."
+                )
+        memory = index_conversation_memory(workspace_id, principal, memory_id)
+        return {"memory": memory, "duplicate": False}
+
+    @app.delete(
+        conversation_base + "/memories/{memory_id}",
+        response_model=ConversationMemoryDeleteReceipt,
+    )
+    def delete_conversation_memory(
+        workspace_id: str,
+        memory_id: str,
+        request: Request,
+        expected_version: int = Query(alias="expectedVersion", ge=1),
+    ) -> dict[str, Any]:
+        principal = principal_for(request, workspace_id, write=True)
+        receipt = conversation_memory.delete_memory(
+            principal.organization_id,
+            workspace_id,
+            principal.actor_id,
+            memory_id,
+            expected_version,
+        )
+        if memory_provider is not None:
+            try:
+                memory_provider.delete(
+                    memory_ids=[memory_id, *receipt["invalidatedMemoryIds"]],
+                    scope=MemoryProviderScope(
+                        organization_id=principal.organization_id,
+                        workspace_id=workspace_id,
+                        actor_id=principal.actor_id,
+                        conversation_id=None,
+                        conversation_kind=None,
+                        persona_id=None,
+                        visibility=None,
+                    ),
+                )
+            except Exception:
+                _LOGGER.warning(
+                    "Conversation memory provider deletion will be reconciled "
+                    "by authorization filtering."
+                )
+        return {
+            "deleted": True,
+            "authorizationEpoch": receipt["authorizationEpoch"],
+            "duplicate": bool(receipt["duplicate"]),
+        }
+
+    @app.get(conversation_base + "/sources", response_model=ConversationMemorySources)
+    def list_conversation_sources(
+        workspace_id: str,
+        request: Request,
+        conversation_id: str = Query(alias="conversationId", min_length=1, max_length=512),
+        limit: int = Query(default=200, ge=1, le=500),
+    ) -> dict[str, Any]:
+        principal = principal_for(request, workspace_id)
+        return conversation_memory.list_sources(
+            principal.organization_id,
+            workspace_id,
+            principal.actor_id,
+            conversation_id,
+            limit=limit,
+        )
+
+    @app.post(
+        conversation_base + "/sources/authorize",
+        response_model=ConversationMemorySourceAuthorizationReceipt,
+    )
+    def authorize_conversation_sources(
+        workspace_id: str, body: ConversationMemorySourceAuthorization, request: Request
+    ) -> dict[str, Any]:
+        principal = principal_for(request, workspace_id)
+        return conversation_memory.authorize_sources(
+            principal.organization_id,
+            workspace_id,
+            principal.actor_id,
+            body.conversation_id,
+            body.authorization_epoch,
+            [item.model_dump(by_alias=True) for item in body.source_refs],
+            conversation_kind=body.conversation_kind,
+            persona_id=body.persona_id,
+        )
+
+    @app.post(
+        conversation_base + "/artifacts/authorize",
+        response_model=ConversationMemoryArtifactAuthorizationReceipt,
+    )
+    def authorize_conversation_artifact(
+        workspace_id: str,
+        body: ConversationMemoryArtifactAuthorization,
+        request: Request,
+    ) -> dict[str, Any]:
+        principal = principal_for(request, workspace_id)
+        return conversation_memory.authorize_artifact(
+            principal.organization_id,
+            workspace_id,
+            principal.actor_id,
+            body.artifact_id,
+            body.conversation_id,
+            body.conversation_kind,
+            body.persona_id,
+            body.authorization_epoch,
+            [item.model_dump(by_alias=True) for item in body.source_refs],
+        )
+
+    @app.post(
+        conversation_base + "/sources/{source_id}/revoke",
+        response_model=ConversationMemorySourceRevocationReceipt,
+    )
+    def revoke_conversation_source(
+        workspace_id: str, source_id: str, request: Request
+    ) -> dict[str, Any]:
+        principal = principal_for(request, workspace_id, write=True)
+        receipt = conversation_memory.revoke_source(
+            principal.organization_id, workspace_id, principal.actor_id, source_id
+        )
+        if memory_provider is not None and receipt["invalidatedMemoryIds"]:
+            try:
+                memory_provider.delete(
+                    memory_ids=receipt["invalidatedMemoryIds"],
+                    scope=MemoryProviderScope(
+                        organization_id=principal.organization_id,
+                        workspace_id=workspace_id,
+                        actor_id=principal.actor_id,
+                        conversation_id=None,
+                        conversation_kind=None,
+                        persona_id=None,
+                        visibility=None,
+                    ),
+                )
+            except Exception:
+                _LOGGER.warning(
+                    "Revoked memory vectors remain filtered by Navigator provenance state."
+                )
+        return receipt
+
+    @app.post(
+        conversation_base + "/sources/{source_id}/grants",
+        response_model=ConversationMemorySourceGrantReceipt,
+        status_code=201,
+    )
+    def grant_conversation_source(
+        workspace_id: str,
+        source_id: str,
+        body: ConversationMemorySourceGrantCreate,
+        request: Request,
+        response: Response,
+    ) -> dict[str, Any]:
+        principal = principal_for(request, workspace_id, write=True)
+        receipt = conversation_memory.grant_source(
+            principal.organization_id,
+            workspace_id,
+            principal.actor_id,
+            source_id,
+            body.model_dump(by_alias=True),
+        )
+        if receipt["duplicate"]:
+            response.status_code = 200
+        return receipt
+
+    @app.delete(
+        conversation_base + "/sources/{source_id}/grants/{grant_id}",
+        response_model=ConversationMemorySourceGrantRevocation,
+    )
+    def revoke_conversation_source_grant(
+        workspace_id: str, source_id: str, grant_id: str, request: Request
+    ) -> dict[str, Any]:
+        principal = principal_for(request, workspace_id, write=True)
+        return conversation_memory.revoke_source_grant(
+            principal.organization_id,
+            workspace_id,
+            principal.actor_id,
+            source_id,
+            grant_id,
+        )
 
     @app.get(base + "/sources", response_model=SourceList)
     def list_sources(workspace_id: str, request: Request) -> dict[str, Any]:
