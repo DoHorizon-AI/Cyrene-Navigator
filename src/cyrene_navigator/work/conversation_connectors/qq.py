@@ -147,9 +147,7 @@ class QQConversationConnector:
         self._max_backoff = reconnect_max_seconds
         self._stop = threading.Event()
         self._active_cancel: threading.Event | None = None
-        self._active_event_future: (
-            concurrent.futures.Future[AdmissionReceipt | None] | None
-        ) = None
+        self._active_event_future: concurrent.futures.Future[AdmissionReceipt | None] | None = None
         self._lock = threading.Lock()
         self._task: asyncio.Task[None] | None = None
         self._status: Literal["stopped", "connecting", "connected", "degraded"] = "stopped"
@@ -461,9 +459,7 @@ class QQConversationConnector:
                     raise
                 except concurrent.futures.TimeoutError as error:
                     future.cancel()
-                    raise TimeoutError(
-                        "QQ inbound Work admission exceeded its deadline"
-                    ) from error
+                    raise TimeoutError("QQ inbound Work admission exceeded its deadline") from error
                 except MessageConnectorValidationError:
                     self._increment_rejected()
                 finally:
@@ -599,9 +595,7 @@ def _recorded_outcome(lease: OperationLease) -> SendOutcome:
         ),
         operation_id=lease.operation_id,
         vendor_message_id=(
-            str(lease.receipt["vendorMessageId"])
-            if lease.receipt.get("vendorMessageId")
-            else None
+            str(lease.receipt["vendorMessageId"]) if lease.receipt.get("vendorMessageId") else None
         ),
         reason=str(lease.receipt["reason"]) if lease.receipt.get("reason") else None,
     )

@@ -150,9 +150,7 @@ def test_qq_plugin_direct_runtime_process_with_fixture_host(tmp_path: Path) -> N
                 while not host.admitted and asyncio.get_running_loop().time() < deadline:
                     await asyncio.sleep(0.02)
                 operation_log_text = (
-                    operation_log.read_text(encoding="utf-8")
-                    if operation_log.exists()
-                    else "none"
+                    operation_log.read_text(encoding="utf-8") if operation_log.exists() else "none"
                 )
                 assert host.admitted, (
                     "QQ fixture event did not reach Work admission: "
@@ -247,9 +245,7 @@ class SimulatedWorkHost:
         self.admitted.append((context, event, event_key))
         return AdmissionReceipt("fixture-event-1", False, "fixture-task-1")
 
-    async def authorize_reply(
-        self, task_id: str, binding_id: str
-    ) -> AuthorizedReplyRoute | None:
+    async def authorize_reply(self, task_id: str, binding_id: str) -> AuthorizedReplyRoute | None:
         if task_id != "fixture-task-1" or binding_id != "qq-native-test":
             return None
         return self._route

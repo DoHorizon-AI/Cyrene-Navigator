@@ -349,9 +349,7 @@ def test_status_route_is_workspace_authenticated_and_redacted() -> None:
         [binding],
     )
     with TestClient(app) as client:
-        response = client.get(
-            "/api/v1/workspaces/workspace-1/work/conversation-connectors/qq"
-        )
+        response = client.get("/api/v1/workspaces/workspace-1/work/conversation-connectors/qq")
 
     assert response.status_code == 200
     body = response.json()
@@ -373,9 +371,7 @@ def test_status_route_uses_workspace_authenticator_before_reading() -> None:
         FakeHost(),
     )
     with TestClient(app) as client:
-        response = client.get(
-            "/api/v1/workspaces/workspace-1/work/conversation-connectors/qq"
-        )
+        response = client.get("/api/v1/workspaces/workspace-1/work/conversation-connectors/qq")
     assert response.status_code == 403
 
 
@@ -421,9 +417,7 @@ class FakeHost:
         self.admitted.append((context, event, event_key))
         return self.admission_receipt
 
-    async def authorize_reply(
-        self, task_id: str, binding_id: str
-    ) -> AuthorizedReplyRoute | None:
+    async def authorize_reply(self, task_id: str, binding_id: str) -> AuthorizedReplyRoute | None:
         assert task_id == "task-1"
         assert binding_id == "qq-account-a"
         index = min(self.authorize_calls, len(self.routes) - 1)
