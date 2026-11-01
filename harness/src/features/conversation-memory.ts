@@ -10,6 +10,8 @@ export type ConversationKind = 'direct' | 'group' | 'channel';
 export type ConversationVisibility = 'private' | 'conversation' | 'workspace';
 export type ConversationRole = 'user' | 'assistant' | 'tool';
 export type ConversationMemoryKind = 'fact' | 'preference' | 'commitment' | 'episode';
+export type ConversationFeatureId = 'conversation-memory.v1' | 'persona-profile.v1'
+  | 'knowledge-graph-dream.v1' | 'research-work.v1' | 'nous-active.v1';
 
 /** Server-derived scope attached to every turn and returned resource. */
 export interface ConversationScope {
@@ -83,9 +85,17 @@ export interface ConversationSourceRef {
   readonly sourceMessageIds: readonly string[];
 }
 
+/** Current authorization outcome with an explicit transport-unavailable marker. */
+export interface ConversationSourceAuthorizationResult {
+  readonly allowed: boolean;
+  readonly currentAuthorizationEpoch: number;
+  readonly deniedSourceIds: readonly string[];
+  readonly unavailable?: boolean;
+}
+
 /** Context added to model input with the proof the host retains for delivery. */
 export interface ContextContribution {
-  readonly feature: 'conversation-memory.v1';
+  readonly feature: ConversationFeatureId;
   readonly content: string;
   readonly sourceRefs: readonly ConversationSourceRef[];
 }
@@ -255,8 +265,9 @@ const MAX_SOURCE_IDS_PER_REF = 128;
 const MAX_TOTAL_SOURCE_IDS = 32_768;
 const MAX_SOURCE_REFS = 256;
 const MAX_SUMMARY_SOURCE_INPUTS = 25_600;
-const pendingSourcesByTurn = new Map<string, readonly ConversationSourceRef[]>();
+const pendingSourcesByTurn = new Map<string, Map<string, readonly ConversationSourceRef[]>>();
 const abortCleanupKeysBySignal = new WeakMap<AbortSignal, Set<string>>();
+const CONVERSATION_MEMORY_FEATURE_ID = 'conversation-memory.v1';
 
 /**
  * Create the optional P2 consumer hooks over the authenticated Navigator Work API.
@@ -289,7 +300,7 @@ export function createConversationMemoryFeature(options: ConversationMemoryFeatu
     async beforeContext(context, input) {
       assertTrustedScope(context);
       context.signal.throwIfAborted();
-      rememberPendingSources(context, []);
+      rememberPendingSources(context, CONVERSATION_MEMORY_FEATURE_ID, []);
       if (!enabled) {
         return { contributions: [] };
       }
@@ -331,16 +342,16 @@ export function createConversationMemoryFeature(options: ConversationMemoryFeatu
       const sourceRefs = normalizeSourceRefs(contributions.flatMap(item => item.sourceRefs));
       const proof = await authorizeConversationSourcesV1(options.api, context, sourceRefs);
       if (!proof.allowed || proof.currentAuthorizationEpoch !== context.authorizationEpoch) {
-        rememberPendingSources(context, []);
+        rememberPendingSources(context, CONVERSATION_MEMORY_FEATURE_ID, []);
         return { contributions: [] };
       }
-      rememberPendingSources(context, sourceRefs);
+      rememberPendingSources(context, CONVERSATION_MEMORY_FEATURE_ID, sourceRefs);
       return { contributions };
     },
 
     async afterTurn(context, input) {
       assertTrustedScope(context);
-      const expectedSources = pendingSourcesByTurn.get(turnKey(context));
+      const expectedSources = pendingSourcesByTurn.get(turnKey(context))?.get(CONVERSATION_MEMORY_FEATURE_ID);
       context.signal.throwIfAborted();
       if (!enabled || input.status !== 'completed') return;
       const assistantText = boundedText(input.assistantText, MAX_MESSAGE_LENGTH);
@@ -469,11 +480,7 @@ export function createConversationMemoryFeature(options: ConversationMemoryFeatu
         return { decision: 'hold', code: 'SOURCE_PROOF_MISSING', authorizationEpoch: context.authorizationEpoch };
       }
       const sourceRefs = normalizeSourceRefs(input.sourceRefs);
-      const expected = pendingSourcesByTurn.get(turnKey(context));
-      if (expected === undefined) {
-        return { decision: 'hold', code: 'SOURCE_PROOF_MISSING', authorizationEpoch: context.authorizationEpoch };
-      }
-      if (!containsAllSourceRefs(sourceRefs, expected)) {
+      if (!hasConversationContextProofV1(context, CONVERSATION_MEMORY_FEATURE_ID, sourceRefs)) {
         return { decision: 'hold', code: 'SOURCE_PROOF_MISSING', authorizationEpoch: context.authorizationEpoch };
       }
       try {
@@ -506,18 +513,26 @@ export async function authorizeConversationSourcesV1(
   api: ConversationMemoryApiV1,
   context: TrustedTurnContext,
   sourceRefs: readonly ConversationSourceRef[],
-): Promise<{ readonly allowed: boolean; readonly currentAuthorizationEpoch: number }> {
+): Promise<ConversationSourceAuthorizationResult> {
+  assertTrustedScope(context);
+  context.signal.throwIfAborted();
+  const normalizedSourceRefs = normalizeSourceRefs(sourceRefs);
   try {
     return await api.authorizeSources(context, {
       conversationId: context.conversationId,
       conversationKind: context.conversationKind,
       authorizationEpoch: context.authorizationEpoch,
       personaId: context.personaId,
-      sourceRefs,
+      sourceRefs: normalizedSourceRefs,
     });
   } catch (error: unknown) {
     if (context.signal.aborted) throw error;
-    return { allowed: false, currentAuthorizationEpoch: context.authorizationEpoch };
+    return {
+      allowed: false,
+      currentAuthorizationEpoch: context.authorizationEpoch,
+      deniedSourceIds: [],
+      unavailable: true,
+    };
   }
 }
 
@@ -669,10 +684,41 @@ function containsAllSourceRefs(actual: readonly ConversationSourceRef[], expecte
   });
 }
 
-function rememberPendingSources(context: TrustedTurnContext, sourceRefs: readonly ConversationSourceRef[]): void {
+/** Record one built-in feature's exact context references for the later delivery gate. */
+export function recordConversationContextSourcesV1(
+  context: TrustedTurnContext,
+  featureId: string,
+  sourceRefs: readonly ConversationSourceRef[],
+): void {
+  assertTrustedScope(context);
+  if (!/^[a-z][a-z0-9.-]{0,63}$/u.test(featureId) || !isSourceRefsWellFormed(sourceRefs)) {
+    throw new ConversationFeatureError('INVALID_SOURCE_PROOF', 'Conversation feature proof is invalid');
+  }
+  rememberPendingSources(context, featureId, sourceRefs);
+}
+
+/** Require the host's actual delivery references to include one feature's complete contribution. */
+export function hasConversationContextProofV1(
+  context: TrustedTurnContext,
+  featureId: string,
+  sourceRefs: readonly ConversationSourceRef[],
+): boolean {
+  if (!isSourceRefsWellFormed(sourceRefs)) return false;
+  const expected = pendingSourcesByTurn.get(turnKey(context))?.get(featureId);
+  return expected !== undefined && containsAllSourceRefs(sourceRefs, expected);
+}
+
+function rememberPendingSources(
+  context: TrustedTurnContext,
+  featureId: string,
+  sourceRefs: readonly ConversationSourceRef[],
+): void {
   const key = turnKey(context);
+  const normalized = normalizeSourceRefs(sourceRefs);
+  const featureProofs = pendingSourcesByTurn.get(key) ?? new Map<string, readonly ConversationSourceRef[]>();
+  featureProofs.set(featureId, normalized);
   pendingSourcesByTurn.delete(key);
-  pendingSourcesByTurn.set(key, sourceRefs);
+  pendingSourcesByTurn.set(key, featureProofs);
   while (pendingSourcesByTurn.size > 2_048) {
     const oldest = pendingSourcesByTurn.keys().next().value;
     if (oldest === undefined) break;
