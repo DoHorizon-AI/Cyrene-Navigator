@@ -757,6 +757,7 @@ def _executor_child_environment(
         "CYRENE_EXCHANGE_URL",
         "CYRENE_EXCHANGE_TOKEN",
         "CYRENE_HARNESS_MODEL",
+        "CYRENE_HARNESS_MODEL_SOURCE",
         "CYRENE_DEVICE_ID",
     )
     for name in provider_names:

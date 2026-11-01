@@ -181,6 +181,38 @@ def test_executor_concurrency_default_matches_minimum_and_rejects_one() -> None:
         )
 
 
+def test_executor_child_receives_selected_harness_model_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The local Executor receives the configured Exchange model source."""
+
+    monkeypatch.setenv("CYRENE_HARNESS_MODEL_SOURCE", "exchange")
+    child = serve_local._executor_child_environment(
+        repository=tmp_path,
+        persistence_url="http://127.0.0.1:3001",
+        workspace_id="round1-workspace",
+        session_token="session-secret",
+        executor_token="executor-secret",
+        dsh_home=tmp_path / "dsh",
+        plugins_dir=tmp_path / "plugins",
+        node="node",
+    )
+    assert child["CYRENE_HARNESS_MODEL_SOURCE"] == "exchange"
+
+    monkeypatch.delenv("CYRENE_HARNESS_MODEL_SOURCE")
+    child_without_override = serve_local._executor_child_environment(
+        repository=tmp_path,
+        persistence_url="http://127.0.0.1:3001",
+        workspace_id="round1-workspace",
+        session_token="session-secret",
+        executor_token="executor-secret",
+        dsh_home=tmp_path / "dsh",
+        plugins_dir=tmp_path / "plugins",
+        node="node",
+    )
+    assert "CYRENE_HARNESS_MODEL_SOURCE" not in child_without_override
+
+
 def test_teams_owner_projection_file_is_forwarded_without_static_actor_env(tmp_path: Path) -> None:
     """Forward scoped owner/catalog files without static actors or unrelated child values."""
 
