@@ -80,6 +80,14 @@ TOKENS = {
         organization_id="org-a",
         actor_private_scope=True,
     ),
+    "actor-private-harness-owner": PersistencePrincipal(
+        "22222222-2222-4222-8222-222222222222",
+        frozenset({"w1"}),
+        can_takeover=True,
+        organization_id="org-a",
+        can_write_harness=True,
+        actor_private_scope=True,
+    ),
     "actor-private-member": PersistencePrincipal(
         "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
         frozenset({"w1"}),
@@ -2823,6 +2831,47 @@ def test_actor_private_principals_get_private_task_memory_and_attachment_rows(
             == 404
         )
 
+        chat_task_body = _task_body("actor-private-chat-task")
+        chat_task_body["metadata"] = {
+            "navigatorConversationOrigin": {
+                "kind": "web",
+                "conversationKind": "direct",
+                "conversationId": "owner-private-chat",
+            }
+        }
+        assert (
+            client.post(
+                base + "/tasks", json=chat_task_body, headers=_headers("teams-v2-owner")
+            ).status_code
+            == 403
+        )
+        chat_harness_headers = _headers("actor-private-harness-owner")
+        chat_task = client.post(base + "/tasks", json=chat_task_body, headers=chat_harness_headers)
+        assert chat_task.status_code == 201, chat_task.text
+        same_actor_owner_headers = _headers("teams-v2-owner")
+        assert (
+            client.get(
+                base + "/tasks/actor-private-chat-task", headers=same_actor_owner_headers
+            ).status_code
+            == 404
+        )
+        assert (
+            client.get(
+                base + "/tasks/actor-private-chat-task/events", headers=same_actor_owner_headers
+            ).status_code
+            == 404
+        )
+        assert (
+            client.get(
+                base + "/tasks/actor-private-chat-task", headers=chat_harness_headers
+            ).status_code
+            == 200
+        )
+        same_actor_tasks = client.get(base + "/tasks", headers=same_actor_owner_headers).json()[
+            "items"
+        ]
+        assert "actor-private-chat-task" not in {item["id"] for item in same_actor_tasks}
+
         private_bytes = b"actor-private attachment"
         private_upload = client.post(
             base + "/attachments",
@@ -2835,6 +2884,17 @@ def test_actor_private_principals_get_private_task_memory_and_attachment_rows(
         )
         assert private_upload.status_code == 201, private_upload.text
         private_digest = private_upload.json()["sha256"]
+        work_store = client.app.state.work_store
+        private_metadata, private_path = work_store.get_attachment(
+            "org-a",
+            "w1",
+            private_digest,
+            actor_id="22222222-2222-4222-8222-222222222222",
+            actor_private_scope=True,
+            require_actor_private=True,
+        )
+        assert private_metadata["sha256"] == private_digest
+        assert private_path.read_bytes() == private_bytes
         assert (
             client.get(base + f"/attachments/{private_digest}", headers=owner_headers).content
             == private_bytes
@@ -2864,6 +2924,16 @@ def test_actor_private_principals_get_private_task_memory_and_attachment_rows(
             client.get(base + f"/attachments/{shared_digest}", headers=owner_headers).content
             == shared_bytes
         )
+        with pytest.raises(PersistenceError) as shared_not_private:
+            work_store.get_attachment(
+                "org-a",
+                "w1",
+                shared_digest,
+                actor_id="22222222-2222-4222-8222-222222222222",
+                actor_private_scope=True,
+                require_actor_private=True,
+            )
+        assert shared_not_private.value.code == "WORK_ATTACHMENT_NOT_FOUND"
 
 
 def test_v3_github_actions_workflow_target_roundtrips_and_stays_actor_private(

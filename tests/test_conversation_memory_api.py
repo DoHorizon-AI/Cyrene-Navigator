@@ -55,6 +55,7 @@ class FakeMemoryProvider:
 
     def __init__(self) -> None:
         self.records: dict[tuple[str, str], tuple[str, str, int, MemoryProviderScope]] = {}
+        self.query_scopes: list[MemoryProviderScope] = []
 
     def upsert(
         self,
@@ -86,10 +87,15 @@ class FakeMemoryProvider:
         limit: int,
     ) -> Sequence[MemoryProviderHit]:
         assert len(embedding) == dimensions
+        self.query_scopes.append(scope)
         return [
             MemoryProviderHit(memory_id, 0.9, model, dimensions)
-            for (owner, memory_id), (_, _, _, _) in self.records.items()
+            for (owner, memory_id), (_, _, _, stored_scope) in self.records.items()
             if owner == scope.actor_id
+            and (
+                scope.conversation_id is None
+                or stored_scope.conversation_id == scope.conversation_id
+            )
         ][:limit]
 
     def delete(self, *, memory_ids: Sequence[str], scope: MemoryProviderScope) -> None:
@@ -401,8 +407,8 @@ def test_memory_query_merges_owner_scoped_provider_pages_before_global_limit(
 
     with _client(tmp_path / "multi-owner-query.sqlite3", with_provider=True) as client:
         owners = (
-            ("alice-token", "alice", "direct-alice"),
-            ("bob-token", "bob", "direct-bob"),
+            ("alice-token", "alice", "group-shared"),
+            ("bob-token", "bob", "group-shared"),
         )
         for token, actor, conversation_id in owners:
             for index in range(6):
@@ -446,6 +452,97 @@ def test_memory_query_merges_owner_scoped_provider_pages_before_global_limit(
         assert response.status_code == 200, response.text
         assert len(response.json()["items"]) == 10
         assert {item["scope"]["visibility"] for item in response.json()["items"]} == {"workspace"}
+        assert all(
+            scope.conversation_id == "group-shared"
+            for scope in client.app.state.work_memory_provider.query_scopes
+        )
+
+
+def test_group_memory_provider_candidates_are_partitioned_by_current_conversation(
+    tmp_path: Path,
+) -> None:
+    """A busy different group cannot consume this conversation's semantic top-k."""
+
+    with _client(tmp_path / "group-provider-partition.sqlite3", with_provider=True) as client:
+        group_ids = ("group-a", "group-b")
+        for group_id in group_ids:
+            message = _post_message(
+                client,
+                token="alice-token",
+                event_id=f"{group_id}-event",
+                conversation_id=group_id,
+                conversation_kind="group",
+                visibility="conversation",
+                content=f"Group fact for {group_id}",
+            )["message"]
+            memory = _create_memory(
+                client,
+                message["id"],
+                token="alice-token",
+                conversation_id=group_id,
+                conversation_kind="group",
+                visibility="conversation",
+            )
+            assert memory["indexState"] == "indexed"
+
+        response = client.post(
+            BASE + "/memories/query",
+            json={
+                "conversationId": "group-a",
+                "conversationKind": "group",
+                "personaId": "persona-a",
+                "query": "group fact",
+                "limit": 1,
+            },
+            headers=_headers("alice-token"),
+        )
+        assert response.status_code == 200, response.text
+        assert [item["scope"]["conversationId"] for item in response.json()["items"]] == ["group-a"]
+        provider = client.app.state.work_memory_provider
+        assert provider.query_scopes[-1].conversation_id == "group-a"
+
+
+def test_unshared_group_history_does_not_exhaust_provider_scope_budget(tmp_path: Path) -> None:
+    """One hundred unrelated groups do not block a query in the current group."""
+
+    with _client(tmp_path / "many-group-scopes.sqlite3", with_provider=True) as client:
+        target_group = "group-100"
+        for index in range(101):
+            conversation_id = f"group-{index}"
+            message = _post_message(
+                client,
+                token="alice-token",
+                event_id=f"group-event-{index}",
+                conversation_id=conversation_id,
+                conversation_kind="group",
+                visibility="conversation",
+                content=f"Fact from {conversation_id}",
+            )["message"]
+            memory = _create_memory(
+                client,
+                message["id"],
+                token="alice-token",
+                conversation_id=conversation_id,
+                conversation_kind="group",
+                visibility="conversation",
+            )
+            assert memory["indexState"] == "indexed"
+
+        response = client.post(
+            BASE + "/memories/query",
+            json={
+                "conversationId": target_group,
+                "conversationKind": "group",
+                "personaId": "persona-a",
+                "query": "fact",
+                "limit": 1,
+            },
+            headers=_headers("alice-token"),
+        )
+        assert response.status_code == 200, response.text
+        assert [item["scope"]["conversationId"] for item in response.json()["items"]] == [
+            target_group
+        ]
 
 
 def test_unconfigured_semantic_provider_fails_closed_and_revoke_invalidates(tmp_path: Path) -> None:

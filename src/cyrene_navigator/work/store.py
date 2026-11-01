@@ -209,6 +209,8 @@ class WorkStore:
         actor_id: str,
         prompt: str,
         idempotency_key: str,
+        *,
+        actor_private_scope: bool = False,
     ) -> tuple[JsonObject, bool]:
         """Atomically create a read-only child from the same actor's auth-wait task.
 
@@ -237,6 +239,14 @@ class WorkStore:
         now = _unix_ms()
         with self._mutation() as conn:
             source = self._require_task(conn, org, workspace, source_task_id)
+            self._require_teams_task_actor(
+                conn,
+                org,
+                workspace,
+                source_task_id,
+                actor.lower(),
+                actor_private_scope=actor_private_scope,
+            )
             if str(source["created_by_actor_id"] or "") != actor:
                 raise _not_found(
                     "WORK_TASK_NOT_FOUND", "The source task does not exist in this Workspace."
@@ -338,6 +348,8 @@ class WorkStore:
         workspace_id: str,
         source_task_id: str,
         actor_id: str,
+        *,
+        actor_private_scope: bool = False,
     ) -> None:
         """Confirm ownership before Navigator revalidates the source DSH identity.
 
@@ -357,6 +369,14 @@ class WorkStore:
         actor = _identifier(actor_id, "actorId")
         with self._read() as conn:
             source = self._require_task(conn, org, workspace, source_task_id)
+            self._require_teams_task_actor(
+                conn,
+                org,
+                workspace,
+                source_task_id,
+                actor.lower(),
+                actor_private_scope=actor_private_scope,
+            )
             if str(source["created_by_actor_id"] or "") != actor:
                 raise _not_found(
                     "WORK_TASK_NOT_FOUND", "The source task does not exist in this Workspace."
@@ -611,6 +631,16 @@ class WorkStore:
                 if actor_private_scope:
                     filters += " AND lower(created_by_actor_id)=?"
                     scope_params.append(requesting_actor)
+                else:
+                    filters += " AND json_extract(work_tasks.metadata_json, "
+                    filters += "'$.navigatorConversationOrigin.kind') IS NULL"
+                    filters += (
+                        " AND NOT EXISTS (SELECT 1 FROM work_task_teams_origins private_origin "
+                    )
+                    filters += "WHERE private_origin.organization_id=work_tasks.organization_id "
+                    filters += "AND private_origin.workspace_id=work_tasks.workspace_id "
+                    filters += "AND private_origin.task_id=work_tasks.task_id "
+                    filters += "AND private_origin.conversation_kind='private')"
                 filters += " AND (NOT EXISTS (SELECT 1 FROM work_task_teams_origins teams_origin "
                 filters += "WHERE teams_origin.organization_id=work_tasks.organization_id "
                 filters += "AND teams_origin.workspace_id=work_tasks.workspace_id "
@@ -3581,6 +3611,7 @@ class WorkStore:
         *,
         actor_id: str | None = None,
         actor_private_scope: bool = False,
+        require_actor_private: bool = False,
     ) -> tuple[JsonObject, Path]:
         """Authorize a digest against metadata in the exact Workspace before reading bytes. |
         读取附件。"""
@@ -3588,9 +3619,14 @@ class WorkStore:
         org, workspace = _scope(organization_id, workspace_id)
         digest = _validate_digest(digest)
         actor = _identifier(actor_id, "actorId").lower() if actor_id is not None else None
-        if actor_private_scope and actor is None:
+        if (actor_private_scope or require_actor_private) and actor is None:
             raise _invalid(
                 "WORK_ATTACHMENT_ACTOR_REQUIRED", "actor-private attachment requires an actor"
+            )
+        if require_actor_private and not actor_private_scope:
+            raise _invalid(
+                "WORK_ATTACHMENT_SCOPE_REQUIRED",
+                "Private attachment readback requires actor-private scope.",
             )
         with self._read() as conn:
             row = None
@@ -3600,7 +3636,7 @@ class WorkStore:
                        AND workspace_id=? AND actor_id=? AND sha256=?""",
                     (org, workspace, actor, digest),
                 ).fetchone()
-            if row is None:
+            if row is None and not require_actor_private:
                 row = conn.execute(
                     """SELECT * FROM work_attachments WHERE organization_id=? AND workspace_id=? AND
                         sha256=?""",
@@ -7339,11 +7375,10 @@ class WorkStore:
         *,
         actor_private_scope: bool = False,
     ) -> bool:
-        """Hide verified Teams-origin tasks from every other Work actor.
+        """Enforce actor-private and authenticated conversation Task read scope.
 
-        Non-Teams tasks retain the existing Workspace sharing behavior. Teams
-        origin is recorded only by the atomic authenticated connector intake,
-        never inferred from mutable task metadata.
+        Web/channel markers are server-derived by the Executor ingress. Teams
+        connector origin remains backed by the atomic authenticated intake rows.
         """
 
         private_owner = conn.execute(
@@ -7351,25 +7386,41 @@ class WorkStore:
                AND workspace_id=? AND task_id=?""",
             (org, workspace, task_id),
         ).fetchone()
+        task = conn.execute(
+            """SELECT created_by_actor_id,
+                      json_extract(
+                          metadata_json,'$.navigatorConversationOrigin.kind') AS chat_origin
+               FROM work_tasks WHERE organization_id=? AND workspace_id=? AND task_id=?""",
+            (org, workspace, task_id),
+        ).fetchone()
+        if task is None:
+            raise _not_found("WORK_TASK_NOT_FOUND", "The task does not exist in this Workspace.")
+        teams_origin_kind = conn.execute(
+            """SELECT conversation_kind FROM work_task_teams_origins WHERE organization_id=?
+               AND workspace_id=? AND task_id=?""",
+            (org, workspace, task_id),
+        ).fetchone()
+        is_chat_task = task["chat_origin"] in {"web", "teams_channel"} or (
+            teams_origin_kind is not None
+            and str(teams_origin_kind["conversation_kind"]) == "private"
+        )
         if private_owner is not None and (
-            actor_id is None or str(private_owner["actor_id"]) != actor_id.lower()
+            actor_id is None or str(private_owner["actor_id"]).lower() != actor_id.lower()
         ):
             raise _not_found("WORK_TASK_NOT_FOUND", "The task does not exist in this Workspace.")
-        if actor_private_scope:
-            task = conn.execute(
-                """SELECT created_by_actor_id FROM work_tasks WHERE organization_id=?
-                   AND workspace_id=? AND task_id=?""",
-                (org, workspace, task_id),
-            ).fetchone()
-            if (
-                actor_id is None
-                or task is None
-                or str(task["created_by_actor_id"] or "").lower() != actor_id.lower()
-            ):
-                raise _not_found(
-                    "WORK_TASK_NOT_FOUND",
-                    "The task does not exist for this actor in this Workspace.",
-                )
+        if is_chat_task and (
+            not actor_private_scope
+            or actor_id is None
+            or str(task["created_by_actor_id"] or "").lower() != actor_id.lower()
+        ):
+            raise _not_found("WORK_TASK_NOT_FOUND", "The task does not exist in this Workspace.")
+        if actor_private_scope and (
+            actor_id is None or str(task["created_by_actor_id"] or "").lower() != actor_id.lower()
+        ):
+            raise _not_found(
+                "WORK_TASK_NOT_FOUND",
+                "The task does not exist for this actor in this Workspace.",
+            )
         origin = conn.execute(
             """SELECT actor_id,actor_subject FROM work_task_teams_origins WHERE organization_id=?
                AND workspace_id=? AND task_id=?""",

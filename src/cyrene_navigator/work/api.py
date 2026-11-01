@@ -745,6 +745,14 @@ def mount_work_routes(
         workspace_id: str, body: TaskCreate, request: Request, response: Response
     ) -> dict[str, Any]:
         principal = principal_for(request, workspace_id, write=True)
+        if "navigatorConversationOrigin" in body.metadata and (
+            not principal.actor_private_scope or not principal.can_write_harness
+        ):
+            raise PersistenceError(
+                WORKSPACE_FORBIDDEN,
+                403,
+                "Conversation Task provenance requires the actor-private Harness principal.",
+            )
         if (
             body.execution_class == "background"
             and body.metadata.get("source") == "conversation-maintenance"
@@ -852,6 +860,7 @@ def mount_work_routes(
             workspace_id,
             task_id,
             principal.actor_id,
+            actor_private_scope=principal.actor_private_scope,
         )
         return Response(status_code=204)
 
@@ -891,6 +900,7 @@ def mount_work_routes(
             principal.actor_id,
             body.prompt,
             idempotency_key,
+            actor_private_scope=principal.actor_private_scope,
         )
         if duplicate:
             response.status_code = 200
@@ -1569,15 +1579,40 @@ def mount_work_routes(
                 principal.actor_id,
                 body.conversation_id,
             )
-            per_owner_limit = max(1, min(body.limit, 100 // len(owner_ids)))
+            provider_scopes: list[tuple[str, str | None, str]]
+            provider_scopes = []
+            if body.conversation_kind in {"group", "channel"}:
+                provider_scopes.extend(
+                    conversation_memory.query_provider_scopes(
+                        principal.organization_id,
+                        workspace_id,
+                        principal.actor_id,
+                        body.conversation_id,
+                        conversation_kind=body.conversation_kind,
+                        persona_id=body.persona_id,
+                        limit=100,
+                    )
+                )
+            else:
+                provider_scopes.extend(
+                    (owner_id, None, body.conversation_kind) for owner_id in owner_ids
+                )
+            if len(provider_scopes) > 100:
+                raise provider_unavailable(
+                    "CONVERSATION_MEMORY_SCOPE_TOO_BROAD",
+                    "Too many authorized source scopes are available for this query.",
+                )
+            per_scope_limit = (
+                max(1, min(body.limit, 100 // len(provider_scopes))) if provider_scopes else 1
+            )
             all_hits: list[MemoryProviderHit] = []
-            for owner_id in owner_ids:
+            for owner_id, provider_conversation_id, provider_conversation_kind in provider_scopes:
                 scope = MemoryProviderScope(
                     organization_id=principal.organization_id,
                     workspace_id=workspace_id,
                     actor_id=owner_id,
-                    conversation_id=None,
-                    conversation_kind=body.conversation_kind,
+                    conversation_id=provider_conversation_id,
+                    conversation_kind=provider_conversation_kind,
                     persona_id=body.persona_id,
                     visibility=None,
                 )
@@ -1587,9 +1622,9 @@ def mount_work_routes(
                     model=batch.model,
                     dimensions=batch.dimensions,
                     scope=scope,
-                    limit=per_owner_limit,
+                    limit=per_scope_limit,
                 )
-                if len(owner_hits) > per_owner_limit:
+                if len(owner_hits) > per_scope_limit:
                     raise provider_unavailable(
                         "MEMORY_PROVIDER_RESPONSE_INVALID",
                         "A memory provider returned more candidates than requested for one owner.",
