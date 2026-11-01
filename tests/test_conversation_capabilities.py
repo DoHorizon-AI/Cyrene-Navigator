@@ -14,8 +14,10 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from threading import Barrier
 from typing import Any
 
 import pytest
@@ -107,7 +109,10 @@ from cyrene_navigator.work.conversation_capabilities.peripheral import (
     HostTrustedCallerSigner,
     build_host_trusted_caller_signer,
 )
-from cyrene_navigator.work.conversation_memory.providers import MemoryProviderScope
+from cyrene_navigator.work.conversation_memory.providers import (
+    MemoryProviderHit,
+    MemoryProviderScope,
+)
 
 _CAPABILITIES = (
     MODEL_CAPABILITY_ID,
@@ -734,6 +739,52 @@ def test_memory_group_queries_are_partitioned_and_missing_group_id_fails_closed(
             limit=1,
         )
         assert [hit.memory_id for hit in hits] == ["group-b-target"]
+
+        query_barrier = Barrier(2)
+
+        def query_group(
+            scope: MemoryProviderScope, query_text: str, limit: int
+        ) -> Sequence[MemoryProviderHit]:
+            query_barrier.wait(timeout=2)
+            return provider.query(
+                text=query_text,
+                embedding=(1.0, 0.0, 0.0),
+                model=profile.model_id,
+                dimensions=3,
+                scope=scope,
+                limit=limit,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            group_a_future = executor.submit(
+                query_group,
+                _scope(
+                    actor_id="same-actor",
+                    conversation_id="group-a",
+                    conversation_kind="group",
+                    visibility=None,
+                ),
+                "group A question",
+                20,
+            )
+            group_b_future = executor.submit(
+                query_group,
+                _scope(
+                    actor_id="same-actor",
+                    conversation_id="group-b",
+                    conversation_kind="group",
+                    visibility=None,
+                ),
+                "group B question",
+                20,
+            )
+            concurrent_group_a_hits = group_a_future.result(timeout=5)
+            concurrent_group_b_hits = group_b_future.result(timeout=5)
+        assert {hit.memory_id for hit in concurrent_group_a_hits} == {
+            f"group-a-{index}" for index in range(12)
+        }
+        assert [hit.memory_id for hit in concurrent_group_b_hits] == ["group-b-target"]
+
         with pytest.raises(PersistenceError) as missing_conversation:
             provider.query(
                 text="group question",
