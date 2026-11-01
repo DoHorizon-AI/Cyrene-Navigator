@@ -37,6 +37,7 @@ function context(overrides = {}) {
     ...scope,
     taskId: 'work-task-bili-1',
     sessionId: 'work-session-bili-1',
+    origin: { kind: 'connector', sourceId: 'connector-bili', externalEventId: 'user-event-bili-1' },
     signal: new AbortController().signal,
     ...overrides,
   };
@@ -49,11 +50,13 @@ function makeWorld({
   failRecordCheckOnce = false,
   failNotificationTaskOnce = false,
   failReadTaskOnce = false,
+  failBeforeReadTaskOnce = false,
+  addUnexpectedRunPlanMetadata = false,
   advanceBeforeNotificationMs = 0,
   initialNotificationOutcome = 'delivered',
   omitDeliveryReceiptId = false,
 } = {}) {
-  const calls = { authorizations: [], operations: [], notifications: [], holds: [], schedules: [], tasks: [], sourceChecks: [] };
+  const calls = { authorizations: [], operations: [], notifications: [], holds: [], schedules: [], tasks: [], sourceChecks: [], subscriptionReconciliations: [] };
   let revoked = false;
   let policy = {
     conversationId: scope.conversationId,
@@ -70,16 +73,57 @@ function makeWorld({
   let subscription;
   let operationReceiptSequence = 0;
   let notificationSequence = 0;
+  let notificationReadbackSequence = 0;
   let failRecordCheck = failRecordCheckOnce;
   let failNotificationTask = failNotificationTaskOnce;
   let failReadTask = failReadTaskOnce;
+  let failBeforeReadTask = failBeforeReadTaskOnce;
   let clockNow = now;
   let notificationOutcome = initialNotificationOutcome;
   const receiptsByKey = new Map();
+  const providerResultsByKey = new Map();
   const notificationsByKey = new Map();
   const completedTasks = new Map();
+  const runPlansByKey = new Map();
   const argumentDigest = value => createHash('sha256').update(canonicalJson(value)).digest('hex');
   const hash = value => createHash('sha256').update(value).digest('hex');
+  const makeRunPlan = value => {
+    const runKey = value.scheduledRunKey;
+    const previous = runPlansByKey.get(runKey);
+    if (previous !== undefined) return previous;
+    const operationIdempotencyKey = `bili-operation-${hash(`cyrene-bili-subscription-operation-v1\u0000${scope.workspaceId}\u0000${scope.actorId}\u0000${value.id}\u0000${runKey}`).slice(0, 32)}`;
+    const taskId = `bili-watch-${hash(`cyrene-bili-subscription-check-v1\u0000${scope.workspaceId}\u0000${scope.actorId}\u0000${value.id}\u0000${runKey}`).slice(0, 32)}`;
+    const sourceMetadata = {
+      source: 'conversation-bili-subscription-read',
+      organizationId: 'org-bili',
+      workspaceId: scope.workspaceId,
+      actorId: scope.actorId,
+      subscriptionId: value.id,
+      delegationId: value.delegationId,
+      connectionRef: value.connectionRef,
+      profileRef: value.profileRef,
+      operationId: value.operationId,
+      resourceRef: value.resourceRef,
+      argumentsDigestSha256: value.argumentsDigestSha256,
+      sourceRefsDigest: hash(canonicalJson(value.sourceRefs)),
+      conversationId: value.conversationId,
+      conversationKind: value.conversationKind,
+      personaId: value.personaId,
+      ownerTaskId: value.ownerTaskId,
+      ownerSessionId: value.ownerSessionId,
+      runKey,
+      expectedVersion: value.scheduledExpectedVersion,
+      operationIdempotencyKey,
+      ...(addUnexpectedRunPlanMetadata ? { legacyOwnerId: scope.actorId } : {}),
+    };
+    const runtimePlanDigest = hash(canonicalJson({
+      taskId, operationIdempotencyKey, sourceMetadata, arguments: value.arguments,
+      cursor: value.cursor, sourceRefs: value.sourceRefs,
+    }));
+    const plan = { taskId, operationIdempotencyKey, sourceMetadata, runtimePlanDigest };
+    runPlansByKey.set(runKey, plan);
+    return plan;
+  };
 
   const api = {
     apiVersion: 1,
@@ -88,7 +132,16 @@ function makeWorld({
       return { allowed: true, currentAuthorizationEpoch: scope.authorizationEpoch, deniedSourceIds: [] };
     },
     async getActiveBehaviorPolicy() { return policy; },
-    async listMessages() { return { items: [], nextCursor: null }; },
+    async listMessages() {
+      return {
+        items: [{
+          id: 'source-message-1', eventId: 'user-event-bili-1', role: 'user', content: 'Check this Bilibili item.',
+          occurredAt: now - 1_000, status: 'active', sourceRefs: [],
+          scope: { conversationId: scope.conversationId, conversationKind: scope.conversationKind, personaId: scope.personaId, visibility: scope.visibility },
+        }],
+        nextCursor: null,
+      };
+    },
   };
   const connections = {
     async getOwnedConnectionByProfile(_ctx, profileRef) {
@@ -123,7 +176,8 @@ function makeWorld({
     async authorize(_ctx, input) {
       calls.authorizations.push(input);
       if (revoked || delegation.revokedAt !== null || !delegation.operationIds.includes(input.operationId)
-        || !delegation.targetScopes.some(scope => scope.operationId === input.operationId && scope.resourceRef === input.resourceRef)) {
+        || !delegation.targetScopes.some(scope => scope.operationId === input.operationId && scope.resourceRef === input.resourceRef
+          && scope.argumentsDigestSha256 === input.argumentsDigestSha256)) {
         return { authorization: null, denialCode: 'BILI_DELEGATION_DENIED' };
       }
       return {
@@ -136,10 +190,12 @@ function makeWorld({
           profileRef: connection.profileRef,
           operationId: input.operationId,
           resourceRef: input.resourceRef,
+          argumentsDigestSha256: input.argumentsDigestSha256,
           delegationVersion: delegation.version,
           directoryEpoch: 7,
           validUntil: delegation.expiresAt,
           proofRef: 'directory-proof-1',
+          proofDigest: argumentDigest({ proof: input.resourceRef, argumentsDigestSha256: input.argumentsDigestSha256 }),
         },
       };
     },
@@ -160,24 +216,31 @@ function makeWorld({
       const data = { content: `verified result ${operationReceiptSequence}` };
       const receipt = {
         id: `work-operation-receipt-${operationReceiptSequence}`,
+        trustedProducer: 'exchange-connector-dispatch',
         workspaceId: scope.workspaceId,
         actorId: scope.actorId,
         connectionRef: connection.connectionRef,
         profileRef: connection.profileRef,
         operationId: input.operationId,
         resourceRef: input.resourceRef,
+        target: input.target,
+        argumentsDigestSha256: input.argumentsDigestSha256,
         argumentsDigestSha256: argumentDigest(input.arguments),
-        outcome,
-        taskStatus: outcome === 'verified' ? 'completed' : 'running',
+        outcome: 'pending',
+        taskStatus: 'running',
         taskId: ctx.taskId,
-        outputSha256: outcome === 'verified' ? hash(canonicalJson(data)) : null,
-        externalReadbackVerified: outcome === 'verified' && input.operationId.startsWith('bilibili.')
+        taskOutputSha256: null,
+        outputSha256: null,
+        externalReadbackVerified: false && input.operationId.startsWith('bilibili.')
           && ['bilibili.comment.create', 'bilibili.dynamic.publish', 'bilibili.dm.send'].includes(input.operationId),
         workOperationId: `work-operation-${operationReceiptSequence}`,
         createdAt: now,
       };
-      const result = { receipt, ...(outcome === 'verified' ? { result: data } : {}) };
-      if (input.idempotencyKey !== undefined) receiptsByKey.set(input.idempotencyKey, result);
+      const result = { receipt };
+      if (input.idempotencyKey !== undefined) {
+        receiptsByKey.set(input.idempotencyKey, result);
+        providerResultsByKey.set(input.idempotencyKey, data);
+      }
       if (revokeAfterOperation) revoked = true;
       return result;
     },
@@ -187,14 +250,21 @@ function makeWorld({
       subscription = {
         id: 'bili-subscription-1',
         ...input,
+        ownerTaskId: _ctx.taskId,
+        ownerSessionId: _ctx.sessionId,
         workspaceId: scope.workspaceId,
         ownerActorId: scope.actorId,
         state: 'active',
         lastOutputSha256: null,
         lastOperationReceiptId: null,
         lastNotificationReceiptId: null,
+        lastNotificationReadbackReceiptId: null,
         lastNotificationOutcome: null,
         lastDeliveryReceiptId: null,
+        scheduledRunKey: `bili-run-${input.idempotencyKey}`,
+        scheduledExpectedVersion: 1,
+        scheduledRunState: 'scheduled',
+        cursor: typeof input.arguments.cursor === 'string' ? input.arguments.cursor : null,
         version: 1,
         createdAt: now,
         updatedAt: now,
@@ -203,6 +273,53 @@ function makeWorld({
     },
     async get(_ctx, id) {
       assert.equal(id, subscription.id);
+      return { subscription };
+    },
+    async claim(_ctx, id, expectedVersion) {
+      assert.equal(id, subscription.id);
+      if (subscription.scheduledRunState === 'claimed' && expectedVersion + 1 === subscription.version) {
+        return { subscription, runPlan: makeRunPlan(subscription) };
+      }
+      assert.equal(subscription.version, expectedVersion);
+      subscription = {
+        ...subscription,
+        version: subscription.version + 1,
+        scheduledExpectedVersion: subscription.version + 1,
+        scheduledRunState: 'claimed',
+        scheduledRunKey: `bili-run-${subscription.id}-v${subscription.version + 1}`,
+      };
+      return { subscription, runPlan: makeRunPlan(subscription) };
+    },
+    async authorizeNotification(_ctx, id, input) {
+      assert.equal(id, subscription.id);
+      assert.equal(input.expectedVersion, subscription.version);
+      assert.equal(input.runKey, subscription.scheduledRunKey);
+      return {
+        allowed: true,
+        reason: null,
+        subscriptionId: subscription.id,
+        version: subscription.version,
+        runKey: subscription.scheduledRunKey,
+        notificationIdempotencyKey: `bili-notification-${hash(`${subscription.id}\u0000${input.sourceOutputSha256}`)}`,
+      };
+    },
+    async recordNotificationReconciliation(_ctx, id, input) {
+      assert.equal(id, subscription.id);
+      assert.equal(input.expectedVersion, subscription.version);
+      assert.equal(input.runKey, subscription.scheduledRunKey);
+      assert.notEqual(subscription.scheduledRunState, 'claimed');
+      calls.subscriptionReconciliations.push(input);
+      subscription = {
+        ...subscription,
+        state: input.state,
+        lastNotificationReceiptId: input.notificationReceiptId,
+        lastNotificationReadbackReceiptId: input.notificationReadbackReceiptId ?? null,
+        lastNotificationOutcome: input.notificationOutcome,
+        lastDeliveryReceiptId: input.deliveryReceiptId ?? null,
+        nextCheckAt: input.nextCheckAt,
+        version: subscription.version + 1,
+        updatedAt: now,
+      };
       return { subscription };
     },
     async list(_ctx, { state, delegationId }) {
@@ -219,15 +336,20 @@ function makeWorld({
       subscription = {
         ...subscription,
         state: input.state,
+        cursor: input.cursor ?? subscription.cursor,
         lastOutputSha256: input.outputSha256 ?? subscription.lastOutputSha256,
         lastOperationReceiptId: input.operationReceiptId ?? subscription.lastOperationReceiptId,
         lastNotificationReceiptId: input.notificationReceiptId ?? subscription.lastNotificationReceiptId,
+        lastNotificationReadbackReceiptId: input.notificationReadbackReceiptId ?? subscription.lastNotificationReadbackReceiptId,
         lastNotificationOutcome: input.notificationOutcome ?? subscription.lastNotificationOutcome,
         lastDeliveryReceiptId: input.notificationOutcome === undefined
           ? subscription.lastDeliveryReceiptId
           : input.deliveryReceiptId ?? null,
         nextCheckAt: input.nextCheckAt,
         version: subscription.version + 1,
+        scheduledExpectedVersion: subscription.version + 1,
+        scheduledRunState: input.state === 'active' ? 'scheduled' : input.state,
+        scheduledRunKey: `bili-check-${subscription.id}-v${subscription.version + 1}`,
         updatedAt: now,
       };
       return { subscription };
@@ -249,18 +371,61 @@ function makeWorld({
       calls.tasks.push(request);
       const existing = completedTasks.get(request.taskId);
       if (existing !== undefined) return existing;
+      if (failBeforeReadTask && request.metadata.source === 'conversation-bili-subscription-read') {
+        failBeforeReadTask = false;
+        throw new Error('simulated process loss after claim, before DSH Task creation');
+      }
       if (request.metadata.source === 'conversation-bili-subscription-notification' && advanceBeforeNotificationMs > 0) {
         clockNow += advanceBeforeNotificationMs;
       }
       const output = await operation({}, signal);
+      if (request.metadata.source === 'conversation-bili-operation'
+        || request.metadata.source === 'conversation-bili-subscription-read') {
+        const operationInput = calls.operations.at(-1);
+        const key = operationInput?.idempotencyKey;
+        const prior = key === undefined ? undefined : receiptsByKey.get(key);
+        if (prior !== undefined) {
+          const failed = failReadTask && request.metadata.source === 'conversation-bili-subscription-read';
+          if (failed) failReadTask = false;
+          const terminalOutcome = failed ? 'uncertain' : outcome;
+          const resultData = providerResultsByKey.get(key);
+          const taskReceipt = {
+            ...prior.receipt,
+            taskId: request.taskId,
+            taskStatus: failed ? 'failed' : 'completed',
+            taskOutputSha256: hash(output),
+            outcome: terminalOutcome,
+            outputSha256: terminalOutcome === 'verified' ? hash(canonicalJson(resultData)) : null,
+            externalReadbackVerified: terminalOutcome === 'verified'
+              && ['bilibili.comment.create', 'bilibili.dynamic.publish', 'bilibili.dm.send'].includes(prior.receipt.operationId),
+          };
+          receiptsByKey.set(key, {
+            receipt: taskReceipt,
+            ...(terminalOutcome === 'verified' ? { result: resultData } : {}),
+          });
+        }
+      }
+      if (request.metadata.source === 'conversation-bili-subscription-notification-readback') {
+        const key = request.metadata.notificationIdempotencyKey;
+        const prior = notificationsByKey.get(key);
+        if (prior !== undefined) {
+          const outputValue = JSON.parse(output);
+          notificationsByKey.set(key, {
+            ...prior,
+            readbackTaskId: request.taskId,
+            readbackTaskStatus: 'completed',
+            readbackTaskOutputSha256: hash(output),
+            readbackSha256: outputValue.readbackSha256,
+          });
+        }
+      }
       const failAfterEffect = failNotificationTask && request.metadata.source === 'conversation-bili-subscription-notification';
       if (failAfterEffect) failNotificationTask = false;
-      const failAfterReadReceipt = failReadTask && request.metadata.source === 'conversation-bili-subscription-read';
-      if (failAfterReadReceipt) failReadTask = false;
       const result = {
         taskId: request.taskId,
         sessionId: request.sessionId,
-        status: failAfterEffect || failAfterReadReceipt ? 'failed' : 'completed',
+        status: failAfterEffect ? 'failed' : request.metadata.source === 'conversation-bili-subscription-read'
+          && receiptsByKey.get(calls.operations.at(-1)?.idempotencyKey)?.receipt.taskStatus === 'failed' ? 'failed' : 'completed',
         output,
         reasoning: '',
         durationMs: 1,
@@ -282,17 +447,73 @@ function makeWorld({
     },
   };
   const notifications = {
-    async findByIdempotencyKey(_context, key) { return notificationsByKey.get(key); },
+    async findByIdempotencyKey(_context, key, _signal, expectedTaskId) {
+      const prior = notificationsByKey.get(key);
+      if (prior === undefined) return undefined;
+      assert.ok(expectedTaskId === prior.taskId || expectedTaskId === prior.readbackTaskId);
+      return prior;
+    },
+    async getById(_context, id, _signal, expectedTaskId) {
+      const prior = [...notificationsByKey.values()].find(receipt => receipt.id === id);
+      if (prior === undefined) return undefined;
+      assert.ok(expectedTaskId === undefined || expectedTaskId === context().taskId
+        || typeof expectedTaskId === 'string' && expectedTaskId.length > 0);
+      return prior;
+    },
+    async runStatusReadback(input) {
+      assert.equal(input.notification.outcome, 'delivered');
+      assert.equal(input.notification.sourceOutputSha256, input.sourceOutputSha256);
+      assert.equal(input.notification.targetDigestSha256, input.hostResolvedTargetDigest);
+      const prior = notificationsByKey.get(input.idempotencyKey);
+      assert.ok(prior);
+      return { readbackSha256: hash('notification status readback'), deliveryReceiptId: prior.deliveryReceiptId };
+    },
+    async completeStatusReadback(input) {
+      const prior = notificationsByKey.get(input.idempotencyKey);
+      assert.ok(prior);
+      assert.equal(input.taskId, prior.readbackTaskId);
+      assert.equal(input.taskOutputSha256, prior.readbackTaskOutputSha256);
+      assert.equal(input.observation.readbackSha256, prior.readbackSha256);
+      const id = `notification-status-readback-${++notificationReadbackSequence}`;
+      const completed = {
+        ...prior,
+        readbackReceiptId: id,
+        readbackTrustedProducer: 'notification-outbox',
+        deliveryReceiptId: input.observation.deliveryReceiptId,
+      };
+      notificationsByKey.set(input.idempotencyKey, completed);
+      return {
+        id,
+        trustedProducer: 'notification-outbox',
+        operationType: 'conversation.bilibili.subscription.notification.readback.v1',
+        taskId: input.taskId,
+        taskStatus: 'completed',
+        taskOutputSha256: input.taskOutputSha256,
+        readbackSha256: input.observation.readbackSha256,
+        deliveryReceiptId: input.observation.deliveryReceiptId,
+      };
+    },
     async deliver(input) {
       calls.notifications.push(input);
       notificationSequence += 1;
       const receipt = {
         id: `notification-receipt-${notificationSequence}`,
         idempotencyKey: input.idempotencyKey,
+        trustedProducer: 'notification-outbox',
+        operationType: 'conversation.bilibili.subscription.notification',
+        readbackOperationType: 'conversation.bilibili.subscription.notification.readback.v1',
         outcome: 'delivered',
         taskId: input.context.taskId,
         sourceOutputSha256: input.operationReceipt.outputSha256,
+        targetDigestSha256: input.operationReceipt.resourceRef.replace(/^sha256:/u, ''),
         contentSha256: 'a'.repeat(64),
+        readbackReceiptId: null,
+        readbackTrustedProducer: null,
+        readbackTaskId: null,
+        readbackTaskStatus: null,
+        readbackTaskOutputSha256: null,
+        readbackSha256: null,
+        updatedAt: now + notificationSequence,
         deliveryReceiptId: omitDeliveryReceiptId ? null : 'platform-delivery-1',
       };
       receipt.outcome = notificationOutcome;
@@ -306,10 +527,21 @@ function makeWorld({
       const receipt = {
         id: `notification-hold-${notificationSequence}`,
         idempotencyKey: input.idempotencyKey,
+        trustedProducer: 'notification-outbox',
+        operationType: 'conversation.bilibili.subscription.notification',
+        readbackOperationType: 'conversation.bilibili.subscription.notification.readback.v1',
         outcome: 'held',
         taskId: input.context.taskId,
         sourceOutputSha256: input.operationReceipt.outputSha256,
+        targetDigestSha256: input.operationReceipt.resourceRef.replace(/^sha256:/u, ''),
         contentSha256: null,
+        readbackReceiptId: null,
+        readbackTrustedProducer: null,
+        readbackTaskId: null,
+        readbackTaskStatus: null,
+        readbackTaskOutputSha256: null,
+        readbackSha256: null,
+        updatedAt: now + notificationSequence,
         deliveryReceiptId: null,
       };
       notificationsByKey.set(input.idempotencyKey, receipt);
@@ -365,31 +597,54 @@ function resourceRef(operationId, target) {
   return `sha256:${createHash('sha256').update(canonicalJson(payload)).digest('hex')}`;
 }
 
-function targetScope(operationId) {
+function targetScope(operationId, args) {
+  let target;
   switch (operationId) {
-    case 'bilibili.search': return { operationId, searchType: 'video' };
-    case 'bilibili.user.find': return { operationId, userId: '10086' };
-    case 'bilibili.video.read': return { operationId, videoId: 'BV1Q541167Qg' };
-    case 'bilibili.comments.list': return { operationId, videoId: 'BV1Q541167Qg', rootCommentId: '0' };
-    case 'bilibili.comment.create': return { operationId, videoId: 'BV1Q541167Qg', rootCommentId: '0', parentCommentId: '0' };
-    case 'bilibili.dynamic.publish': return { operationId, userId: '10086' };
-    case 'bilibili.dynamics.list': return { operationId, userId: '10086' };
-    case 'bilibili.dynamic.read': return { operationId, dynamicId: '12345' };
-    case 'bilibili.dm.list': return { operationId, peerUserId: '9988' };
-    case 'bilibili.dm.read': return { operationId, peerUserId: '9988', messageId: '12345' };
-    case 'bilibili.dm.send': return { operationId, peerUserId: '9988' };
+    case 'bilibili.search': target = { operationId, searchType: 'video' }; break;
+    case 'bilibili.user.find': target = { operationId, userId: '10086' }; break;
+    case 'bilibili.video.read': target = { operationId, videoId: 'BV1Q541167Qg' }; break;
+    case 'bilibili.comments.list': target = { operationId, videoId: 'BV1Q541167Qg', rootCommentId: '0' }; break;
+    case 'bilibili.comment.create': target = { operationId, videoId: 'BV1Q541167Qg', rootCommentId: '0', parentCommentId: '0' }; break;
+    case 'bilibili.dynamic.publish': target = { operationId, userId: '10086' }; break;
+    case 'bilibili.dynamics.list': target = { operationId, userId: '10086' }; break;
+    case 'bilibili.dynamic.read': target = { operationId, dynamicId: '12345' }; break;
+    case 'bilibili.dm.list': target = { operationId, peerUserId: '9988' }; break;
+    case 'bilibili.dm.read': target = { operationId, peerUserId: '9988', messageId: '12345' }; break;
+    case 'bilibili.dm.send': target = { operationId, peerUserId: '9988' }; break;
     default: throw new Error(`Add an explicit target fixture for ${operationId}`);
   }
+  return { ...target, argumentsDigestSha256: createHash('sha256').update(canonicalJson(args)).digest('hex') };
 }
 
 async function createDelegation(world, operationIds = ['bilibili.search', 'bilibili.comment.create', 'bilibili.dynamics.list']) {
+  const scopes = operationIds.flatMap(value => {
+    if (typeof value !== 'string') return [value];
+    return defaultArguments(value).map(args => targetScope(value, args));
+  });
   const result = await world.feature.createDelegation(context(), {
     granteeActorId: scope.actorId,
     profileRef: connection.profileRef,
-    operationScopes: operationIds.map(targetScope),
+    operationScopes: scopes,
     expiresAt: now + 10 * 24 * 60 * 60 * 1_000,
   });
   return result.delegation;
+}
+
+function defaultArguments(operationId) {
+  switch (operationId) {
+    case 'bilibili.search': return [{ keyword: 'cyrene', search_type: 'video', page: 3 }];
+    case 'bilibili.user.find': return [{ user_id: '10086' }];
+    case 'bilibili.video.read': return [{ video_id: 'BV1Q541167Qg' }];
+    case 'bilibili.comments.list': return [{ video_id: 'BV1Q541167Qg', root_comment_id: '0', page: 2, limit: 10 }];
+    case 'bilibili.comment.create': return [{ video_id: 'BV1Q541167Qg', root_comment_id: '0', parent_comment_id: '0', content: 'reviewed by owner' }];
+    case 'bilibili.dynamic.publish': return [{ user_id: '10086', content: 'A new dynamic' }];
+    case 'bilibili.dynamics.list': return [{ user_id: '10086', limit: 20 }];
+    case 'bilibili.dynamic.read': return [{ dynamic_id: '12345' }];
+    case 'bilibili.dm.list': return [{ peer_user_id: '9988', limit: 20 }];
+    case 'bilibili.dm.read': return [{ peer_user_id: '9988', message_id: '12345' }];
+    case 'bilibili.dm.send': return [{ peer_user_id: '9988', content: 'message' }];
+    default: throw new Error(`Add default arguments for ${operationId}`);
+  }
 }
 
 test('delegation pins one owner-scoped Exchange connection and exact operation scope', async () => {
@@ -426,7 +681,7 @@ test('all eleven operation adapters emit the closed connector schema and exact r
     [{ kind: 'send_dm', peerUserId: '9988', content: 'message' }, { peer_user_id: '9988', content: 'message' }],
   ];
   const world = makeWorld();
-  const delegation = await createDelegation(world, operationIds);
+  const delegation = await createDelegation(world, cases.map(([, expectedArguments], index) => targetScope(operationIds[index], expectedArguments)));
   for (let index = 0; index < cases.length; index += 1) {
     const [operation, expectedArguments] = cases[index];
     await world.feature.execute(context({ taskId: `schema-task-${index}` }), {
@@ -451,6 +706,17 @@ test('delegated DM targets are exact and cannot be widened by a tool request', a
     operation: { kind: 'send_dm', peerUserId: '9999', content: 'not authorized' },
   }), error => error.code === 'BILI_OPERATION_OUTSIDE_DELEGATION');
   assert.equal(world.calls.operations.length, 0);
+});
+
+test('delegation binds exact operation arguments as well as resource target', async () => {
+  const world = makeWorld();
+  const delegation = await createDelegation(world, [targetScope('bilibili.dm.send', { peer_user_id: '9988', content: 'approved text' })]);
+  await assert.rejects(world.feature.execute(context(), {
+    delegationId: delegation.id,
+    idempotencyKey: 'dm-changed-content',
+    operation: { kind: 'send_dm', peerUserId: '9988', content: 'different text' },
+  }), error => error.code === 'BILI_OPERATION_OUTSIDE_DELEGATION');
+  assert.equal(world.calls.operations.length, 0, 'changed input digest must be denied before the Exchange operation port');
 });
 
 test('reads use a fresh Work/Directory grant and exact Work receipt; retries reconcile by idempotency key', async () => {
@@ -508,7 +774,7 @@ test('scheduled subscription runs a real DSH Work Task, checks fresh delegation 
     idempotencyKey: 'subscription-key-1',
     delegationId: delegation.id,
     sourceRefs,
-    operation: { kind: 'list_dynamics', userId: '10086', limit: 10 },
+    operation: { kind: 'list_dynamics', userId: '10086' },
     expiresAt: now + 5 * 24 * 60 * 60 * 1_000,
     nextCheckAt: now + 10_000,
   });
@@ -517,13 +783,58 @@ test('scheduled subscription runs a real DSH Work Task, checks fresh delegation 
   const result = await world.feature.runScheduledSubscription(context(), created.subscription.id);
   assert.equal(result.outcome, 'checked');
   assert.equal(result.taskStatus, 'completed');
-  assert.equal(world.calls.tasks.length, 2, 'read and notification use separate idempotent DSH Work Task identities');
+  assert.equal(world.calls.tasks.length, 3, 'read, notification and independent delivery readback use separate DSH Work Tasks');
   assert.equal(world.calls.tasks[0].metadata.source, 'conversation-bili-subscription-read');
   assert.equal(world.calls.tasks[1].metadata.source, 'conversation-bili-subscription-notification');
   assert.equal(world.calls.notifications.length, 1);
   assert.ok(world.calls.authorizations.length >= 4, 'account authority is checked at scheduling, read and delivery');
   assert.equal(world.subscription.lastOperationReceiptId, 'work-operation-receipt-1');
   assert.ok(world.subscription.nextCheckAt > now);
+});
+
+test('a claimed subscription reuses its server-issued run plan after process loss before DSH dispatch', async () => {
+  const world = makeWorld({ failBeforeReadTaskOnce: true });
+  const delegation = await createDelegation(world, ['bilibili.dynamics.list']);
+  const { subscription } = await world.feature.createSubscription(context(), {
+    idempotencyKey: 'subscription-claim-replay',
+    delegationId: delegation.id,
+    sourceRefs,
+    operation: { kind: 'list_dynamics', userId: '10086' },
+    expiresAt: now + 5 * 24 * 60 * 60 * 1_000,
+    nextCheckAt: now + 10_000,
+  });
+
+  await assert.rejects(world.feature.runScheduledSubscription(context(), subscription.id), /process loss after claim/u);
+  const claimedAfterCrash = world.subscription;
+  assert.equal(claimedAfterCrash.scheduledRunState, 'claimed');
+  assert.equal(claimedAfterCrash.version, 2);
+  const firstTaskId = world.calls.tasks[0].taskId;
+  const firstPlan = world.calls.tasks[0].metadata;
+
+  const recovered = await world.feature.runScheduledSubscription(context(), subscription.id);
+  assert.equal(recovered.taskStatus, 'completed');
+  assert.equal(world.calls.tasks[1].taskId, firstTaskId, 'recovery reuses the plan returned by the persisted claim');
+  assert.deepEqual(world.calls.tasks[1].metadata, firstPlan);
+  assert.equal(world.calls.operations.length, 1);
+});
+
+test('scheduled subscription rejects run-plan metadata outside the frozen server contract', async () => {
+  const world = makeWorld({ addUnexpectedRunPlanMetadata: true });
+  const delegation = await createDelegation(world, ['bilibili.dynamics.list']);
+  const { subscription } = await world.feature.createSubscription(context(), {
+    idempotencyKey: 'subscription-extra-run-plan-field',
+    delegationId: delegation.id,
+    sourceRefs,
+    operation: { kind: 'list_dynamics', userId: '10086' },
+    expiresAt: now + 5 * 24 * 60 * 60 * 1_000,
+    nextCheckAt: now + 10_000,
+  });
+  await assert.rejects(world.feature.runScheduledSubscription(context(), subscription.id), error => {
+    assert.equal(error.code, 'BILI_SUBSCRIPTION_RUN_PLAN_INVALID');
+    return true;
+  });
+  assert.equal(world.calls.tasks.length, 0, 'malformed metadata is rejected before DSH task dispatch');
+  assert.equal(world.calls.operations.length, 0, 'malformed metadata never reaches Exchange');
 });
 
 test('queued outbox receipt is not reported delivered and is reconciled without a second send', async () => {
@@ -533,7 +844,7 @@ test('queued outbox receipt is not reported delivered and is reconciled without 
     idempotencyKey: 'subscription-outbox-pending',
     delegationId: delegation.id,
     sourceRefs,
-    operation: { kind: 'list_dynamics', userId: '10086', limit: 10 },
+    operation: { kind: 'list_dynamics', userId: '10086' },
     expiresAt: now + 5 * 24 * 60 * 60 * 1_000,
     nextCheckAt: now + 10_000,
   });
@@ -554,7 +865,7 @@ test('queued outbox receipt is not reported delivered and is reconciled without 
   assert.equal(world.subscription.lastDeliveryReceiptId, 'platform-delivery-1');
   assert.equal(world.calls.notifications.length, 1, 'status reconciliation must never submit a second notification');
   assert.equal(world.calls.operations.length, 1, 'pending outbox status is reconciled before another provider read');
-  assert.equal(world.calls.tasks.length, 2, 'the exact notification task identity remains stable across recovery');
+  assert.equal(world.calls.tasks.length, 3, 'status reconciliation adds one readback Task without resending');
 });
 
 test('an outbox acknowledgement without a platform delivery receipt becomes uncertain', async () => {
@@ -607,7 +918,7 @@ test('cooldown scans past a full recent page before allowing a subscription noti
     if (input.cursor === undefined) {
       return {
         items: Array.from({ length: 100 }, (_, index) => ({
-          id: `recent-user-${index}`, eventId: `event-${index}`, role: 'user', content: 'recent',
+          id: `recent-user-${index}`, eventId: index === 0 ? 'user-event-bili-1' : `event-${index}`, role: 'user', content: 'recent',
           occurredAt: now - 100, status: 'active',
           scope: { conversationId: scope.conversationId, conversationKind: scope.conversationKind, personaId: scope.personaId, visibility: scope.visibility },
         })),
@@ -634,7 +945,7 @@ test('cooldown scans past a full recent page before allowing a subscription noti
   });
   const result = await world.feature.runScheduledSubscription(context(), subscription.id);
   assert.equal(result.outcome, 'held');
-  assert.equal(historyPages, 2, 'cooldown scans the next keyset page before making a send decision');
+  assert.equal(historyPages, 3, 'current-request lineage lookup and the two-page cooldown scan all use the authenticated Work history API');
   assert.equal(world.calls.notifications.length, 0);
   assert.equal(world.calls.holds.length, 1);
 });
@@ -709,18 +1020,19 @@ test('completed read and notification Work Tasks recover after a crash before su
     nextCheckAt: now + 10_000,
   });
   await assert.rejects(world.feature.runScheduledSubscription(context(), subscription.id), /simulated crash before subscription checkpoint/u);
-  assert.equal(world.subscription.version, 1);
+  assert.equal(world.subscription.version, 2, 'claim persisted before the later Work checkpoint failed');
+  assert.equal(world.subscription.scheduledRunState, 'claimed');
 
   const recovered = await world.feature.runScheduledSubscription(context(), subscription.id);
   assert.equal(recovered.outcome, 'checked');
-  assert.equal(world.subscription.version, 2);
+  assert.equal(world.subscription.version, 3);
   assert.equal(world.subscription.lastOperationReceiptId, 'work-operation-receipt-1');
   assert.equal(world.subscription.lastNotificationReceiptId, 'notification-receipt-1');
   assert.equal(world.calls.operations.length, 1, 'completed read Work Task is reconciled by its persistent operation key');
   assert.equal(world.calls.notifications.length, 1, 'completed notification Work Task is reconciled by its durable receipt');
 });
 
-test('read receipt recovers when the DSH Task terminal response fails after provider data was verified', async () => {
+test('read receipt stays uncertain when its child DSH Task fails before a completed output receipt', async () => {
   const world = makeWorld({ failReadTaskOnce: true });
   const delegation = await createDelegation(world, ['bilibili.dynamics.list']);
   const { subscription } = await world.feature.createSubscription(context(), {
@@ -733,10 +1045,11 @@ test('read receipt recovers when the DSH Task terminal response fails after prov
   });
   const result = await world.feature.runScheduledSubscription(context(), subscription.id);
   assert.equal(result.taskStatus, 'failed', 'the DSH Task failure remains visible');
-  assert.equal(result.outcome, 'checked', 'the matching completed Work receipt reconciles the read safely');
+  assert.equal(result.outcome, 'uncertain', 'a provider result without completed child Task binding is not released');
   assert.equal(world.calls.operations.length, 1);
-  assert.equal(world.calls.notifications.length, 1);
+  assert.equal(world.calls.notifications.length, 0);
   assert.equal(world.subscription.lastOperationReceiptId, 'work-operation-receipt-1');
+  assert.equal(world.subscription.state, 'uncertain');
 });
 
 test('scheduled Bilibili identifiers parse only the explicit marker kind', () => {
