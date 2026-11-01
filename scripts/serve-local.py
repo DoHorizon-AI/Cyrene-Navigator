@@ -8,6 +8,7 @@ JSON object containing only service URLs. 子进程日志和服务凭据不会�
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import importlib
 import json
@@ -59,6 +60,7 @@ _PERSISTENCE_CAPABILITY_ENV_NAMES = (
     "CYRENE_NAVIGATOR_MEMORY_MAINTENANCE_TENANTS",
     "CYRENE_NAVIGATOR_SPEECH_ENABLED",
     "CYRENE_NAVIGATOR_SPEECH_DEFAULT_LANGUAGE",
+    "CYRENE_CONVERSATION_ASSISTANT_ENABLED",
 )
 
 
@@ -80,6 +82,7 @@ class ChildService:
     first_line: queue.Queue[str]
     reader: threading.Thread
     secrets_to_check: tuple[str, ...]
+    stderr_file: Any = None
 
 
 def main() -> int:
@@ -185,7 +188,8 @@ def main() -> int:
     artifact_root = state_dir / "artifacts"
     dsh_home = state_dir / "dsh-home"
     plugins_dir = state_dir / "plugins"
-    for path in (artifact_root, dsh_home, plugins_dir):
+    logs_dir = state_dir / "logs"
+    for path in (artifact_root, dsh_home, plugins_dir, logs_dir):
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         _restrict_directory(path)
 
@@ -267,6 +271,7 @@ def main() -> int:
                     persistence_env_refs,
                     executor_work_token=executor_work_token,
                 ),
+                log_dir=logs_dir,
             )
             services.append(persistence)
             persistence_banner = _read_startup(persistence, args.startup_timeout)
@@ -312,6 +317,7 @@ def main() -> int:
                 secrets_to_check=_executor_startup_secrets(
                     session_token, executor_token, executor_env
                 ),
+                log_dir=logs_dir,
             )
             services.append(executor)
             executor_banner = _read_startup(executor, args.startup_timeout)
@@ -353,6 +359,7 @@ def main() -> int:
                 cwd=repository,
                 env=web_env,
                 secrets_to_check=(session_token, executor_token),
+                log_dir=logs_dir,
             )
             services.append(web)
             web_banner = _read_startup(web, args.startup_timeout)
@@ -1111,17 +1118,22 @@ def _start_child(
     cwd: Path,
     env: dict[str, str],
     secrets_to_check: tuple[str, ...],
+    log_dir: Path | None = None,
 ) -> ChildService:
-    """Launch a service, keeping stderr and all post-banner output private."""
+    """Launch a service, keeping stderr logged to private disk and post-banner output private."""
 
     creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+    stderr_file = None
+    if log_dir is not None:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stderr_file = open(log_dir / f"{name}.stderr.log", "a", encoding="utf-8")  # noqa: SIM115
     process = subprocess.Popen(
         command,
         cwd=cwd,
         env=env,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=stderr_file if stderr_file is not None else subprocess.DEVNULL,
         text=True,
         encoding="utf-8",
         errors="replace",
@@ -1131,6 +1143,8 @@ def _start_child(
     )
     output = process.stdout
     if output is None:
+        if stderr_file is not None:
+            stderr_file.close()
         process.kill()
         raise RuntimeError(f"{name} service did not expose a startup channel")
     first_line: queue.Queue[str] = queue.Queue(maxsize=1)
@@ -1149,7 +1163,9 @@ def _start_child(
 
     reader = threading.Thread(target=drain_stdout, name=f"{name}-stdout", daemon=True)
     reader.start()
-    return ChildService(name, process, first_line, reader, secrets_to_check)
+    return ChildService(
+        name, process, first_line, reader, secrets_to_check, stderr_file=stderr_file
+    )
 
 
 def _read_startup(child: ChildService, timeout: float) -> dict[str, Any]:
@@ -1272,6 +1288,9 @@ def _stop_child(child: ChildService, timeout: float) -> None:
             process.wait(timeout=timeout)
     if process.stdout is not None:
         process.stdout.close()
+    if child.stderr_file is not None:
+        with contextlib.suppress(OSError):
+            child.stderr_file.close()
     child.reader.join(timeout=1)
 
 

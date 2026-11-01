@@ -4508,7 +4508,7 @@ export class NavigatorExecutor {
       if (record === undefined) return;
       if (TERMINAL_STATUSES.has(record.status) || PAUSED_STATUSES.has(record.status)) {
         if (record.status !== 'completed') {
-          this.writeConversationAssistantHeld(res, record, 'CONVERSATION_ASSISTANT_NOT_DELIVERED');
+          this.writeConversationAssistantHeld(res, record, resolveSafeConversationAssistantErrorCode(record.error));
           return;
         }
         try {
@@ -4704,7 +4704,7 @@ export class NavigatorExecutor {
         output: '',
         reasoning: '',
         error: TERMINAL_STATUSES.has(record.status) || PAUSED_STATUSES.has(record.status)
-          ? 'CONVERSATION_ASSISTANT_NOT_DELIVERED'
+          ? resolveSafeConversationAssistantErrorCode(record.error)
           : undefined,
       });
     }
@@ -5666,6 +5666,43 @@ function safeErrorMessage(value: unknown): string {
 
 function abortMessage(reason: unknown): string {
   return reason instanceof Error ? reason.message : 'Task was aborted';
+}
+
+const SAFE_CONVERSATION_ASSISTANT_ERROR_CODES = new Set([
+  'CONVERSATION_ASSISTANT_NOT_DELIVERED',
+  'CONVERSATION_ASSISTANT_SOURCE_REVOKED',
+  'CONVERSATION_ASSISTANT_SOURCE_UNAVAILABLE',
+  'CONVERSATION_ASSISTANT_REPLY_NOT_READY',
+  'CONVERSATION_ASSISTANT_UNAVAILABLE',
+  'CONVERSATION_ASSISTANT_WEB_ACTOR_UNAVAILABLE',
+  'CONVERSATION_ASSISTANT_ACTOR_SCOPE_MISMATCH',
+  'CONVERSATION_ASSISTANT_REQUEST_INVALID',
+  'CONVERSATION_ASSISTANT_ACTOR_UNVERIFIED',
+  'CONVERSATION_INGRESS_INVALID',
+  'CONVERSATION_MESSAGE_SCOPE_MISMATCH',
+  'CONVERSATION_SOURCE_PROOF_LIMIT_EXCEEDED',
+  'CONVERSATION_AUTHORIZATION_EPOCH_CHANGED',
+  'CONVERSATION_MEMORY_API_UNAVAILABLE',
+  'IDEMPOTENCY_KEY_REQUIRED',
+  'EXECUTION_FAILED',
+  'MODEL_UNAVAILABLE',
+  'TIMEOUT',
+  'ABORTED',
+  'MEMORY_PROVIDER_UNAVAILABLE',
+  'MEMORY_API_UNAVAILABLE',
+]);
+
+function resolveSafeConversationAssistantErrorCode(error: string | undefined): string {
+  if (typeof error === 'string') {
+    const trimmed = error.trim();
+    if (SAFE_CONVERSATION_ASSISTANT_ERROR_CODES.has(trimmed)) return trimmed;
+    const match = /\b([A-Z0-9_]{3,64})\b/.exec(trimmed);
+    const code = match?.[1];
+    if (code !== undefined && SAFE_CONVERSATION_ASSISTANT_ERROR_CODES.has(code)) {
+      return code;
+    }
+  }
+  return 'CONVERSATION_ASSISTANT_NOT_DELIVERED';
 }
 
 function taskParams(body: Record<string, any>): ExecuteTaskParams {

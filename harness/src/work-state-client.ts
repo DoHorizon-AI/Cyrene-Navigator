@@ -987,6 +987,7 @@ export class WorkStateClient implements WorkStateStore {
       readonly conversationId: string;
       readonly conversationKind: string;
       readonly order: 'desc';
+      readonly personaId?: string | null;
       readonly cursor?: string;
       readonly limit: number;
       readonly includeRevoked?: boolean;
@@ -997,6 +998,7 @@ export class WorkStateClient implements WorkStateStore {
         order: input.order,
         limit: String(Math.min(input.limit, 100)),
       });
+      if (input.personaId !== undefined && input.personaId !== null) query.set('personaId', input.personaId);
       if (input.cursor !== undefined) query.set('cursor', input.cursor);
       if (input.includeRevoked !== undefined) query.set('includeRevoked', String(input.includeRevoked));
       return query.toString();

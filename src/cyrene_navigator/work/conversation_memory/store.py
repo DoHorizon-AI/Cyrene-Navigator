@@ -1901,57 +1901,56 @@ class ConversationMemoryStore:
     def _invalidate_source_dependents(
         self, conn: sqlite3.Connection, org: str, workspace: str, source_id: str, now: int
     ) -> tuple[list[str], list[str]]:
-        affected_sources = {source_id}
+        visited_sources: set[str] = set()
+        pending_sources: set[str] = {source_id}
         message_ids: set[str] = set()
         memory_ids: set[str] = set()
-        while True:
-            placeholders = ",".join("?" for _ in affected_sources)
+        while pending_sources:
+            current_sources = pending_sources - visited_sources
+            if not current_sources:
+                break
+            visited_sources.update(current_sources)
+            placeholders = ",".join("?" for _ in current_sources)
             found_messages = conn.execute(
                 f"""SELECT DISTINCT message_id FROM conversation_memory_message_sources
                     WHERE organization_id=? AND workspace_id=?
                       AND source_message_id IN ({placeholders})""",
-                (org, workspace, *sorted(affected_sources)),
+                (org, workspace, *sorted(current_sources)),
             ).fetchall()
-            new_messages = {str(row[0]) for row in found_messages} - message_ids - affected_sources
+            new_messages = {str(row[0]) for row in found_messages} - message_ids - visited_sources
             found_memories = conn.execute(
                 f"""SELECT DISTINCT memory_id FROM conversation_memory_item_sources
                     WHERE organization_id=? AND workspace_id=?
                       AND source_message_id IN ({placeholders})""",
-                (org, workspace, *sorted(affected_sources)),
+                (org, workspace, *sorted(current_sources)),
             ).fetchall()
             new_memories = {str(row[0]) for row in found_memories} - memory_ids
-            memory_refs = (
-                conn.execute(
-                    f"""SELECT DISTINCT message_id FROM conversation_memory_message_memory_sources
-                    WHERE organization_id=? AND workspace_id=? AND source_memory_id IN
-                    (SELECT memory_id FROM conversation_memory_items WHERE organization_id=?
-                     AND workspace_id=? AND memory_id IN ({placeholders}))""",
-                    (org, workspace, org, workspace, *sorted(memory_ids | new_memories)),
+            if new_memories:
+                mem_placeholders = ",".join("?" for _ in new_memories)
+                memory_refs = conn.execute(
+                    f"""SELECT DISTINCT message_id
+                        FROM conversation_memory_message_memory_sources
+                        WHERE organization_id=? AND workspace_id=?
+                          AND source_memory_id IN ({mem_placeholders})""",
+                    (org, workspace, *sorted(new_memories)),
                 ).fetchall()
-                if memory_ids or new_memories
-                else []
-            )
-            new_messages.update(str(row[0]) for row in memory_refs)
-            memory_dependents = (
-                conn.execute(
-                    f"""SELECT DISTINCT i.memory_id FROM conversation_memory_item_memory_sources s
-                    JOIN conversation_memory_items i ON i.organization_id=s.organization_id
-                     AND i.workspace_id=s.workspace_id AND i.actor_id=s.actor_id
-                     AND i.memory_id=s.memory_id
-                    WHERE s.organization_id=? AND s.workspace_id=? AND s.source_memory_id IN
-                    (SELECT memory_id FROM conversation_memory_items WHERE organization_id=?
-                     AND workspace_id=? AND memory_id IN ({placeholders}))""",
-                    (org, workspace, org, workspace, *sorted(memory_ids | new_memories)),
+                unseen_refs = {str(row[0]) for row in memory_refs} - message_ids - visited_sources
+                new_messages.update(unseen_refs)
+                memory_dependents = conn.execute(
+                    f"""SELECT DISTINCT i.memory_id
+                        FROM conversation_memory_item_memory_sources s
+                        JOIN conversation_memory_items i ON i.organization_id=s.organization_id
+                         AND i.workspace_id=s.workspace_id AND i.actor_id=s.actor_id
+                         AND i.memory_id=s.memory_id
+                        WHERE s.organization_id=? AND s.workspace_id=?
+                          AND s.source_memory_id IN ({mem_placeholders})""",
+                    (org, workspace, *sorted(new_memories)),
                 ).fetchall()
-                if memory_ids or new_memories
-                else []
-            )
-            new_memories.update(str(row[0]) for row in memory_dependents)
-            if not new_messages and not new_memories:
-                break
+                new_memories.update({str(row[0]) for row in memory_dependents} - memory_ids)
+
             message_ids.update(new_messages)
             memory_ids.update(new_memories)
-            affected_sources.update(new_messages)
+            pending_sources = new_messages
         if message_ids:
             placeholders = ",".join("?" for _ in message_ids)
             conn.execute(
