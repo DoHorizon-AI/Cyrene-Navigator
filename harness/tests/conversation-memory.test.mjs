@@ -73,7 +73,7 @@ function message(id, role = 'user', overrides = {}) {
 }
 
 function baseApi(overrides = {}) {
-  const calls = { createMessages: [], listMessages: [], listMemories: [], queries: [], createMemories: [], authorizations: [] };
+  const calls = { createMessages: [], listMessages: [], listMemories: [], queries: [], createMemories: [], authorizations: [], revocation: [] };
   const api = {
     apiVersion: 1,
     async createMessage(context, input) {
@@ -371,7 +371,9 @@ test('completed turns use the configured summarizer and archive only unarchived 
   };
 
   await feature.beforeContext(context, { query: '' });
-  await feature.afterTurn(context, turn);
+  const assistantReceipt = await feature.afterTurn(context, turn);
+  assert.equal(assistantReceipt.assistantMessageId, 'message-new-assistant');
+  assert.equal(assistantReceipt.assistantEventId, calls.createMessages[0].input.eventId);
   const delivery = await feature.beforeDelivery(context, { text: turn.assistantText, sourceRefs: turn.sourceRefs });
   assert.deepEqual(delivery, { decision: 'allow', authorizationEpoch: context.authorizationEpoch });
   await feature.beforeContext(context, { query: '' });
@@ -399,19 +401,23 @@ test('failed and aborted turns do not create assistant messages or summaries', a
   const { api, calls } = baseApi();
   const model = summaryProvider();
   const feature = createConversationMemoryFeature({ api, summaryProvider: model });
-  await feature.afterTurn(trustedContext(), { userEventId: 'event-1', assistantText: 'partial', status: 'failed' });
-  await feature.afterTurn(trustedContext(), { userEventId: 'event-2', assistantText: 'partial', status: 'aborted' });
+  assert.equal(await feature.afterTurn(trustedContext(), { userEventId: 'event-1', assistantText: 'partial', status: 'failed' }), undefined);
+  assert.equal(await feature.afterTurn(trustedContext(), { userEventId: 'event-2', assistantText: 'partial', status: 'aborted' }), undefined);
   assert.equal(calls.createMessages.length, 0);
   assert.equal(model.calls.length, 0);
 });
 
-test('summary archival refuses lineage overflow instead of persisting a truncated dependency set', async () => {
+test('summary archival refuses lineage overflow and invalidates a newly persisted assistant message', async () => {
   const inherited = Array.from({ length: 256 }, (_, memoryIndex) => ({
     memoryId: `memory-${memoryIndex}`,
     memoryVersion: 1,
     sourceMessageIds: Array.from({ length: 128 }, (_, sourceIndex) => `source-${memoryIndex}-${sourceIndex}`),
   }));
   const { api, calls } = baseApi({
+    async revokeSource(context, sourceId) {
+      calls.revocation.push({ context, sourceId });
+      return { sourceId, authorizationEpoch: context.authorizationEpoch + 1, invalidatedCount: 1, invalidatedMessageIds: [sourceId], invalidatedMemoryIds: [] };
+    },
     async listMessages(context, input) {
       calls.listMessages.push({ context, input });
       return {
@@ -442,6 +448,7 @@ test('summary archival refuses lineage overflow instead of persisting a truncate
     error => error.code === 'INVALID_SOURCE_PROOF',
   );
   assert.equal(calls.createMemories.length, 0);
+  assert.deepEqual(calls.revocation.map(item => item.sourceId), ['assistant-new']);
 });
 
 test('feature setup rejects a missing real summary provider and aborted retrieval does no I/O', async () => {
