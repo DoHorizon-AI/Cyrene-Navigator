@@ -14,6 +14,14 @@ dependencies = [
   "pydantic==2.13.5",
   "tzdata==2026.5",
   "uvicorn==0.52.4",
+  "cyrene-plugin-runtime @ git+https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git@219eedb661003d4b24e8bde9c5aed2a202e2b4f3#subdirectory=sdk/python/cyrene_plugin_runtime",
+  "cyrene-model-provider-contracts @ git+https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git@219eedb661003d4b24e8bde9c5aed2a202e2b4f3#subdirectory=sdk/python/cyrene_model_provider_contracts",
+  "cyrene-memory-provider-contracts @ git+https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git@219eedb661003d4b24e8bde9c5aed2a202e2b4f3#subdirectory=sdk/python/cyrene_memory_provider_contracts",
+  "cyrene-knowledge-graph-contracts @ git+https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git@219eedb661003d4b24e8bde9c5aed2a202e2b4f3#subdirectory=sdk/python/cyrene_knowledge_graph_contracts",
+  "cyrene-tool-provider-contracts @ git+https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git@219eedb661003d4b24e8bde9c5aed2a202e2b4f3#subdirectory=sdk/python/cyrene_tool_provider_contracts",
+  "cyrene-speech-provider-contracts @ git+https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git@219eedb661003d4b24e8bde9c5aed2a202e2b4f3#subdirectory=sdk/python/cyrene_speech_provider_contracts",
+  "cyrene-integration-contracts @ git+https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git@219eedb661003d4b24e8bde9c5aed2a202e2b4f3#subdirectory=sdk/python/cyrene_integration_contracts",
+  "cyrene-message-connector-contracts @ git+https://github.com/DoHorizon-AI/Cyrene-Plugins-Official.git@219eedb661003d4b24e8bde9c5aed2a202e2b4f3#subdirectory=sdk/python/cyrene_message_connector_contracts",
 ]
 
 [tool.hatch.metadata]

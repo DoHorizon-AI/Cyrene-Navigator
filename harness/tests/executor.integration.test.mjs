@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 import { createExecutorApp } from '../dist/serve.js';
 import { parseCredentialNotificationsConfig } from '../dist/executor.js';
 import { InMemoryWorkStateStore, WorkStateClient, WorkStateHttpError } from '../dist/work-state-client.js';
@@ -21,6 +22,8 @@ import { ExchangeConnectorAuthorizationClient, ExchangeConnectorRequestError, ca
 import { disposeWithin } from '../../scripts/serve-executor.mjs';
 import { LlmAdapter, ToolCallId } from '@deepseek-ai/dsh-llm';
 import { defineTool } from '@deepseek-ai/dsh-tools';
+
+const SERVE_EXECUTOR_SCRIPT = fileURLToPath(new URL('../../scripts/serve-executor.mjs', import.meta.url));
 
 const TEST_BEARER = 'executor-test-token';
 process.env.CYRENE_EXECUTOR_TOKEN = TEST_BEARER;
@@ -1961,6 +1964,34 @@ test('NavigatorExecutor: an admitted task can be cancelled before the dispatcher
   }
 });
 
+test('NavigatorExecutor: recovered actor-owned task cancellation uses its actor Work client', async () => {
+  const ownerStore = new InMemoryWorkStateStore();
+  const actorStore = new InMemoryWorkStateStore();
+  const actorId = '11111111-1111-4111-8111-111111111111';
+  const task = await actorStore.createTask({
+    id: 'actor-cancel-after-restart',
+    sessionId: 'actor-cancel-session',
+    prompt: 'Cancel through the owner-scoped Work client',
+  });
+  await actorStore.claimTask(task.id);
+  const { executor, ctx } = await createTestApp(new TestMockAdapter(), { workStateStore: ownerStore });
+  executor.config.workActorClients = {
+    async resolveTask(taskId) {
+      if (taskId !== task.id) return undefined;
+      return { actorAadObjectId: actorId, store: actorStore, task: await actorStore.getTask(taskId) };
+    },
+  };
+  try {
+    assert.equal(await executor.cancelTask(task.id), true);
+    assert.equal((await actorStore.getTask(task.id)).status, 'aborted');
+    assert.equal(await ownerStore.getTask(task.id), undefined);
+    const events = await actorStore.getEvents(task.id, 0);
+    assert.ok(events.events.some(row => row.event.code === 'TASK_ABORTED'));
+  } finally {
+    await disposeApp({ executor, ctx });
+  }
+});
+
 test('NavigatorExecutor: recovery adopts safe queued rows and fails uncertain or human-gated rows', async () => {
   const store = new InMemoryWorkStateStore();
   const queued = await store.createTask({ id: 'recover-queued', sessionId: 'session-queued', prompt: 'Safe to start' });
@@ -2052,7 +2083,7 @@ test('serve-executor SIGTERM drain timeout exits nonzero within its cleanup boun
   skip: process.platform === 'win32' ? 'Windows terminates a child on SIGTERM instead of running the POSIX handler.' : false,
 }, async () => {
   const child = spawn(process.execPath, [
-    'scripts/serve-executor.mjs', '--port=0', '--host=127.0.0.1', '--test-mode', '--test-echo-adapter',
+    SERVE_EXECUTOR_SCRIPT, '--port=0', '--host=127.0.0.1', '--test-mode', '--test-echo-adapter',
     '--drain-timeout-ms=0', '--abort-cleanup-timeout-ms=500',
   ], {
     cwd: process.cwd(),

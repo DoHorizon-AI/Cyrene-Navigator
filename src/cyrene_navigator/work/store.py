@@ -114,8 +114,13 @@ class WorkStore:
         description = _optional_text(body.get("description"), "description", 20_000)
         metadata = _json_object(body.get("metadata", {}), "metadata")
         _task_notification_descriptor(metadata)
-        _validate_task_execution_metadata(execution_class, metadata)
         created_by_actor_id = _identifier(actor_id, "actorId") if actor_id else ""
+        _validate_task_execution_metadata(
+            execution_class,
+            metadata,
+            actor_id=created_by_actor_id,
+            workspace_id=workspace,
+        )
         create_digest = _digest(
             {
                 "sessionId": session_id,
@@ -204,6 +209,8 @@ class WorkStore:
         actor_id: str,
         prompt: str,
         idempotency_key: str,
+        *,
+        actor_private_scope: bool = False,
     ) -> tuple[JsonObject, bool]:
         """Atomically create a read-only child from the same actor's auth-wait task.
 
@@ -232,6 +239,14 @@ class WorkStore:
         now = _unix_ms()
         with self._mutation() as conn:
             source = self._require_task(conn, org, workspace, source_task_id)
+            self._require_teams_task_actor(
+                conn,
+                org,
+                workspace,
+                source_task_id,
+                actor.lower(),
+                actor_private_scope=actor_private_scope,
+            )
             if str(source["created_by_actor_id"] or "") != actor:
                 raise _not_found(
                     "WORK_TASK_NOT_FOUND", "The source task does not exist in this Workspace."
@@ -333,6 +348,8 @@ class WorkStore:
         workspace_id: str,
         source_task_id: str,
         actor_id: str,
+        *,
+        actor_private_scope: bool = False,
     ) -> None:
         """Confirm ownership before Navigator revalidates the source DSH identity.
 
@@ -352,6 +369,14 @@ class WorkStore:
         actor = _identifier(actor_id, "actorId")
         with self._read() as conn:
             source = self._require_task(conn, org, workspace, source_task_id)
+            self._require_teams_task_actor(
+                conn,
+                org,
+                workspace,
+                source_task_id,
+                actor.lower(),
+                actor_private_scope=actor_private_scope,
+            )
             if str(source["created_by_actor_id"] or "") != actor:
                 raise _not_found(
                     "WORK_TASK_NOT_FOUND", "The source task does not exist in this Workspace."
@@ -606,6 +631,16 @@ class WorkStore:
                 if actor_private_scope:
                     filters += " AND lower(created_by_actor_id)=?"
                     scope_params.append(requesting_actor)
+                else:
+                    filters += " AND json_extract(work_tasks.metadata_json, "
+                    filters += "'$.navigatorConversationOrigin.kind') IS NULL"
+                    filters += (
+                        " AND NOT EXISTS (SELECT 1 FROM work_task_teams_origins private_origin "
+                    )
+                    filters += "WHERE private_origin.organization_id=work_tasks.organization_id "
+                    filters += "AND private_origin.workspace_id=work_tasks.workspace_id "
+                    filters += "AND private_origin.task_id=work_tasks.task_id "
+                    filters += "AND private_origin.conversation_kind='private')"
                 filters += " AND (NOT EXISTS (SELECT 1 FROM work_task_teams_origins teams_origin "
                 filters += "WHERE teams_origin.organization_id=work_tasks.organization_id "
                 filters += "AND teams_origin.workspace_id=work_tasks.workspace_id "
@@ -1796,6 +1831,33 @@ class WorkStore:
                     str(row["task_id"]),
                     _identifier(actor_id, "actorId").lower() if actor_id is not None else None,
                     actor_private_scope=actor_private_scope,
+                )
+            return self._operation_view(row)
+
+    def get_operation_by_idempotency_key(
+        self,
+        organization_id: str | None,
+        workspace_id: str,
+        idempotency_key: str,
+    ) -> JsonObject:
+        """Read an immutable operation by tenant-scoped effective idempotency key.
+
+        Callers should derive an actor-bound effective key and independently
+        verify the stored request's actor-scope digest before exposing it.
+        """
+
+        org, workspace = _scope(organization_id, workspace_id)
+        key = _identifier(idempotency_key, "idempotencyKey")
+        with self._read() as conn:
+            row = conn.execute(
+                """SELECT * FROM work_operations WHERE organization_id=? AND workspace_id=?
+                   AND idempotency_key=?""",
+                (org, workspace, key),
+            ).fetchone()
+            if row is None:
+                raise _not_found(
+                    "WORK_OPERATION_NOT_FOUND",
+                    "The operation does not exist in this Workspace.",
                 )
             return self._operation_view(row)
 
@@ -3549,6 +3611,7 @@ class WorkStore:
         *,
         actor_id: str | None = None,
         actor_private_scope: bool = False,
+        require_actor_private: bool = False,
     ) -> tuple[JsonObject, Path]:
         """Authorize a digest against metadata in the exact Workspace before reading bytes. |
         读取附件。"""
@@ -3556,19 +3619,24 @@ class WorkStore:
         org, workspace = _scope(organization_id, workspace_id)
         digest = _validate_digest(digest)
         actor = _identifier(actor_id, "actorId").lower() if actor_id is not None else None
-        if actor_private_scope and actor is None:
+        if (actor_private_scope or require_actor_private) and actor is None:
             raise _invalid(
                 "WORK_ATTACHMENT_ACTOR_REQUIRED", "actor-private attachment requires an actor"
             )
+        if require_actor_private and not actor_private_scope:
+            raise _invalid(
+                "WORK_ATTACHMENT_SCOPE_REQUIRED",
+                "Private attachment readback requires actor-private scope.",
+            )
         with self._read() as conn:
             row = None
-            if actor_private_scope:
+            if actor is not None:
                 row = conn.execute(
                     """SELECT * FROM work_private_attachments WHERE organization_id=?
                        AND workspace_id=? AND actor_id=? AND sha256=?""",
                     (org, workspace, actor, digest),
                 ).fetchone()
-            if row is None:
+            if row is None and not require_actor_private:
                 row = conn.execute(
                     """SELECT * FROM work_attachments WHERE organization_id=? AND workspace_id=? AND
                         sha256=?""",
@@ -7307,11 +7375,10 @@ class WorkStore:
         *,
         actor_private_scope: bool = False,
     ) -> bool:
-        """Hide verified Teams-origin tasks from every other Work actor.
+        """Enforce actor-private and authenticated conversation Task read scope.
 
-        Non-Teams tasks retain the existing Workspace sharing behavior. Teams
-        origin is recorded only by the atomic authenticated connector intake,
-        never inferred from mutable task metadata.
+        Web/channel markers are server-derived by the Executor ingress. Teams
+        connector origin remains backed by the atomic authenticated intake rows.
         """
 
         private_owner = conn.execute(
@@ -7319,25 +7386,41 @@ class WorkStore:
                AND workspace_id=? AND task_id=?""",
             (org, workspace, task_id),
         ).fetchone()
+        task = conn.execute(
+            """SELECT created_by_actor_id,
+                      json_extract(
+                          metadata_json,'$.navigatorConversationOrigin.kind') AS chat_origin
+               FROM work_tasks WHERE organization_id=? AND workspace_id=? AND task_id=?""",
+            (org, workspace, task_id),
+        ).fetchone()
+        if task is None:
+            raise _not_found("WORK_TASK_NOT_FOUND", "The task does not exist in this Workspace.")
+        teams_origin_kind = conn.execute(
+            """SELECT conversation_kind FROM work_task_teams_origins WHERE organization_id=?
+               AND workspace_id=? AND task_id=?""",
+            (org, workspace, task_id),
+        ).fetchone()
+        is_chat_task = task["chat_origin"] in {"web", "teams_channel"} or (
+            teams_origin_kind is not None
+            and str(teams_origin_kind["conversation_kind"]) == "private"
+        )
         if private_owner is not None and (
-            actor_id is None or str(private_owner["actor_id"]) != actor_id.lower()
+            actor_id is None or str(private_owner["actor_id"]).lower() != actor_id.lower()
         ):
             raise _not_found("WORK_TASK_NOT_FOUND", "The task does not exist in this Workspace.")
-        if actor_private_scope:
-            task = conn.execute(
-                """SELECT created_by_actor_id FROM work_tasks WHERE organization_id=?
-                   AND workspace_id=? AND task_id=?""",
-                (org, workspace, task_id),
-            ).fetchone()
-            if (
-                actor_id is None
-                or task is None
-                or str(task["created_by_actor_id"] or "").lower() != actor_id.lower()
-            ):
-                raise _not_found(
-                    "WORK_TASK_NOT_FOUND",
-                    "The task does not exist for this actor in this Workspace.",
-                )
+        if is_chat_task and (
+            not actor_private_scope
+            or actor_id is None
+            or str(task["created_by_actor_id"] or "").lower() != actor_id.lower()
+        ):
+            raise _not_found("WORK_TASK_NOT_FOUND", "The task does not exist in this Workspace.")
+        if actor_private_scope and (
+            actor_id is None or str(task["created_by_actor_id"] or "").lower() != actor_id.lower()
+        ):
+            raise _not_found(
+                "WORK_TASK_NOT_FOUND",
+                "The task does not exist for this actor in this Workspace.",
+            )
         origin = conn.execute(
             """SELECT actor_id,actor_subject FROM work_task_teams_origins WHERE organization_id=?
                AND workspace_id=? AND task_id=?""",
@@ -8490,7 +8573,13 @@ def _task_notification_descriptor(metadata: Mapping[str, Any]) -> JsonObject | N
     }
 
 
-def _validate_task_execution_metadata(execution_class: object, metadata: Mapping[str, Any]) -> None:
+def _validate_task_execution_metadata(
+    execution_class: object,
+    metadata: Mapping[str, Any],
+    *,
+    actor_id: str,
+    workspace_id: str,
+) -> None:
     """Keep background task authority host-generated and bound to a v2 responsibility.
 
     Args:
@@ -8499,13 +8588,48 @@ def _validate_task_execution_metadata(execution_class: object, metadata: Mapping
     Raises:
         PersistenceError: If a background task has no verifiable workflow provenance.
 
-    中文：后台任务必须携带责任、发生实例和 owner Teams 线程引用，不能由普通任务冒充。
+    中文：后台任务必须携带已验证的工作流或对话维护来源，不能由普通任务冒充。
     """
 
     if execution_class == "foreground":
         return
     if execution_class != "background":
         raise _invalid("WORK_TASK_INVALID_EXECUTION_CLASS", "executionClass is not supported")
+    if metadata.get("source") == "conversation-maintenance":
+        required = {
+            "source",
+            "maintenanceJobId",
+            "kind",
+            "workspaceId",
+            "actorId",
+            "idempotencyKey",
+            "jobVersion",
+        }
+        allowed_kinds = {"dream", "forget", "daily_review", "backup", "import"}
+        if set(metadata) != required:
+            raise _invalid(
+                "WORK_TASK_BACKGROUND_PROVENANCE_REQUIRED",
+                "Conversation maintenance task provenance has unsupported or missing fields",
+            )
+        _identifier(metadata.get("maintenanceJobId"), "metadata.maintenanceJobId")
+        _identifier(metadata.get("idempotencyKey"), "metadata.idempotencyKey")
+        if _nonnegative_integer(metadata.get("jobVersion"), "metadata.jobVersion") < 1:
+            raise _invalid(
+                "WORK_TASK_BACKGROUND_PROVENANCE_REQUIRED",
+                "Conversation maintenance jobVersion must be positive",
+            )
+        if metadata.get("kind") not in allowed_kinds:
+            raise _invalid(
+                "WORK_TASK_BACKGROUND_PROVENANCE_REQUIRED",
+                "Conversation maintenance task kind is not supported",
+            )
+        if metadata.get("actorId") != actor_id or metadata.get("workspaceId") != workspace_id:
+            raise PersistenceError(
+                "WORK_TASK_ACTOR_SCOPE_MISMATCH",
+                403,
+                "Conversation maintenance task provenance does not match its Work principal.",
+            )
+        return
     if metadata.get("source") != "workflow":
         raise _invalid(
             "WORK_TASK_BACKGROUND_PROVENANCE_REQUIRED",
