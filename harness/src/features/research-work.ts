@@ -107,7 +107,6 @@ export interface SkillEvidenceProducerV1 {
   readonly apiVersion: 1;
   execute(
     context: TrustedTurnContext,
-    childTask: { readonly taskId: string; readonly sessionId: string },
     input: {
       readonly actionId: string;
       readonly target: Readonly<Record<string, unknown>>;
@@ -412,8 +411,7 @@ export function createResearchWorkFeature(options: ResearchWorkOptions): Researc
         'verified-skill', context.conversationId, actionId, targetDigestSha256,
         inputSha256, guideVersion, guideSha256,
       );
-      const taskId = conversationWorkTaskId('research', `skill:${context.taskId}:${idempotencyKey}`);
-      const produced = await producer.execute(context, { taskId, sessionId: context.sessionId }, {
+      const produced = await producer.execute(context, {
         actionId,
         target,
         actionInput,

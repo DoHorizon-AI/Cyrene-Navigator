@@ -254,7 +254,7 @@ function makeDependencies(overrides = {}) {
   };
   const skillEvidenceProducer = {
     apiVersion: 1,
-    async execute(_ctx, _childTask, input) {
+    async execute(_ctx, input) {
       const targetDigestSha256 = sha(canonicalJson(input.target));
       const inputSha256 = sha(canonicalJson(input.actionInput));
       const guideSha256 = sha(input.guideText);
