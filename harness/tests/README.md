@@ -28,6 +28,11 @@ enforced JSON Schema subset remain visible as hints while the host still
 rejects invalid arguments. These tests do not prove that a real model always
 follows the guidance.
 
+`codebuddy-acp-execution.integration.test.mjs` uses a local fake ACP server to
+verify CodeBuddy's evidence/retry policy is included on the first prompt and on
+a second prompt after the native session is restored. It does not make a real
+model request.
+
 `antigravity-acp-execution.integration.test.mjs` runs a local fake ACP v1
 agent and the real task-local stdio MCP sidecar. It verifies exact native model
 option readback, separate Work mappings, restart loading, profile credential
@@ -93,6 +98,8 @@ and interactive GUI evidence.
 
 `codebuddy-adapter.test.mjs` 使用本地 fake executable 验证受限 CLI 参数、DSH 历史序列化、标准 tool-call block、当前 schema 校验、终态结果处理、超时和取消。它不会发出带凭据的模型请求，也不代表真实模型推理。
 该测试还检查 prompt 会区分成功证据与失败观察、要求提交祖先关系提供明确证据，并避免机械重试。`tool-providers.test.mjs` 验证 DSH 强制执行的 JSON Schema 子集未包含的约束仍作为提示暴露给模型，同时由宿主拒绝无效参数。这些测试不能证明真实模型总会遵守提示。
+
+`codebuddy-acp-execution.integration.test.mjs` 使用本地 fake ACP server 验证 CodeBuddy 的证据/重试规则同时进入首次 prompt 和原生 session 恢复后的第二次 prompt；它不会发出真实模型请求。
 
 `antigravity-acp-execution.integration.test.mjs` 使用本地 fake ACP v1 agent 和真实任务级
 stdio MCP sidecar。它验证原生模型选项精确回读、独立 Work mapping、重启续接、profile 凭据

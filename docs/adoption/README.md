@@ -18,13 +18,16 @@ real upstream packages.
 - CodeBuddy LLM turns use restricted structured output; the existing DSH
   AgentLoop remains the sole executor and returned tool arguments are checked
   against the active catalog before a DSH tool-call block is emitted.
-- The CodeBuddy prompt distinguishes successful evidence from failed
-  observations, requires explicit comparison evidence for ancestry claims, and
-  discourages repeating a call when `retryable` is false or unknown. Provider
-  constraints omitted from DSH's enforced JSON Schema subset remain visible as
-  model-facing hints; Navigator's host validator stays authoritative. This
-  guidance improves behavior but cannot guarantee that a model never makes an
-  unsupported claim.
+- Both CodeBuddy model adapters receive shared evidence and retry guidance.
+  The native CodeBuddy ACP profile appends it to every prompt, including
+  resumed sessions; the structured-output adapter supplies the same text in
+  its request prompt.
+  It distinguishes successful evidence from failed observations, requires
+  explicit comparison evidence for ancestry claims, and discourages repeating
+  a call when `retryable` is false or unknown. Provider constraints omitted
+  from DSH's enforced JSON Schema subset remain visible as model-facing hints;
+  Navigator's host validator stays authoritative. This guidance improves
+  behavior but cannot guarantee that a model never makes an unsupported claim.
 - The explicit `codebuddy-acp` task backend runs the official CodeBuddy ACP
   stdio process without a DSH reasoning loop. Navigator retains Work/session
   ownership and exposes only host-authorized Exchange tools through a task-local
@@ -157,7 +160,7 @@ the model; tool validation and durable receipts remain the enforceable boundary.
 - 客户端交付反馈会将已提交输入与持久化回执关联，并保留失败输入供用户显式恢复。
 - Compaction 只在 compaction 请求中移除工具声明；输出不含文本时按 fail-closed 处理。
 - CodeBuddy LLM 调用只使用受限结构化输出；现有 DSH AgentLoop 仍是唯一工具执行者，并且在发出 DSH tool-call block 前按当前工具目录检查工具名和参数。
-- CodeBuddy prompt 会区分成功证据与失败观察；提交祖先关系必须有明确 compare 证据；`retryable` 为 false 或未知时不应重复同一调用。DSH 强制执行的 JSON Schema 子集未包含的 provider 约束会作为模型可见提示保留，Navigator 宿主 validator 仍是权威校验。这些规则用于改善行为，不能保证模型绝不作无依据陈述。
+- CodeBuddy 的不同模型执行路径共用证据与重试规则。CodeBuddy 原生 ACP profile 每轮都会在请求后追加规则，包括恢复的会话；结构化输出 adapter 也会把相同规则加入模型请求。规则区分成功证据与失败观察，要求祖先关系提供明确 compare 证据，并避免在 `retryable` 为 false 或未知时机械重试。DSH 强制执行的 JSON Schema 子集未包含的 provider 约束仍以模型可见提示提供，Navigator 宿主 validator 继续负责权威校验。这些提示改善行为，但不能保证模型绝不作无依据陈述。
 - 显式 `codebuddy-acp` Work Task backend 使用官方 ACP stdio 进程，不套 DSH reasoning loop。Navigator 继续拥有 Work/session 状态，并通过任务级 MCP bridge 只公开宿主授权的 Exchange 工具，复用现有授权与回执路径。
 
 原生宿主通过 `CYRENE_NATIVE_HOST` 启动，不依赖外部 Platform 工具或源码。实现的方法由 `hello` 握手报告，范围仅限 Navigator 所有的操作。
