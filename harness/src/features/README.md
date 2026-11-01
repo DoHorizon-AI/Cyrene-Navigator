@@ -20,6 +20,7 @@ host ports.
 | `research-work.ts` | Work-receipt-backed notes and scheduled read-only watches / Work 回执支持的研究笔记与定时只读观察 |
 | `nous-active.ts` | Sourced focus/handoff context, policy-gated follow-ups and retraction / 带来源的焦点与交接上下文、策略门控跟进及撤回 |
 | `conversation-daily-review.ts` | Resumable, source-authorized daily review artifacts with independent Work readback / 可恢复、来源授权的对话每日复盘制品及 Work 独立回读 |
+| `bilibili-delegation.ts` | Owner-bound Bilibili operation scopes and DSH-scheduled read subscriptions / 绑定账号所有者的 B站操作范围与 DSH 定时只读订阅 |
 
 All modules use the authenticated Work API and current source authorization.
 Background maintenance uses the existing DSH Work Task and Schedule; proactive
