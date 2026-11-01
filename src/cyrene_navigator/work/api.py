@@ -70,6 +70,7 @@ from cyrene_navigator.work.models import (
     ConversationMemoryCreate,
     ConversationMemoryDeleteReceipt,
     ConversationMemoryList,
+    ConversationMemoryMessage,
     ConversationMemoryMessageCreate,
     ConversationMemoryMessages,
     ConversationMemoryOverview,
@@ -1350,7 +1351,9 @@ def mount_work_routes(
                 "unavailable",
             )
         try:
-            batch: EmbeddingBatch = embeddings.embed([str(current["text"])])
+            batch: EmbeddingBatch = embeddings.embed(
+                [str(current["text"])], purpose="document"
+            )
             if len(batch.vectors) != 1:
                 raise provider_unavailable(
                     "MEMORY_EMBEDDING_RESPONSE_INVALID",
@@ -1450,6 +1453,30 @@ def mount_work_routes(
             include_revoked=include_revoked,
         )
 
+    @app.get(
+        conversation_base + "/messages/{message_id}",
+        response_model=ConversationMemoryMessage,
+    )
+    def get_conversation_message(
+        workspace_id: str,
+        message_id: str,
+        request: Request,
+        conversation_id: str = Query(alias="conversationId", min_length=1, max_length=512),
+        conversation_kind: ConversationKind = Query(alias="conversationKind"),  # noqa: B008
+        persona_id: str | None = Query(default=None, alias="personaId", max_length=512),
+    ) -> dict[str, Any]:
+        principal = principal_for(request, workspace_id)
+        receipt = conversation_memory.get_message(
+            principal.organization_id,
+            workspace_id,
+            principal.actor_id,
+            conversation_id,
+            message_id,
+            conversation_kind=conversation_kind,
+            persona_id=persona_id,
+        )
+        return receipt["message"]
+
     @app.post(conversation_base + "/messages", status_code=201)
     def create_conversation_message(
         workspace_id: str,
@@ -1528,7 +1555,7 @@ def mount_work_routes(
                 "Semantic memory search requires configured embedding and memory providers.",
             )
         try:
-            batch = embedding_client.embed([body.query])
+            batch = embedding_client.embed([body.query], purpose="query")
             if len(batch.vectors) != 1:
                 raise provider_unavailable(
                     "MEMORY_EMBEDDING_RESPONSE_INVALID",

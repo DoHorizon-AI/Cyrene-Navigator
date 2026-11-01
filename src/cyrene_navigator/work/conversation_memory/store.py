@@ -426,6 +426,40 @@ class ConversationMemoryStore:
             ]
         return {"items": [self._message_view(row) for row in visible], "nextCursor": next_cursor}
 
+    def get_message(
+        self,
+        organization_id: str | None,
+        workspace_id: str,
+        actor_id: str,
+        conversation_id: str,
+        message_id: str,
+        *,
+        conversation_kind: str,
+        persona_id: str | None = None,
+    ) -> JsonObject:
+        """Read one exact current message only when its full source lineage is authorized."""
+
+        org, workspace, actor = _scope(organization_id, workspace_id, actor_id)
+        conversation = _identifier(conversation_id, "conversationId")
+        message = _identifier(message_id, "messageId")
+        kind = _choice(conversation_kind, "conversationKind", {"direct", "group", "channel"})
+        persona = _optional_identifier(persona_id, "personaId")
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT * FROM conversation_memory_messages WHERE organization_id=?
+                   AND workspace_id=? AND actor_id=? AND conversation_id=? AND message_id=?
+                   AND status='active'""",
+                (org, workspace, actor, conversation, message),
+            ).fetchone()
+            if row is None or not self._message_lineage_accessible(
+                conn, org, workspace, actor, conversation, kind, persona, row
+            ):
+                raise _not_found(
+                    "CONVERSATION_MEMORY_MESSAGE_NOT_FOUND",
+                    "Message was not found in this authorized conversation scope.",
+                )
+            return {"message": self._message_view(row)}
+
     def create_memory(
         self,
         organization_id: str | None,
@@ -1426,6 +1460,22 @@ class ConversationMemoryStore:
                     "CONVERSATION_MEMORY_NOT_FOUND", "Memory was not found in this actor scope."
                 )
             return self._memory_view(row)
+
+    def get_memory(
+        self,
+        organization_id: str | None,
+        workspace_id: str,
+        actor_id: str,
+        memory_id: str,
+    ) -> JsonObject:
+        """Read one active actor-scoped memory with its exact lineage revision."""
+
+        return self.get_memory_for_index(
+            organization_id,
+            workspace_id,
+            actor_id,
+            memory_id,
+        )
 
     def _validate_source_ids(
         self,

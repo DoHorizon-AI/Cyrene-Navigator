@@ -9,6 +9,13 @@ import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
 import { dirname, isAbsolute } from 'node:path';
+import type {
+  ConversationMemoryApiV1,
+  ConversationMemory as ConversationMemoryFeatureRecord,
+  ConversationMessage as ConversationMessageFeatureRecord,
+  ConversationSourceRef as ConversationSourceRefFeatureRecord,
+  TrustedTurnContext,
+} from './features/conversation-memory.js';
 
 export type ExecutionStatus =
   | 'queued'
@@ -392,6 +399,19 @@ export interface WorkStateStore {
     request: WorkConversationArtifactAuthorization,
     signal?: AbortSignal,
   ): Promise<WorkConversationArtifactAuthorizationReceipt>;
+  /** Build the actor-scoped conversation API over this already authenticated client. */
+  conversationMemoryApiV1?(actorId: string): ConversationMemoryApiV1;
+  /** Read the current authorization epoch through this actor-scoped client. */
+  getConversationMemoryOverview?(signal?: AbortSignal): Promise<{
+    readonly authorizationEpoch: number;
+    readonly counts: Readonly<{ messages: number; memories: number; sources: number }>;
+  }>;
+  getConversationMemoryMessage?(input: {
+    readonly messageId: string;
+    readonly conversationId: string;
+    readonly conversationKind: 'direct' | 'group' | 'channel';
+    readonly personaId: string | null;
+  }, signal?: AbortSignal): Promise<ConversationMessageFeatureRecord | undefined>;
 }
 
 export interface WorkStateConnection {
@@ -468,6 +488,18 @@ function countField(value: unknown, key: string): number {
   return value;
 }
 
+function finiteNumber(value: unknown, key: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new TypeError(`Invalid Work ${key}`);
+  }
+  return value;
+}
+
+function booleanField(value: unknown, key: string): boolean {
+  if (typeof value !== 'boolean') throw new TypeError(`Invalid Work ${key}`);
+  return value;
+}
+
 function decodeWorkAttachment(value: unknown): WorkAttachmentRecord {
   const row = object(value, 'Work attachment');
   const artifactId = stringField(row.artifactId, 'artifactId');
@@ -529,6 +561,111 @@ function decodeConversationMaintenanceJob(value: unknown): ConversationMaintenan
     createdAt: timeField(row.createdAt, 'createdAt')!,
     updatedAt: timeField(row.updatedAt, 'updatedAt')!,
   };
+}
+
+function decodeConversationSourceRefs(value: unknown, field: string): readonly ConversationSourceRefFeatureRecord[] {
+  if (!Array.isArray(value) || value.length > 256) throw new TypeError(`Invalid ${field}`);
+  return value.map((entry, index) => {
+    const row = object(entry, `${field}[${index}]`);
+    const memoryId = row.memoryId === null ? null : stringField(row.memoryId, 'memoryId');
+    const memoryVersion = row.memoryVersion === null
+      ? null
+      : timeField(row.memoryVersion, 'memoryVersion')!;
+    if ((memoryId === null) !== (memoryVersion === null) || (memoryVersion !== null && memoryVersion < 1)) {
+      throw new TypeError(`Invalid ${field}[${index}] memory version`);
+    }
+    if (!Array.isArray(row.sourceMessageIds) || row.sourceMessageIds.length > 128) {
+      throw new TypeError(`Invalid ${field}[${index}] message ids`);
+    }
+    const sourceMessageIds = row.sourceMessageIds.map((item, idIndex) =>
+      stringField(item, `${field}[${index}].sourceMessageIds[${idIndex}]`));
+    if (memoryId === null && sourceMessageIds.length === 0) {
+      throw new TypeError(`Invalid empty ${field}[${index}]`);
+    }
+    return { memoryId, memoryVersion, sourceMessageIds };
+  });
+}
+
+function decodeConversationResourceScope(value: unknown): ConversationMessageFeatureRecord['scope'] {
+  const row = object(value, 'Conversation resource scope');
+  const kinds = ['direct', 'group', 'channel'] as const;
+  const visibilityValues = ['private', 'conversation', 'workspace'] as const;
+  const conversationKind = row.conversationKind as typeof kinds[number];
+  const visibility = row.visibility as typeof visibilityValues[number];
+  if (!kinds.includes(conversationKind) || !visibilityValues.includes(visibility)) {
+    throw new TypeError('Invalid conversation resource scope');
+  }
+  return {
+    conversationId: stringField(row.conversationId, 'conversationId'),
+    conversationKind,
+    personaId: row.personaId === null ? null : stringField(row.personaId, 'personaId'),
+    visibility,
+  };
+}
+
+function decodeConversationMessage(value: unknown): ConversationMessageFeatureRecord {
+  const row = object(value, 'Conversation message');
+  if (row.role !== 'user' && row.role !== 'assistant' && row.role !== 'tool') {
+    throw new TypeError('Invalid conversation message role');
+  }
+  if (row.status !== 'active' && row.status !== 'revoked') {
+    throw new TypeError('Invalid conversation message status');
+  }
+  return {
+    id: stringField(row.id, 'message id'),
+    eventId: stringField(row.eventId, 'eventId'),
+    role: row.role,
+    content: stringField(row.content, 'message content', true),
+    occurredAt: timeField(row.occurredAt, 'occurredAt')!,
+    status: row.status,
+    ...(row.sourceRefs === undefined
+      ? {}
+      : { sourceRefs: decodeConversationSourceRefs(row.sourceRefs, 'message sourceRefs') }),
+    scope: decodeConversationResourceScope(row.scope),
+  };
+}
+
+function decodeConversationMemory(
+  value: unknown,
+  isHit: boolean,
+): ConversationMemoryFeatureRecord {
+  const row = object(value, 'Conversation memory');
+  const id = row.id === undefined || row.id === null ? undefined : stringField(row.id, 'memory id');
+  const memoryId = row.memoryId === undefined || row.memoryId === null
+    ? undefined
+    : stringField(row.memoryId, 'memoryId');
+  if (id === undefined && memoryId === undefined) throw new TypeError('Conversation memory omitted its identity');
+  const kinds = ['fact', 'preference', 'commitment', 'episode'] as const;
+  if (!kinds.includes(row.kind as typeof kinds[number])) throw new TypeError('Invalid conversation memory kind');
+  const state = row.state;
+  if (state !== undefined && !['active', 'invalidated', 'deleted'].includes(String(state))) {
+    throw new TypeError('Invalid conversation memory state');
+  }
+  if (!Array.isArray(row.sourceMessageIds) || row.sourceMessageIds.length > 32_768) {
+    throw new TypeError('Invalid conversation memory source message ids');
+  }
+  const memory: ConversationMemoryFeatureRecord = {
+    ...(id === undefined ? {} : { id }),
+    ...(memoryId === undefined ? {} : { memoryId }),
+    version: timeField(row.version, 'memory version')!,
+    kind: row.kind as ConversationMemoryFeatureRecord['kind'],
+    text: stringField(row.text, 'memory text', true),
+    sourceMessageIds: row.sourceMessageIds.map((item, index) => stringField(item, `sourceMessageIds[${index}]`)),
+    ...(row.sourceRefs === undefined
+      ? {}
+      : { sourceRefs: decodeConversationSourceRefs(row.sourceRefs, 'memory sourceRefs') }),
+    scope: decodeConversationResourceScope(row.scope),
+    ...(row.authorizationEpoch === undefined
+      ? {}
+      : { authorizationEpoch: timeField(row.authorizationEpoch, 'authorizationEpoch')! }),
+    ...(state === undefined ? {} : { state: state as ConversationMemoryFeatureRecord['state'] }),
+    ...(row.score === undefined ? {} : { score: finiteNumber(row.score, 'memory score') }),
+    ...(row.stale === undefined ? {} : { stale: booleanField(row.stale, 'memory stale') }),
+  };
+  if (!isHit && memory.state === undefined) {
+    throw new TypeError('Conversation memory record omitted its state');
+  }
+  return memory;
 }
 
 function decodeTask(value: unknown): TaskRecord {
@@ -779,6 +916,270 @@ export class WorkStateClient implements WorkStateStore {
       throw new TypeError('Authorized Work attachment does not match the requested artifact');
     }
     return { allowed, currentAuthorizationEpoch, artifact: record };
+  }
+
+  /** Read actor-scoped conversation counts and the current authorization epoch. */
+  async getConversationMemoryOverview(signal?: AbortSignal): Promise<{
+    readonly authorizationEpoch: number;
+    readonly counts: Readonly<{ messages: number; memories: number; sources: number }>;
+  }> {
+    const row = object(await this.requestAt(
+      `${this.workUrl}/conversation-memory/overview`,
+      'GET',
+      undefined,
+      undefined,
+      {},
+      undefined,
+      signal,
+    ), 'Conversation memory overview');
+    const counts = object(row.counts, 'Conversation memory counts');
+    return {
+      authorizationEpoch: timeField(row.authorizationEpoch, 'authorizationEpoch')!,
+      counts: {
+        messages: countField(counts.messages, 'message count'),
+        memories: countField(counts.memories, 'memory count'),
+        sources: countField(counts.sources, 'source count'),
+      },
+    };
+  }
+
+  /** Read one exact active message through the authenticated actor-scoped Work route. */
+  async getConversationMemoryMessage(input: {
+    readonly messageId: string;
+    readonly conversationId: string;
+    readonly conversationKind: 'direct' | 'group' | 'channel';
+    readonly personaId: string | null;
+  }, signal?: AbortSignal): Promise<ConversationMessageFeatureRecord | undefined> {
+    const query = new URLSearchParams({
+      conversationId: boundedString(input.conversationId, 'conversation id', 512),
+      conversationKind: input.conversationKind,
+    });
+    if (input.personaId !== null) query.set('personaId', boundedString(input.personaId, 'persona id', 512));
+    try {
+      const value = await this.requestAt(
+        `${this.workUrl}/conversation-memory/messages/${encodeURIComponent(boundedString(input.messageId, 'conversation message id', 512))}?${query}`,
+        'GET',
+        undefined,
+        undefined,
+        {},
+        undefined,
+        signal,
+      );
+      return decodeConversationMessage(value);
+    } catch (error: unknown) {
+      if (error instanceof WorkStateHttpError && error.status === 404) return undefined;
+      throw error;
+    }
+  }
+
+  /** Build the typed P2 API adapter for one already verified Work principal. */
+  conversationMemoryApiV1(actorId: string): ConversationMemoryApiV1 {
+    const expectedActor = boundedString(actorId, 'conversation memory actor id', 512).toLowerCase();
+    const base = `${this.workUrl}/conversation-memory`;
+    const assertScope = (context: TrustedTurnContext): void => {
+      if (context.workspaceId !== this.connection.workspaceId
+        || context.actorId.toLowerCase() !== expectedActor) {
+        throw new WorkStateHttpError(403, 'CONVERSATION_MEMORY_ACTOR_SCOPE_MISMATCH');
+      }
+      context.signal.throwIfAborted();
+    };
+    const cursorQuery = (input: {
+      readonly conversationId: string;
+      readonly conversationKind: string;
+      readonly order: 'desc';
+      readonly cursor?: string;
+      readonly limit: number;
+      readonly includeRevoked?: boolean;
+    }): string => {
+      const query = new URLSearchParams({
+        conversationId: input.conversationId,
+        conversationKind: input.conversationKind,
+        order: input.order,
+        limit: String(Math.min(input.limit, 100)),
+      });
+      if (input.cursor !== undefined) query.set('cursor', input.cursor);
+      if (input.includeRevoked !== undefined) query.set('includeRevoked', String(input.includeRevoked));
+      return query.toString();
+    };
+    const api: ConversationMemoryApiV1 = {
+      apiVersion: 1,
+      createMessage: async (context, input) => {
+        assertScope(context);
+        const receipt = object(await this.requestAt(
+          `${base}/messages`,
+          'POST',
+          input,
+          undefined,
+          {},
+          undefined,
+          context.signal,
+        ), 'Conversation message receipt');
+        if (typeof receipt.duplicate !== 'boolean') throw new TypeError('Invalid conversation message duplicate flag');
+        return {
+          message: decodeConversationMessage(receipt.message),
+          duplicate: receipt.duplicate,
+        };
+      },
+      listMessages: async (context, input) => {
+        assertScope(context);
+        const row = object(await this.requestAt(
+          `${base}/messages?${cursorQuery(input)}`,
+          'GET',
+          undefined,
+          undefined,
+          {},
+          undefined,
+          context.signal,
+        ), 'Conversation message page');
+        if (!Array.isArray(row.items)) throw new TypeError('Invalid conversation message page items');
+        const nextCursor = row.nextCursor === null || row.nextCursor === undefined
+          ? null
+          : stringField(row.nextCursor, 'conversation nextCursor');
+        return {
+          items: row.items.map(decodeConversationMessage),
+          nextCursor,
+        };
+      },
+      listMemories: async (context, input) => {
+        assertScope(context);
+        const query = new URLSearchParams({
+          conversationId: input.conversationId,
+          conversationKind: input.conversationKind,
+          state: input.state,
+          limit: String(Math.min(input.limit, 500)),
+        });
+        if (input.personaId !== null) query.set('personaId', input.personaId);
+        const row = object(await this.requestAt(
+          `${base}/memories?${query}`,
+          'GET',
+          undefined,
+          undefined,
+          {},
+          undefined,
+          context.signal,
+        ), 'Conversation memory page');
+        if (!Array.isArray(row.items)) throw new TypeError('Invalid conversation memory items');
+        return {
+          items: row.items.map(value => decodeConversationMemory(value, false)),
+          authorizationEpoch: timeField(row.authorizationEpoch, 'authorizationEpoch')!,
+        };
+      },
+      queryMemories: async (context, input) => {
+        assertScope(context);
+        const row = object(await this.requestAt(
+          `${base}/memories/query`,
+          'POST',
+          input,
+          undefined,
+          {},
+          undefined,
+          context.signal,
+        ), 'Conversation memory query result');
+        if (!Array.isArray(row.items)) throw new TypeError('Invalid conversation memory query items');
+        return {
+          items: row.items.map(value => decodeConversationMemory(value, true)),
+          authorizationEpoch: timeField(row.authorizationEpoch, 'authorizationEpoch')!,
+        };
+      },
+      createMemory: async (context, input) => {
+        assertScope(context);
+        const receipt = object(await this.requestAt(
+          `${base}/memories`,
+          'POST',
+          input,
+          undefined,
+          {},
+          undefined,
+          context.signal,
+        ), 'Conversation memory receipt');
+        if (typeof receipt.duplicate !== 'boolean') throw new TypeError('Invalid conversation memory duplicate flag');
+        return {
+          memory: decodeConversationMemory(receipt.memory, false),
+          duplicate: receipt.duplicate,
+        };
+      },
+      updateMemory: async (context, memoryId, input) => {
+        assertScope(context);
+        const receipt = object(await this.requestAt(
+          `${base}/memories/${encodeURIComponent(boundedString(memoryId, 'memory id', 512))}`,
+          'PATCH',
+          input,
+          undefined,
+          {},
+          undefined,
+          context.signal,
+        ), 'Conversation memory update receipt');
+        if (typeof receipt.duplicate !== 'boolean') throw new TypeError('Invalid conversation memory duplicate flag');
+        return {
+          memory: decodeConversationMemory(receipt.memory, false),
+          duplicate: receipt.duplicate,
+        };
+      },
+      deleteMemory: async (context, memoryId, expectedVersion) => {
+        assertScope(context);
+        const query = new URLSearchParams({ expectedVersion: String(expectedVersion) });
+        const receipt = object(await this.requestAt(
+          `${base}/memories/${encodeURIComponent(boundedString(memoryId, 'memory id', 512))}?${query}`,
+          'DELETE',
+          undefined,
+          undefined,
+          {},
+          undefined,
+          context.signal,
+        ), 'Conversation memory delete receipt');
+        if (typeof receipt.deleted !== 'boolean' || typeof receipt.duplicate !== 'boolean') {
+          throw new TypeError('Invalid conversation memory delete result');
+        }
+        return {
+          deleted: receipt.deleted,
+          duplicate: receipt.duplicate,
+          authorizationEpoch: timeField(receipt.authorizationEpoch, 'authorizationEpoch')!,
+        };
+      },
+      revokeSource: async (context, sourceId) => {
+        assertScope(context);
+        const receipt = object(await this.requestAt(
+          `${base}/sources/${encodeURIComponent(boundedString(sourceId, 'source id', 512))}/revoke`,
+          'POST',
+          {},
+          undefined,
+          {},
+          undefined,
+          context.signal,
+        ), 'Conversation source revocation receipt');
+        if (!Array.isArray(receipt.invalidatedMessageIds) || !Array.isArray(receipt.invalidatedMemoryIds)) {
+          throw new TypeError('Invalid conversation source invalidation result');
+        }
+        return {
+          sourceId: stringField(receipt.sourceId, 'sourceId'),
+          authorizationEpoch: timeField(receipt.authorizationEpoch, 'authorizationEpoch')!,
+          invalidatedCount: countField(receipt.invalidatedCount, 'invalidatedCount'),
+          invalidatedMessageIds: receipt.invalidatedMessageIds.map((item, index) => stringField(item, `invalidatedMessageIds[${index}]`)),
+          invalidatedMemoryIds: receipt.invalidatedMemoryIds.map((item, index) => stringField(item, `invalidatedMemoryIds[${index}]`)),
+        };
+      },
+      authorizeSources: async (context, input) => {
+        assertScope(context);
+        const receipt = object(await this.requestAt(
+          `${base}/sources/authorize`,
+          'POST',
+          input,
+          undefined,
+          {},
+          undefined,
+          context.signal,
+        ), 'Conversation source authorization');
+        if (typeof receipt.allowed !== 'boolean' || !Array.isArray(receipt.deniedSourceIds)) {
+          throw new TypeError('Invalid conversation source authorization receipt');
+        }
+        return {
+          allowed: receipt.allowed,
+          currentAuthorizationEpoch: timeField(receipt.currentAuthorizationEpoch, 'currentAuthorizationEpoch')!,
+          deniedSourceIds: receipt.deniedSourceIds.map((item, index) => stringField(item, `deniedSourceIds[${index}]`)),
+        };
+      },
+    };
+    return Object.freeze(api);
   }
 
   /** Read one actor-owned maintenance job for trusted DSH recovery and CAS. */

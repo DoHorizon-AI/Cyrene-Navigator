@@ -10,7 +10,7 @@ import { createServer } from 'node:http';
 import type { IncomingMessage, ServerResponse, Server } from 'node:http';
 import type { Context } from '@deepseek-ai/cordis';
 import { brandString } from '@deepseek-ai/dsh-brand';
-import type { Agent, AgentOptions, ModelSelection, ModelSelectionRef } from '@deepseek-ai/dsh-agent';
+import type { Agent, AgentHandle, AgentOptions, ModelSelection, ModelSelectionRef } from '@deepseek-ai/dsh-agent';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
 import type { TokenUsage } from '@deepseek-ai/dsh-llm';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
@@ -48,6 +48,15 @@ import type { ModelRoute } from './model-policy.js';
 import type { ConversationExecutionBackend } from './codebuddy-acp-execution.js';
 import type { WorkflowSourceTaskReceipt } from './workflows/store.js';
 import { getConnectorToolCatalog } from './tool-providers.js';
+import { VOLATILE_CONVERSATION_SESSION_PREFIX } from './persistence.js';
+import { ConversationFeatureError, createConversationMemoryFeature } from './features/conversation-memory.js';
+import type {
+  ConversationMemoryApiV1,
+  ConversationMemoryFeature,
+  ConversationSourceRef,
+  ConversationSummaryProviderV1,
+  TrustedTurnContext,
+} from './features/conversation-memory.js';
 
 export type TaskStatus = ExecutionStatus;
 export type TaskExecutionClass = 'foreground' | 'background';
@@ -64,6 +73,13 @@ export interface ExecuteTaskParams {
   readonly executionClass?: TaskExecutionClass;
   /** Host-owned provenance and policy facts persisted with the Work Task. */
   readonly metadata?: Readonly<Record<string, unknown>>;
+  /** Host-only browser ingress marker; the public request parser never accepts this field. */
+  readonly conversationOrigin?: {
+    readonly kind: 'web';
+    readonly conversationKind: 'direct';
+    readonly conversationId?: string;
+    readonly eventId?: string;
+  };
 }
 
 /** Host-only durable background task that invokes fixed registered tools without an LLM turn. */
@@ -150,6 +166,8 @@ interface InternalTaskState {
   record: TaskRecord;
   workState?: WorkStateStore;
   actorAadObjectId?: string;
+  /** DSH-only per-task session id; Work keeps the stable conversation session id. */
+  dshSessionId?: string;
   output: string;
   reasoning: string;
   blocked?: Map<string, Extract<ExecutorStreamEvent, { type: 'subagent-blocked' }>>;
@@ -161,6 +179,17 @@ interface InternalTaskState {
   modelSelection?: ModelSelectionRef;
   modelRoute?: ModelSelection;
   fixedToolTask?: boolean;
+  /** Active static-profile turn. Output remains private until its source gate passes. */
+  conversationTurn?: {
+    readonly feature: ConversationMemoryFeature;
+    readonly context: TrustedTurnContext;
+    readonly userEventId: string;
+    readonly userMessageId: string;
+    readonly sourceRefs: readonly ConversationSourceRef[];
+    assistantMessageId?: string;
+  };
+  conversationDeliveryText?: string;
+  conversationDeliveryHoldCode?: string;
   authorizationPause?: boolean;
   eventChain: Promise<void>;
   eventFailure?: unknown;
@@ -202,6 +231,11 @@ export interface ExecutorConfig {
     sessionId: string,
     operationId: string,
   ) => Promise<string>;
+  /** Enable the static actor-private conversation assistant profile for chat tasks. */
+  readonly conversationAssistant?: {
+    readonly enabled: boolean;
+    readonly personaId: string;
+  };
 }
 
 /** Process-local drain state; durable queued rows remain in the Work service. */
@@ -678,12 +712,16 @@ export class NavigatorExecutor {
       const timestamp = Date.now();
       if (chunk.type === 'text-delta' && chunk.text) {
         task.output += chunk.text;
-        this.publish(task, { type: 'text-delta', taskId: task.id, text: chunk.text, timestamp });
-        void this.patch(task, { output: task.output }).catch(() => undefined);
+        if (task.conversationTurn === undefined) {
+          this.publish(task, { type: 'text-delta', taskId: task.id, text: chunk.text, timestamp });
+          void this.patch(task, { output: task.output }).catch(() => undefined);
+        }
       } else if (chunk.type === 'reasoning-delta' && chunk.text) {
         task.reasoning += chunk.text;
-        this.publish(task, { type: 'reasoning-delta', taskId: task.id, text: chunk.text, timestamp });
-        void this.patch(task, { reasoning: task.reasoning }).catch(() => undefined);
+        if (task.conversationTurn === undefined) {
+          this.publish(task, { type: 'reasoning-delta', taskId: task.id, text: chunk.text, timestamp });
+          void this.patch(task, { reasoning: task.reasoning }).catch(() => undefined);
+        }
       } else if (chunk.type === 'usage' && task.modelRoute !== undefined) {
         void this.publish(task, {
           type: 'model-usage',
@@ -694,10 +732,12 @@ export class NavigatorExecutor {
           timestamp,
         }).catch(() => undefined);
       } else if (chunk.type === 'block-end' && chunk.block?.type === 'tool-call') {
-        this.publish(task, {
-          type: 'tool-call', taskId: task.id, callId: String(chunk.block.id),
-          tool: chunk.block.name, args: chunk.block.arguments, timestamp,
-        });
+        if (task.conversationTurn === undefined) {
+          this.publish(task, {
+            type: 'tool-call', taskId: task.id, callId: String(chunk.block.id),
+            tool: chunk.block.name, args: chunk.block.arguments, timestamp,
+          });
+        }
       }
     });
 
@@ -714,6 +754,7 @@ export class NavigatorExecutor {
       const task = taskId ? this.tasks.get(taskId) : undefined;
       if (!task || (task.record.status !== 'running' && task.record.status !== 'awaiting_user_authorization')) return;
       if (event.type === 'tool/result') {
+        if (task.conversationTurn !== undefined) return;
         const data = event.data as SessionEvent<'tool/result'>['data'];
         const blocks = data.message.content;
         const result = blocks.flatMap(block => block.type === 'text' ? [block.text] : []).join('');
@@ -1249,7 +1290,7 @@ export class NavigatorExecutor {
   /** Select persistence credentials only for an active verified task matching the private session owner. */
   workTokenEnvForSession(sessionId: string): string | undefined {
     const expectedActor = this.sessionActorById.get(sessionId);
-    const active = [...this.tasks.values()].find(task => task.sessionId === sessionId
+    const active = [...this.tasks.values()].find(task => (task.sessionId === sessionId || task.dshSessionId === sessionId)
       && task.actorAadObjectId !== undefined && !TERMINAL_STATUSES.has(task.record.status));
     if (expectedActor === undefined || active?.actorAadObjectId !== expectedActor) return undefined;
     return this.config.workActorClients?.tokenEnvForActor(expectedActor)
@@ -1261,7 +1302,8 @@ export class NavigatorExecutor {
   /** Identify actor-private persistence sessions without accepting caller-supplied task metadata. */
   actorPrivateSession(sessionId: string): boolean {
     return this.config.workActorClients !== undefined
-      && (sessionId.startsWith('teams-') || this.sessionActorById.has(sessionId));
+      && (sessionId.startsWith('teams-') || sessionId.startsWith(VOLATILE_CONVERSATION_SESSION_PREFIX)
+        || this.sessionActorById.has(sessionId));
   }
 
   /** Read task event receipts through its selected owner-scoped Work client. */
@@ -1437,7 +1479,18 @@ export class NavigatorExecutor {
       ? undefined
       : normalizeExecutionClass(params.executionClass);
     const executionClass = requestedExecutionClass ?? 'foreground';
-    const metadata = params.metadata === undefined ? undefined : normalizeTaskMetadata(params.metadata);
+    const metadataValue: Record<string, unknown> = params.metadata === undefined
+      ? {}
+      : { ...params.metadata };
+    if (params.conversationOrigin !== undefined) {
+      if (metadataValue.navigatorConversationOrigin !== undefined) {
+        throw new TypeError('Conversation ingress provenance is host-owned');
+      }
+      metadataValue.navigatorConversationOrigin = params.conversationOrigin;
+    }
+    const metadata = Object.keys(metadataValue).length === 0
+      ? undefined
+      : normalizeTaskMetadata(metadataValue);
     if (params.timeoutMs !== undefined && (!Number.isSafeInteger(params.timeoutMs) || params.timeoutMs <= 0)) {
       throw new TypeError('timeoutMs must be a positive integer');
     }
@@ -1633,6 +1686,7 @@ export class NavigatorExecutor {
       ? undefined
       : setTimeout(() => task.abortController.abort(new Error(`Task timed out after ${timeoutMs}ms`)), timeoutMs);
     let disposeContinuationGuard: (() => void) | undefined;
+    let ownedAgentHandle: AgentHandle | undefined;
     let claimed = false;
     try {
       task.abortController.signal.throwIfAborted();
@@ -1644,6 +1698,12 @@ export class NavigatorExecutor {
         return outcome(claim.task);
       }
       claimed = true;
+      if (this.config.conversationAssistant?.enabled === true && task.actorAadObjectId === undefined
+        && task.record.createdByActorId !== undefined) {
+        task.actorAadObjectId = uuidText(task.record.createdByActorId, 'conversation assistant Work actor');
+        this.taskActorById.set(task.id, task.actorAadObjectId);
+        this.sessionActorById.set(task.sessionId, task.actorAadObjectId);
+      }
       task.blocked = await this.readBlockedReceipts(task.id, workState);
       const startedAt = claim.task.startedAt ?? Date.now();
       await this.flushEvents(task);
@@ -1665,19 +1725,28 @@ export class NavigatorExecutor {
       const agentOptions: AgentOptions = defaultSelection
         ? { provider: defaultSelection.provider, model: defaultSelection.model }
         : {};
+      const volatileConversationTurn = this.config.conversationAssistant?.enabled === true
+        && isTrustedConversationAssistantTask(task.record);
+      const sessionId = brandString<SessionId>(volatileConversationTurn
+        ? `${VOLATILE_CONVERSATION_SESSION_PREFIX}${randomUUID()}`
+        : task.sessionId);
+      if (volatileConversationTurn) {
+        task.dshSessionId = sessionId;
+        this.activeTaskBySessionId.set(sessionId, task.id);
+        if (task.actorAadObjectId !== undefined) this.sessionActorById.set(sessionId, task.actorAadObjectId);
+      }
       let selectionRef: ModelSelectionRef | undefined;
       const setup = (agentCtx: Context): void => {
         if (defaultSelection === undefined) return;
         selectionRef = { current: defaultSelection, assembled: undefined };
-        this.installAgentModelSelection(agentCtx, selectionRef, task.sessionId);
+        this.installAgentModelSelection(agentCtx, selectionRef, sessionId);
       };
 
-      const sessionId = brandString<SessionId>(task.sessionId);
-      const existing = agents.get(sessionId);
+      const existing = volatileConversationTurn ? undefined : agents.get(sessionId);
       let agent: Agent;
       if (existing) agent = existing;
       else {
-        const persisted = this.ctx.get('sessionPersistence')
+        const persisted = !volatileConversationTurn && this.ctx.get('sessionPersistence')
           ? await this.ctx.sessionPersistence.stat(sessionId, { signal: task.abortController.signal })
           : undefined;
         const handle = persisted
@@ -1689,13 +1758,14 @@ export class NavigatorExecutor {
             setup,
             signal: task.abortController.signal,
           });
+        if (volatileConversationTurn) ownedAgentHandle = handle;
         agent = handle.agent;
       }
 
       selectionRef ??= this.agentModelSelections.get(agent);
       if (selectionRef === undefined && defaultSelection !== undefined) {
         selectionRef = { current: defaultSelection, assembled: undefined };
-        this.installAgentModelSelection(agent.ctx, selectionRef, task.sessionId);
+        this.installAgentModelSelection(agent.ctx, selectionRef, sessionId);
       }
       if (selectionRef !== undefined && defaultSelection !== undefined) {
         // A newly admitted task uses the configured default; a failure may move this live Session to a backup.
@@ -1708,6 +1778,7 @@ export class NavigatorExecutor {
       this.agentTaskMap.set(agent, task.id);
       this.sessionTaskMap.set(agent.session, task.id);
       this.activeTaskBySessionId.set(task.sessionId, task.id);
+      this.activeTaskBySessionId.set(sessionId, task.id);
       if (isReadOnlyContinuation(task.record)) {
         // Agent-scoped guards are inherited by child-agent contexts, without blocking unrelated sessions.
         disposeContinuationGuard = agent.ctx.tools.guard(execution => {
@@ -1718,8 +1789,9 @@ export class NavigatorExecutor {
         });
       }
       task.abortController.signal.throwIfAborted();
+      const conversationPrompt = await this.beginConversationAssistantTurn(task, params.prompt);
       agent.followup(createUserMessage({
-        content: [{ type: 'text', text: params.prompt }],
+        content: [{ type: 'text', text: conversationPrompt }],
         source: { kind: 'user' },
       }));
 
@@ -1744,20 +1816,51 @@ export class NavigatorExecutor {
       if (TERMINAL_STATUSES.has(task.record.status)) return outcome(task.record);
 
       if (!task.output) task.output = this.extractLatestAssistantText(agent.session);
+      const preliminaryStatus: TaskStatus = task.abortController.signal.aborted
+        ? 'aborted'
+        : task.agentError || (task.blocked?.size ?? 0) > 0 ? 'failed' : 'completed';
+      if (task.conversationTurn !== undefined) {
+        const assistantText = this.extractLatestAssistantText(agent.session);
+        if (preliminaryStatus === 'completed' && assistantText.length > 0) {
+          task.output = assistantText;
+          const decision = await this.finishConversationAssistantTurn(task, assistantText);
+          if (decision === 'allow') {
+            task.conversationDeliveryText = assistantText;
+          } else {
+            task.conversationDeliveryHoldCode = decision;
+            task.output = '';
+            task.reasoning = '';
+          }
+        } else {
+          task.output = '';
+        }
+        task.reasoning = '';
+      }
       const finishedAt = Date.now();
       const isAborted = task.abortController.signal.aborted;
       // Let the agent finish all remaining work before reporting partial failure.
       // 中文：先完成其余可执行工作，再汇总无法执行项并记录部分失败。
       task.output = appendBlockedSummary(task.output, task.blocked);
       const hasBlocked = (task.blocked?.size ?? 0) > 0;
-      const status: TaskStatus = isAborted ? 'aborted' : task.agentError || hasBlocked ? 'failed' : 'completed';
-      const error = task.error ?? task.agentError ?? (isAborted ? 'Task was cancelled'
+      const status: TaskStatus = isAborted ? 'aborted'
+        : task.agentError || hasBlocked || task.conversationDeliveryHoldCode !== undefined ? 'failed' : 'completed';
+      if (task.conversationTurn !== undefined && status !== 'completed') {
+        task.output = '';
+        task.reasoning = '';
+      }
+      const error = task.error ?? task.conversationDeliveryHoldCode ?? task.agentError ?? (isAborted ? 'Task was cancelled'
         : hasBlocked ? '部分子任务无法执行；已继续完成其余可执行工作，详见结果中的无法执行项。' : undefined);
       const durationMs = finishedAt - (task.record.startedAt ?? task.record.createdAt);
       await this.patch(task, {
         status, output: task.output, reasoning: task.reasoning,
         ...(error === undefined ? {} : { error }),
       });
+      if (status === 'completed' && task.conversationDeliveryText !== undefined) {
+        await this.publish(task, {
+          type: 'text-delta', taskId: task.id, text: task.conversationDeliveryText, timestamp: Date.now(),
+        });
+        task.conversationDeliveryText = undefined;
+      }
       await this.publish(task, {
         type: 'status', taskId: task.id, sessionId: task.sessionId, status, timestamp: finishedAt,
       });
@@ -1799,7 +1902,14 @@ export class NavigatorExecutor {
           : task.record.error ?? 'Exchange connection authorization is required. Progress is preserved and automatic replay is disabled.'
         : isAborted ? abortMessage(task.abortController.signal.reason) : safeErrorMessage(err));
       const durationMs = endedAt - (task.record.startedAt ?? task.record.createdAt);
+      if (task.record.status !== 'completed' && task.conversationTurn?.assistantMessageId !== undefined) {
+        await this.revokeUnsentConversationAssistantMessage(task, task.output).catch(() => undefined);
+      }
       task.output ||= task.agent ? this.extractLatestAssistantText(task.agent.session) : '';
+      if (task.conversationTurn !== undefined) {
+        task.output = '';
+        task.reasoning = '';
+      }
       task.output = appendBlockedSummary(task.output, task.blocked);
       try {
         // Close a failed write chain with an independent terminal reconciliation.
@@ -1829,6 +1939,378 @@ export class NavigatorExecutor {
     } finally {
       disposeContinuationGuard?.();
       if (timeoutId !== undefined) clearTimeout(timeoutId);
+      if (ownedAgentHandle !== undefined) {
+        if (task.agent !== undefined) {
+          if (this.agentTaskMap.get(task.agent) === task.id) this.agentTaskMap.delete(task.agent);
+          if (this.sessionTaskMap.get(task.agent.session) === task.id) this.sessionTaskMap.delete(task.agent.session);
+        }
+        await ownedAgentHandle.dispose().catch(() => undefined);
+        task.agent = undefined;
+      }
+      const volatileSessionId = task.dshSessionId;
+      if (volatileSessionId !== undefined) {
+        if (this.activeTaskBySessionId.get(volatileSessionId) === task.id) this.activeTaskBySessionId.delete(volatileSessionId);
+        if (task.actorAadObjectId !== undefined
+          && this.sessionActorById.get(volatileSessionId) === task.actorAadObjectId) {
+          this.sessionActorById.delete(volatileSessionId);
+        }
+        task.dshSessionId = undefined;
+      }
+    }
+  }
+
+  /** Persist and authorize one actor-private conversation turn before it enters DSH context. */
+  private async beginConversationAssistantTurn(task: InternalTaskState, prompt: string): Promise<string> {
+    const profile = this.config.conversationAssistant;
+    if (profile?.enabled !== true) return prompt;
+    if (!isTrustedConversationAssistantTask(task.record)) return prompt;
+    if (this.config.conversationBackend !== undefined) {
+      throw new ExecutorRequestError(
+        503,
+        'CONVERSATION_ASSISTANT_BACKEND_UNAVAILABLE',
+        'The conversation assistant profile requires the configured DSH model runtime.',
+      );
+    }
+
+    const workState = task.workState ?? this.config.workState;
+    const actorId = task.actorAadObjectId ?? task.record.createdByActorId;
+    if (actorId === undefined || task.record.createdByActorId?.toLowerCase() !== actorId.toLowerCase()) {
+      throw new ExecutorRequestError(
+        403,
+        'CONVERSATION_ASSISTANT_ACTOR_UNVERIFIED',
+        'The persisted Work Task has no matching server-derived actor identity.',
+      );
+    }
+    if (this.config.workActorClients !== undefined
+      && this.config.workActorClients.forActor(actorId) !== workState) {
+      throw new ExecutorRequestError(
+        403,
+        'CONVERSATION_ASSISTANT_ACTOR_SCOPE_MISMATCH',
+        'The Work Task is not bound to its dedicated actor Work principal.',
+      );
+    }
+    const api: ConversationMemoryApiV1 | undefined = workState.conversationMemoryApiV1?.(actorId);
+    const overview = await workState.getConversationMemoryOverview?.(task.abortController.signal);
+    if (api === undefined || overview === undefined) {
+      throw new ExecutorRequestError(
+        503,
+        'CONVERSATION_MEMORY_API_UNAVAILABLE',
+        'The actor-scoped conversation memory Work API is unavailable.',
+      );
+    }
+
+    const metadata = task.record.metadata ?? {};
+    const thread = metadata.teamsThread;
+    const ingress = metadata.conversationIngress;
+    const isTeamsPrivate = task.record.origin?.kind === 'teams_private';
+    const origin = metadata.navigatorConversationOrigin;
+    const originRow = origin !== null && typeof origin === 'object' && !Array.isArray(origin)
+      ? origin as Record<string, unknown>
+      : undefined;
+    const isWeb = originRow?.kind === 'web' && originRow.conversationKind === 'direct';
+    const isTeamsGroup = originRow?.kind === 'teams_channel' && originRow.conversationKind === 'group'
+      && thread !== null && typeof thread === 'object' && !Array.isArray(thread);
+    if (task.executionClass !== 'foreground' || (!isTeamsPrivate && !isTeamsGroup && !isWeb)) return prompt;
+    const conversationKind = isTeamsGroup ? 'group' as const : 'direct' as const;
+    const visibility = isTeamsGroup ? 'conversation' as const : 'private' as const;
+    const ingressRow = (isTeamsPrivate || isTeamsGroup)
+      && ingress !== null && typeof ingress === 'object' && !Array.isArray(ingress)
+      ? ingress as Record<string, unknown>
+      : undefined;
+    const ingressEventId = typeof ingressRow?.eventId === 'string' ? ingressRow.eventId : undefined;
+    const ingressContent = typeof ingressRow?.content === 'string' ? ingressRow.content : undefined;
+    const originEventId = isWeb && typeof originRow?.eventId === 'string' ? originRow.eventId : undefined;
+    const userEventId = originEventId ?? ingressEventId
+      ?? (isTeamsPrivate ? `teams-private-${task.record.origin!.messageId}` : `navigator-task-${task.id}`);
+    if (userEventId.length < 1 || userEventId.length > 512 || /[\u0000-\u001f\u007f]/u.test(userEventId)) {
+      throw new ExecutorRequestError(422, 'CONVERSATION_INGRESS_INVALID', 'Conversation event identity is invalid.');
+    }
+    const userText = ingressContent ?? prompt;
+    if (userText.length < 1 || Buffer.byteLength(userText, 'utf8') > 32_000) {
+      throw new ExecutorRequestError(422, 'CONVERSATION_INGRESS_INVALID', 'Conversation message content is invalid.');
+    }
+    const conversationId = isWeb && typeof originRow?.conversationId === 'string'
+      ? originRow.conversationId
+      : task.sessionId;
+    const sourceId = isTeamsPrivate
+      ? task.record.origin!.messageId
+      : isTeamsGroup && typeof (thread as Record<string, unknown>).threadId === 'string'
+      ? (thread as Record<string, unknown>).threadId as string
+        : task.id;
+    const context: TrustedTurnContext = {
+      taskId: task.id,
+      sessionId: task.sessionId,
+      workspaceId: this.config.workspaceId,
+      actorId: actorId.toLowerCase(),
+      conversationId,
+      conversationKind,
+      personaId: profile.personaId,
+      visibility,
+      authorizationEpoch: overview.authorizationEpoch,
+      origin: {
+        kind: isTeamsPrivate ? 'teams_private' : isTeamsGroup ? 'teams_thread' : 'web',
+        sourceId,
+        externalEventId: userEventId,
+      },
+      signal: task.abortController.signal,
+    };
+
+    const event = await api.createMessage(context, {
+      eventId: userEventId,
+      conversationId,
+      conversationKind,
+      personaId: profile.personaId,
+      visibility,
+      role: 'user',
+      content: userText,
+      occurredAt: task.record.createdAt,
+    });
+    if (event.message.eventId !== userEventId || event.message.role !== 'user'
+      || event.message.scope.conversationId !== conversationId
+      || event.message.scope.conversationKind !== conversationKind
+      || event.message.scope.personaId !== profile.personaId) {
+      throw new ExecutorRequestError(
+        502,
+        'CONVERSATION_MESSAGE_SCOPE_MISMATCH',
+        'The conversation Work API returned a message outside the trusted turn scope.',
+      );
+    }
+
+    const historical = await api.listMessages(context, {
+      conversationId,
+      conversationKind,
+      order: 'desc',
+      limit: 100,
+    });
+    const candidates: {
+      readonly message: (typeof historical.items)[number];
+      readonly refs: readonly ConversationSourceRef[];
+    }[] = [];
+    let historyCharacters = 0;
+    let historySourceIds = 0;
+    for (const message of historical.items) {
+      if (message.status !== 'active' || message.eventId === userEventId
+        || message.scope.conversationId !== conversationId
+        || message.scope.conversationKind !== conversationKind
+        || message.scope.personaId !== profile.personaId
+        || (message.role !== 'user' && message.role !== 'assistant')) continue;
+      const refs = message.sourceRefs ?? [];
+      if (candidates.length >= 48 || historyCharacters + message.content.length > 16_000) continue;
+      const messageSourceCount = refs.reduce((count, ref) => count + ref.sourceMessageIds.length, 0);
+      if (candidates.reduce((count, item) => count + item.refs.length, 0) + refs.length > 256
+        || historySourceIds + messageSourceCount > 32_768) continue;
+      candidates.push({ message, refs });
+      historyCharacters += message.content.length;
+      historySourceIds += messageSourceCount;
+    }
+    const allHistoryRefs = candidates.flatMap(item => item.refs);
+    const authorizedHistory: { role: 'user' | 'assistant'; content: string; occurredAt: number }[] = [];
+    const historySourceRefs: ConversationSourceRef[] = [];
+    let historyAllowed = true;
+    if (allHistoryRefs.length > 0) {
+      const proof = await api.authorizeSources(context, {
+        conversationId,
+        conversationKind,
+        authorizationEpoch: context.authorizationEpoch,
+        personaId: profile.personaId,
+        sourceRefs: allHistoryRefs,
+      });
+      if (proof.currentAuthorizationEpoch !== context.authorizationEpoch) {
+        throw new ExecutorRequestError(
+          409,
+          'CONVERSATION_AUTHORIZATION_EPOCH_CHANGED',
+          'Conversation source authorization changed while history was being prepared.',
+        );
+      }
+      historyAllowed = proof.allowed;
+    }
+    for (const candidate of candidates) {
+      let allowed = historyAllowed || candidate.refs.length === 0;
+      if (!historyAllowed && candidate.refs.length > 0) {
+        const proof = await api.authorizeSources(context, {
+          conversationId,
+          conversationKind,
+          authorizationEpoch: context.authorizationEpoch,
+          personaId: profile.personaId,
+          sourceRefs: candidate.refs,
+        });
+        if (proof.currentAuthorizationEpoch !== context.authorizationEpoch) {
+          throw new ExecutorRequestError(
+            409,
+            'CONVERSATION_AUTHORIZATION_EPOCH_CHANGED',
+            'Conversation source authorization changed while history was being prepared.',
+          );
+        }
+        allowed = proof.allowed;
+      }
+      if (!allowed) continue;
+      authorizedHistory.push({
+        role: candidate.message.role as 'user' | 'assistant',
+        content: candidate.message.content,
+        occurredAt: candidate.message.occurredAt,
+      });
+      historySourceRefs.push(...candidate.refs);
+    }
+
+    const summaryProvider: ConversationSummaryProviderV1 = {
+      apiVersion: 1,
+      summarize: async input => {
+        input.signal.throwIfAborted();
+        const agent = task.agent;
+        const selection = task.modelSelection?.current;
+        if (agent === undefined || selection === undefined) {
+          throw new ConversationFeatureError('MODEL_UNAVAILABLE', 'The active DSH model route is unavailable');
+        }
+        const sourceText = input.messages.map(message =>
+          `${message.role} (${new Date(message.occurredAt).toISOString()}): ${message.content}`
+        ).join('\n');
+        if (Buffer.byteLength(sourceText, 'utf8') > 48_000) {
+          throw new ConversationFeatureError('MODEL_UNAVAILABLE', 'Conversation summary input exceeds the bounded model request');
+        }
+        const stream = agent.ctx.llm.stream({
+          provider: selection.provider,
+          model: selection.model,
+          ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort }),
+          system: 'Summarize only durable facts, preferences, commitments, and unresolved points explicitly present in the supplied conversation. Preserve uncertainty. Do not infer identity or add advice. Return only a concise summary.',
+          messages: [{ role: 'user', content: [{ type: 'text', text: sourceText }] }],
+          temperature: 0.1,
+          maxTokens: 512,
+          signal: input.signal,
+          sessionId: brandString<SessionId>(task.sessionId),
+        });
+        let summary = '';
+        for await (const chunk of stream) {
+          input.signal.throwIfAborted();
+          if (chunk.type === 'text-delta') summary += chunk.text;
+          if (Buffer.byteLength(summary, 'utf8') > 8_000) {
+            throw new ConversationFeatureError('MODEL_UNAVAILABLE', 'Conversation summary exceeded its bounded output');
+          }
+        }
+        const normalized = summary.trim();
+        if (!normalized) {
+          throw new ConversationFeatureError('MODEL_UNAVAILABLE', 'The configured model returned an empty conversation summary');
+        }
+        return normalized;
+      },
+    };
+    const feature = createConversationMemoryFeature({ api, summaryProvider });
+    const contextResult = await feature.beforeContext(context, { query: userText });
+    const userSourceRef: ConversationSourceRef = {
+      memoryId: null,
+      memoryVersion: null,
+      sourceMessageIds: [event.message.id],
+    };
+    const sourceRefs = [
+      userSourceRef,
+      ...historySourceRefs,
+      ...contextResult.contributions.flatMap(contribution => contribution.sourceRefs),
+    ];
+    const totalSourceMessageIds = sourceRefs.reduce((count, ref) => count + ref.sourceMessageIds.length, 0);
+    if (sourceRefs.length > 256 || totalSourceMessageIds > 32_768) {
+      throw new ExecutorRequestError(
+        422,
+        'CONVERSATION_SOURCE_PROOF_LIMIT_EXCEEDED',
+        'The complete conversation source lineage exceeds the supported safe bound.',
+      );
+    }
+    task.conversationTurn = {
+      feature,
+      context,
+      userEventId,
+      userMessageId: event.message.id,
+      sourceRefs,
+    };
+    const promptParts: string[] = [];
+    if (authorizedHistory.length > 0) {
+      promptParts.push(`Prior authorized conversation:\n${authorizedHistory.reverse()
+        .map(message => `${message.role}: ${message.content}`).join('\n\n')}`);
+    }
+    if (contextResult.contributions.length > 0) {
+      promptParts.push(`Authorized conversation memory:\n${contextResult.contributions
+        .map(contribution => contribution.content).join('\n')}`);
+    }
+    promptParts.push(`Current user message:\n${userText}`);
+    return promptParts.join('\n\n');
+  }
+
+  /** Archive a completed turn, then perform the authoritative final source check. */
+  private async finishConversationAssistantTurn(task: InternalTaskState, assistantText: string): Promise<'allow' | string> {
+    const turn = task.conversationTurn;
+    if (turn === undefined) return 'allow';
+    const decision = await turn.feature.beforeDelivery(turn.context, {
+      text: assistantText,
+      sourceRefs: turn.sourceRefs,
+    });
+    if (decision.decision !== 'allow') {
+      return decision.code ?? 'SOURCE_AUTHORIZATION_UNAVAILABLE';
+    }
+    try {
+      await turn.feature.afterTurn(turn.context, {
+        userEventId: turn.userEventId,
+        assistantText,
+        status: 'completed',
+        sourceRefs: turn.sourceRefs,
+      });
+      const workState = task.workState ?? this.config.workState;
+      const api = workState.conversationMemoryApiV1?.(turn.context.actorId);
+      if (api === undefined) {
+        throw new ExecutorRequestError(
+          503,
+          'CONVERSATION_MEMORY_API_UNAVAILABLE',
+          'The actor-scoped conversation API disappeared before delivery.',
+        );
+      }
+      const page = await api.listMessages(turn.context, {
+        conversationId: turn.context.conversationId,
+        conversationKind: turn.context.conversationKind,
+        order: 'desc',
+        limit: 10,
+      });
+      const message = page.items.find(item => item.role === 'assistant' && item.content === assistantText
+        && item.scope.conversationId === turn.context.conversationId
+        && item.scope.personaId === turn.context.personaId);
+      if (message === undefined) {
+        throw new ExecutorRequestError(
+          502,
+          'CONVERSATION_ASSISTANT_MESSAGE_UNAVAILABLE',
+          'The Work API did not return the exact current assistant message after archival.',
+        );
+      }
+      turn.assistantMessageId = message.id;
+      const finalDecision = await turn.feature.beforeDelivery(turn.context, {
+        text: assistantText,
+        sourceRefs: turn.sourceRefs,
+      });
+      if (finalDecision.decision !== 'allow') {
+        await api.revokeSource(turn.context, message.id);
+        turn.assistantMessageId = undefined;
+        return finalDecision.code ?? 'SOURCE_AUTHORIZATION_UNAVAILABLE';
+      }
+      return 'allow';
+    } catch (error: unknown) {
+      await this.revokeUnsentConversationAssistantMessage(task, assistantText);
+      throw error;
+    }
+  }
+
+  private async revokeUnsentConversationAssistantMessage(task: InternalTaskState, assistantText: string): Promise<void> {
+    const turn = task.conversationTurn;
+    if (turn === undefined) return;
+    const workState = task.workState ?? this.config.workState;
+    const api = workState.conversationMemoryApiV1?.(turn.context.actorId);
+    if (api === undefined) return;
+    try {
+      const messageId = turn.assistantMessageId ?? (await api.listMessages(turn.context, {
+        conversationId: turn.context.conversationId,
+        conversationKind: turn.context.conversationKind,
+        order: 'desc',
+        limit: 10,
+      })).items.find(item => item.role === 'assistant' && item.content === assistantText
+        && item.scope.conversationId === turn.context.conversationId
+        && item.scope.personaId === turn.context.personaId)?.id;
+      if (messageId !== undefined) await api.revokeSource(turn.context, messageId);
+    } catch {
+      // The task remains held; a later source-authorization pass fails closed if cleanup is unavailable.
     }
   }
 
@@ -2245,7 +2727,8 @@ export class NavigatorExecutor {
     const taskId = this.activeTaskBySessionId.get(sessionId);
     if (taskId === undefined) return undefined;
     const task = this.tasks.get(taskId);
-    if (!task || task.sessionId !== sessionId || TERMINAL_STATUSES.has(task.record.status)) return undefined;
+    if (!task || (task.sessionId !== sessionId && task.dshSessionId !== sessionId)
+      || TERMINAL_STATUSES.has(task.record.status)) return undefined;
     return task.agent !== undefined || this.config.conversationBackend !== undefined ? task.id : undefined;
   }
 
@@ -2550,6 +3033,10 @@ export class NavigatorExecutor {
         prompt: buildTeamsTaskPrompt(priorThread?.messages ?? [], normalized.text, normalized.actorSubject),
         title: 'Teams request',
         metadata: {
+          navigatorConversationOrigin: {
+            kind: 'teams_channel',
+            conversationKind: 'group',
+          },
           teamsCaller: {
             issuer: normalized.actorIssuer,
             subject: normalized.actorSubject,
@@ -2563,6 +3050,10 @@ export class NavigatorExecutor {
             channelId: normalized.route.channelId,
             conversationId: normalized.route.conversationId,
             rootThreadId: normalized.route.rootThreadId,
+          },
+          conversationIngress: {
+            eventId,
+            content: normalized.text,
           },
           notification: {
             type: 'teams.message',
@@ -2675,7 +3166,17 @@ export class NavigatorExecutor {
         sessionId,
         prompt: normalized.text,
         title: 'Private Teams request',
-        metadata: {},
+        metadata: {
+          conversationIngress: {
+            eventId: `teams-private-event-${sha256(canonicalJson({
+              tenantId: normalized.tenantId,
+              botAppId: normalized.botAppId,
+              actorAadObjectId: normalized.actorSubject,
+              messageId: normalized.messageId,
+            }))}`,
+            content: normalized.text,
+          },
+        },
       },
     });
     if (receipt.task !== undefined) {
@@ -2948,6 +3449,7 @@ export class NavigatorExecutor {
       const route = readTeamsNotificationRoute(notification.payload);
       if (route.tenantId !== caller.tenantId) throw new TypeError('Teams notification tenant does not match its task actor');
       const text = boundedTeamsMessageText(notification.payload.text, 'Teams notification text', 20_000);
+      await this.authorizeConversationTaskDelivery(workState, task, expectedActorId, text);
       const conversation = {
         tenantId: route.tenantId,
         teamId: route.teamId,
@@ -3045,6 +3547,7 @@ export class NavigatorExecutor {
       if (!authorized.includes(route.actorAadObjectId)) throw new TypeError('Private notification owner is no longer authorized');
       const serviceUrl = validateTeamsServiceUrl(route.serviceUrl, route.tenantId);
       const text = boundedTeamsMessageText(notification.payload.text, 'private notification text', 20_000);
+      await this.authorizeConversationTaskDelivery(workState, task, route.actorAadObjectId, text);
       const retryCount = notification.result.retryCount ?? 0;
       if (typeof retryCount !== 'number' || !Number.isSafeInteger(retryCount) || retryCount < 0) {
         throw new TypeError('Private notification retry counter is invalid');
@@ -3095,6 +3598,93 @@ export class NavigatorExecutor {
       const uncertain = providerCallStarted && isUncertainConnectorOutcome(error);
       await finish.call(this.config.workState, notification.id, lease.leaseToken,
         uncertain ? 'uncertain' : 'failed', { code: safeErrorCode(error) }).catch(() => undefined);
+    }
+  }
+
+  /** Recheck the persisted assistant event immediately before an asynchronous Teams send. */
+  private async authorizeConversationTaskDelivery(
+    workState: WorkStateStore,
+    task: TaskRecord,
+    expectedActorId: string | undefined,
+    text: string,
+  ): Promise<void> {
+    if (this.config.conversationAssistant?.enabled !== true) return;
+    const actorId = task.createdByActorId?.toLowerCase();
+    if (task.status !== 'completed' || actorId === undefined
+      || (expectedActorId !== undefined && actorId !== expectedActorId.toLowerCase())) {
+      throw new ExecutorRequestError(
+        409,
+        'CONVERSATION_ASSISTANT_REPLY_NOT_READY',
+        'A conversation-assistant reply without a completed actor-owned Work Task cannot be delivered.',
+      );
+    }
+    if (this.config.workActorClients !== undefined
+      && this.config.workActorClients.forActor(actorId) !== workState) {
+      throw new ExecutorRequestError(
+        403,
+        'CONVERSATION_ASSISTANT_ACTOR_SCOPE_MISMATCH',
+        'The Teams reply is not bound to its dedicated actor Work principal.',
+      );
+    }
+    const api = workState.conversationMemoryApiV1?.(actorId);
+    const overview = await workState.getConversationMemoryOverview?.(AbortSignal.timeout(10_000));
+    if (api === undefined || overview === undefined) {
+      throw new ExecutorRequestError(
+        503,
+        'CONVERSATION_MEMORY_API_UNAVAILABLE',
+        'Current conversation source authorization is unavailable at Teams delivery.',
+      );
+    }
+    const metadata = task.metadata ?? {};
+    const isGroup = metadata.teamsThread !== undefined;
+    const conversationKind = isGroup ? 'group' as const : 'direct' as const;
+    const visibility = isGroup ? 'conversation' as const : 'private' as const;
+    const profile = this.config.conversationAssistant;
+    const signal = AbortSignal.timeout(10_000);
+    const context: TrustedTurnContext = {
+      taskId: task.id,
+      sessionId: task.sessionId,
+      workspaceId: this.config.workspaceId,
+      actorId,
+      conversationId: task.sessionId,
+      conversationKind,
+      personaId: profile.personaId,
+      visibility,
+      authorizationEpoch: overview.authorizationEpoch,
+      signal,
+    };
+    const page = await api.listMessages(context, {
+      conversationId: context.conversationId,
+      conversationKind,
+      order: 'desc',
+      limit: 20,
+    });
+    const response = page.items.find(message => message.role === 'assistant' && message.content === text
+      && message.scope.conversationId === context.conversationId
+      && message.scope.conversationKind === conversationKind
+      && message.scope.personaId === profile.personaId
+      && message.scope.visibility === visibility);
+    if (response === undefined) {
+      throw new ExecutorRequestError(
+        409,
+        'CONVERSATION_ASSISTANT_RESPONSE_SOURCE_MISSING',
+        'The exact assistant response has no active Work source record.',
+      );
+    }
+    const authorization = await api.authorizeSources(context, {
+      conversationId: context.conversationId,
+      conversationKind,
+      authorizationEpoch: overview.authorizationEpoch,
+      personaId: profile.personaId,
+      sourceRefs: response.sourceRefs ?? [],
+    });
+    if (!authorization.allowed || authorization.currentAuthorizationEpoch !== context.authorizationEpoch) {
+      await api.revokeSource(context, response.id).catch(() => undefined);
+      throw new ExecutorRequestError(
+        409,
+        'CONVERSATION_ASSISTANT_SOURCE_REVOKED',
+        'Conversation sources changed before the Teams reply could be sent.',
+      );
     }
   }
 
@@ -3455,6 +4045,70 @@ export class NavigatorExecutor {
         const body = await this.readJsonBody(req);
         const record = await this.startTask(taskParams(body));
         this.sendJson(res, 202, record);
+        return;
+      }
+      if (method === 'POST' && url.pathname === '/api/v1/conversation-assistant/turns') {
+        if (this.config.conversationAssistant?.enabled !== true) {
+          throw new ExecutorRequestError(
+            503,
+            'CONVERSATION_ASSISTANT_UNAVAILABLE',
+            'The static conversation-assistant profile is not enabled.',
+          );
+        }
+        const idempotencyKey = req.headers['idempotency-key'];
+        if (typeof idempotencyKey !== 'string' || !/^[\x21-\x7e]{1,200}$/u.test(idempotencyKey)) {
+          throw new ExecutorRequestError(400, 'IDEMPOTENCY_KEY_REQUIRED', 'A bounded Idempotency-Key is required.');
+        }
+        const body = await this.readJsonBody(req);
+        if (!isExactObjectKeys(body, ['conversationId', 'text'])) {
+          throw new ExecutorRequestError(
+            400,
+            'CONVERSATION_ASSISTANT_REQUEST_INVALID',
+            'A conversation turn requires exactly conversationId and text.',
+          );
+        }
+        const conversationId = boundedText(body.conversationId, 'conversation id', 200);
+        if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/u.test(conversationId)) {
+          throw new ExecutorRequestError(400, 'CONVERSATION_ASSISTANT_REQUEST_INVALID', 'Conversation id is invalid.');
+        }
+        const text = boundedTeamsMessageText(body.text, 'conversation message', 20_000);
+        const eventDigest = sha256(canonicalJson({
+          conversationId,
+          idempotencyKey,
+          workspaceId: this.config.workspaceId,
+        }));
+        const sessionDigest = sha256(canonicalJson({
+          conversationId,
+          workspaceId: this.config.workspaceId,
+        }));
+        const sessionId = `conversation-${sessionDigest.slice(0, 40)}`;
+        const taskId = `conversation-${eventDigest.slice(0, 40)}`;
+        const eventId = `web-event-${eventDigest}`;
+        const record = await this.startTask({
+          taskId,
+          sessionId,
+          prompt: text,
+          metadata: { source: 'conversation-assistant-web-ingress-v1' },
+          conversationOrigin: {
+            kind: 'web',
+            conversationKind: 'direct',
+            conversationId,
+            eventId,
+          },
+        });
+        if (record.status === 'queued' && this.drainToken === undefined) {
+          void this.dispatchTask(record.id).catch(error => {
+            this.ctx.logger.warn(`Conversation assistant task dispatch failed (${safeErrorMessage(error)})`);
+          });
+        }
+        this.sendJson(res, 202, {
+          conversationId,
+          taskId: record.id,
+          sessionId: record.sessionId,
+          status: record.status,
+          eventsUrl: `/api/v1/tasks/${encodeURIComponent(record.id)}/events?after=0`,
+          statusUrl: `/api/v1/tasks/${encodeURIComponent(record.id)}/status`,
+        });
         return;
       }
       if (method === 'POST' && url.pathname === '/api/v1/tasks/dispatch') {
@@ -3886,6 +4540,20 @@ function assertTaskActorScope(record: TaskRecord, actorAadObjectId?: string): vo
   if (record.createdByActorId?.toLowerCase() !== actorAadObjectId.toLowerCase()) {
     throw new Error('Work Task creator does not match the verified Teams actor.');
   }
+}
+
+/** Recognize only foreground Web/Teams conversation ingress, never arbitrary Work prompts. */
+function isTrustedConversationAssistantTask(record: TaskRecord): boolean {
+  if (record.executionClass !== 'foreground') return false;
+  if (record.origin?.kind === 'teams_private') return true;
+  const value = record.metadata?.navigatorConversationOrigin;
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const origin = value as Record<string, unknown>;
+  if (origin.kind === 'web') return origin.conversationKind === 'direct';
+  if (origin.kind === 'teams_channel') {
+    return origin.conversationKind === 'group' && record.metadata?.teamsThread !== undefined;
+  }
+  return false;
 }
 
 /** Treat an explicit persisted marker or server-reserved ID prefix as read-only. */

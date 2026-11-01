@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Literal
 
 from fastapi.testclient import TestClient
 
@@ -36,8 +37,15 @@ TOKENS = {
 class FakeEmbeddings:
     """Fixture adapter that proves the API calls the injected embeddings seam."""
 
-    def embed(self, texts: Sequence[str], *, model: str | None = None) -> EmbeddingBatch:
+    def embed(
+        self,
+        texts: Sequence[str],
+        *,
+        model: str | None = None,
+        purpose: Literal["document", "query"] = "document",
+    ) -> EmbeddingBatch:
         assert texts
+        assert purpose in {"document", "query"}
         return EmbeddingBatch(((0.75, 0.25),), "fixture-embedding-v1", 2)
 
 
@@ -195,6 +203,28 @@ def test_message_event_idempotency_ignores_server_generated_time(tmp_path: Path)
             headers=_headers(),
         )
         assert forged.status_code == 422
+
+
+def test_exact_message_readback_is_actor_scope_and_lineage_checked(tmp_path: Path) -> None:
+    """Exact message lookup never returns revoked or cross-actor source content."""
+
+    with _client(tmp_path / "message-readback.sqlite3") as client:
+        message = _post_message(client)["message"]
+        query = "conversationId=direct-alice&conversationKind=direct&personaId=persona-a"
+        path = BASE + f"/messages/{message['id']}?{query}"
+        current = client.get(path, headers=_headers())
+        assert current.status_code == 200, current.text
+        assert current.json()["id"] == message["id"]
+
+        other_actor = client.get(path, headers=_headers("bob-token"))
+        assert other_actor.status_code == 404
+
+        revoked = client.post(
+            BASE + f"/sources/{message['id']}/revoke", json={}, headers=_headers()
+        )
+        assert revoked.status_code == 200
+        after_revoke = client.get(path, headers=_headers())
+        assert after_revoke.status_code == 404
 
 
 def test_private_source_cannot_cross_to_group_or_persona(tmp_path: Path) -> None:

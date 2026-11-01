@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 from cyrene_navigator.persistence.errors import PersistenceError
 
@@ -63,15 +63,6 @@ class MemoryProviderScope:
     visibility: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class GraphProviderReadback:
-    """Independent graph state returned after provider upsert and read-back."""
-
-    readback_digest: str
-    node_count: int
-    edge_count: int
-
-
 class KnowledgeGraphProvider(Protocol):
     """Narrow host adapter over the published ``knowledge.graph.v1`` capability."""
 
@@ -82,8 +73,13 @@ class KnowledgeGraphProvider(Protocol):
         workspace_id: str,
         actor_id: str,
         changeset: Mapping[str, object],
-    ) -> GraphProviderReadback:
-        """Upsert a proposal and independently read back every node and edge."""
+    ) -> Mapping[str, object]:
+        """Upsert a proposal and independently read back every node and edge.
+
+        The result must contain exactly ``readbackDigest``, ``nodeCount``, and
+        ``edgeCount``. The facade compares its digest to the immutable proposal
+        digest before it commits a projected state.
+        """
         ...
 
     def query(
@@ -97,15 +93,21 @@ class KnowledgeGraphProvider(Protocol):
         persona_id: str | None,
         query: str,
         limit: int,
-    ) -> Sequence[Mapping[str, object]]:
-        """Return bounded graph matches with their original source message IDs."""
+    ) -> Mapping[str, object]:
+        """Return ``{items: [...]}`` with source IDs on every bounded match."""
         ...
 
 
 class EmbeddingClient(Protocol):
     """Invoke the configured model.provider.v1 embeddings method."""
 
-    def embed(self, texts: Sequence[str], *, model: str | None = None) -> EmbeddingBatch:
+    def embed(
+        self,
+        texts: Sequence[str],
+        *,
+        model: str | None = None,
+        purpose: Literal["document", "query"] = "document",
+    ) -> EmbeddingBatch:
         """Return real vectors or raise a safe typed provider failure."""
         ...
 
