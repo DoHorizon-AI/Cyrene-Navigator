@@ -322,14 +322,15 @@ export function createConversationMemoryFeature(options: ConversationMemoryFeatu
 
     async afterTurn(context, input) {
       assertTrustedScope(context);
-      const expectedSources = pendingSourcesByTurn.get(turnKey(context)) ?? [];
+      const expectedSources = pendingSourcesByTurn.get(turnKey(context));
       clearPendingSources(context);
       context.signal.throwIfAborted();
       if (!enabled || input.status !== 'completed') return;
       const assistantText = boundedText(input.assistantText, MAX_MESSAGE_LENGTH);
       const userEventId = boundedText(input.userEventId, 512);
       if (!assistantText || !userEventId) return;
-      if (!isSourceRefsWellFormed(input.sourceRefs) || !containsAllSourceRefs(input.sourceRefs, expectedSources)) {
+      if (expectedSources === undefined || !isSourceRefsWellFormed(input.sourceRefs)
+        || !containsAllSourceRefs(input.sourceRefs, expectedSources)) {
         throw new ConversationFeatureError('INVALID_SOURCE_PROOF', 'Completed turn omitted a context source reference');
       }
 
@@ -359,7 +360,7 @@ export function createConversationMemoryFeature(options: ConversationMemoryFeatu
 
       const archivedIds = new Set<string>();
       for (const memory of activeMemories.items) {
-        if (!matchesScope(memory, context) || memory.state !== 'active') continue;
+        if (!matchesScope(memory, context) || memory.state !== 'active' || memory.kind !== 'episode') continue;
         for (const id of memory.sourceMessageIds) archivedIds.add(id);
       }
       if (activeMemories.authorizationEpoch !== context.authorizationEpoch) return;
@@ -379,7 +380,13 @@ export function createConversationMemoryFeature(options: ConversationMemoryFeatu
       const inheritedSourceIds = pending.flatMap(message => (message.sourceRefs ?? []).flatMap(ref => ref.sourceMessageIds));
       const sourceMessageIds = stableUnique([...pending.map(message => message.id), ...inheritedSourceIds], MAX_SOURCE_IDS);
       if (sourceMessageIds.length < minimumMessages) return;
-      const sourceRefs = normalizeSourceRefs(pending.flatMap(message => message.sourceRefs ?? []));
+      const sourceRefs = normalizeSourceRefs([
+        ...pending.flatMap(message => message.sourceRefs ?? []),
+        { memoryId: null, memoryVersion: null, sourceMessageIds: stableUnique(pending.map(message => message.id), MAX_SOURCE_IDS) },
+      ]);
+      const proof = await authorizeCurrentSources(options.api, context, sourceRefs);
+      if (!proof.allowed || proof.currentAuthorizationEpoch !== context.authorizationEpoch) return;
+      context.signal.throwIfAborted();
       let summary: string;
       try {
         if (summaryProvider === undefined) {
@@ -417,7 +424,10 @@ export function createConversationMemoryFeature(options: ConversationMemoryFeatu
         return { decision: 'hold', code: 'SOURCE_PROOF_MISSING', authorizationEpoch: context.authorizationEpoch };
       }
       const sourceRefs = normalizeSourceRefs(input.sourceRefs);
-      const expected = pendingSourcesByTurn.get(turnKey(context)) ?? [];
+      const expected = pendingSourcesByTurn.get(turnKey(context));
+      if (expected === undefined) {
+        return { decision: 'hold', code: 'SOURCE_PROOF_MISSING', authorizationEpoch: context.authorizationEpoch };
+      }
       if (!containsAllSourceRefs(sourceRefs, expected)) {
         return { decision: 'hold', code: 'SOURCE_PROOF_MISSING', authorizationEpoch: context.authorizationEpoch };
       }
