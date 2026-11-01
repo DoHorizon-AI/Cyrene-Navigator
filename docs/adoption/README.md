@@ -18,6 +18,16 @@ real upstream packages.
 - CodeBuddy LLM turns use restricted structured output; the existing DSH
   AgentLoop remains the sole executor and returned tool arguments are checked
   against the active catalog before a DSH tool-call block is emitted.
+- Both CodeBuddy model adapters receive shared evidence and retry guidance.
+  The native CodeBuddy ACP profile appends it to every prompt, including
+  resumed sessions; the structured-output adapter supplies the same text in
+  its request prompt.
+  It distinguishes successful evidence from failed observations, requires
+  explicit comparison evidence for ancestry claims, and discourages repeating
+  a call when `retryable` is false or unknown. Provider constraints omitted
+  from DSH's enforced JSON Schema subset remain visible as model-facing hints;
+  Navigator's host validator stays authoritative. This guidance improves
+  behavior but cannot guarantee that a model never makes an unsupported claim.
 - The explicit `codebuddy-acp` task backend runs the official CodeBuddy ACP
   stdio process without a DSH reasoning loop. Navigator retains Work/session
   ownership and exposes only host-authorized Exchange tools through a task-local
@@ -129,6 +139,17 @@ be treated as a runtime success claim.
 Navigator keeps its changes in repository-owned Cordis plugins and client
 extensions. A change to upstream Harness is proposed upstream or retained as an
 explicit, reviewable adapter; it must not be hidden in an installation script.
+
+## Business-agent merge boundary
+
+When integrating older plugins or the Aether conversation work, retain the
+CodeBuddy transport envelope, the shared evidence/retry policy, and host-side
+provider-constraint validation. Merge conversation memory and presentation
+features in their owning modules; do not replace the evidence policy with
+feature-specific prompt text, treat a tool error as a successful fact, or move
+execution authority out of the DSH AgentLoop. If both branches edit the prompt,
+combine their policies and keep the transport rules explicit. Prompt text guides
+the model; tool validation and durable receipts remain the enforceable boundary.
 ---
 <!-- Chinese Translation / 中文翻译 -->
 
@@ -139,6 +160,7 @@ explicit, reviewable adapter; it must not be hidden in an installation script.
 - 客户端交付反馈会将已提交输入与持久化回执关联，并保留失败输入供用户显式恢复。
 - Compaction 只在 compaction 请求中移除工具声明；输出不含文本时按 fail-closed 处理。
 - CodeBuddy LLM 调用只使用受限结构化输出；现有 DSH AgentLoop 仍是唯一工具执行者，并且在发出 DSH tool-call block 前按当前工具目录检查工具名和参数。
+- CodeBuddy 的不同模型执行路径共用证据与重试规则。CodeBuddy 原生 ACP profile 每轮都会在请求后追加规则，包括恢复的会话；结构化输出 adapter 也会把相同规则加入模型请求。规则区分成功证据与失败观察，要求祖先关系提供明确 compare 证据，并避免在 `retryable` 为 false 或未知时机械重试。DSH 强制执行的 JSON Schema 子集未包含的 provider 约束仍以模型可见提示提供，Navigator 宿主 validator 继续负责权威校验。这些提示改善行为，但不能保证模型绝不作无依据陈述。
 - 显式 `codebuddy-acp` Work Task backend 使用官方 ACP stdio 进程，不套 DSH reasoning loop。Navigator 继续拥有 Work/session 状态，并通过任务级 MCP bridge 只公开宿主授权的 Exchange 工具，复用现有授权与回执路径。
 
 原生宿主通过 `CYRENE_NATIVE_HOST` 启动，不依赖外部 Platform 工具或源码。实现的方法由 `hello` 握手报告，范围仅限 Navigator 所有的操作。
@@ -168,3 +190,7 @@ Profile 测试使用真实固定版本 Harness CLI、Bundle、Rust host 和本�
 ## 上游补丁策略
 
 Navigator 将改动保留在仓库自有 Cordis 插件和客户端扩展中。对上游 Harness 的修改应向上游提议，或作为明确且可审查的适配器保留；不得隐藏在安装脚本中。
+
+## Business agent 合并边界
+
+合入旧插件或 Aether conversation 改动时，必须保留 CodeBuddy transport envelope、共享证据/重试规则和宿主侧 provider constraint 校验。Conversation memory 与展示能力留在其所属模块；不能用功能专属 prompt 替换通用证据规则，不能把工具错误当作成功事实，也不能把执行权移出 DSH AgentLoop。若双方修改同一 prompt，应合并各自规则并保留明确的 transport 约束。Prompt 只指导模型；工具校验和持久化回执才是可执行的边界。

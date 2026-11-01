@@ -444,9 +444,10 @@ function createDefinition(
       ? ` [Trusted cloud call context: provider ${providerId}; profile_ref "${cloudProfileRef}". Use this exact profile_ref for this binding.]`
       : ' [Trusted cloud profile hint unavailable; do not guess profile_ref for this binding.]'
     : '';
+  const inputConstraintDescription = describeProviderConstraints(tool.constraints);
   return {
     name,
-    description: `${tool.name} (configured provider ${binding.bindingId})${repositoryDescription}${cloudProfileDescription}: ${tool.description}`,
+    description: `${tool.name} (configured provider ${binding.bindingId})${repositoryDescription}${cloudProfileDescription}${inputConstraintDescription}: ${tool.description}`,
     parameters: structuredClone(tool.inputSchema),
     output: {
       schema: OUTPUT_SCHEMA,
@@ -1547,6 +1548,28 @@ const PROJECTED_PROVIDER_CONSTRAINTS = new Set([
   'pattern', 'minimum', 'maximum', 'minLength', 'maxLength',
   'minItems', 'maxItems', 'uniqueItems', 'minProperties', 'maxProperties', 'x-maxUtf8Bytes',
 ]);
+
+/** Keep DSH's enforced schema subset while making host-enforced bounds visible to the model. | 保留 DSH 校验子集，同时将宿主约束提示提供给模型。 */
+function describeProviderConstraints(constraints: readonly ProviderInputConstraint[]): string {
+  if (constraints.length === 0) return '';
+  const descriptions = constraints.map(constraint => {
+    const rules: string[] = [];
+    if (constraint.pattern !== undefined) rules.push(`must match pattern ${JSON.stringify(constraint.pattern)}`);
+    if (constraint.minimum !== undefined) rules.push(`minimum ${constraint.minimum}`);
+    if (constraint.maximum !== undefined) rules.push(`maximum ${constraint.maximum}`);
+    if (constraint.minLength !== undefined) rules.push(`minimum length ${constraint.minLength}`);
+    if (constraint.maxLength !== undefined) rules.push(`maximum length ${constraint.maxLength}`);
+    if (constraint.maxUtf8Bytes !== undefined) rules.push(`maximum UTF-8 length ${constraint.maxUtf8Bytes} bytes`);
+    if (constraint.minItems !== undefined) rules.push(`minimum items ${constraint.minItems}`);
+    if (constraint.maxItems !== undefined) rules.push(`maximum items ${constraint.maxItems}`);
+    if (constraint.uniqueItems === true) rules.push('items must be unique');
+    if (constraint.minProperties !== undefined) rules.push(`minimum properties ${constraint.minProperties}`);
+    if (constraint.maxProperties !== undefined) rules.push(`maximum properties ${constraint.maxProperties}`);
+    const path = constraint.path.length === 0 ? '$' : JSON.stringify(constraint.path);
+    return `${path}: ${rules.join(', ')}`;
+  });
+  return ` [Host-enforced input constraints: ${descriptions.join('; ')}.]`;
+}
 
 function collectProviderConstraints(schema: JsonValue): ProviderInputConstraint[] {
   const constraints: ProviderInputConstraint[] = [];
