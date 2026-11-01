@@ -71,6 +71,8 @@ class NoModelAdapter extends LlmAdapter {
 }
 
 function workflow() {
+  const pollCron = cronAtLeastTenMinutesAhead('UTC');
+  const digestCron = cronAtLeastTenMinutesAhead('America/New_York');
   return {
     id: WORKFLOW_ID,
     version: 2,
@@ -87,7 +89,7 @@ function workflow() {
     triggers: [{
       id: TRIGGER_ID,
       kind: 'github_incremental_poll',
-      schedule: { kind: 'cron', expression: '*/5 * * * *', timeZone: 'UTC' },
+      schedule: { kind: 'cron', expression: pollCron, timeZone: 'UTC' },
       targetIds: REPOSITORIES.map(repository => repository.id),
       initialBaseline: 'record_without_notification',
       search: { state: 'open', labels: [], limit: 50 },
@@ -112,7 +114,7 @@ function workflow() {
       quietHours: { start: '22:00', end: '08:00', timeZone: 'America/New_York' },
       digest: {
         enabled: true,
-        schedule: { kind: 'cron', expression: '0 9 * * *', timeZone: 'America/New_York' },
+        schedule: { kind: 'cron', expression: digestCron, timeZone: 'America/New_York' },
         maxPerDay: 1,
       },
       destination: { kind: 'responsibility_thread' },
@@ -120,6 +122,20 @@ function workflow() {
     },
     enabled: true,
   };
+}
+
+function cronAtLeastTenMinutesAhead(timeZone) {
+  const target = new Date(Date.now() + 10 * 60_000);
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    minute: 'numeric',
+    hour: 'numeric',
+    day: 'numeric',
+    month: 'numeric',
+    hourCycle: 'h23',
+  }).formatToParts(target);
+  const fields = Object.fromEntries(parts.map(part => [part.type, part.value]));
+  return `${fields.minute} ${fields.hour} ${fields.day} ${fields.month} *`;
 }
 
 function connectorSnapshot() {

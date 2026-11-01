@@ -27,9 +27,10 @@ import {
   canonicalJson,
   sha256,
   teamsThreadResourceRef,
+  validateTeamsMessageText,
   validateTeamsServiceUrl,
 } from './connector-authorization.ts';
-import type { ConnectorGrantRequest, TeamsMessageRoute } from './connector-authorization.ts';
+import type { ConnectorGrantRequest, TeamsMessageDeliveryOutcome, TeamsMessageRoute } from './connector-authorization.ts';
 import {
   decodeProviderTokenUsage,
   isModelAvailabilityFailure,
@@ -40,6 +41,10 @@ import type { ModelRoute } from './model-policy.js';
 import type { ConversationExecutionBackend } from './codebuddy-acp-execution.js';
 import type { WorkflowSourceTaskReceipt } from './workflows/store.js';
 import { getConnectorToolCatalog } from './tool-providers.js';
+
+const DEFAULT_PRIVATE_TEAMS_NOTIFICATION_TIMEOUT_MS = 75_000;
+const PRIVATE_TEAMS_NOTIFICATION_CLAIM_LIMIT = 1;
+const PRIVATE_TEAMS_NOTIFICATION_LEASE_SECONDS = 120;
 
 export type TaskStatus = ExecutionStatus;
 export type TaskExecutionClass = 'foreground' | 'background';
@@ -206,6 +211,8 @@ export interface TeamsExecutorConfig {
   readonly taskActorSubjectsFile?: string;
   /** Explicit opt-in gate paired with the Teams package's personal-chat setting. */
   readonly personalChatEnabled?: boolean;
+  /** Bounded outer private-send deadline; omitted production config uses 75 seconds. */
+  readonly privateNotificationTimeoutMs?: number;
   /** Host-selected actor allowed to use the existing free-form model entitlement. */
   readonly modelActorSubject?: string;
   readonly ingressSecretEnv: string;
@@ -235,12 +242,7 @@ export interface TeamsPersonalMessageSendRequest {
   readonly text: string;
 }
 
-export interface TeamsPersonalMessageSendOutcome {
-  readonly outcome: 'accepted' | 'rejected' | 'rate_limited' | 'uncertain';
-  readonly vendorMessageId?: string;
-  readonly reasonCode?: string;
-  readonly retryAfterSeconds?: number;
-}
+export type TeamsPersonalMessageSendOutcome = TeamsMessageDeliveryOutcome;
 
 /** Fixed host-owned health selectors and the only Teams route for credential notices. */
 export interface CredentialNotificationsConfig {
@@ -2568,16 +2570,16 @@ export class NavigatorExecutor {
         && this.config.workState.finishPrivateNotification !== undefined) {
         const privateLeases = await this.config.workState.claimPrivateNotifications({
           workerId: `navigator-teams-private-${process.pid}`,
-          limit: 10,
-          leaseSeconds: 60,
+          limit: PRIVATE_TEAMS_NOTIFICATION_CLAIM_LIMIT,
+          leaseSeconds: PRIVATE_TEAMS_NOTIFICATION_LEASE_SECONDS,
           type: 'teams.message',
           connectorId: config.connectorId,
         });
         for (const lease of privateLeases) await this.deliverTeamsPersonalNotification(lease, config);
         const privateCredentialLeases = await this.config.workState.claimPrivateNotifications({
           workerId: `navigator-graph-credential-private-${process.pid}`,
-          limit: 10,
-          leaseSeconds: 60,
+          limit: PRIVATE_TEAMS_NOTIFICATION_CLAIM_LIMIT,
+          leaseSeconds: PRIVATE_TEAMS_NOTIFICATION_LEASE_SECONDS,
           type: 'teams.credential-health',
           connectorId: config.connectorId,
         });
@@ -2819,6 +2821,7 @@ export class NavigatorExecutor {
       }
       const requestId = `${notification.id}:attempt:${retryCount + 1}`;
       if (requestId.length > 200) throw new TypeError('Private notification request id is too long');
+      const sendSignal = privateTeamsNotificationSignal(config);
       providerCallStarted = true;
       const result = await config.sendPrivateMessage({
         requestId,
@@ -2833,18 +2836,23 @@ export class NavigatorExecutor {
         target_kind: 'owner_private',
         actor_aad_object_id: route.actorAadObjectId,
         text,
-      }, AbortSignal.timeout(15_000));
+      }, sendSignal);
       if (result.outcome === 'rate_limited' && result.retryAfterSeconds !== undefined) {
         await finish.call(this.config.workState, notification.id, lease.leaseToken, 'retry', {
           reasonCode: result.reasonCode ?? 'rate_limited',
         }, Math.min(Math.max(Math.ceil(result.retryAfterSeconds), 1), 300));
         return;
       }
-      const outcome = result.outcome === 'accepted' ? 'delivered'
-        : result.outcome === 'uncertain' ? 'uncertain' : 'failed';
+      const acceptedVendorMessageId = result.outcome === 'accepted'
+        && typeof result.vendorMessageId === 'string' && result.vendorMessageId.trim().length > 0
+        ? result.vendorMessageId : undefined;
+      const hasAcceptedReceipt = acceptedVendorMessageId !== undefined;
+      const outcome = hasAcceptedReceipt ? 'delivered'
+        : result.outcome === 'uncertain' || result.outcome === 'accepted' ? 'uncertain' : 'failed';
       await finish.call(this.config.workState, notification.id, lease.leaseToken, outcome, {
-        reasonCode: result.reasonCode ?? null,
-        vendorMessageId: result.vendorMessageId ?? null,
+        reasonCode: result.reasonCode ?? (result.outcome === 'accepted' && !hasAcceptedReceipt
+          ? 'teams_accepted_receipt_missing_vendor_message_id' : null),
+        vendorMessageId: acceptedVendorMessageId ?? null,
       });
     } catch (error: unknown) {
       if (!started) return;
@@ -2909,6 +2917,7 @@ export class NavigatorExecutor {
       }
       const requestId = `${notification.id}:attempt:${retryCount + 1}`;
       if (requestId.length > 200) throw new TypeError('Private credential health request id is too long');
+      const sendSignal = privateTeamsNotificationSignal(config);
       providerCallStarted = true;
       const result = await config.sendPrivateMessage({
         requestId,
@@ -2923,18 +2932,23 @@ export class NavigatorExecutor {
         target_kind: 'owner_private',
         actor_aad_object_id: route.actorAadObjectId,
         text,
-      }, AbortSignal.timeout(15_000));
+      }, sendSignal);
       if (result.outcome === 'rate_limited' && result.retryAfterSeconds !== undefined) {
         await finish.call(this.config.workState, notification.id, lease.leaseToken, 'retry', {
           reasonCode: result.reasonCode ?? 'rate_limited',
         }, Math.min(Math.max(Math.ceil(result.retryAfterSeconds), 1), 300));
         return;
       }
-      const outcome = result.outcome === 'accepted' ? 'delivered'
-        : result.outcome === 'uncertain' ? 'uncertain' : 'failed';
+      const acceptedVendorMessageId = result.outcome === 'accepted'
+        && typeof result.vendorMessageId === 'string' && result.vendorMessageId.trim().length > 0
+        ? result.vendorMessageId : undefined;
+      const hasAcceptedReceipt = acceptedVendorMessageId !== undefined;
+      const outcome = hasAcceptedReceipt ? 'delivered'
+        : result.outcome === 'uncertain' || result.outcome === 'accepted' ? 'uncertain' : 'failed';
       await finish.call(this.config.workState, notification.id, lease.leaseToken, outcome, {
-        reasonCode: result.reasonCode ?? null,
-        vendorMessageId: result.vendorMessageId ?? null,
+        reasonCode: result.reasonCode ?? (result.outcome === 'accepted' && !hasAcceptedReceipt
+          ? 'teams_accepted_receipt_missing_vendor_message_id' : null),
+        vendorMessageId: acceptedVendorMessageId ?? null,
       });
     } catch (error: unknown) {
       if (!started) return;
@@ -4200,6 +4214,15 @@ function validateTeamsRootThreadId(value: unknown): string {
   return rootThreadId;
 }
 
+/** Bound the private sender's whole grant-plus-message window. | 私聊grant与消息共用外层总预算。 */
+function privateTeamsNotificationSignal(config: TeamsExecutorConfig): AbortSignal {
+  const timeoutMs = config.privateNotificationTimeoutMs ?? DEFAULT_PRIVATE_TEAMS_NOTIFICATION_TIMEOUT_MS;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 120_000) {
+    throw new TypeError('Invalid private Teams notification timeout');
+  }
+  return AbortSignal.timeout(timeoutMs);
+}
+
 function isUncertainConnectorOutcome(error: unknown): boolean {
   if (error instanceof ExchangeConnectorRequestError) return error.outcomeUnknown;
   if (error instanceof WorkStateHttpError) return error.status >= 500;
@@ -4207,7 +4230,12 @@ function isUncertainConnectorOutcome(error: unknown): boolean {
 }
 
 function safeErrorCode(error: unknown): string {
-  if (error instanceof ExchangeConnectorRequestError && error.status !== undefined) return `EXCHANGE_HTTP_${error.status}`;
+  if (error instanceof ExchangeConnectorRequestError) {
+    if (error.safeCode !== undefined) return error.safeCode;
+    if (error.status !== undefined) return `EXCHANGE_HTTP_${error.status}`;
+    return error.outcomeUnknown ? 'EXCHANGE_CONNECTOR_OUTCOME_UNKNOWN' : 'EXCHANGE_CONNECTOR_FAILED';
+  }
+  if (error instanceof ExecutorRequestError) return error.code.slice(0, 128);
   if (error instanceof WorkStateHttpError) return error.code.slice(0, 128);
   return 'TEAMS_DELIVERY_FAILED';
 }
@@ -4242,12 +4270,11 @@ function boundedText(value: unknown, label: string, maximum: number): string {
 }
 
 function boundedTeamsMessageText(value: unknown, label: string, maximum: number): string {
-  // Match the store's NUL/length guards while allowing LF, CRLF, and TAB in message text.
-  if (typeof value !== 'string' || value.length === 0 || value.length > maximum
-    || value.includes('\u0000')) {
+  try {
+    return validateTeamsMessageText(value, label, maximum);
+  } catch {
     throw new ExecutorRequestError(400, 'TEAMS_EVENT_INVALID', `${label} is invalid.`);
   }
-  return value;
 }
 
 function uuidText(value: unknown, label: string): string {
