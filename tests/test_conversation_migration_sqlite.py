@@ -130,6 +130,25 @@ class _MemoryPort:
         )
 
 
+class _MemoryWithoutTombstoneReadback:
+    """Model a pre-migration host that cannot verify deleted memory state."""
+
+    def __init__(self, store: Any) -> None:
+        self.store = store
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.store, name)
+
+    def get_memory(
+        self,
+        organization_id: str,
+        workspace_id: str,
+        actor_id: str,
+        memory_id: str,
+    ) -> Mapping[str, object] | None:
+        return self.store.get_memory(organization_id, workspace_id, actor_id, memory_id)
+
+
 class _ProfilePort:
     """Adapt public profile-candidate APIs and source validation to one test database."""
 
@@ -688,7 +707,7 @@ def test_restore_preflight_blocks_memory_without_tombstone_readback(
     source = JsonLinesMigrationSource(
         io.BytesIO(content), artifact_id=artifact_id, expected_sha256=digest
     )
-    service = _service(memory, domains, work, artifact_id, digest)
+    service = _service(_MemoryWithoutTombstoneReadback(memory), domains, work, artifact_id, digest)
     preview = service.preview(SCOPE, source)
 
     with pytest.raises(MigrationError) as error:
