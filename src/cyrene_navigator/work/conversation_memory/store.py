@@ -16,7 +16,8 @@ import json
 import re
 import sqlite3
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -2127,14 +2128,18 @@ class ConversationMemoryStore:
             "status": str(row["status"]),
         }
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         """Open a short-lived SQLite connection with strict timeout and foreign-key policy."""
 
         conn = sqlite3.connect(self._db_path, timeout=10, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=10000")
-        return conn
+        try:
+            yield conn
+        finally:
+            conn.close()
 
 
 def _scope(organization_id: str | None, workspace_id: str, actor_id: str) -> tuple[str, str, str]:
