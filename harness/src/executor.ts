@@ -36,9 +36,10 @@ import {
   canonicalJson,
   sha256,
   teamsThreadResourceRef,
+  validateTeamsMessageText,
   validateTeamsServiceUrl,
 } from './connector-authorization.ts';
-import type { ConnectorGrantRequest, TeamsMessageRoute } from './connector-authorization.ts';
+import type { ConnectorGrantRequest, TeamsMessageDeliveryOutcome, TeamsMessageRoute } from './connector-authorization.ts';
 import {
   decodeProviderTokenUsage,
   isModelAvailabilityFailure,
@@ -58,6 +59,10 @@ import type {
   ConversationSummaryProviderV1,
   TrustedTurnContext,
 } from './features/conversation-memory.js';
+
+const DEFAULT_PRIVATE_TEAMS_NOTIFICATION_TIMEOUT_MS = 75_000;
+const PRIVATE_TEAMS_NOTIFICATION_CLAIM_LIMIT = 1;
+const PRIVATE_TEAMS_NOTIFICATION_LEASE_SECONDS = 120;
 
 export type TaskStatus = ExecutionStatus;
 export type TaskExecutionClass = 'foreground' | 'background';
@@ -290,6 +295,8 @@ export interface TeamsExecutorConfig {
   readonly taskActorSubjectsFile?: string;
   /** Explicit opt-in gate paired with the Teams package's personal-chat setting. */
   readonly personalChatEnabled?: boolean;
+  /** Bounded outer private-send deadline; omitted production config uses 75 seconds. */
+  readonly privateNotificationTimeoutMs?: number;
   /** Host-selected actor allowed to use the existing free-form model entitlement. */
   readonly modelActorSubject?: string;
   readonly ingressSecretEnv: string;
@@ -319,12 +326,7 @@ export interface TeamsPersonalMessageSendRequest {
   readonly text: string;
 }
 
-export interface TeamsPersonalMessageSendOutcome {
-  readonly outcome: 'accepted' | 'rejected' | 'rate_limited' | 'uncertain';
-  readonly vendorMessageId?: string;
-  readonly reasonCode?: string;
-  readonly retryAfterSeconds?: number;
-}
+export type TeamsPersonalMessageSendOutcome = TeamsMessageDeliveryOutcome;
 
 /** Fixed host-owned health selectors and the only Teams route for credential notices. */
 export interface CredentialNotificationsConfig {
@@ -1766,6 +1768,12 @@ export class NavigatorExecutor {
         this.installAgentModelSelection(agentCtx, selectionRef, sessionId);
       };
 
+      // Volatile conversation assistant turns use a dedicated unique session id prefix
+      // (VOLATILE_CONVERSATION_SESSION_PREFIX) and are never resumed from persistent storage,
+      // which isolates each turn's Agent lifecycle. When DSH Schedule is mounted at the host
+      // root, ScheduleService attaches per-agent tools (schedule_create, etc.) into the newly
+      // created agent's agent.ctx; ensuring volatile turns own their unique handle prevents
+      // colliding duplicate tool registrations across concurrent or sequential turn creations.
       const existing = volatileConversationTurn ? undefined : agents.get(sessionId);
       let agent: Agent;
       if (existing) agent = existing;
@@ -1844,7 +1852,10 @@ export class NavigatorExecutor {
         ? 'aborted'
         : task.agentError || (task.blocked?.size ?? 0) > 0 ? 'failed' : 'completed';
       if (task.conversationTurn !== undefined) {
-        const assistantText = this.extractLatestAssistantText(agent.session);
+        // The Work conversation-memory API stores normalized (trimmed) message text, so deliver the
+        // same normalized value; otherwise the authoritative exact readback rejects model replies
+        // that only carry surrounding whitespace. 中文：按存储归一化后的文本投递，避免回读校验误判。
+        const assistantText = this.extractLatestAssistantText(agent.session).trim();
         if (preliminaryStatus === 'completed' && assistantText.length > 0) {
           task.output = assistantText;
           const decision = await this.finishConversationAssistantTurn(task, assistantText);
@@ -3349,16 +3360,16 @@ export class NavigatorExecutor {
         && this.config.workState.finishPrivateNotification !== undefined) {
         const privateLeases = await this.config.workState.claimPrivateNotifications({
           workerId: `navigator-teams-private-${process.pid}`,
-          limit: 10,
-          leaseSeconds: 60,
+          limit: PRIVATE_TEAMS_NOTIFICATION_CLAIM_LIMIT,
+          leaseSeconds: PRIVATE_TEAMS_NOTIFICATION_LEASE_SECONDS,
           type: 'teams.message',
           connectorId: config.connectorId,
         });
         for (const lease of privateLeases) await this.deliverTeamsPersonalNotification(lease, config);
         const privateCredentialLeases = await this.config.workState.claimPrivateNotifications({
           workerId: `navigator-graph-credential-private-${process.pid}`,
-          limit: 10,
-          leaseSeconds: 60,
+          limit: PRIVATE_TEAMS_NOTIFICATION_CLAIM_LIMIT,
+          leaseSeconds: PRIVATE_TEAMS_NOTIFICATION_LEASE_SECONDS,
           type: 'teams.credential-health',
           connectorId: config.connectorId,
         });
@@ -3602,6 +3613,7 @@ export class NavigatorExecutor {
       }
       const requestId = `${notification.id}:attempt:${retryCount + 1}`;
       if (requestId.length > 200) throw new TypeError('Private notification request id is too long');
+      const sendSignal = privateTeamsNotificationSignal(config);
       providerCallStarted = true;
       const result = await config.sendPrivateMessage({
         requestId,
@@ -3616,18 +3628,23 @@ export class NavigatorExecutor {
         target_kind: 'owner_private',
         actor_aad_object_id: route.actorAadObjectId,
         text,
-      }, AbortSignal.timeout(15_000));
+      }, sendSignal);
       if (result.outcome === 'rate_limited' && result.retryAfterSeconds !== undefined) {
         await finish.call(this.config.workState, notification.id, lease.leaseToken, 'retry', {
           reasonCode: result.reasonCode ?? 'rate_limited',
         }, Math.min(Math.max(Math.ceil(result.retryAfterSeconds), 1), 300));
         return;
       }
-      const outcome = result.outcome === 'accepted' ? 'delivered'
-        : result.outcome === 'uncertain' ? 'uncertain' : 'failed';
+      const acceptedVendorMessageId = result.outcome === 'accepted'
+        && typeof result.vendorMessageId === 'string' && result.vendorMessageId.trim().length > 0
+        ? result.vendorMessageId : undefined;
+      const hasAcceptedReceipt = acceptedVendorMessageId !== undefined;
+      const outcome = hasAcceptedReceipt ? 'delivered'
+        : result.outcome === 'uncertain' || result.outcome === 'accepted' ? 'uncertain' : 'failed';
       await finish.call(this.config.workState, notification.id, lease.leaseToken, outcome, {
-        reasonCode: result.reasonCode ?? null,
-        vendorMessageId: result.vendorMessageId ?? null,
+        reasonCode: result.reasonCode ?? (result.outcome === 'accepted' && !hasAcceptedReceipt
+          ? 'teams_accepted_receipt_missing_vendor_message_id' : null),
+        vendorMessageId: acceptedVendorMessageId ?? null,
       });
     } catch (error: unknown) {
       if (!started) return;
@@ -3657,6 +3674,7 @@ export class NavigatorExecutor {
     text: string,
   ): Promise<void> {
     if (!isTrustedConversationAssistantTask(task)) return;
+    if (this.config.conversationAssistant?.enabled !== true) return;
     const actorId = task.createdByActorId?.toLowerCase();
     if (task.status !== 'completed' || actorId === undefined
       || (expectedActorId !== undefined && actorId !== expectedActorId.toLowerCase())) {
@@ -3675,7 +3693,8 @@ export class NavigatorExecutor {
       );
     }
     const api = workState.conversationMemoryApiV1?.(actorId);
-    const overview = await workState.getConversationMemoryOverview?.(AbortSignal.timeout(10_000));
+    const deliveryTimeoutMs = Number(process.env.CYRENE_PERSISTENCE_REQUEST_TIMEOUT_MS ?? 45_000);
+    const overview = await workState.getConversationMemoryOverview?.(AbortSignal.timeout(deliveryTimeoutMs));
     if (api === undefined || overview === undefined) {
       throw new ExecutorRequestError(
         503,
@@ -3691,7 +3710,7 @@ export class NavigatorExecutor {
         'The static conversation-assistant profile is unavailable for source revalidation.',
       );
     }
-    const signal = AbortSignal.timeout(10_000);
+    const signal = AbortSignal.timeout(deliveryTimeoutMs);
     const proof = await this.readConversationAssistantSourceProof(task.id, workState);
     if (proof === undefined || proof.contentSha256 !== sha256(text)
       || proof.personaId !== profile.personaId) {
@@ -3886,6 +3905,7 @@ export class NavigatorExecutor {
       }
       const requestId = `${notification.id}:attempt:${retryCount + 1}`;
       if (requestId.length > 200) throw new TypeError('Private credential health request id is too long');
+      const sendSignal = privateTeamsNotificationSignal(config);
       providerCallStarted = true;
       const result = await config.sendPrivateMessage({
         requestId,
@@ -3900,18 +3920,23 @@ export class NavigatorExecutor {
         target_kind: 'owner_private',
         actor_aad_object_id: route.actorAadObjectId,
         text,
-      }, AbortSignal.timeout(15_000));
+      }, sendSignal);
       if (result.outcome === 'rate_limited' && result.retryAfterSeconds !== undefined) {
         await finish.call(this.config.workState, notification.id, lease.leaseToken, 'retry', {
           reasonCode: result.reasonCode ?? 'rate_limited',
         }, Math.min(Math.max(Math.ceil(result.retryAfterSeconds), 1), 300));
         return;
       }
-      const outcome = result.outcome === 'accepted' ? 'delivered'
-        : result.outcome === 'uncertain' ? 'uncertain' : 'failed';
+      const acceptedVendorMessageId = result.outcome === 'accepted'
+        && typeof result.vendorMessageId === 'string' && result.vendorMessageId.trim().length > 0
+        ? result.vendorMessageId : undefined;
+      const hasAcceptedReceipt = acceptedVendorMessageId !== undefined;
+      const outcome = hasAcceptedReceipt ? 'delivered'
+        : result.outcome === 'uncertain' || result.outcome === 'accepted' ? 'uncertain' : 'failed';
       await finish.call(this.config.workState, notification.id, lease.leaseToken, outcome, {
-        reasonCode: result.reasonCode ?? null,
-        vendorMessageId: result.vendorMessageId ?? null,
+        reasonCode: result.reasonCode ?? (result.outcome === 'accepted' && !hasAcceptedReceipt
+          ? 'teams_accepted_receipt_missing_vendor_message_id' : null),
+        vendorMessageId: acceptedVendorMessageId ?? null,
       });
     } catch (error: unknown) {
       if (!started) return;
@@ -4508,7 +4533,7 @@ export class NavigatorExecutor {
       if (record === undefined) return;
       if (TERMINAL_STATUSES.has(record.status) || PAUSED_STATUSES.has(record.status)) {
         if (record.status !== 'completed') {
-          this.writeConversationAssistantHeld(res, record, 'CONVERSATION_ASSISTANT_NOT_DELIVERED');
+          this.writeConversationAssistantHeld(res, record, resolveSafeConversationAssistantErrorCode(record.error));
           return;
         }
         try {
@@ -4704,7 +4729,7 @@ export class NavigatorExecutor {
         output: '',
         reasoning: '',
         error: TERMINAL_STATUSES.has(record.status) || PAUSED_STATUSES.has(record.status)
-          ? 'CONVERSATION_ASSISTANT_NOT_DELIVERED'
+          ? resolveSafeConversationAssistantErrorCode(record.error)
           : undefined,
       });
     }
@@ -5544,6 +5569,15 @@ function validateTeamsRootThreadId(value: unknown): string {
   return rootThreadId;
 }
 
+/** Bound the private sender's whole grant-plus-message window. | 私聊grant与消息共用外层总预算。 */
+function privateTeamsNotificationSignal(config: TeamsExecutorConfig): AbortSignal {
+  const timeoutMs = config.privateNotificationTimeoutMs ?? DEFAULT_PRIVATE_TEAMS_NOTIFICATION_TIMEOUT_MS;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 120_000) {
+    throw new TypeError('Invalid private Teams notification timeout');
+  }
+  return AbortSignal.timeout(timeoutMs);
+}
+
 function isUncertainConnectorOutcome(error: unknown): boolean {
   if (error instanceof ExchangeConnectorRequestError) return error.outcomeUnknown;
   if (error instanceof WorkStateHttpError) return error.status >= 500;
@@ -5551,7 +5585,12 @@ function isUncertainConnectorOutcome(error: unknown): boolean {
 }
 
 function safeErrorCode(error: unknown): string {
-  if (error instanceof ExchangeConnectorRequestError && error.status !== undefined) return `EXCHANGE_HTTP_${error.status}`;
+  if (error instanceof ExchangeConnectorRequestError) {
+    if (error.safeCode !== undefined) return error.safeCode;
+    if (error.status !== undefined) return `EXCHANGE_HTTP_${error.status}`;
+    return error.outcomeUnknown ? 'EXCHANGE_CONNECTOR_OUTCOME_UNKNOWN' : 'EXCHANGE_CONNECTOR_FAILED';
+  }
+  if (error instanceof ExecutorRequestError) return error.code.slice(0, 128);
   if (error instanceof WorkStateHttpError) return error.code.slice(0, 128);
   return 'TEAMS_DELIVERY_FAILED';
 }
@@ -5623,12 +5662,11 @@ function boundedText(value: unknown, label: string, maximum: number): string {
 }
 
 function boundedTeamsMessageText(value: unknown, label: string, maximum: number): string {
-  // Match the store's NUL/length guards while allowing LF, CRLF, and TAB in message text.
-  if (typeof value !== 'string' || value.length === 0 || value.length > maximum
-    || value.includes('\u0000')) {
+  try {
+    return validateTeamsMessageText(value, label, maximum);
+  } catch {
     throw new ExecutorRequestError(400, 'TEAMS_EVENT_INVALID', `${label} is invalid.`);
   }
-  return value;
 }
 
 function uuidText(value: unknown, label: string): string {
@@ -5666,6 +5704,43 @@ function safeErrorMessage(value: unknown): string {
 
 function abortMessage(reason: unknown): string {
   return reason instanceof Error ? reason.message : 'Task was aborted';
+}
+
+const SAFE_CONVERSATION_ASSISTANT_ERROR_CODES = new Set([
+  'CONVERSATION_ASSISTANT_NOT_DELIVERED',
+  'CONVERSATION_ASSISTANT_SOURCE_REVOKED',
+  'CONVERSATION_ASSISTANT_SOURCE_UNAVAILABLE',
+  'CONVERSATION_ASSISTANT_REPLY_NOT_READY',
+  'CONVERSATION_ASSISTANT_UNAVAILABLE',
+  'CONVERSATION_ASSISTANT_WEB_ACTOR_UNAVAILABLE',
+  'CONVERSATION_ASSISTANT_ACTOR_SCOPE_MISMATCH',
+  'CONVERSATION_ASSISTANT_REQUEST_INVALID',
+  'CONVERSATION_ASSISTANT_ACTOR_UNVERIFIED',
+  'CONVERSATION_INGRESS_INVALID',
+  'CONVERSATION_MESSAGE_SCOPE_MISMATCH',
+  'CONVERSATION_SOURCE_PROOF_LIMIT_EXCEEDED',
+  'CONVERSATION_AUTHORIZATION_EPOCH_CHANGED',
+  'CONVERSATION_MEMORY_API_UNAVAILABLE',
+  'IDEMPOTENCY_KEY_REQUIRED',
+  'EXECUTION_FAILED',
+  'MODEL_UNAVAILABLE',
+  'TIMEOUT',
+  'ABORTED',
+  'MEMORY_PROVIDER_UNAVAILABLE',
+  'MEMORY_API_UNAVAILABLE',
+]);
+
+function resolveSafeConversationAssistantErrorCode(error: string | undefined): string {
+  if (typeof error === 'string') {
+    const trimmed = error.trim();
+    if (SAFE_CONVERSATION_ASSISTANT_ERROR_CODES.has(trimmed)) return trimmed;
+    const match = /\b([A-Z0-9_]{3,64})\b/.exec(trimmed);
+    const code = match?.[1];
+    if (code !== undefined && SAFE_CONVERSATION_ASSISTANT_ERROR_CODES.has(code)) {
+      return code;
+    }
+  }
+  return 'CONVERSATION_ASSISTANT_NOT_DELIVERED';
 }
 
 function taskParams(body: Record<string, any>): ExecuteTaskParams {

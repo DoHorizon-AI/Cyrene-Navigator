@@ -79,13 +79,14 @@ Windows 也必须执行同一顺序并使用批准的 Node runtime；编译前�
 ## Teams message admission / Teams 消息接入
 
 The Teams bridge preserves LF, CRLF and TAB in message text, including line
-breaks inserted between separate content parts. It rejects NUL characters and
-text longer than 20,000 JavaScript string code units. Identifier validation
-remains stricter and continues to reject control characters.
+breaks inserted between separate content parts. It rejects whitespace-only
+text, NUL, other C0 control characters, DEL, and text longer than 20,000
+JavaScript string code units. It forwards accepted text unchanged.
+Identifier validation remains stricter and rejects all control characters.
 
 Teams bridge 会保留消息正文中的 LF、CRLF 与 TAB，也会保留不同内容片段之间的换行；
-正文包含 NUL 或超过 20,000 个 JavaScript UTF-16 code unit 时拒绝。标识符校验仍更严格，
-继续拒绝控制字符。
+纯空白正文，或包含 NUL、其他 C0 控制字符、DEL，或超过 20,000 个 JavaScript UTF-16
+code unit 时会拒绝；其余正文按原文保留。标识符校验仍更严格，会拒绝全部控制字符。
 ---
 <!-- Chinese Translation / 中文翻译 -->
 

@@ -66,7 +66,7 @@ function privateGrantFor(input, principalSubject = privateActorId) {
   const argumentsValue = {
     targetKind: 'owner_private',
     conversation: privateConversation,
-    text: 'Private owner status.',
+    text: input.text,
   };
   const request = {
     requestId: input.requestId,
@@ -84,6 +84,28 @@ function privateGrantFor(input, principalSubject = privateActorId) {
   const now = Math.floor(Date.now() / 1000);
   return {
     connectorGrantBin: 'AQ==', grantRef: 'sha256:private-fixture', audience: 'exchange',
+    organizationId: 'org-1', issuedAt: now, expiresAt: now + 15, request,
+  };
+}
+
+function providerGrantFor(input) {
+  const argumentsValue = input.arguments;
+  const request = {
+    requestId: input.requestId,
+    workspaceId: 'workspace-1',
+    principalIssuer: `https://login.microsoftonline.com/${route.tenantId}/v2.0`,
+    principalSubject: '11111111-1111-4111-8111-111111111111',
+    connectionRef: input.connectionRef,
+    providerId: input.providerId,
+    profileRef: input.profileRef,
+    operationId: input.operationId,
+    resourceRef: input.resourceRef,
+    argumentsDigestSha256: sha256(canonicalJson(argumentsValue)),
+    arguments: argumentsValue,
+  };
+  const now = Math.floor(Date.now() / 1000);
+  return {
+    connectorGrantBin: 'AQ==', grantRef: 'sha256:provider-fixture', audience: 'exchange',
     organizationId: 'org-1', issuedAt: now, expiresAt: now + 15, request,
   };
 }
@@ -120,6 +142,137 @@ async function withHttpResponse(status, headers, responseBody, run) {
   }
 }
 
+test('GitHub provider operation timeout covers headers and body without extending grant or other provider calls', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'navigator-github-operation-budget-'));
+  const hmacKeyFile = join(directory, 'exchange-hmac.key');
+  await writeFile(hmacKeyFile, Buffer.alloc(32, 0x6d), { mode: 0o600 });
+  const received = [];
+  const responseTimers = new Set();
+  const delayed = (callback, response) => {
+    const timer = setTimeout(() => {
+      responseTimers.delete(timer);
+      callback();
+    }, 180);
+    responseTimers.add(timer);
+    response.once('close', () => {
+      clearTimeout(timer);
+      responseTimers.delete(timer);
+    });
+  };
+  const server = createServer((request, response) => {
+    const chunks = [];
+    request.on('data', chunk => chunks.push(chunk));
+    request.on('end', () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      received.push({ url: request.url, body });
+      const isGrant = request.url === '/internal/v1/connector-operation-grants';
+      let payload;
+      if (isGrant) {
+        const { arguments: _arguments, ...claimsWithoutArguments } = body;
+        const now = Math.floor(Date.now() / 1_000);
+        payload = JSON.stringify({
+          connectorGrantBin: 'AQ==', grantRef: 'slow-grant-fixture', audience: 'exchange',
+          issuedAt: now, expiresAt: now + 10,
+          claims: { ...claimsWithoutArguments, organizationId: 'org-1' },
+        });
+      } else {
+        payload = JSON.stringify({ requestId: body.requestId, outcome: 'verified', result: { complete: true } });
+      }
+      const writeHeaders = () => response.writeHead(200, { 'content-type': 'application/json' });
+      if (body.requestId === 'github-delayed-headers:1') {
+        delayed(() => {
+          writeHeaders();
+          response.end(payload);
+        }, response);
+        return;
+      }
+      writeHeaders();
+      response.write(payload.slice(0, -1));
+      delayed(() => response.end(payload.slice(-1)), response);
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const client = new ExchangeConnectorAuthorizationClient({
+      baseUrl: `http://127.0.0.1:${server.address().port}`,
+      hmacKeyFile,
+      hmacKeyId: 'test-key',
+      audience: 'exchange',
+      requestTimeoutMs: 100,
+      githubProviderOperationTimeoutMs: 400,
+    });
+    const githubInput = requestId => ({
+      requestId,
+      connectionRef,
+      providerId: 'github',
+      profileRef: 'github-profile',
+      operationId: 'github.vendor.cli.execute',
+      resourceRef: 'sha256:github-owner-repo',
+      arguments: { argv: ['api', 'repos/owner/repo/pulls?state=all', '--paginate'] },
+    });
+    const githubHeaders = githubInput('github-delayed-headers:1');
+    const githubBody = githubInput('github-delayed-body:1');
+    const githubHeaderResult = await client.callProviderOperation(
+      githubHeaders, providerGrantFor(githubHeaders), new AbortController().signal,
+    );
+    const githubBodyResult = await client.callProviderOperation(
+      githubBody, providerGrantFor(githubBody), new AbortController().signal,
+    );
+    assert.deepEqual(githubHeaderResult, {
+      requestId: githubHeaders.requestId, outcome: 'verified', result: { complete: true },
+    });
+    assert.deepEqual(githubBodyResult, {
+      requestId: githubBody.requestId, outcome: 'verified', result: { complete: true },
+    });
+
+    const otherProvider = {
+      ...githubInput('other-provider-default-timeout:1'),
+      providerId: 'huggingface',
+      profileRef: 'hf-profile',
+      operationId: 'hf.model.get',
+    };
+    await assert.rejects(
+      client.callProviderOperation(otherProvider, providerGrantFor(otherProvider), new AbortController().signal),
+      error => error instanceof ExchangeConnectorRequestError
+        && error.outcomeUnknown && error.safeCode === 'EXCHANGE_RESPONSE_BODY_TIMEOUT',
+    );
+
+    const grantRequest = {
+      requestId: 'github-grant-default-timeout:1',
+      workspaceId: 'workspace-1',
+      principalIssuer: `https://login.microsoftonline.com/${route.tenantId}/v2.0`,
+      principalSubject: '11111111-1111-4111-8111-111111111111',
+      connectionRef,
+      providerId: 'github',
+      profileRef: 'github-profile',
+      operationId: 'github.vendor.cli.execute',
+      resourceRef: 'sha256:github-owner-repo',
+      arguments: { argv: ['api', 'repos/owner/repo/pulls?state=all', '--paginate'] },
+    };
+    grantRequest.argumentsDigestSha256 = sha256(canonicalJson(grantRequest.arguments));
+    await assert.rejects(
+      client.mintGrant(grantRequest, new AbortController().signal),
+      error => error instanceof ExchangeConnectorRequestError
+        && error.outcomeUnknown && error.safeCode === 'EXCHANGE_RESPONSE_BODY_TIMEOUT',
+    );
+
+    assert.equal(received.length, 4);
+    assert.equal(received.filter(item => item.body.requestId === githubHeaders.requestId).length, 1,
+      'a slow GitHub header response is never replayed');
+    assert.equal(received.filter(item => item.body.requestId === githubBody.requestId).length, 1,
+      'a slow GitHub response body is never replayed');
+    assert.equal(received.filter(item => item.body.requestId === otherProvider.requestId).length, 1,
+      'a timed-out non-GitHub provider call is never replayed');
+    assert.equal(received.filter(item => item.body.requestId === grantRequest.requestId).length, 1,
+      'the grant request keeps the ordinary timeout and is never replayed');
+  } finally {
+    for (const timer of responseTimers) clearTimeout(timer);
+    server.closeAllConnections();
+    await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('accepts Exchange UNKNOWN tombstones as terminal uncertain delivery', async () => {
   const input = { requestId: 'notification-1:attempt:1', conversation: route, text: 'The task completed.' };
   await withHttpResponse(200, {}, {
@@ -150,7 +303,7 @@ test('sends only the Work-resolved owner-private route through the existing Team
     requestId: 'private-notification-1:attempt:1',
     targetKind: 'owner_private',
     conversation: privateConversation,
-    text: 'Private owner status.',
+    text: 'Private owner status.\n\n**Final:** complete\r\n- first\titem',
   };
   await withHttpResponse(200, {}, {
     requestId: input.requestId, status: 'accepted', vendorMessageId: 'private-message-1',
@@ -171,6 +324,32 @@ test('sends only the Work-resolved owner-private route through the existing Team
   });
 });
 
+test('owner-private accepted receipts without a nonblank vendor ID stay uncertain', async () => {
+  for (const [index, vendorMessageId] of [undefined, '', ' \t '].entries()) {
+    const input = {
+      requestId: `private-notification-missing-id-${index}:attempt:1`,
+      targetKind: 'owner_private',
+      conversation: privateConversation,
+      text: 'Private owner status.',
+    };
+    const responseBody = {
+      requestId: input.requestId,
+      status: 'accepted',
+      ...(vendorMessageId === undefined ? {} : { vendorMessageId }),
+    };
+    await withHttpResponse(200, {}, responseBody, async (client, received) => {
+      const result = await client.sendPrivateTeamsMessage(
+        input, privateGrantFor(input), connectionRef, profileRef, new AbortController().signal,
+      );
+      assert.deepEqual(result, {
+        outcome: 'uncertain',
+        reasonCode: 'teams_accepted_receipt_missing_vendor_message_id',
+      });
+      assert.equal(received.length, 1);
+    });
+  }
+});
+
 test('owner-private send rejects actor or grant route mismatch before Exchange invocation', async () => {
   const input = {
     requestId: 'private-notification-mismatch:attempt:1',
@@ -179,20 +358,44 @@ test('owner-private send rejects actor or grant route mismatch before Exchange i
     text: 'Private owner status.',
   };
   await withHttpResponse(200, {}, { requestId: input.requestId, status: 'accepted' }, async (client, received) => {
-    await assert.rejects(client.sendPrivateTeamsMessage(
-      input,
-      privateGrantFor(input, '33333333-3333-4333-8333-333333333333'),
-      connectionRef,
-      profileRef,
-      new AbortController().signal,
-    ), /grant actor does not match/u);
-    await assert.rejects(client.sendPrivateTeamsMessage(
-      { ...input, conversation: { ...privateConversation, serviceUrl: 'https://smba.trafficmanager.net/amer/' } },
-      privateGrantFor(input),
-      connectionRef,
-      profileRef,
-      new AbortController().signal,
-    ), /does not match the exact provider call/u);
+    await assert.rejects(
+      client.sendPrivateTeamsMessage(
+        input,
+        privateGrantFor(input, '33333333-3333-4333-8333-333333333333'),
+        connectionRef,
+        profileRef,
+        new AbortController().signal,
+      ), error => error instanceof ExchangeConnectorRequestError
+        && !error.outcomeUnknown && error.safeCode === 'TEAMS_PRIVATE_SEND_NOT_STARTED',
+    );
+    await assert.rejects(
+      client.sendPrivateTeamsMessage(
+        { ...input, conversation: { ...privateConversation, serviceUrl: 'https://smba.trafficmanager.net/amer/' } },
+        privateGrantFor(input),
+        connectionRef,
+        profileRef,
+        new AbortController().signal,
+      ), error => error instanceof ExchangeConnectorRequestError
+        && !error.outcomeUnknown && error.safeCode === 'TEAMS_PRIVATE_SEND_NOT_STARTED',
+    );
+    const invalidTextInput = { ...input, text: 'Private owner\u000bstatus.' };
+    await assert.rejects(
+      client.sendPrivateTeamsMessage(
+        invalidTextInput, privateGrantFor(invalidTextInput), connectionRef, profileRef,
+        new AbortController().signal,
+      ), error => error instanceof ExchangeConnectorRequestError
+        && !error.outcomeUnknown && error.safeCode === 'TEAMS_PRIVATE_SEND_NOT_STARTED',
+    );
+    for (const [index, text] of ['   ', '\n', '\r\n\t '].entries()) {
+      const whitespaceInput = { ...input, requestId: `private-notification-blank-${index}:attempt:1`, text };
+      await assert.rejects(
+        client.sendPrivateTeamsMessage(
+          whitespaceInput, privateGrantFor(whitespaceInput), connectionRef, profileRef,
+          new AbortController().signal,
+        ), error => error instanceof ExchangeConnectorRequestError
+          && !error.outcomeUnknown && error.safeCode === 'TEAMS_PRIVATE_SEND_NOT_STARTED',
+      );
+    }
     assert.equal(received.length, 0);
   });
 });
@@ -213,6 +416,194 @@ test('owner-private send preserves Exchange uncertain receipts without treating 
     assert.deepEqual(result, { outcome: 'uncertain', reasonCode: 'teams_delivery_outcome_unknown' });
     assert.equal(received.length, 1);
   });
+});
+
+test('owner-private response body deadline is uncertain and never causes a second send', async () => {
+  const input = {
+    requestId: 'private-notification-body-timeout:attempt:1',
+    targetKind: 'owner_private',
+    conversation: privateConversation,
+    text: 'Private owner status.',
+  };
+  let received = 0;
+  let responseTimer;
+  const server = createServer((request, response) => {
+    const chunks = [];
+    request.on('data', chunk => chunks.push(chunk));
+    request.on('end', () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      received += 1;
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.write(`{"requestId":"${body.requestId}","status":"accepted",`);
+      response.once('close', () => {
+        if (responseTimer !== undefined) clearTimeout(responseTimer);
+      });
+      responseTimer = setTimeout(() => response.end('"vendorMessageId":"late-message"}'), 500);
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = server.address();
+    const client = new ExchangeConnectorAuthorizationClient({
+      baseUrl: `http://127.0.0.1:${address.port}`,
+      hmacKeyFile: '/unused-for-provider-grant-fixture',
+      hmacKeyId: 'test-key',
+      audience: 'exchange',
+      requestTimeoutMs: 500,
+      privateTeamsMessageTimeoutMs: 100,
+    });
+    const startedAt = performance.now();
+    await assert.rejects(
+      client.sendPrivateTeamsMessage(input, privateGrantFor(input), connectionRef, profileRef,
+        new AbortController().signal),
+      error => error instanceof ExchangeConnectorRequestError
+        && error.outcomeUnknown
+        && error.safeCode === 'EXCHANGE_RESPONSE_BODY_TIMEOUT',
+    );
+    assert.ok(performance.now() - startedAt < 350, 'body reading must remain inside the bounded request deadline');
+    assert.equal(received, 1, 'an incomplete accepted response must not trigger a duplicate send');
+  } finally {
+    if (responseTimer !== undefined) clearTimeout(responseTimer);
+    server.closeAllConnections();
+    await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
+});
+
+test('private Teams timeout is longer only for private sends; channel sends keep the ordinary cap', async () => {
+  const privateInput = {
+    requestId: 'private-notification-timeout-scope:attempt:1',
+    targetKind: 'owner_private',
+    conversation: privateConversation,
+    text: 'Private owner status.',
+  };
+  const channelInput = {
+    requestId: 'channel-notification-timeout-scope:attempt:1',
+    conversation: route,
+    text: 'The task completed.',
+  };
+  const received = [];
+  const responseTimers = new Set();
+  const server = createServer((request, response) => {
+    const chunks = [];
+    request.on('data', chunk => chunks.push(chunk));
+    request.on('end', () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      received.push(body);
+      const timer = setTimeout(() => {
+        response.end(JSON.stringify({
+          requestId: body.requestId,
+          status: 'accepted',
+          vendorMessageId: 'delayed-fixture-message',
+        }));
+        responseTimers.delete(timer);
+      }, 150);
+      responseTimers.add(timer);
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.once('close', () => {
+        clearTimeout(timer);
+        responseTimers.delete(timer);
+      });
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = server.address();
+    const client = new ExchangeConnectorAuthorizationClient({
+      baseUrl: `http://127.0.0.1:${address.port}`,
+      hmacKeyFile: '/unused-for-provider-grant-fixture',
+      hmacKeyId: 'test-key',
+      audience: 'exchange',
+      requestTimeoutMs: 100,
+      privateTeamsMessageTimeoutMs: 400,
+    });
+    const privateResult = await client.sendPrivateTeamsMessage(
+      privateInput, privateGrantFor(privateInput), connectionRef, profileRef, new AbortController().signal,
+    );
+    assert.deepEqual(privateResult, { outcome: 'accepted', vendorMessageId: 'delayed-fixture-message' });
+    assert.equal(received.length, 1);
+
+    await assert.rejects(
+      client.sendTeamsMessage(
+        channelInput, grantFor(channelInput), connectionRef, profileRef, new AbortController().signal,
+      ), error => error instanceof ExchangeConnectorRequestError
+        && error.outcomeUnknown && error.safeCode === 'EXCHANGE_CONNECTOR_REQUEST_TIMEOUT',
+    );
+    assert.equal(received.length, 2, 'the channel call keeps its ordinary request cap and is never replayed');
+  } finally {
+    for (const timer of responseTimers) clearTimeout(timer);
+    server.closeAllConnections();
+    await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
+});
+
+test('owner-private HTTP 408 is uncertain while explicit 403 remains a definite rejection', async () => {
+  const input = {
+    requestId: 'private-notification-http-status:attempt:1',
+    targetKind: 'owner_private',
+    conversation: privateConversation,
+    text: 'Private owner status.',
+  };
+  for (const [status, outcomeUnknown] of [[408, true], [403, false]]) {
+    await withHttpResponse(status, {}, { code: 'fixture_rejection' }, async (client, received) => {
+      await assert.rejects(
+        client.sendPrivateTeamsMessage(input, privateGrantFor(input), connectionRef, profileRef,
+          new AbortController().signal),
+        error => error instanceof ExchangeConnectorRequestError
+          && error.status === status && error.outcomeUnknown === outcomeUnknown,
+      );
+      assert.equal(received.length, 1, 'a rejected or uncertain response must not trigger a second POST');
+    });
+  }
+});
+
+test('owner-private HTTP 408 body timeout keeps its uncertain classification and safe code', async () => {
+  const input = {
+    requestId: 'private-notification-http-408-body-timeout:attempt:1',
+    targetKind: 'owner_private',
+    conversation: privateConversation,
+    text: 'Private owner status.',
+  };
+  let received = 0;
+  let responseTimer;
+  const server = createServer((request, response) => {
+    request.resume();
+    request.on('end', () => {
+      received += 1;
+      response.writeHead(408, { 'content-type': 'application/json' });
+      response.write('{"code":"upstream_timeout",');
+      response.once('close', () => {
+        if (responseTimer !== undefined) clearTimeout(responseTimer);
+      });
+      responseTimer = setTimeout(() => response.end('"detail":"late body"}'), 500);
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = server.address();
+    const client = new ExchangeConnectorAuthorizationClient({
+      baseUrl: `http://127.0.0.1:${address.port}`,
+      hmacKeyFile: '/unused-for-provider-grant-fixture',
+      hmacKeyId: 'test-key',
+      audience: 'exchange',
+      requestTimeoutMs: 500,
+      privateTeamsMessageTimeoutMs: 100,
+    });
+    const startedAt = performance.now();
+    await assert.rejects(
+      client.sendPrivateTeamsMessage(input, privateGrantFor(input), connectionRef, profileRef,
+        new AbortController().signal),
+      error => error instanceof ExchangeConnectorRequestError
+        && error.status === 408
+        && error.outcomeUnknown
+        && error.safeCode === 'EXCHANGE_RESPONSE_BODY_TIMEOUT',
+    );
+    assert.ok(performance.now() - startedAt < 350, '408 response-body reads remain inside the request deadline');
+    assert.equal(received, 1, 'an uncertain 408 must not trigger a duplicate POST');
+  } finally {
+    if (responseTimer !== undefined) clearTimeout(responseTimer);
+    server.closeAllConnections();
+    await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
 });
 
 test('retries only an explicit HTTP 429 rate-limit response with bounded Retry-After', async () => {
