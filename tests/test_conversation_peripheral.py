@@ -43,7 +43,11 @@ from cyrene_navigator.work.conversation_peripheral.ports import (
     SignedExchangeRequest,
     VerifiedArtifactCaller,
 )
-from cyrene_navigator.work.conversation_peripheral.routes import mount_peripheral_routes
+from cyrene_navigator.work.conversation_peripheral.routes import (
+    _bilibili_result_artifact_from_operation,
+    _BilibiliChildTask,
+    mount_peripheral_routes,
+)
 from cyrene_navigator.work.store import WorkStore
 
 WORKSPACE = "workspace-test"
@@ -498,6 +502,77 @@ def _app(tmp_path: Path, ports: PeripheralPorts) -> tuple[TestClient, WorkStore]
 
 def _headers(token: str = "writer-token") -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.mark.parametrize("content_state", ["private", "shared", "symlink", "oversize"])
+def test_bilibili_result_replay_requires_private_bounded_regular_content(
+    tmp_path: Path, content_state: str
+) -> None:
+    """A replay cannot fall back to shared data or follow a replaced result file.
+
+    中文：回执重放不能回退到共享附件，也不能跟随替换后的链接或无界读取。
+    """
+    _client, store = _app(tmp_path, PeripheralPorts())
+    principal = PRINCIPALS["writer-token"]
+    raw = b'{"items":[{"title":"observed"}]}'
+    digest = hashlib.sha256(raw).hexdigest()
+    store.put_attachment(
+        ORGANIZATION,
+        WORKSPACE,
+        "read-result.json",
+        "application/json",
+        raw,
+        actor_id=principal.actor_id,
+        actor_private_scope=content_state != "shared",
+    )
+    if content_state in {"symlink", "oversize"}:
+        _metadata, content = store.get_attachment(
+            ORGANIZATION,
+            WORKSPACE,
+            digest,
+            actor_id=principal.actor_id,
+            actor_private_scope=True,
+            require_actor_private=True,
+        )
+        if content_state == "symlink":
+            target = tmp_path / "same-bytes.json"
+            target.write_bytes(raw)
+            content.unlink()
+            content.symlink_to(target)
+        else:
+            with content.open("ab") as source:
+                source.truncate(1_500_001)
+    task = _BilibiliChildTask(
+        task_id="result-child",
+        source="conversation-bili-operation",
+        profile_ref=PROFILE_REF,
+        idempotency_key="result-replay-key",
+        resource_ref="bilibili:search",
+        target={},
+        operation_request={},
+    )
+    operation = {
+        "taskId": task.task_id,
+        "trustedProducer": "exchange-connector-dispatch",
+        "evidence": {"resultArtifactId": digest, "resultSha256": digest},
+    }
+    if content_state == "private":
+        result = _bilibili_result_artifact_from_operation(
+            store, principal, WORKSPACE, operation, task
+        )
+        assert result == {
+            "artifactId": digest,
+            "sha256": digest,
+            "mimeType": "application/json",
+            "size": len(raw),
+        }
+    else:
+        with pytest.raises(PersistenceError) as error:
+            _bilibili_result_artifact_from_operation(store, principal, WORKSPACE, operation, task)
+        assert error.value.code in {
+            "WORK_ATTACHMENT_NOT_FOUND",
+            "BILIBILI_RESULT_READBACK_MISMATCH",
+        }
 
 
 def _media_binding() -> tuple[FixedToolBinding, _FakeSigner, _FakeToolClient]:

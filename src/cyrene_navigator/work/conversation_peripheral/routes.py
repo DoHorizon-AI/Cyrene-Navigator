@@ -17,10 +17,13 @@ import base64
 import dataclasses
 import hashlib
 import json
+import os
 import re
+import stat
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, cast
 from urllib.parse import quote
 from uuid import UUID, uuid4
@@ -43,6 +46,7 @@ from cyrene_navigator.work.models import (
 )
 from cyrene_navigator.work.store import WorkStore
 
+from .identity import bilibili_operation_idempotency_key
 from .models import (
     BackupReceipt,
     BilibiliAccount,
@@ -81,6 +85,7 @@ from .ports import (
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _MEDIA_TYPE = re.compile(r"[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+\Z")
 _MAX_ATTACHMENT_BYTES = 10_000_000
+_MAX_BILIBILI_RESULT_BYTES = 1_500_000
 _IMAGE_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
 _AUDIO_MIME_TYPES = frozenset(
     {"audio/mpeg", "audio/mp4", "audio/ogg", "audio/wav", "audio/webm", "audio/x-wav"}
@@ -1771,7 +1776,7 @@ def _store_bilibili_result_artifact(
         ).encode("utf-8")
     except (TypeError, ValueError, UnicodeError):
         raise _provider_payload_error("BILIBILI_PROVIDER_INVALID_PAYLOAD") from None
-    if not raw or len(raw) > 1_500_000:
+    if not raw or len(raw) > _MAX_BILIBILI_RESULT_BYTES:
         raise PersistenceError(
             "BILIBILI_RESULT_TOO_LARGE", 413, "The Bilibili result exceeds the Work limit."
         )
@@ -1796,8 +1801,9 @@ def _store_bilibili_result_artifact(
         expected_digest,
         actor_id=principal.actor_id,
         actor_private_scope=True,
+        require_actor_private=True,
     )
-    readback = path.read_bytes()
+    readback = _read_bilibili_result_attachment(path, metadata.get("size"))
     if (
         metadata.get("sha256") != expected_digest
         or metadata.get("mediaType") != "application/json"
@@ -1851,8 +1857,9 @@ def _bilibili_result_artifact_from_operation(
         digest,
         actor_id=principal.actor_id,
         actor_private_scope=True,
+        require_actor_private=True,
     )
-    raw = path.read_bytes()
+    raw = _read_bilibili_result_attachment(path, metadata.get("size"))
     if (
         metadata.get("sha256") != digest
         or metadata.get("mediaType") != "application/json"
@@ -1869,6 +1876,39 @@ def _bilibili_result_artifact_from_operation(
         "mimeType": "application/json",
         "size": len(raw),
     }
+
+
+def _read_bilibili_result_attachment(path: Path, expected_size: Any) -> bytes:
+    """Read only a bounded regular result file without following its final symlink."""
+
+    if type(expected_size) is not int or not 1 <= expected_size <= _MAX_BILIBILI_RESULT_BYTES:
+        raise PersistenceError(
+            "BILIBILI_RESULT_READBACK_MISMATCH", 502, "Work result size is invalid."
+        )
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as source:
+            before = os.fstat(source.fileno())
+            if not stat.S_ISREG(before.st_mode) or before.st_size != expected_size:
+                raise PersistenceError(
+                    "BILIBILI_RESULT_READBACK_MISMATCH", 502, "Work result content is invalid."
+                )
+            raw = source.read(_MAX_BILIBILI_RESULT_BYTES + 1)
+            after = os.fstat(source.fileno())
+    except OSError:
+        raise PersistenceError(
+            "BILIBILI_RESULT_READBACK_MISMATCH", 502, "Work result content is unavailable."
+        ) from None
+    if len(raw) != expected_size or (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
+        raise PersistenceError(
+            "BILIBILI_RESULT_READBACK_MISMATCH", 502, "Work result changed during readback."
+        )
+    return raw
 
 
 async def _call_bilibili_exchange(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -2577,8 +2617,7 @@ def _bilibili_effective_operation_key(
     """Scope one stable feature key to the authenticated Work actor and tenant."""
 
     actor_scope = actor_scope_sha256(principal, workspace_id)
-    digest = hashlib.sha256(f"{actor_scope}\0{logical_key}".encode()).hexdigest()
-    return f"bilibili:{digest}"
+    return bilibili_operation_idempotency_key(actor_scope, logical_key)
 
 
 def _value(value: Mapping[str, Any], snake: str, *aliases: str) -> Any:
