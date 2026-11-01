@@ -164,9 +164,14 @@ class BilibiliAccountList(WorkModel):
 
 
 class BilibiliConnection(WorkModel):
-    """Safe selection for one actor-owned Exchange connection."""
+    """Safe selection for one actor-owned Exchange connection and profile."""
 
-    connection_ref: str
+    connection_ref: str = Field(
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    )
+    profile_ref: str = Field(
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    )
     provider: Literal["bilibili"] = "bilibili"
     display_name: str
     enabled: bool

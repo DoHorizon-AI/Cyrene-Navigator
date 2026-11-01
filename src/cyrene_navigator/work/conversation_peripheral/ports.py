@@ -19,6 +19,7 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Protocol
 from urllib.parse import quote, urlsplit
 from uuid import UUID, uuid4
@@ -26,6 +27,7 @@ from uuid import UUID, uuid4
 import httpx
 
 from cyrene_navigator.persistence.store import PersistencePrincipal
+from cyrene_navigator.work.conversation_artifact_bridge.registry import ActiveCallRegistry
 
 
 class PeripheralPortError(Exception):
@@ -124,7 +126,7 @@ class FixedToolBinding:
     signer: TrustedCallerSigner
     client: ToolProviderClient
 
-    async def invoke(
+    def create_caller_context(
         self,
         provider_tool_id: str,
         arguments: Mapping[str, Any],
@@ -133,12 +135,12 @@ class FixedToolBinding:
         workspace_id: str,
         request_id: str,
     ) -> Mapping[str, Any]:
-        """Sign and invoke one allowlisted tool through the configured binding."""
+        """Sign one immutable tool call before its bridge grant is registered."""
 
         operation_id = self.operation_ids.get(provider_tool_id)
         if operation_id is None:
             raise PeripheralPortError("PERIPHERAL_OPERATION_UNAVAILABLE", unavailable=True)
-        context = self.signer.sign_context(
+        return self.signer.sign_context(
             method=provider_tool_id,
             operation_id=operation_id,
             payload=arguments,
@@ -147,6 +149,26 @@ class FixedToolBinding:
             binding_id=self.binding_id,
             caller_workload=self.caller_workload,
             audience=self.audience,
+            request_id=request_id,
+        )
+
+    async def invoke(
+        self,
+        provider_tool_id: str,
+        arguments: Mapping[str, Any],
+        *,
+        principal: PersistencePrincipal,
+        workspace_id: str,
+        request_id: str,
+        caller_context: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        """Sign and invoke one allowlisted tool through the configured binding."""
+
+        context = caller_context or self.create_caller_context(
+            provider_tool_id,
+            arguments,
+            principal=principal,
+            workspace_id=workspace_id,
             request_id=request_id,
         )
         call_tool = self.client.call_tool
@@ -713,12 +735,39 @@ class VerifiedArtifactCaller:
 
 
 @dataclass(frozen=True, slots=True)
-class ArtifactBridgeConfig:
-    """Loopback-only Work attachment bridge secrets and binding verifier."""
+class ArtifactBridgeBinding:
+    """One plugin binding's loopback bearer and signed caller verifier."""
 
     bearer_token: str
     binding_id: str
     verifier: ArtifactCallerVerifier
+
+    def __post_init__(self) -> None:
+        if (
+            not self.binding_id
+            or len(self.binding_id) > 200
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}", self.binding_id) is None
+        ):
+            raise ValueError("artifact bridge binding ID is invalid")
+        if re.fullmatch(r"[0-9a-f]{64}", self.bearer_token) is None:
+            raise ValueError("artifact bridge service bearer must be 32-byte lowercase hex")
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactBridgeConfig:
+    """Configured binding set and one shared live-call registry."""
+
+    bindings: Mapping[str, ArtifactBridgeBinding]
+    registry: ActiveCallRegistry
+
+    def __post_init__(self) -> None:
+        selected = dict(self.bindings)
+        if any(
+            not isinstance(binding, ArtifactBridgeBinding) or key != binding.binding_id
+            for key, binding in selected.items()
+        ):
+            raise ValueError("artifact bridge bindings must use their fixed binding IDs")
+        object.__setattr__(self, "bindings", MappingProxyType(selected))
 
 
 @dataclass(frozen=True, slots=True)
@@ -733,6 +782,7 @@ class PeripheralPorts:
 
 
 __all__ = [
+    "ArtifactBridgeBinding",
     "ArtifactBridgeConfig",
     "ArtifactCallerVerifier",
     "BackupPort",

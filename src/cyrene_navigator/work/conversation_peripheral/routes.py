@@ -12,24 +12,31 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import dataclasses
 import hashlib
-import hmac
-import ipaddress
 import json
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, cast
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
 from fastapi import FastAPI, Header, Query, Request, Response
-from pydantic import Field
 
 from cyrene_navigator.persistence.errors import PersistenceError
 from cyrene_navigator.persistence.store import PersistencePrincipal
+from cyrene_navigator.work.conversation_artifact_bridge.models import ArtifactReadGrant
+from cyrene_navigator.work.conversation_artifact_bridge.registry import (
+    ActiveCallLease,
+    actor_scope_sha256,
+    canonical_arguments_sha256,
+)
+from cyrene_navigator.work.conversation_artifact_bridge.routes import (
+    mount_conversation_artifact_bridge,
+)
 from cyrene_navigator.work.models import (
     AttachmentRecord,
     OperationReceipt,
@@ -60,7 +67,6 @@ from .models import (
     SpeechStatus,
     SpeechTranscription,
     SpeechTranscriptionRequest,
-    WorkModel,
 )
 from .ports import (
     ArtifactBridgeConfig,
@@ -69,14 +75,11 @@ from .ports import (
     FixedToolBinding,
     PeripheralPortError,
     PeripheralPorts,
-    VerifiedArtifactCaller,
 )
 
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
-_BRIDGE_TOKEN = re.compile(r"[0-9a-f]{64}\Z")
 _MEDIA_TYPE = re.compile(r"[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+\Z")
 _MAX_ATTACHMENT_BYTES = 10_000_000
-_MAX_BASE64_BYTES = 14_000_000
 _IMAGE_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
 _AUDIO_MIME_TYPES = frozenset(
     {"audio/mpeg", "audio/mp4", "audio/ogg", "audio/wav", "audio/webm", "audio/x-wav"}
@@ -96,22 +99,6 @@ _BILIBILI_WRITE_OPERATIONS = (
     "bilibili.dynamic.publish",
     "bilibili.dm.send",
 )
-
-
-class _ArtifactReadBody(WorkModel):
-    artifact_id: str = Field(pattern=r"^[0-9a-f]{64}$")
-    tool_id: str = Field(min_length=1, max_length=200)
-    arguments: dict[str, Any]
-    caller_context: dict[str, Any]
-
-
-class _ArtifactWriteBody(WorkModel):
-    mime_type: str = Field(min_length=1, max_length=256)
-    name: str = Field(min_length=1, max_length=512)
-    content_base64: str = Field(min_length=1, max_length=_MAX_BASE64_BYTES)
-    tool_id: str = Field(min_length=1, max_length=200)
-    arguments: dict[str, Any]
-    caller_context: dict[str, Any]
 
 
 PrincipalFor = Callable[..., PersistencePrincipal]
@@ -156,7 +143,7 @@ def mount_peripheral_routes(
         workspace_id: str, body: MediaAssetImport, request: Request, response: Response
     ) -> dict[str, Any]:
         principal = principal_for(request, workspace_id, write=True)
-        _read_attachment(
+        selected_attachment, _ = _read_attachment(
             store,
             principal,
             workspace_id,
@@ -164,20 +151,38 @@ def mount_peripheral_routes(
             accepted_types=_IMAGE_MIME_TYPES,
         )
         binding = _require_binding(ports.media, "MEDIA_PROVIDER_UNAVAILABLE")
-        result = await _invoke_tool(
+        arguments = {
+            "artifact_id": body.attachment_digest,
+            "title": body.title,
+            "alt_text": body.alt_text,
+            "tags": body.tags,
+        }
+
+        def project_import(
+            result: Mapping[str, Any], _lease: ActiveCallLease
+        ) -> tuple[dict[str, Any], Mapping[str, Any]]:
+            asset = _validate_provider_model(MediaAsset, result)
+            _validate_asset_attachment(asset, selected_attachment, body.attachment_digest)
+            return asset, {}
+
+        asset = await _invoke_artifact_tool(
             binding,
             "media.asset.import",
-            {
-                "artifact_id": body.attachment_digest,
-                "title": body.title,
-                "alt_text": body.alt_text,
-                "tags": body.tags,
-            },
+            arguments,
             principal=principal,
             workspace_id=workspace_id,
             request_id=_request_id(request),
+            store=store,
+            bridge=ports.artifact_bridge,
+            read_grants=(
+                ArtifactReadGrant(
+                    body.attachment_digest,
+                    "human_selection",
+                    frozenset(_IMAGE_MIME_TYPES),
+                ),
+            ),
+            projector=project_import,
         )
-        asset = _validate_provider_model(MediaAsset, result)
         response.status_code = 201
         return asset
 
@@ -185,64 +190,91 @@ def mount_peripheral_routes(
     async def get_media_asset(workspace_id: str, asset_id: str, request: Request) -> dict[str, Any]:
         principal = principal_for(request, workspace_id)
         binding = _require_binding(ports.media, "MEDIA_PROVIDER_UNAVAILABLE")
-        result = await _invoke_tool(
+
+        def project_asset_read(
+            result: Mapping[str, Any], lease: ActiveCallLease
+        ) -> tuple[dict[str, Any], Mapping[str, Any]]:
+            value = _json_object(result, "MEDIA_PROVIDER_INVALID_PAYLOAD")
+            asset = _validate_provider_model(MediaAsset, value.get("asset"))
+            artifact = _json_object(value.get("artifact"), "MEDIA_PROVIDER_INVALID_PAYLOAD")
+            digest = artifact.get("sha256")
+            if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+                raise _provider_payload_error("MEDIA_PROVIDER_INVALID_PAYLOAD")
+            bridge = _require_artifact_bridge(ports.artifact_bridge)
+            bridge.registry.assert_output(lease, digest)
+            attachment, _ = _read_attachment(
+                store,
+                principal,
+                workspace_id,
+                digest,
+                accepted_types=_IMAGE_MIME_TYPES,
+                actor_private_scope=True,
+            )
+            _validate_asset_attachment(asset, attachment, digest)
+            return (
+                {
+                    "asset": asset,
+                    "attachment": attachment,
+                    "downloadPath": _workspace_route_path(
+                        base,
+                        workspace_id,
+                        f"/media/assets/{quote(asset_id, safe='')}/attachment",
+                    ),
+                },
+                {"artifactSha256": digest},
+            )
+
+        return await _invoke_artifact_tool(
             binding,
             "media.asset.get",
             {"asset_id": asset_id},
             principal=principal,
             workspace_id=workspace_id,
             request_id=_request_id(request),
+            store=store,
+            bridge=ports.artifact_bridge,
+            write_mime_types=_IMAGE_MIME_TYPES,
+            projector=project_asset_read,
         )
-        value = _json_object(result, "MEDIA_PROVIDER_INVALID_PAYLOAD")
-        asset = _validate_provider_model(MediaAsset, value.get("asset"))
-        artifact = _json_object(value.get("artifact"), "MEDIA_PROVIDER_INVALID_PAYLOAD")
-        digest = artifact.get("sha256")
-        if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
-            raise _provider_payload_error()
-        attachment, _ = _read_attachment(
-            store,
-            principal,
-            workspace_id,
-            digest,
-            accepted_types=_IMAGE_MIME_TYPES,
-            actor_private_scope=True,
-        )
-        return {
-            "asset": asset,
-            "attachment": attachment,
-            "downloadPath": _workspace_route_path(
-                base,
-                workspace_id,
-                f"/media/assets/{quote(asset_id, safe='')}/attachment",
-            ),
-        }
 
     @app.get(base + "/media/assets/{asset_id}/attachment", response_model=None)
     async def download_media_asset(workspace_id: str, asset_id: str, request: Request) -> Response:
         principal = principal_for(request, workspace_id)
-        result = await _invoke_tool(
+
+        def project_asset_download(
+            result: Mapping[str, Any], lease: ActiveCallLease
+        ) -> tuple[Response, Mapping[str, Any]]:
+            value = _json_object(result, "MEDIA_PROVIDER_INVALID_PAYLOAD")
+            asset = _validate_provider_model(MediaAsset, value.get("asset"))
+            artifact = _json_object(value.get("artifact"), "MEDIA_PROVIDER_INVALID_PAYLOAD")
+            digest = artifact.get("sha256")
+            if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+                raise _provider_payload_error("MEDIA_PROVIDER_INVALID_PAYLOAD")
+            bridge = _require_artifact_bridge(ports.artifact_bridge)
+            bridge.registry.assert_output(lease, digest)
+            attachment, data = _read_attachment(
+                store,
+                principal,
+                workspace_id,
+                digest,
+                accepted_types=_IMAGE_MIME_TYPES,
+                actor_private_scope=True,
+            )
+            _validate_asset_attachment(asset, attachment, digest)
+            return _attachment_response(attachment, data), {"artifactSha256": digest}
+
+        return await _invoke_artifact_tool(
             _require_binding(ports.media, "MEDIA_PROVIDER_UNAVAILABLE"),
             "media.asset.get",
             {"asset_id": asset_id},
             principal=principal,
             workspace_id=workspace_id,
             request_id=_request_id(request),
+            store=store,
+            bridge=ports.artifact_bridge,
+            write_mime_types=_IMAGE_MIME_TYPES,
+            projector=project_asset_download,
         )
-        value = _json_object(result, "MEDIA_PROVIDER_INVALID_PAYLOAD")
-        _validate_provider_model(MediaAsset, value.get("asset"))
-        artifact = _json_object(value.get("artifact"), "MEDIA_PROVIDER_INVALID_PAYLOAD")
-        digest = artifact.get("sha256")
-        if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
-            raise _provider_payload_error()
-        attachment, data = _read_attachment(
-            store,
-            principal,
-            workspace_id,
-            digest,
-            accepted_types=_IMAGE_MIME_TYPES,
-            actor_private_scope=True,
-        )
-        return _attachment_response(attachment, data)
 
     @app.delete(base + "/media/assets/{asset_id}", response_model=MediaAssetDeleteReceipt)
     async def delete_media_asset(
@@ -279,37 +311,52 @@ def mount_peripheral_routes(
         workspace_id: str, body: MediaCardRender, request: Request
     ) -> dict[str, Any]:
         principal = principal_for(request, workspace_id, write=True)
-        result = await _invoke_tool(
+
+        def project_card_render(
+            result: Mapping[str, Any], lease: ActiveCallLease
+        ) -> tuple[dict[str, Any], Mapping[str, Any]]:
+            value = _json_object(result, "MEDIA_PROVIDER_INVALID_PAYLOAD")
+            asset = _validate_provider_model(MediaAsset, value.get("asset"))
+            artifact = _json_object(value.get("artifact"), "MEDIA_PROVIDER_INVALID_PAYLOAD")
+            digest = artifact.get("sha256")
+            if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+                raise _provider_payload_error("MEDIA_PROVIDER_INVALID_PAYLOAD")
+            bridge = _require_artifact_bridge(ports.artifact_bridge)
+            bridge.registry.assert_output(lease, digest)
+            attachment, _ = _read_attachment(
+                store,
+                principal,
+                workspace_id,
+                digest,
+                accepted_types={"image/png"},
+                actor_private_scope=True,
+            )
+            _validate_asset_attachment(asset, attachment, digest)
+            return (
+                {
+                    "asset": asset,
+                    "attachment": attachment,
+                    "downloadPath": _workspace_route_path(
+                        base,
+                        workspace_id,
+                        f"/media/assets/{quote(str(asset.get('assetId')), safe='')}/attachment",
+                    ),
+                },
+                {"artifactSha256": digest},
+            )
+
+        return await _invoke_artifact_tool(
             _require_binding(ports.media, "MEDIA_PROVIDER_UNAVAILABLE"),
             "media.card.render",
             {"title": body.title, "body": body.content, "theme": body.theme},
             principal=principal,
             workspace_id=workspace_id,
             request_id=_request_id(request),
+            store=store,
+            bridge=ports.artifact_bridge,
+            write_mime_types={"image/png"},
+            projector=project_card_render,
         )
-        value = _json_object(result, "MEDIA_PROVIDER_INVALID_PAYLOAD")
-        asset = _validate_provider_model(MediaAsset, value.get("asset"))
-        artifact = _json_object(value.get("artifact"), "MEDIA_PROVIDER_INVALID_PAYLOAD")
-        digest = artifact.get("sha256")
-        if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
-            raise _provider_payload_error()
-        attachment, _ = _read_attachment(
-            store,
-            principal,
-            workspace_id,
-            digest,
-            accepted_types={"image/png"},
-            actor_private_scope=True,
-        )
-        return {
-            "asset": asset,
-            "attachment": attachment,
-            "downloadPath": _workspace_route_path(
-                base,
-                workspace_id,
-                f"/media/assets/{quote(str(asset.get('assetId')), safe='')}/attachment",
-            ),
-        }
 
     @app.get(base + "/speech/config", response_model=SpeechConfig)
     async def get_speech_config(workspace_id: str, request: Request) -> dict[str, Any]:
@@ -408,7 +455,14 @@ def mount_peripheral_routes(
                 _validate_provider_model(
                     BilibiliConnection,
                     {
-                        "connection_ref": _value(item, "connection_ref", "connectionRef", "id"),
+                        "connection_ref": _exchange_uuid_ref(
+                            _value(item, "connection_ref", "connectionRef", "id"),
+                            "EXCHANGE_CONNECTION_RESPONSE_INVALID",
+                        ),
+                        "profile_ref": _exchange_uuid_ref(
+                            _value(item, "profile_ref", "profileRef"),
+                            "EXCHANGE_CONNECTION_RESPONSE_INVALID",
+                        ),
                         "provider": "bilibili",
                         "display_name": _value(item, "display_name", "displayName") or "Bilibili",
                         "enabled": _value(item, "enabled") is True,
@@ -522,6 +576,53 @@ def mount_peripheral_routes(
             "writeOperations": list(_BILIBILI_WRITE_OPERATIONS),
         }
 
+    @app.get(
+        base + "/bilibili/operations/by-idempotency-key",
+        response_model=OperationReceipt,
+    )
+    async def get_bilibili_operation_by_idempotency_key(
+        workspace_id: str,
+        request: Request,
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ) -> dict[str, Any]:
+        principal = principal_for(request, workspace_id)
+        effective_key = _bilibili_effective_operation_key(principal, workspace_id, idempotency_key)
+        lookup = getattr(store, "get_operation_by_idempotency_key", None)
+        if not callable(lookup):
+            raise PersistenceError(
+                "WORK_OPERATION_LOOKUP_UNAVAILABLE",
+                503,
+                "Work operation lookup is unavailable.",
+                True,
+            )
+        try:
+            operation = lookup(principal.organization_id, workspace_id, effective_key)
+        except PersistenceError as error:
+            if error.code == "WORK_OPERATION_NOT_FOUND":
+                raise PersistenceError(
+                    "BILIBILI_OPERATION_NOT_FOUND", 404, "Bilibili operation not found."
+                ) from None
+            raise
+        operation_request = operation.get("request")
+        stored_operation_id = (
+            operation_request.get("operationId") if isinstance(operation_request, Mapping) else None
+        )
+        if (
+            not isinstance(operation_request, Mapping)
+            or operation_request.get("actorScopeSha256")
+            != actor_scope_sha256(principal, workspace_id)
+            or stored_operation_id not in _BILIBILI_WRITE_OPERATIONS
+            or operation.get("operationType") != f"tool.provider.v1:{stored_operation_id}"
+            or not isinstance(operation_request.get("argumentsSha256"), str)
+            or _DIGEST.fullmatch(operation_request["argumentsSha256"]) is None
+            or not isinstance(operation_request.get("connectionRefDigest"), str)
+            or _DIGEST.fullmatch(operation_request["connectionRefDigest"]) is None
+        ):
+            raise PersistenceError(
+                "BILIBILI_OPERATION_NOT_FOUND", 404, "Bilibili operation not found."
+            )
+        return {"operation": operation, "duplicate": True}
+
     @app.post(base + "/bilibili/connections/{connection_ref}/reads/{operation_id}")
     async def bilibili_read(
         workspace_id: str,
@@ -581,31 +682,21 @@ def mount_peripheral_routes(
         await _require_bilibili_connection(port, principal, workspace_id, connection_ref)
         connection_ref = str(UUID(connection_ref))
         connection_digest = hashlib.sha256(connection_ref.encode()).hexdigest()
-        actor_scope_material = (
-            f"{principal.organization_id or ''}\0{workspace_id}\0"
-            f"{principal.actor_id}\0{connection_digest}"
-        )
-        actor_scope = hashlib.sha256(actor_scope_material.encode()).hexdigest()
-        key_digest = hashlib.sha256(
-            f"{actor_scope}\0{operation_id}\0{idempotency_key}".encode()
+        actor_scope = actor_scope_sha256(principal, workspace_id)
+        connection_scope = hashlib.sha256(
+            f"{actor_scope}\0{connection_digest}".encode()
         ).hexdigest()
-        effective_key = f"bilibili:{key_digest}"
-        argument_digest = hashlib.sha256(
-            json.dumps(
-                body.arguments,
-                allow_nan=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
-        ).hexdigest()
+        effective_key = _bilibili_effective_operation_key(principal, workspace_id, idempotency_key)
+        argument_digest = canonical_arguments_sha256(body.arguments)
         operation, duplicate = store.create_operation(
             principal.organization_id,
             workspace_id,
             {
                 "idempotencyKey": effective_key,
                 "operationType": f"tool.provider.v1:{operation_id}",
-                "target": f"connector-target:{actor_scope}",
+                "target": f"connector-target:{connection_scope}",
                 "request": {
+                    "actorScopeSha256": actor_scope,
                     "connectionRefDigest": connection_digest,
                     "operationId": operation_id,
                     "argumentsSha256": argument_digest,
@@ -750,87 +841,7 @@ def mount_peripheral_routes(
         )
         return _attachment_response(attachment, data)
 
-    _mount_artifact_bridge(app, store, ports.artifact_bridge)
-
-
-def _mount_artifact_bridge(
-    app: FastAPI, store: WorkStore, config: ArtifactBridgeConfig | None
-) -> None:
-    """Mount fixed local bridge paths used by the media plugin resolver."""
-
-    @app.post("/v1/artifacts/read")
-    def read_work_artifact(body: _ArtifactReadBody, request: Request) -> dict[str, Any]:
-        bridge = _require_bridge(config)
-        _authorize_bridge_request(request, bridge.bearer_token)
-        if body.tool_id != "media.asset.import":
-            raise PersistenceError("WORK_ATTACHMENT_BRIDGE_FORBIDDEN", 403, "Tool is not allowed.")
-        caller = _verify_artifact_call(bridge, body.tool_id, body.arguments, body.caller_context)
-        metadata, path = store.get_attachment(
-            caller.organization_id,
-            caller.workspace_id,
-            body.artifact_id,
-            actor_id=caller.actor_id,
-            actor_private_scope=True,
-        )
-        data = path.read_bytes()
-        if (
-            metadata["sha256"] != body.artifact_id
-            or hashlib.sha256(data).hexdigest() != body.artifact_id
-            or metadata["mediaType"] not in _IMAGE_MIME_TYPES
-            or len(data) > _MAX_ATTACHMENT_BYTES
-        ):
-            raise PersistenceError(
-                "WORK_ATTACHMENT_INTEGRITY_FAILURE", 422, "Attachment failed integrity validation."
-            )
-        return {
-            "artifactId": body.artifact_id,
-            "sha256": body.artifact_id,
-            "mimeType": metadata["mediaType"],
-            "size": len(data),
-            "contentBase64": base64.b64encode(data).decode("ascii"),
-        }
-
-    @app.post("/v1/artifacts/write")
-    def write_work_artifact(body: _ArtifactWriteBody, request: Request) -> dict[str, Any]:
-        bridge = _require_bridge(config)
-        _authorize_bridge_request(request, bridge.bearer_token)
-        if body.tool_id not in {"media.asset.get", "media.card.render"}:
-            raise PersistenceError("WORK_ATTACHMENT_BRIDGE_FORBIDDEN", 403, "Tool is not allowed.")
-        caller = _verify_artifact_call(bridge, body.tool_id, body.arguments, body.caller_context)
-        if body.mime_type not in _IMAGE_MIME_TYPES:
-            raise PersistenceError(
-                "WORK_ATTACHMENT_UNSUPPORTED_MEDIA", 415, "Unsupported media type."
-            )
-        try:
-            data = base64.b64decode(body.content_base64, validate=True)
-        except ValueError:
-            raise PersistenceError(
-                "WORK_ATTACHMENT_INVALID_ENCODING", 422, "Invalid attachment encoding."
-            ) from None
-        if not data or len(data) > _MAX_ATTACHMENT_BYTES:
-            raise PersistenceError(
-                "WORK_ATTACHMENT_INVALID_SIZE", 413, "Attachment bytes must be at most 10 MB."
-            )
-        digest = hashlib.sha256(data).hexdigest()
-        metadata = store.put_attachment(
-            caller.organization_id,
-            caller.workspace_id,
-            body.name,
-            body.mime_type,
-            data,
-            actor_id=caller.actor_id,
-            actor_private_scope=True,
-        )
-        if metadata["sha256"] != digest:
-            raise PersistenceError(
-                "WORK_ATTACHMENT_INTEGRITY_FAILURE", 500, "Attachment digest mismatch."
-            )
-        return {
-            "artifactId": digest,
-            "sha256": digest,
-            "mimeType": body.mime_type,
-            "size": len(data),
-        }
+    mount_conversation_artifact_bridge(app, store, ports.artifact_bridge)
 
 
 def _bilibili_exchange_port(ports: PeripheralPorts) -> ExchangeBilibiliPort:
@@ -897,8 +908,7 @@ async def _require_bilibili_connection(
                 "BILIBILI_CONNECTION_NOT_FOUND", 404, "Bilibili connection not found."
             )
         profile_ref = _value(item, "profile_ref", "profileRef")
-        if not isinstance(profile_ref, str) or not profile_ref:
-            raise _provider_payload_error("EXCHANGE_CONNECTION_RESPONSE_INVALID")
+        _exchange_uuid_ref(profile_ref, "EXCHANGE_CONNECTION_RESPONSE_INVALID")
         return item
     raise PersistenceError("BILIBILI_CONNECTION_NOT_FOUND", 404, "Bilibili connection not found.")
 
@@ -1251,6 +1261,175 @@ async def _invoke_tool(
     return _json_object(result, "PERIPHERAL_PROVIDER_INVALID_PAYLOAD")
 
 
+async def _invoke_artifact_tool[ArtifactResult](
+    binding: FixedToolBinding,
+    tool_id: str,
+    arguments: Mapping[str, Any],
+    *,
+    principal: PersistencePrincipal,
+    workspace_id: str,
+    request_id: str,
+    store: WorkStore,
+    bridge: ArtifactBridgeConfig | None,
+    projector: Callable[
+        [Mapping[str, Any], ActiveCallLease], tuple[ArtifactResult, Mapping[str, Any]]
+    ],
+    read_grants: Sequence[ArtifactReadGrant] = (),
+    write_mime_types: Collection[str] = (),
+) -> ArtifactResult:
+    """Run one media artifact operation under a durable Work receipt and live lease.
+
+    The receipt contains only argument and actor-scope digests. The registry binds
+    the short-lived bridge permission to this exact Work Operation and signature.
+    中文：操作回执不存参数正文；插件桥权限仅在本次调用期有效。
+    """
+
+    configured_bridge = _require_artifact_bridge(bridge)
+    artifact_binding = configured_bridge.bindings.get(binding.binding_id)
+    if (
+        artifact_binding is None
+        or artifact_binding.binding_id != binding.binding_id
+        or not request_id
+        or len(request_id) > 200
+        or binding.operation_ids.get(tool_id) != tool_id
+    ):
+        raise PersistenceError(
+            "ARTIFACT_PROVIDER_UNAVAILABLE", 503, "Artifact provider binding is unavailable.", True
+        )
+
+    try:
+        caller_context = binding.create_caller_context(
+            tool_id,
+            arguments,
+            principal=principal,
+            workspace_id=workspace_id,
+            request_id=request_id,
+        )
+    except Exception:
+        raise PersistenceError(
+            "ARTIFACT_PROVIDER_UNAVAILABLE", 503, "Artifact provider binding is unavailable.", True
+        ) from None
+
+    actor_scope = actor_scope_sha256(principal, workspace_id)
+    idempotency_material = f"{actor_scope}\0{tool_id}\0{request_id}".encode()
+    idempotency_key = "artifact-call:" + hashlib.sha256(idempotency_material).hexdigest()
+    operation, duplicate = store.create_operation(
+        principal.organization_id,
+        workspace_id,
+        {
+            "idempotencyKey": idempotency_key,
+            "operationType": f"tool.provider.v1:{tool_id}",
+            "request": {
+                "toolId": tool_id,
+                "argumentsSha256": canonical_arguments_sha256(arguments),
+                "actorScopeSha256": actor_scope,
+            },
+        },
+        actor_id=principal.actor_id,
+        actor_private_scope=principal.actor_private_scope,
+    )
+    if duplicate:
+        raise PersistenceError(
+            "WORK_ARTIFACT_CALL_ALREADY_RECORDED",
+            409,
+            "This artifact call already has a durable outcome; it was not replayed.",
+        )
+
+    operation_id = str(operation["id"])
+    try:
+        lease = configured_bridge.registry.register_operation_call(
+            principal,
+            workspace_id,
+            work_operation_id=operation_id,
+            request_id=request_id,
+            binding_id=binding.binding_id,
+            tool_id=tool_id,
+            operation_id=tool_id,
+            arguments=arguments,
+            caller_context=caller_context,
+            read_grants=read_grants,
+            write_mime_types=tuple(write_mime_types),
+        )
+    except Exception:
+        store.update_operation(
+            principal.organization_id,
+            workspace_id,
+            operation_id,
+            "verified",
+            {"status": "REJECTED", "toolId": tool_id, "errorCode": "CALL_NOT_AUTHORIZED"},
+            actor_id=principal.actor_id,
+            actor_private_scope=principal.actor_private_scope,
+        )
+        raise
+
+    try:
+        try:
+            raw_result = await binding.invoke(
+                tool_id,
+                arguments,
+                principal=principal,
+                workspace_id=workspace_id,
+                request_id=request_id,
+                caller_context=caller_context,
+            )
+            result = _json_object(raw_result, "MEDIA_PROVIDER_INVALID_PAYLOAD")
+            projected, details = projector(result, lease)
+            configured_bridge.registry.assert_call_current(lease)
+            safe_details = _json_object(details, "MEDIA_PROVIDER_INVALID_PAYLOAD")
+            store.update_operation(
+                principal.organization_id,
+                workspace_id,
+                operation_id,
+                "verified",
+                {"status": "SUCCEEDED", "toolId": tool_id, **safe_details},
+                actor_id=principal.actor_id,
+                actor_private_scope=principal.actor_private_scope,
+            )
+            return projected
+        except BaseException as error:
+            store.update_operation(
+                principal.organization_id,
+                workspace_id,
+                operation_id,
+                "uncertain",
+                {"status": "UNKNOWN_RESULT", "toolId": tool_id},
+                actor_id=principal.actor_id,
+                actor_private_scope=principal.actor_private_scope,
+            )
+            if isinstance(error, asyncio.CancelledError):
+                raise
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            if isinstance(error, PersistenceError):
+                raise
+            if isinstance(error, PeripheralPortError):
+                status = 503 if error.unavailable else 502
+                raise PersistenceError(
+                    error.code,
+                    status,
+                    "Configured artifact provider failed after call admission.",
+                    error.unavailable,
+                ) from None
+            raise PersistenceError(
+                "PERIPHERAL_PROVIDER_FAILED",
+                502,
+                "Configured artifact provider returned an invalid result.",
+                True,
+            ) from None
+    finally:
+        lease.close()
+
+
+def _require_artifact_bridge(
+    bridge: ArtifactBridgeConfig | None,
+) -> ArtifactBridgeConfig:
+    if bridge is None or not bridge.bindings:
+        raise PersistenceError(
+            "ARTIFACT_BRIDGE_UNAVAILABLE", 503, "Artifact bridge is not configured.", True
+        )
+    return bridge
+
+
 async def invoke_port(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     """Invoke host adapters without blocking the ASGI loop for sync implementations."""
 
@@ -1313,55 +1492,6 @@ def _attachment_response(attachment: AttachmentRecord, data: bytes) -> Response:
     )
 
 
-def _verify_artifact_call(
-    config: ArtifactBridgeConfig,
-    tool_id: str,
-    arguments: Mapping[str, Any],
-    caller_context: Mapping[str, Any],
-) -> VerifiedArtifactCaller:
-    try:
-        caller = config.verifier.verify_artifact_call(
-            tool_id=tool_id,
-            arguments=arguments,
-            caller_context=caller_context,
-            binding_id=config.binding_id,
-        )
-    except Exception:
-        raise PersistenceError(
-            "WORK_ATTACHMENT_BRIDGE_FORBIDDEN", 403, "Caller context invalid."
-        ) from None
-    if not isinstance(caller, VerifiedArtifactCaller):
-        raise PersistenceError("WORK_ATTACHMENT_BRIDGE_FORBIDDEN", 403, "Caller context invalid.")
-    return caller
-
-
-def _authorize_bridge_request(request: Request, bearer_token: str) -> None:
-    host = request.client.host if request.client is not None else ""
-    try:
-        is_loopback = ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        is_loopback = False
-    auth = request.headers.get("authorization", "")
-    scheme, _, token = auth.partition(" ")
-    if (
-        not is_loopback
-        or scheme.lower() != "bearer"
-        or not _BRIDGE_TOKEN.fullmatch(bearer_token)
-        or not hmac.compare_digest(token, bearer_token)
-    ):
-        raise PersistenceError(
-            "WORK_ATTACHMENT_BRIDGE_FORBIDDEN", 403, "Local bridge authorization failed."
-        )
-
-
-def _require_bridge(config: ArtifactBridgeConfig | None) -> ArtifactBridgeConfig:
-    if config is None:
-        raise PersistenceError(
-            "WORK_ATTACHMENT_BRIDGE_UNAVAILABLE", 503, "Artifact bridge unavailable.", True
-        )
-    return config
-
-
 def _require_port(port: Any, code: str) -> Any:
     if port is None:
         raise PersistenceError(code, 503, "Configured capability is unavailable.", True)
@@ -1380,6 +1510,20 @@ def _validate_provider_model(model_type: type[Any], value: Any) -> dict[str, Any
     except Exception:
         raise _provider_payload_error() from None
     return cast(dict[str, Any], parsed.model_dump(by_alias=True, exclude_none=False))
+
+
+def _validate_asset_attachment(
+    asset: Mapping[str, Any], attachment: AttachmentRecord, digest: str
+) -> None:
+    """Bind provider metadata to the exact bytes authorized by WorkStore."""
+
+    if (
+        attachment.sha256 != digest
+        or asset.get("digest") != digest
+        or asset.get("mimeType") != attachment.media_type
+        or asset.get("byteSize") != attachment.size
+    ):
+        raise _provider_payload_error("MEDIA_PROVIDER_INVALID_PAYLOAD")
 
 
 def _json_object(value: Any, code: str) -> dict[str, Any]:
@@ -1407,6 +1551,18 @@ def _request_id(request: Request) -> str:
     return uuid4().hex
 
 
+def _bilibili_effective_operation_key(
+    principal: PersistencePrincipal,
+    workspace_id: str,
+    logical_key: str,
+) -> str:
+    """Scope one stable feature key to the authenticated Work actor and tenant."""
+
+    actor_scope = actor_scope_sha256(principal, workspace_id)
+    digest = hashlib.sha256(f"{actor_scope}\0{logical_key}".encode()).hexdigest()
+    return f"bilibili:{digest}"
+
+
 def _value(value: Mapping[str, Any], snake: str, *aliases: str) -> Any:
     """Read one known projection field from its fixed wire-name alternatives."""
 
@@ -1416,6 +1572,17 @@ def _value(value: Mapping[str, Any], snake: str, *aliases: str) -> Any:
         if alias in value:
             return value[alias]
     return None
+
+
+def _exchange_uuid_ref(value: Any, error_code: str) -> str:
+    """Project one opaque Exchange UUID without accepting arbitrary identities."""
+
+    if not isinstance(value, str):
+        raise _provider_payload_error(error_code)
+    try:
+        return str(UUID(value))
+    except ValueError:
+        raise _provider_payload_error(error_code) from None
 
 
 def _mapping_view(value: Any) -> Mapping[str, Any] | None:

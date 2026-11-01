@@ -14,7 +14,10 @@ import asyncio
 import base64
 import hashlib
 import json
+import sqlite3
 from collections.abc import Mapping
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -25,12 +28,18 @@ from fastapi.testclient import TestClient
 
 from cyrene_navigator.persistence import PersistencePrincipal, create_persistence_app
 from cyrene_navigator.persistence.errors import PersistenceError
+from cyrene_navigator.work.conversation_artifact_bridge import (
+    create_conversation_artifact_registry,
+)
 from cyrene_navigator.work.conversation_peripheral.ports import (
+    ArtifactBridgeBinding,
+    ArtifactBridgeConfig,
     ExchangeBilibiliHttpClient,
     ExchangeBilibiliHttpError,
     FixedToolBinding,
     PeripheralPorts,
     SignedExchangeRequest,
+    VerifiedArtifactCaller,
 )
 from cyrene_navigator.work.conversation_peripheral.routes import mount_peripheral_routes
 from cyrene_navigator.work.store import WorkStore
@@ -97,14 +106,70 @@ class _FakeSigner:
 
     def sign_context(self, **kwargs: Any) -> Mapping[str, Any]:
         self.calls.append(kwargs)
-        return {"binding": kwargs["binding_id"], "request_id": kwargs["request_id"]}
+        issued = datetime.now(UTC)
+        fields = {
+            "method": kwargs["method"],
+            "operation_id": kwargs["operation_id"],
+            "caller_workload": kwargs["caller_workload"],
+            "audience": kwargs["audience"],
+            "issuer": "https://navigator.test/issuer",
+            "subject": kwargs["principal"].actor_id,
+            "organization_id": kwargs["principal"].organization_id,
+            "workspace_id": kwargs["workspace_id"],
+            "binding_id": kwargs["binding_id"],
+            "request_id": kwargs["request_id"],
+            "issued_at": issued.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+            "expires_at": (issued + timedelta(seconds=120))
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+            "payload_sha256": hashlib.sha256(
+                json.dumps(
+                    kwargs["payload"],
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest(),
+        }
+        return {**fields, "signature": "a" * 64}
+
+
+class _FakeArtifactCallerVerifier:
+    """Return only identity claims for fixed test tool contexts."""
+
+    def verify_artifact_call(
+        self,
+        *,
+        tool_id: str,
+        arguments: Mapping[str, Any],
+        caller_context: Mapping[str, Any],
+        binding_id: str,
+    ) -> VerifiedArtifactCaller:
+        del arguments
+        if (
+            caller_context.get("method") != tool_id
+            or caller_context.get("operation_id") != tool_id
+            or caller_context.get("binding_id") != binding_id
+            or caller_context.get("signature") != "a" * 64
+        ):
+            raise ValueError("invalid test caller context")
+        return VerifiedArtifactCaller(
+            organization_id=str(caller_context["organization_id"]),
+            workspace_id=str(caller_context["workspace_id"]),
+            actor_id=str(caller_context["subject"]),
+        )
 
 
 class _FakeToolClient:
-    """Return deterministic official-provider DTOs without simulating HTTP auth."""
+    """Call the real ASGI artifact bridge before returning test provider results."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any], Mapping[str, Any]]] = []
+        self.bridge_app: Any | None = None
+        self.bridge_token = "c" * 64
+        self.import_asset_override: dict[str, Any] | None = None
+        self.output_asset_override: dict[str, Any] | None = None
 
     async def call_tool(
         self,
@@ -115,18 +180,64 @@ class _FakeToolClient:
         selected = dict(arguments)
         self.calls.append((provider_tool_id, selected, caller_context))
         if provider_tool_id == "media.asset.import":
+            response = await self._bridge_request(
+                "/v1/artifacts/read",
+                {
+                    "artifactId": selected["artifact_id"],
+                    "toolId": provider_tool_id,
+                    "arguments": selected,
+                    "callerContext": dict(caller_context),
+                },
+            )
+            if response.status_code != 200:
+                raise RuntimeError("artifact read was denied")
+            if (
+                hashlib.sha256(base64.b64decode(response.json()["contentBase64"])).hexdigest()
+                != selected["artifact_id"]
+            ):
+                raise RuntimeError("artifact read digest did not match")
+            if self.import_asset_override is not None:
+                return self.import_asset_override
             return _asset(selected["artifact_id"])
-        if provider_tool_id == "media.asset.get":
+        if provider_tool_id in {"media.asset.get", "media.card.render"}:
+            response = await self._bridge_request(
+                "/v1/artifacts/write",
+                {
+                    "mimeType": "image/png",
+                    "name": "test-image.png",
+                    "contentBase64": PNG_BASE64,
+                    "toolId": provider_tool_id,
+                    "arguments": selected,
+                    "callerContext": dict(caller_context),
+                },
+            )
+            if response.status_code != 200:
+                raise RuntimeError("artifact write was denied")
+            artifact = response.json()
             return {
-                "asset": _asset(),
+                "asset": self.output_asset_override or _asset(artifact["sha256"]),
                 "artifact": {
-                    "artifact_id": PNG_SHA256,
-                    "sha256": PNG_SHA256,
+                    "artifact_id": artifact["artifactId"],
+                    "sha256": artifact["sha256"],
                     "mime_type": "image/png",
-                    "size": len(PNG_BYTES),
+                    "size": artifact["size"],
                 },
             }
         raise AssertionError(f"unexpected media operation {provider_tool_id}")
+
+    async def _bridge_request(self, path: str, body: Mapping[str, Any]) -> httpx.Response:
+        if self.bridge_app is None:
+            raise RuntimeError("artifact bridge test app was not injected")
+        transport = httpx.ASGITransport(
+            app=self.bridge_app,
+            client=("127.0.0.1", 31337),
+        )
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+            return await client.post(
+                path,
+                json=dict(body),
+                headers={"Authorization": f"Bearer {self.bridge_token}"},
+            )
 
 
 class _FakeSpeech:
@@ -303,7 +414,25 @@ def _principal_for(
 def _app(tmp_path: Path, ports: PeripheralPorts) -> tuple[TestClient, WorkStore]:
     app = create_persistence_app(tmp_path / "conversation.sqlite3", PRINCIPALS)
     store: WorkStore = app.state.work_store
+    if ports.media is not None and ports.artifact_bridge is None:
+        ports = replace(
+            ports,
+            artifact_bridge=ArtifactBridgeConfig(
+                bindings={
+                    ports.media.binding_id: ArtifactBridgeBinding(
+                        bearer_token="c" * 64,
+                        binding_id=ports.media.binding_id,
+                        verifier=_FakeArtifactCallerVerifier(),
+                    )
+                },
+                registry=create_conversation_artifact_registry(store),
+            ),
+        )
     mount_peripheral_routes(app, BASE, _principal_for, store, ports)
+    if ports.media is not None:
+        tool_client = ports.media.client
+        if isinstance(tool_client, _FakeToolClient):
+            tool_client.bridge_app = app
     return TestClient(app), store
 
 
@@ -373,6 +502,97 @@ def test_media_import_uses_authorized_work_attachment_and_signed_fixed_tool(tmp_
     assert signer.calls[0]["principal"].actor_id == "writer"
 
 
+def test_media_outputs_cross_real_bridge_and_remain_owner_private(tmp_path: Path) -> None:
+    binding, _signer, tool = _media_binding()
+    client, store = _app(tmp_path, PeripheralPorts(media=binding))
+    base = BASE.format(workspace_id=WORKSPACE)
+
+    with client:
+        fetched = client.get(f"{base}/media/assets/asset-test", headers=_headers())
+        rendered = client.post(
+            f"{base}/media/cards/render",
+            headers=_headers(),
+            json={"title": "Private card", "content": "Private body", "theme": "warm"},
+        )
+
+    assert fetched.status_code == 200
+    assert rendered.status_code == 201
+    assert fetched.json()["attachment"]["sha256"] == PNG_SHA256
+    assert rendered.json()["attachment"]["sha256"] == PNG_SHA256
+    assert [call[0] for call in tool.calls] == ["media.asset.get", "media.card.render"]
+    _metadata, path = store.get_attachment(
+        ORGANIZATION,
+        WORKSPACE,
+        PNG_SHA256,
+        actor_id="writer",
+        actor_private_scope=True,
+    )
+    assert path.read_bytes() == PNG_BYTES
+    try:
+        store.get_attachment(
+            ORGANIZATION,
+            WORKSPACE,
+            PNG_SHA256,
+            actor_id="reader",
+            actor_private_scope=True,
+        )
+    except PersistenceError as error:
+        assert error.code == "WORK_ATTACHMENT_NOT_FOUND"
+    else:
+        raise AssertionError("a different actor read a private media output")
+    with sqlite3.connect(store.db_path) as connection:
+        operations = connection.execute(
+            "SELECT status, request_json, evidence_json FROM work_operations"
+        ).fetchall()
+    assert len(operations) == 2
+    assert all(status == "verified" for status, _request, _evidence in operations)
+    receipts = json.dumps(operations)
+    assert "Private card" not in receipts and "Private body" not in receipts
+
+
+def test_media_import_rejects_well_formed_metadata_for_different_bytes(tmp_path: Path) -> None:
+    binding, _signer, tool = _media_binding()
+    tool.import_asset_override = _asset("d" * 64)
+    client, store = _app(tmp_path, PeripheralPorts(media=binding))
+    attachment = store.put_attachment(
+        ORGANIZATION,
+        WORKSPACE,
+        "source.png",
+        "image/png",
+        PNG_BYTES,
+        actor_id="writer",
+    )
+
+    with client:
+        response = client.post(
+            f"{BASE.format(workspace_id=WORKSPACE)}/media/assets/import",
+            headers=_headers(),
+            json={"attachmentDigest": attachment["sha256"], "title": "test"},
+        )
+
+    assert response.status_code == 502
+    with sqlite3.connect(store.db_path) as connection:
+        status = connection.execute("SELECT status FROM work_operations").fetchone()[0]
+    assert status == "uncertain"
+
+
+def test_media_output_rejects_asset_metadata_not_bound_to_written_bytes(tmp_path: Path) -> None:
+    binding, _signer, tool = _media_binding()
+    tool.output_asset_override = _asset("d" * 64)
+    client, store = _app(tmp_path, PeripheralPorts(media=binding))
+
+    with client:
+        response = client.get(
+            f"{BASE.format(workspace_id=WORKSPACE)}/media/assets/asset-test",
+            headers=_headers(),
+        )
+
+    assert response.status_code == 502
+    with sqlite3.connect(store.db_path) as connection:
+        status = connection.execute("SELECT status FROM work_operations").fetchone()[0]
+    assert status == "uncertain"
+
+
 def test_media_and_speech_fail_closed_for_missing_or_unowned_inputs(tmp_path: Path) -> None:
     no_ports, _ = _app(tmp_path / "missing", PeripheralPorts())
     with no_ports:
@@ -440,6 +660,7 @@ def test_bilibili_account_qr_and_read_routes_project_only_safe_data(tmp_path: Pa
     assert connections.status_code == 200
     assert connections.json()["items"][0] == {
         "connectionRef": CONNECTION_REF,
+        "profileRef": PROFILE_REF,
         "provider": "bilibili",
         "displayName": "我的哔哩哔哩",
         "enabled": True,
@@ -530,6 +751,74 @@ def test_bilibili_write_receipts_are_idempotent_and_never_store_message_text(
     assert len(exchange.calls) == 3
     assert UUID(exchange.calls[0]["work_operation_id"] or "")
     assert "private comment text" not in json.dumps(saved.json())
+
+
+def test_bilibili_idempotency_lookup_is_read_only_and_actor_scoped(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    exchange = _FakeExchangeBilibili()
+    exchange.write_outcomes.append(
+        (
+            "verified",
+            {
+                "status": "SUCCEEDED",
+                "receipt_id": "receipt-feature",
+                "external_id": "comment-feature",
+                "readback_verified": True,
+                "readback_sha256": "c" * 64,
+            },
+        )
+    )
+    client, store = _app(tmp_path, PeripheralPorts(bilibili_exchange=exchange))
+    base = BASE.format(workspace_id=WORKSPACE)
+    key = "feature-write:subscription-1:version-7"
+    write_path = f"{base}/bilibili/connections/{CONNECTION_REF}/writes/bilibili.comment.create"
+    body = {
+        "arguments": {
+            "video_id": "BV1234567890",
+            "root_comment_id": "0",
+            "parent_comment_id": "0",
+            "content": "do not persist this body",
+        }
+    }
+    with client:
+        started = client.post(
+            write_path,
+            headers={**_headers(), "Idempotency-Key": key},
+            json=body,
+        )
+    operation = started.json()["operation"]
+    captured_keys: list[str] = []
+
+    def read_operation(_organization: str, _workspace: str, effective_key: str) -> dict[str, Any]:
+        captured_keys.append(effective_key)
+        return store.get_operation(
+            ORGANIZATION,
+            WORKSPACE,
+            operation["id"],
+            actor_id="writer",
+            actor_private_scope=True,
+        )
+
+    monkeypatch.setattr(store, "get_operation_by_idempotency_key", read_operation, raising=False)
+    with client:
+        receipt = client.get(
+            f"{base}/bilibili/operations/by-idempotency-key",
+            headers={**_headers(), "Idempotency-Key": key},
+        )
+        other_actor = client.get(
+            f"{base}/bilibili/operations/by-idempotency-key",
+            headers={**_headers("reader-token"), "Idempotency-Key": key},
+        )
+
+    assert started.status_code == 200
+    assert receipt.status_code == 200
+    assert receipt.json()["operation"]["id"] == operation["id"]
+    assert receipt.json()["operation"]["status"] == "verified"
+    assert other_actor.status_code == 404
+    assert len(exchange.calls) == 1, "GET lookup must not dispatch a provider write"
+    assert len(captured_keys) == 2 and captured_keys[0] != captured_keys[1]
+    assert "do not persist this body" not in json.dumps(receipt.json())
 
 
 def test_bilibili_http_rejection_is_definite_and_post_dispatch_loss_is_uncertain(
