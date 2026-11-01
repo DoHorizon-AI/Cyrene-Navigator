@@ -36,6 +36,7 @@ const MAX_HANDOFFS = 12;
 const MAX_NOUS_CONTEXT_CHARACTERS = 8_000;
 const MAX_FOCUS_SUMMARY = 2_000;
 const MAX_HANDOFF_SUMMARY = 8_000;
+const FOLLOWUP_RECONCILE_INTERVAL_MS = 30_000;
 
 export interface ExistingConversationTaskOutcomeV1 {
   readonly taskId: string;
@@ -47,6 +48,8 @@ export interface ExistingConversationTaskOutcomeV1 {
 
 /** Host adapter for the normal Navigator DSH executor and authorized connector send path. */
 export interface ExistingConversationTaskPortV1 {
+  /** Pure read of a persisted actor-private DSH Task and its exact delivery receipt. */
+  read(context: TrustedTurnContext, taskId: string, signal: AbortSignal): Promise<ExistingConversationTaskOutcomeV1 | undefined>;
   dispatch(context: TrustedTurnContext, input: {
     readonly taskId: string;
     readonly conversationId: string;
@@ -97,7 +100,7 @@ export interface NousActiveFeature {
     readonly scheduleId?: string;
   }>;
   runScheduledFollowup(context: TrustedTurnContext, focusItemId: string): Promise<{
-    readonly status: 'dispatched' | 'deferred' | 'held' | 'disabled';
+    readonly status: 'dispatched' | 'pending' | 'deferred' | 'held' | 'disabled';
     readonly taskOutcome?: ExistingConversationTaskOutcomeV1;
     readonly dueAt?: number;
   }>;
@@ -306,6 +309,26 @@ export function createNousActiveFeature(options: NousActiveOptions): NousActiveF
       }
       assertNoFollowupLoop(context);
       const taskId = followupTaskId(context, item);
+      const existing = await options.tasks.read(context, taskId, context.signal);
+      if (existing !== undefined) {
+        if (existing.taskId !== taskId) {
+          throw new ConversationDomainApiError('FOLLOWUP_TASK_ID_MISMATCH', 502, false, 'Task read returned another follow-up identity');
+        }
+        if (isConfirmedDelivered(existing)) {
+          await markFollowupWaiting(options.api, options.scheduler, context, item, existing);
+          return { status: 'dispatched', taskOutcome: existing };
+        }
+        if (existing.deliveryStatus === 'held') {
+          await options.scheduler.cancel(conversationScheduleMarker('followup', item.id), context.signal);
+          return { status: 'held', taskOutcome: existing };
+        }
+        const dueAt = now() + FOLLOWUP_RECONCILE_INTERVAL_MS;
+        await options.scheduler.ensureOneShot(conversationScheduleMarker('followup', item.id), dueAt, {
+          signal: context.signal,
+          rearmInactive: true,
+        });
+        return { status: 'pending', taskOutcome: existing, dueAt };
+      }
       const origin = {
         kind: 'conversation-followup',
         sourceId: item.id,
@@ -326,15 +349,20 @@ export function createNousActiveFeature(options: NousActiveOptions): NousActiveF
       if (outcome.taskId !== taskId) {
         throw new ConversationDomainApiError('FOLLOWUP_TASK_ID_MISMATCH', 502, false, 'Follow-up executor returned another task identity');
       }
-      if (outcome.status === 'completed' && outcome.deliveryStatus === 'delivered') {
-        const latest = await findFocusItem(options.api, context, item.id);
-        if (latest.item.version === item.version && latest.item.state === 'open') {
-          await options.api.transitionFocusItem(context, item.id, { state: 'waiting', expectedVersion: item.version });
-        }
-        await options.scheduler.cancel(conversationScheduleMarker('followup', item.id), context.signal);
+      if (isConfirmedDelivered(outcome)) {
+        await markFollowupWaiting(options.api, options.scheduler, context, item, outcome);
         return { status: 'dispatched', taskOutcome: outcome };
       }
-      return { status: outcome.deliveryStatus === 'held' ? 'held' : 'dispatched', taskOutcome: outcome };
+      if (outcome.deliveryStatus === 'held') {
+        await options.scheduler.cancel(conversationScheduleMarker('followup', item.id), context.signal);
+        return { status: 'held', taskOutcome: outcome };
+      }
+      const dueAt = now() + FOLLOWUP_RECONCILE_INTERVAL_MS;
+      await options.scheduler.ensureOneShot(conversationScheduleMarker('followup', item.id), dueAt, {
+        signal: context.signal,
+        rearmInactive: true,
+      });
+      return { status: 'pending', taskOutcome: outcome, dueAt };
     },
 
     async retractFollowup(context, focusItemId, version) {
@@ -402,6 +430,31 @@ export function createNousActiveFeature(options: NousActiveOptions): NousActiveF
     },
   };
   return Object.freeze(feature);
+}
+
+async function markFollowupWaiting(
+  api: ConversationDomainApiV1,
+  scheduler: ConversationDshScheduler,
+  context: TrustedTurnContext,
+  item: FocusItem,
+  outcome: ExistingConversationTaskOutcomeV1,
+): Promise<void> {
+  if (!isConfirmedDelivered(outcome)) {
+    throw new ConversationDomainApiError('FOLLOWUP_DELIVERY_RECEIPT_REQUIRED', 409, false, 'Only a completed platform delivery receipt can advance a focus item');
+  }
+  const latest = await findFocusItem(api, context, item.id);
+  if (latest.item.state === 'open' && latest.item.version === item.version) {
+    const changed = await api.transitionFocusItem(context, item.id, { state: 'waiting', expectedVersion: item.version });
+    if (changed.item.state !== 'waiting' || changed.item.version <= item.version) {
+      throw new ConversationDomainApiError('FOLLOWUP_FOCUS_READBACK_MISMATCH', 409, false, 'Work did not persist the waiting transition');
+    }
+  }
+  await scheduler.cancel(conversationScheduleMarker('followup', item.id), context.signal);
+}
+
+function isConfirmedDelivered(outcome: ExistingConversationTaskOutcomeV1): boolean {
+  return outcome.status === 'completed' && outcome.deliveryStatus === 'delivered'
+    && typeof outcome.deliveryReceiptId === 'string' && outcome.deliveryReceiptId.trim().length > 0;
 }
 
 async function evaluatePolicy(
