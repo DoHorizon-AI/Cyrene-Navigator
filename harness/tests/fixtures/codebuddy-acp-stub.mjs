@@ -221,6 +221,11 @@ async function handlePrompt(message) {
     assert.equal(loadedSession, 'native-session-1');
     assert.doesNotMatch(requestText, /No previous DSH conversation history was imported/u);
   }
+  assert.match(requestText, /Navigator evidence and retry policy \(behavior guidance, not a runtime guarantee\)/u);
+  assert.match(requestText, /An error or is_error tool result proves only that the observation failed/u);
+  assert.match(requestText, /A retryable:false result means stop/u);
+  assert.match(requestText, /Do not infer commit ancestry, merge reachability, CI outcome/u);
+  assert.match(requestText, /Keep connector binding or connection UUIDs distinct from provider resource IDs/u);
   const permission = await request('session/request_permission', {
     sessionId: message.params.sessionId,
     toolCall: { kind: 'terminal', title: 'Bash', rawInput: { command: 'printf denied' } },

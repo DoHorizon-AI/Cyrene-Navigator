@@ -406,12 +406,20 @@ test('separate GitHub bindings expose distinct host repository labels in DSH and
   const inputSchema = {
     type: 'object',
     properties: {
+      repository_id: { type: 'string', pattern: '^[0-9]+$' },
+      repository: { type: 'string', pattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' },
+      query: { type: 'string', maxLength: 200 },
+    },
+    required: ['repository_id', 'repository', 'query'],
+    additionalProperties: false,
+  };
+  const projectedInputSchema = {
+    ...inputSchema,
+    properties: {
       repository_id: { type: 'string' },
       repository: { type: 'string' },
       query: { type: 'string' },
     },
-    required: ['repository_id', 'repository', 'query'],
-    additionalProperties: false,
   };
   const snapshot = {
     schemaVersion: 1,
@@ -473,10 +481,13 @@ test('separate GitHub bindings expose distinct host repository labels in DSH and
         assert.ok(schema, `the model-facing schema should name ${item.repository}`);
         assert.ok(schema.description.includes(`configured provider ${item.bindingId})`));
         assert.ok(schema.description.includes(`https://github.com/${item.repository}`));
-        assert.deepEqual(schema.parameters, inputSchema);
+        assert.ok(schema.description.includes('["repository_id"]: must match pattern "^[0-9]+$"'));
+        assert.ok(schema.description.includes('["repository"]: must match pattern "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"'));
+        assert.ok(schema.description.includes('["query"]: maximum length 200'));
+        assert.deepEqual(schema.parameters, projectedInputSchema);
         const acpTool = getCodeBuddyAcpToolCatalog(ctx).find(entry => entry.name === schema.name);
         assert.equal(acpTool?.description, schema.description);
-        assert.deepEqual(acpTool?.inputSchema, inputSchema);
+        assert.deepEqual(acpTool?.inputSchema, projectedInputSchema);
       }
       assert.notEqual(schemas[0].name, schemas[1].name);
     } finally {
@@ -496,6 +507,7 @@ test('registers canonical read tools and routes calls through the configured bin
     assert.ok(schema);
     assert.equal(schema.parameters.properties.query.type, 'string');
     assert.equal(schema.parameters.properties.query.pattern, undefined);
+    assert.ok(schema.description.includes('Host-enforced input constraints: ["query"]: must match pattern "^[A-Za-z]+$"'));
     const name = schema.name;
     const result = await execute(ctx, name, { query: 'Ada' }, 'read-call-1', false);
 

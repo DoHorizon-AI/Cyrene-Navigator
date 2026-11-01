@@ -37,6 +37,9 @@ import type {
 import { decodeHandle, decodeSnapshot, integer, PersistenceHttp, record } from './persistence-wire.ts';
 import type { PersistenceConnection, RemoteHandle } from './persistence-wire.ts';
 
+/** Reserved DSH sessions are volatile per-turn scratch space and never reach Work persistence. */
+export const VOLATILE_CONVERSATION_SESSION_PREFIX = 'navigator-conversation-turn-';
+
 /** Deployment controls for remote persistence, batching and writer renewal.  中文：远端持久化、批处理和 writer 续租的部署控制参数。 */
 export interface Config extends PersistenceConnection {
   clientId: string;
@@ -121,6 +124,9 @@ export default class CyreneSessionPersistence extends SessionPersistence {
     if ((snapshot.isSeeded && options?.inheritedEventCount === undefined) || (!snapshot.isSeeded && inheritedEventCount !== 0)) {
       throw new TypeError('Session inherited prefix does not match its header');
     }
+    if (String(snapshot.id).startsWith(VOLATILE_CONVERSATION_SESSION_PREFIX)) {
+      return new VolatileConversationSessionHandle(snapshot, inheritedEventCount);
+    }
     return this.adopt(decodeHandle(await this.requestForSession(snapshot.id, '', {
       header: snapshot, inheritedEventCount, clientId: this.clientId,
     }, options?.signal), snapshot.id));
@@ -128,6 +134,9 @@ export default class CyreneSessionPersistence extends SessionPersistence {
 
   override async open(id: SessionId, access: SessionAccess, options?: SessionPersistenceOpenOptions): Promise<SessionHandle> {
     options?.signal?.throwIfAborted();
+    if (String(id).startsWith(VOLATILE_CONVERSATION_SESSION_PREFIX)) {
+      throw new SessionPersistenceNotFoundError(id);
+    }
     const reserved = access === 'write' ? this.takeovers.get(id) : undefined;
     if (reserved) {
       this.takeovers.delete(id);
@@ -183,6 +192,7 @@ export default class CyreneSessionPersistence extends SessionPersistence {
   }
 
   override async stat(id: SessionId, options?: SessionPersistenceStatOptions): Promise<SessionPersistenceSnapshot | undefined> {
+    if (String(id).startsWith(VOLATILE_CONVERSATION_SESSION_PREFIX)) return undefined;
     try {
       return decodeSnapshot(await this.requestForSession(
         id,
@@ -273,6 +283,57 @@ export default class CyreneSessionPersistence extends SessionPersistence {
     this.handles.add(handle);
     if (remote.access === 'write') this.writers.set(remote.id, handle);
     return handle;
+  }
+}
+
+/** In-process-only DSH scratch log for one conversation task; it is never backed by Work. */
+class VolatileConversationSessionHandle implements SessionHandle {
+  readonly id: SessionId;
+  readonly header: SessionHeader;
+  readonly inheritedEventCount: SessionLogOffset;
+  readonly access: SessionAccess = 'write';
+  private readonly events: SessionEvent[] = [];
+  private closed = false;
+
+  constructor(header: SessionHeader, inheritedEventCount: SessionLogOffset) {
+    this.id = header.id;
+    this.header = header;
+    this.inheritedEventCount = inheritedEventCount;
+  }
+
+  async read(offset = 0, length = Number.MAX_SAFE_INTEGER, options?: SessionHandleReadOptions): Promise<SessionHandleReadResult> {
+    this.assertOpen('read');
+    options?.signal?.throwIfAborted();
+    const start = integer(offset, 'volatile session read offset');
+    const count = integer(length, 'volatile session read length');
+    return {
+      eventState: 'detached',
+      events: validateStoredEvents(this.header, [...materializeAppendBatch([...this.events.slice(start, start + count)])]),
+    };
+  }
+
+  async append(events: readonly SessionEvent[], options?: SessionHandleAppendOptions): Promise<void> {
+    this.assertOpen('append');
+    options?.signal?.throwIfAborted();
+    const batch = validateStoredEvents(this.header, [...materializeAppendBatch([...events])]);
+    assertContiguous(this.id, batch, this.events.length);
+    this.events.push(...batch);
+  }
+
+  async flush(options?: SessionHandleFlushOptions): Promise<void> {
+    this.assertOpen('flush');
+    options?.signal?.throwIfAborted();
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
+    this.events.length = 0;
+  }
+
+  [Symbol.asyncDispose](): Promise<void> { return this.close(); }
+
+  private assertOpen(operation: string): void {
+    if (this.closed) throw new SessionHandleClosedError(this.id, operation);
   }
 }
 

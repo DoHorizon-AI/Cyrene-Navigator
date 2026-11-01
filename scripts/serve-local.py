@@ -8,6 +8,7 @@ JSON object containing only service URLs. 子进程日志和服务凭据不会�
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import importlib
 import json
@@ -38,6 +39,29 @@ _PROBE_TIMEOUT_SECONDS = 0.5
 _MAX_TASK_CONCURRENCY = 32
 _MAX_CONNECTOR_TOOL_CATALOG_BYTES = 32 * 1024 * 1024
 _MAX_CONNECTOR_TOOL_CATALOG_ITEMS = 128
+_EXECUTOR_WORK_TOKEN_ENV = "CYRENE_EXECUTOR_WORK_TOKEN"
+_PERSISTENCE_CAPABILITY_ENV_NAMES = (
+    "CYRENE_NAVIGATOR_MODEL_PROVIDER_CONNECTION_REF",
+    "CYRENE_NAVIGATOR_MEMORY_PROVIDER_CONNECTION_REF",
+    "CYRENE_NAVIGATOR_KNOWLEDGE_GRAPH_CONNECTION_REF",
+    "CYRENE_NAVIGATOR_TOOL_PROVIDER_CONNECTION_REF",
+    "CYRENE_NAVIGATOR_SPEECH_PROVIDER_CONNECTION_REF",
+    "CYRENE_NAVIGATOR_EMBEDDING_MODEL_ID",
+    "CYRENE_NAVIGATOR_EMBEDDING_PROFILE_ID",
+    "CYRENE_NAVIGATOR_EMBEDDING_DIMENSIONS",
+    "CYRENE_NAVIGATOR_EMBEDDING_DOCUMENT_PREFIX",
+    "CYRENE_NAVIGATOR_EMBEDDING_QUERY_PREFIX",
+    "CYRENE_NAVIGATOR_TOOL_BINDING_ID",
+    "CYRENE_NAVIGATOR_TOOL_CALLER_WORKLOAD",
+    "CYRENE_NAVIGATOR_TOOL_AUDIENCE",
+    "CYRENE_NAVIGATOR_TOOL_ISSUER",
+    "CYRENE_NAVIGATOR_TOOL_SIGNING_KEY_ENV",
+    "CYRENE_NAVIGATOR_TOOL_IDS",
+    "CYRENE_NAVIGATOR_MEMORY_MAINTENANCE_TENANTS",
+    "CYRENE_NAVIGATOR_SPEECH_ENABLED",
+    "CYRENE_NAVIGATOR_SPEECH_DEFAULT_LANGUAGE",
+    "CYRENE_CONVERSATION_ASSISTANT_ENABLED",
+)
 
 
 class _WindowsByteLock(Protocol):
@@ -58,6 +82,7 @@ class ChildService:
     first_line: queue.Queue[str]
     reader: threading.Thread
     secrets_to_check: tuple[str, ...]
+    stderr_file: Any = None
 
 
 def main() -> int:
@@ -98,6 +123,11 @@ def main() -> int:
     )
     parser.add_argument("--startup-timeout", type=float, default=_STARTUP_TIMEOUT_SECONDS)
     parser.add_argument("--shutdown-timeout", type=float, default=_STOP_TIMEOUT_SECONDS)
+    parser.add_argument(
+        "--shutdown-stdin",
+        action="store_true",
+        help="gracefully stop when the launcher writes 'shutdown' or closes stdin",
+    )
     parser.add_argument("--node", default=os.environ.get("NODE", "node"))
     parser.add_argument(
         "--insecure-http",
@@ -158,14 +188,18 @@ def main() -> int:
     artifact_root = state_dir / "artifacts"
     dsh_home = state_dir / "dsh-home"
     plugins_dir = state_dir / "plugins"
-    for path in (artifact_root, dsh_home, plugins_dir):
+    logs_dir = state_dir / "logs"
+    for path in (artifact_root, dsh_home, plugins_dir, logs_dir):
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         _restrict_directory(path)
 
     session_token = os.environ.get(args.principal_token_env) or secrets.token_urlsafe(48)
     executor_token = secrets.token_urlsafe(48)
-    while executor_token == session_token:
+    executor_work_token = secrets.token_urlsafe(48)
+    while executor_token in {session_token, executor_work_token}:
         executor_token = secrets.token_urlsafe(48)
+    while executor_work_token == session_token:
+        executor_work_token = secrets.token_urlsafe(48)
     web_pairing_path = state_dir / "pairing-code"
     try:
         principal_config, config_path, config_is_temporary = _resolve_principal_config(
@@ -191,6 +225,13 @@ def main() -> int:
 
     for signum in (signal.SIGINT, signal.SIGTERM):
         previous_handlers[signum] = signal.signal(signum, request_stop)
+    if args.shutdown_stdin:
+        threading.Thread(
+            target=_watch_shutdown_stdin,
+            args=(stop_requested,),
+            name="navigator-stdin-shutdown",
+            daemon=True,
+        ).start()
 
     try:
         with tempfile.TemporaryDirectory(prefix="principal-", dir=runtime_dir) as temporary:
@@ -203,6 +244,7 @@ def main() -> int:
                 session_token,
                 args.principal_token_env,
                 persistence_env_refs,
+                executor_work_token=executor_work_token,
             )
             persistence = _start_child(
                 "persistence",
@@ -222,7 +264,14 @@ def main() -> int:
                 ],
                 cwd=repository,
                 env=python_env,
-                secrets_to_check=(session_token, executor_token),
+                secrets_to_check=_persistence_startup_secrets(
+                    session_token,
+                    executor_token,
+                    python_env,
+                    persistence_env_refs,
+                    executor_work_token=executor_work_token,
+                ),
+                log_dir=logs_dir,
             )
             services.append(persistence)
             persistence_banner = _read_startup(persistence, args.startup_timeout)
@@ -238,8 +287,9 @@ def main() -> int:
                 repository=repository,
                 persistence_url=persistence_url,
                 workspace_id=args.workspace_id,
-                session_token=session_token,
+                session_token=executor_work_token,
                 executor_token=executor_token,
+                workspace_owner_actor_id=args.actor_id,
                 dsh_home=dsh_home,
                 plugins_dir=plugins_dir,
                 node=args.node,
@@ -264,7 +314,10 @@ def main() -> int:
                 executor_command,
                 cwd=repository,
                 env=executor_env,
-                secrets_to_check=(session_token, executor_token),
+                secrets_to_check=_executor_startup_secrets(
+                    session_token, executor_token, executor_env
+                ),
+                log_dir=logs_dir,
             )
             services.append(executor)
             executor_banner = _read_startup(executor, args.startup_timeout)
@@ -306,6 +359,7 @@ def main() -> int:
                 cwd=repository,
                 env=web_env,
                 secrets_to_check=(session_token, executor_token),
+                log_dir=logs_dir,
             )
             services.append(web)
             web_banner = _read_startup(web, args.startup_timeout)
@@ -362,6 +416,19 @@ def _provider_configuration_is_complete(environment: Mapping[str, str]) -> bool:
 
     names = ("CYRENE_EXCHANGE_URL", "CYRENE_EXCHANGE_TOKEN", "CYRENE_HARNESS_MODEL")
     return all(environment.get(name) for name in names)
+
+
+def _watch_shutdown_stdin(stop_requested: threading.Event, stream: Any = None) -> None:
+    """Honor one launcher shutdown command without treating other stdin as input."""
+
+    input_stream = sys.stdin if stream is None else stream
+    try:
+        for line in input_stream:
+            if line.strip() == "shutdown":
+                stop_requested.set()
+                return
+    finally:
+        stop_requested.set()
 
 
 def _validate_public_url(value: str) -> None:
@@ -509,48 +576,65 @@ def _resolve_principal_config(
     actor_id: str,
     principal_token_env: str,
 ) -> tuple[dict[str, Any], Path | None, bool]:
-    """Load an explicit owner configuration or create a scoped local principal."""
+    """Load a local owner and add an isolated Executor Work principal."""
 
     if configured_path is None:
-        return (
-            {
-                "principals": [
-                    {
-                        "token_env": principal_token_env,
-                        "actor_id": actor_id,
-                        "workspace_ids": [workspace_id],
-                        "organization_id": organization_id,
-                        "can_takeover": True,
-                        "can_write_harness": True,
-                    }
-                ]
-            },
-            None,
-            True,
-        )
-    path = configured_path.expanduser().resolve()
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict) or not isinstance(value.get("principals"), list):
-        raise ValueError("--principal-config must contain a principals array")
-    matching = [
-        principal
-        for principal in value["principals"]
-        if isinstance(principal, dict) and principal.get("token_env") == principal_token_env
-    ]
-    if len(matching) != 1:
-        raise ValueError("--principal-config must define one matching owner token reference")
-    owner = matching[0]
-    if (
-        owner.get("workspace_ids") != [workspace_id]
-        or owner.get("organization_id") != organization_id
-        or owner.get("can_takeover") is not True
-        or owner.get("can_write_harness") is not True
+        value: dict[str, Any] = {
+            "principals": [
+                {
+                    "token_env": principal_token_env,
+                    "actor_id": actor_id,
+                    "workspace_ids": [workspace_id],
+                    "organization_id": organization_id,
+                    "can_takeover": True,
+                    "can_write_harness": True,
+                }
+            ]
+        }
+    else:
+        path = configured_path.expanduser().resolve()
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict) or not isinstance(value.get("principals"), list):
+            raise ValueError("--principal-config must contain a principals array")
+        matching = [
+            principal
+            for principal in value["principals"]
+            if isinstance(principal, dict) and principal.get("token_env") == principal_token_env
+        ]
+        if len(matching) != 1:
+            raise ValueError("--principal-config must define one matching owner token reference")
+        owner = matching[0]
+        if (
+            owner.get("actor_id") != actor_id
+            or owner.get("workspace_ids") != [workspace_id]
+            or owner.get("organization_id") != organization_id
+            or owner.get("can_takeover") is not True
+            or owner.get("can_write_harness") is not True
+        ):
+            raise ValueError(
+                "--principal-config owner must match the selected actor, organization, and "
+                "Workspace and explicitly grant Harness writes"
+            )
+
+    principals = value["principals"]
+    if any(
+        isinstance(principal, dict) and principal.get("token_env") == _EXECUTOR_WORK_TOKEN_ENV
+        for principal in principals
     ):
-        raise ValueError(
-            "--principal-config owner must match the selected organization and Workspace and "
-            "explicitly grant Harness writes"
-        )
-    return value, path, False
+        raise ValueError("--principal-config cannot define the reserved Executor Work token")
+    value["principals"] = [
+        *principals,
+        {
+            "token_env": _EXECUTOR_WORK_TOKEN_ENV,
+            "actor_id": actor_id,
+            "workspace_ids": [workspace_id],
+            "organization_id": organization_id,
+            "can_takeover": True,
+            "can_write_harness": True,
+            "actor_private_scope": True,
+        },
+    ]
+    return value, None, True
 
 
 def _environment_references(config: dict[str, Any]) -> set[str]:
@@ -593,22 +677,62 @@ def _persistence_child_environment(
     session_token: str,
     principal_token_env: str,
     env_references: set[str],
+    *,
+    executor_work_token: str | None = None,
 ) -> dict[str, str]:
     """Build the persistence environment from its declared credential refs only."""
 
     environment = _base_child_environment(repository)
     environment["CYRENE_SESSION_TOKEN"] = session_token
     environment[principal_token_env] = session_token
+    if executor_work_token is not None:
+        environment[_EXECUTOR_WORK_TOKEN_ENV] = executor_work_token
     for name in (
         "CYRENE_PERSISTENCE_TLS_CERT_FILE",
         "CYRENE_PERSISTENCE_TLS_KEY_FILE",
     ):
         if name in os.environ:
             environment[name] = os.environ[name]
-    for name in env_references.difference({principal_token_env, "CYRENE_SESSION_TOKEN"}):
+    for name in _PERSISTENCE_CAPABILITY_ENV_NAMES:
         if name in os.environ:
             environment[name] = os.environ[name]
+    signing_key_env = environment.get("CYRENE_NAVIGATOR_TOOL_SIGNING_KEY_ENV")
+    if signing_key_env is not None:
+        if not _ENV_NAME_RE.fullmatch(signing_key_env):
+            raise ValueError("CYRENE_NAVIGATOR_TOOL_SIGNING_KEY_ENV must be an environment name")
+        if signing_key_env in os.environ:
+            environment[signing_key_env] = os.environ[signing_key_env]
+    for name in env_references.difference(
+        {principal_token_env, "CYRENE_SESSION_TOKEN", _EXECUTOR_WORK_TOKEN_ENV}
+    ):
+        if name in os.environ:
+            environment[name] = os.environ[name]
+    if executor_work_token is not None:
+        environment[_EXECUTOR_WORK_TOKEN_ENV] = executor_work_token
     return environment
+
+
+def _persistence_startup_secrets(
+    session_token: str,
+    executor_token: str,
+    environment: Mapping[str, str],
+    credential_references: set[str],
+    *,
+    executor_work_token: str | None = None,
+) -> tuple[str, ...]:
+    """Redact bearer and signing-key values if a child echoes its startup JSON."""
+
+    names = set(credential_references)
+    signing_key_name = environment.get("CYRENE_NAVIGATOR_TOOL_SIGNING_KEY_ENV")
+    if signing_key_name is not None:
+        names.add(signing_key_name)
+    values = (
+        session_token,
+        executor_token,
+        executor_work_token or "",
+        *(environment[name] for name in sorted(names) if environment.get(name)),
+    )
+    return tuple(dict.fromkeys(value for value in values if value))
 
 
 def _executor_child_environment(
@@ -618,12 +742,18 @@ def _executor_child_environment(
     workspace_id: str,
     session_token: str,
     executor_token: str,
+    workspace_owner_actor_id: str | None = None,
     dsh_home: Path,
     plugins_dir: Path,
     node: str,
     integration_environment: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Build the DSH child environment; provider secrets never enter Python children."""
+
+    if workspace_owner_actor_id is not None and not _WORKSPACE_RE.fullmatch(
+        workspace_owner_actor_id
+    ):
+        raise ValueError("workspace_owner_actor_id must be a bounded deployment identifier")
 
     allowed = ("PATH", "HOME", "SYSTEMROOT", "WINDIR", "TEMP", "TMP")
     environment = {name: os.environ[name] for name in allowed if name in os.environ}
@@ -634,6 +764,7 @@ def _executor_child_environment(
         "CYRENE_EXCHANGE_URL",
         "CYRENE_EXCHANGE_TOKEN",
         "CYRENE_HARNESS_MODEL",
+        "CYRENE_HARNESS_MODEL_SOURCE",
         "CYRENE_DEVICE_ID",
     )
     for name in provider_names:
@@ -654,7 +785,27 @@ def _executor_child_environment(
             "NODE": node,
         }
     )
+    if workspace_owner_actor_id is not None:
+        environment["CYRENE_WORKSPACE_OWNER_ACTOR_ID"] = workspace_owner_actor_id
     return environment
+
+
+def _executor_startup_secrets(
+    session_token: str, executor_token: str, environment: Mapping[str, str]
+) -> tuple[str, ...]:
+    """Keep bearer values out of the executor's public readiness line.
+
+    The model-provider token is also checked because the executor receives it
+    directly and its startup envelope must remain safe to publish.
+    """
+
+    values = (
+        session_token,
+        executor_token,
+        environment.get("CYRENE_EXCHANGE_TOKEN", ""),
+        environment.get("CYRENE_EXCHANGE_INTEGRATION_USER_TOKEN", ""),
+    )
+    return tuple(dict.fromkeys(value for value in values if value))
 
 
 def _executor_integration_environment(
@@ -663,17 +814,22 @@ def _executor_integration_environment(
     """Forward fixed Product config and only declared integration secret references."""
 
     result: dict[str, str] = {}
+    conversation_assistant = environment.get("CYRENE_CONVERSATION_ASSISTANT_ENABLED")
+    if conversation_assistant is not None:
+        if conversation_assistant not in {"true", "false"}:
+            raise ValueError("CYRENE_CONVERSATION_ASSISTANT_ENABLED must be 'true' or 'false'")
+        result["CYRENE_CONVERSATION_ASSISTANT_ENABLED"] = conversation_assistant
     workflows_enabled = environment.get("CYRENE_WORKFLOWS_ENABLED")
     if workflows_enabled is not None:
         if workflows_enabled not in {"true", "false"}:
             raise ValueError("CYRENE_WORKFLOWS_ENABLED must be 'true' or 'false'")
         result["CYRENE_WORKFLOWS_ENABLED"] = workflows_enabled
 
-    concurrency = environment.get("CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS", "1")
+    concurrency = environment.get("CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS", "2")
     if not re.fullmatch(r"[0-9]{1,2}", concurrency):
         raise ValueError("CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS must be an integer")
-    if not 1 <= int(concurrency) <= _MAX_TASK_CONCURRENCY:
-        raise ValueError("CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS must be between 1 and 32")
+    if not 2 <= int(concurrency) <= _MAX_TASK_CONCURRENCY:
+        raise ValueError("CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS must be between 2 and 32")
     result["CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS"] = concurrency
 
     integration_url = environment.get("CYRENE_EXCHANGE_INTEGRATION_URL")
@@ -962,17 +1118,22 @@ def _start_child(
     cwd: Path,
     env: dict[str, str],
     secrets_to_check: tuple[str, ...],
+    log_dir: Path | None = None,
 ) -> ChildService:
-    """Launch a service, keeping stderr and all post-banner output private."""
+    """Launch a service, keeping stderr logged to private disk and post-banner output private."""
 
     creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+    stderr_file = None
+    if log_dir is not None:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stderr_file = open(log_dir / f"{name}.stderr.log", "a", encoding="utf-8")  # noqa: SIM115
     process = subprocess.Popen(
         command,
         cwd=cwd,
         env=env,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=stderr_file if stderr_file is not None else subprocess.DEVNULL,
         text=True,
         encoding="utf-8",
         errors="replace",
@@ -982,6 +1143,8 @@ def _start_child(
     )
     output = process.stdout
     if output is None:
+        if stderr_file is not None:
+            stderr_file.close()
         process.kill()
         raise RuntimeError(f"{name} service did not expose a startup channel")
     first_line: queue.Queue[str] = queue.Queue(maxsize=1)
@@ -1000,7 +1163,9 @@ def _start_child(
 
     reader = threading.Thread(target=drain_stdout, name=f"{name}-stdout", daemon=True)
     reader.start()
-    return ChildService(name, process, first_line, reader, secrets_to_check)
+    return ChildService(
+        name, process, first_line, reader, secrets_to_check, stderr_file=stderr_file
+    )
 
 
 def _read_startup(child: ChildService, timeout: float) -> dict[str, Any]:
@@ -1123,6 +1288,9 @@ def _stop_child(child: ChildService, timeout: float) -> None:
             process.wait(timeout=timeout)
     if process.stdout is not None:
         process.stdout.close()
+    if child.stderr_file is not None:
+        with contextlib.suppress(OSError):
+            child.stderr_file.close()
     child.reader.join(timeout=1)
 
 

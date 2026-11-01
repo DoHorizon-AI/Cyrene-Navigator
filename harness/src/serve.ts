@@ -34,9 +34,12 @@ import { CodeBuddyLlmAdapter } from './codebuddy-adapter.js';
 import { AntigravityLlmAdapter, DEFAULT_ANTIGRAVITY_MODEL } from './antigravity-adapter.js';
 import {
   ExchangeConnectorAuthorizationClient,
+  ExchangeConnectorRequestError,
   canonicalJson,
   sha256,
   validateTeamsServiceUrl,
+  validateTeamsMessageText,
+  type ExchangeConnectorSafeErrorCode,
 } from './connector-authorization.js';
 import {
   InMemoryWorkStateStore,
@@ -117,6 +120,8 @@ import type { TrustedUserBearerProvider } from './integrations/exchange-integrat
 export interface CreateExecutorAppOptions {
   readonly persistenceUrl?: string;
   readonly workspaceId?: string;
+  /** Server-bound single-owner identity for local Web conversation admission. */
+  readonly workspaceOwnerActorId?: string;
   readonly exchangeUrl?: string;
   readonly exchangeIntegrationUrl?: string;
   readonly exchangeIntegrationWorkspaceId?: string;
@@ -162,6 +167,8 @@ export interface CreateExecutorAppOptions {
   readonly cloudConnectionConfigPath?: string;
   readonly subagentConfigPath?: string;
   readonly teams?: TeamsExecutorConfig;
+  /** Opt in to the static, actor-private P2 conversation assistant profile. */
+  readonly enableConversationAssistant?: boolean;
   /** Restrict a Teams deployment to authenticated text conversations with no model tools. | 仅允许通过身份校验的纯文字对话，不向模型开放工具。 */
   readonly teamsChatOnly?: boolean;
   readonly connectorBindingsPath?: string;
@@ -189,9 +196,18 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
   }
   if (options.enableTestEchoAdapter && !testMode) throw new Error('The echo adapter is test-only');
   const executionBackend = resolveExecutionBackend(options.executionBackend, testMode);
+  const conversationAssistantEnabled = resolveConversationAssistantEnabled(options.enableConversationAssistant);
+  if (conversationAssistantEnabled && executionBackend !== 'dsh') {
+    throw new Error('The conversation-assistant profile requires the DSH execution backend');
+  }
 
   const persistenceUrl = options.persistenceUrl ?? process.env.CYRENE_PERSISTENCE_URL;
   const workspaceId = options.workspaceId ?? process.env.CYRENE_WORKSPACE_ID;
+  const workspaceOwnerActorId = options.workspaceOwnerActorId
+    ?? process.env.CYRENE_WORKSPACE_OWNER_ACTOR_ID;
+  if (workspaceOwnerActorId !== undefined) {
+    boundedHostText(workspaceOwnerActorId, 'CYRENE_WORKSPACE_OWNER_ACTOR_ID', 512);
+  }
   const configuredTeams = options.teams ?? await createTeamsExecutorConfig(workspaceId);
   const privateTeamsMessageSender = configuredTeams?.personalChatEnabled === true && workspaceId !== undefined
     ? createPrivateTeamsMessageSender(configuredTeams, workspaceId)
@@ -279,7 +295,7 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
         workspaceId,
         tokenEnv: 'CYRENE_SESSION_TOKEN',
         privateBridgeTokenEnv: 'CYRENE_PRIVATE_TEAMS_BRIDGE_TOKEN',
-        requestTimeoutMs: 10_000,
+        requestTimeoutMs: Number(process.env.CYRENE_PERSISTENCE_REQUEST_TIMEOUT_MS ?? 45_000),
       })
       : testMode ? new InMemoryWorkStateStore() : (() => { throw new Error('Durable work-state configuration is required'); })());
   if (production && (workState instanceof InMemoryWorkStateStore || options.workStateStore === undefined && !persistenceUrl)) {
@@ -315,7 +331,7 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
         || value === process.env.CYRENE_PRIVATE_TEAMS_BRIDGE_TOKEN)) {
       throw new Error('Work actor token environment references must resolve to distinct dedicated credentials');
     }
-    workActorClients = new WorkActorClientRegistry({ baseUrl: persistenceUrl, workspaceId, requestTimeoutMs: 10_000 }, workActorReferences);
+    workActorClients = new WorkActorClientRegistry({ baseUrl: persistenceUrl, workspaceId, requestTimeoutMs: Number(process.env.CYRENE_PERSISTENCE_REQUEST_TIMEOUT_MS ?? 45_000) }, workActorReferences);
   }
   if (teams?.personalChatEnabled === true) {
     if (workActorReferences === undefined || workActorReferences.length < 1 || workActorReferences.length > 5) {
@@ -390,7 +406,7 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
       tokenEnvForSession: (sessionId: string) => persistenceTokenEnvForSession(sessionId),
       actorPrivateScopeForSession: (sessionId: string) => actorPrivateScopeForSession(sessionId),
       clientId: process.env.CYRENE_DEVICE_ID ?? 'navigator-cloud-daemon',
-      requestTimeoutMs: 10_000,
+      requestTimeoutMs: Number(process.env.CYRENE_PERSISTENCE_REQUEST_TIMEOUT_MS ?? 45_000),
       heartbeatMs: 1_000,
       batchDelayMs: 10,
       maxPendingEvents: 128,
@@ -610,6 +626,15 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
     allowedOrigins: options.allowedOrigins,
     ...(revalidateExchangeAuthorization === undefined ? {} : { revalidateExchangeAuthorization }),
     ...(readExchangeOperationState === undefined ? {} : { readExchangeOperationState }),
+    ...(conversationAssistantEnabled
+      ? {
+        conversationAssistant: {
+          enabled: true,
+          personaId: 'conversation-assistant',
+          ...(workspaceOwnerActorId === undefined ? {} : { webActorId: workspaceOwnerActorId }),
+        },
+      }
+      : {}),
   });
 
   const executor = ctx.get('executor');
@@ -619,7 +644,7 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
   const pluginManager = ctx.get('pluginManager');
   const workflowStore = workflowsEnabled
     ? new WorkflowsClient({
-      baseUrl: persistenceUrl!, workspaceId: workspaceId!, tokenEnv: 'CYRENE_SESSION_TOKEN', requestTimeoutMs: 10_000,
+      baseUrl: persistenceUrl!, workspaceId: workspaceId!, tokenEnv: 'CYRENE_SESSION_TOKEN', requestTimeoutMs: Number(process.env.CYRENE_PERSISTENCE_REQUEST_TIMEOUT_MS ?? 45_000),
     })
     : undefined;
   const workflowStoresByActor = new Map<string, WorkflowsClient>();
@@ -628,7 +653,7 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
       const tokenEnv = workActorClients.tokenEnvForActor(actorId);
       if (tokenEnv === undefined) continue;
       workflowStoresByActor.set(actorId, new WorkflowsClient({
-        baseUrl: persistenceUrl, workspaceId, tokenEnv, requestTimeoutMs: 10_000,
+        baseUrl: persistenceUrl, workspaceId, tokenEnv, requestTimeoutMs: Number(process.env.CYRENE_PERSISTENCE_REQUEST_TIMEOUT_MS ?? 45_000),
       }));
     }
   }
@@ -1059,53 +1084,92 @@ function createPrivateTeamsMessageSender(
   const client = config.exchangeAuthorization;
   if (!(client instanceof ExchangeConnectorAuthorizationClient)) return undefined;
   return async (request: TeamsPersonalMessageSendRequest, signal: AbortSignal) => {
-    if (config.personalChatEnabled !== true || request.target_kind !== 'owner_private'
-      || !exactKeys(request as unknown as Readonly<Record<string, unknown>>, [
-        'requestId', 'conversation', 'tenant_id', 'service_url', 'target_kind', 'actor_aad_object_id', 'text',
-      ])) {
-      throw new TypeError('Private Teams delivery is not enabled or the host request shape is invalid');
+    let messageSendStarted = false;
+    try {
+      if (config.personalChatEnabled !== true || request.target_kind !== 'owner_private'
+        || !exactKeys(request as unknown as Readonly<Record<string, unknown>>, [
+          'requestId', 'conversation', 'tenant_id', 'service_url', 'target_kind', 'actor_aad_object_id', 'text',
+        ])) {
+        throw new TypeError('Private Teams delivery is not enabled or the host request shape is invalid');
+      }
+      const conversationInput = request.conversation as unknown as Record<string, unknown>;
+      if (!exactKeys(conversationInput, ['vendor', 'account_id', 'conversation_id', 'kind'])
+        || conversationInput.vendor !== 'msteams' || conversationInput.kind !== 'private') {
+        throw new TypeError('Private Teams conversation scope is invalid');
+      }
+      const tenantId = requireUuidValue(request.tenant_id, 'private Teams tenant id');
+      const botAppId = requireUuidValue(conversationInput.account_id, 'private Teams bot app id');
+      const actorAadObjectId = requireUuidValue(request.actor_aad_object_id, 'private Teams actor id');
+      if (tenantId !== config.tenantId.toLowerCase() || botAppId !== config.botAppId.toLowerCase()) {
+        throw new TypeError('Private Teams route is outside the configured tenant or bot');
+      }
+      const conversationId = boundedHostText(conversationInput.conversation_id, 'private Teams conversation id', 512);
+      const serviceUrl = validateTeamsServiceUrl(request.service_url, tenantId);
+      const text = validateTeamsMessageText(request.text, 'private Teams message text', 20_000);
+      const requestId = boundedHostText(request.requestId, 'private Teams request id', 200);
+      const issuer = `https://login.microsoftonline.com/${tenantId}/v2.0`;
+      const currentSubjects = await resolveTeamsTaskActorSubjects(config, workspaceId, issuer);
+      if (!currentSubjects.includes(actorAadObjectId)) {
+        throw new TypeError('Private Teams route actor is no longer authorized');
+      }
+      const conversation = { tenantId, botAppId, actorAadObjectId, conversationId, serviceUrl };
+      const args = { targetKind: 'owner_private', conversation, text } as const;
+      const grant = await client.mintGrant({
+        requestId,
+        workspaceId,
+        principalIssuer: issuer,
+        principalSubject: actorAadObjectId,
+        connectionRef: config.exchangeConnectionRef,
+        providerId: 'msteams',
+        profileRef: config.exchangeProfileRef,
+        operationId: 'msteams.message.reply',
+        resourceRef: `msteams-personal:${sha256(canonicalJson(conversation))}`,
+        argumentsDigestSha256: sha256(canonicalJson(args)),
+        arguments: args,
+      }, signal);
+      if (grant.request.principalSubject.toLowerCase() !== actorAadObjectId) {
+        throw new TypeError('Exchange private Teams grant actor does not match the Work-resolved owner');
+      }
+      messageSendStarted = true;
+      return await client.sendPrivateTeamsMessage({ requestId, targetKind: 'owner_private', conversation, text },
+        grant, config.exchangeConnectionRef, config.exchangeProfileRef, signal);
+    } catch (error: unknown) {
+      if (messageSendStarted) throw error;
+      throw privateTeamsPreSendFailure(error);
     }
-    const conversationInput = request.conversation as unknown as Record<string, unknown>;
-    if (!exactKeys(conversationInput, ['vendor', 'account_id', 'conversation_id', 'kind'])
-      || conversationInput.vendor !== 'msteams' || conversationInput.kind !== 'private') {
-      throw new TypeError('Private Teams conversation scope is invalid');
-    }
-    const tenantId = requireUuidValue(request.tenant_id, 'private Teams tenant id');
-    const botAppId = requireUuidValue(conversationInput.account_id, 'private Teams bot app id');
-    const actorAadObjectId = requireUuidValue(request.actor_aad_object_id, 'private Teams actor id');
-    if (tenantId !== config.tenantId.toLowerCase() || botAppId !== config.botAppId.toLowerCase()) {
-      throw new TypeError('Private Teams route is outside the configured tenant or bot');
-    }
-    const conversationId = boundedHostText(conversationInput.conversation_id, 'private Teams conversation id', 512);
-    const serviceUrl = validateTeamsServiceUrl(request.service_url, tenantId);
-    const text = boundedHostText(request.text, 'private Teams message text', 20_000);
-    const requestId = boundedHostText(request.requestId, 'private Teams request id', 200);
-    const issuer = `https://login.microsoftonline.com/${tenantId}/v2.0`;
-    const currentSubjects = await resolveTeamsTaskActorSubjects(config, workspaceId, issuer);
-    if (!currentSubjects.includes(actorAadObjectId)) {
-      throw new TypeError('Private Teams route actor is no longer authorized');
-    }
-    const conversation = { tenantId, botAppId, actorAadObjectId, conversationId, serviceUrl };
-    const args = { targetKind: 'owner_private', conversation, text } as const;
-    const grant = await client.mintGrant({
-      requestId,
-      workspaceId,
-      principalIssuer: issuer,
-      principalSubject: actorAadObjectId,
-      connectionRef: config.exchangeConnectionRef,
-      providerId: 'msteams',
-      profileRef: config.exchangeProfileRef,
-      operationId: 'msteams.message.reply',
-      resourceRef: `msteams-personal:${sha256(canonicalJson(conversation))}`,
-      argumentsDigestSha256: sha256(canonicalJson(args)),
-      arguments: args,
-    }, signal);
-    if (grant.request.principalSubject.toLowerCase() !== actorAadObjectId) {
-      throw new TypeError('Exchange private Teams grant actor does not match the Work-resolved owner');
-    }
-    return client.sendPrivateTeamsMessage({ requestId, targetKind: 'owner_private', conversation, text },
-      grant, config.exchangeConnectionRef, config.exchangeProfileRef, signal);
   };
+}
+
+/** Mark route checks and grant minting as definitely before the Teams message call. | 授权阶段尚未调用 Teams，结果明确为未发送。 */
+function privateTeamsPreSendFailure(error: unknown): ExchangeConnectorRequestError {
+  if (!(error instanceof ExchangeConnectorRequestError)) {
+    return new ExchangeConnectorRequestError(
+      'Private Teams message was not sent because preparation failed',
+      undefined,
+      false,
+      undefined,
+      undefined,
+      'TEAMS_PRIVATE_SEND_NOT_STARTED',
+    );
+  }
+  const safeCode: ExchangeConnectorSafeErrorCode =
+    error.safeCode === 'EXCHANGE_CONNECTOR_REQUEST_TIMEOUT' || error.safeCode === 'EXCHANGE_RESPONSE_BODY_TIMEOUT'
+      ? 'EXCHANGE_GRANT_TIMEOUT'
+      : error.safeCode === 'EXCHANGE_CONNECTOR_ABORTED' || error.safeCode === 'EXCHANGE_REQUEST_NOT_SENT'
+        ? 'EXCHANGE_GRANT_ABORTED'
+        : error.safeCode === 'EXCHANGE_CONNECTOR_NO_RESPONSE' || error.safeCode === 'EXCHANGE_RESPONSE_BODY_INCOMPLETE'
+          ? 'EXCHANGE_GRANT_NO_RESPONSE'
+          : error.status !== undefined && error.status >= 400
+            ? `EXCHANGE_GRANT_HTTP_${error.status}`
+            : 'EXCHANGE_GRANT_FAILED';
+  return new ExchangeConnectorRequestError(
+    'Private Teams authorization grant failed before message invocation',
+    error.status,
+    false,
+    undefined,
+    error.retryAfterSeconds,
+    safeCode,
+  );
 }
 
 function exactKeys(value: Readonly<Record<string, unknown>>, fields: readonly string[]): boolean {
@@ -1169,6 +1233,20 @@ function resolveTeamsChatOnly(option: boolean | undefined): boolean {
     throw new TypeError('CYRENE_TEAMS_CHAT_ONLY and TEAMS_CHAT_ONLY must agree');
   }
   return option ?? environmentValues[0] === 'true';
+}
+
+function resolveConversationAssistantEnabled(option: boolean | undefined): boolean {
+  const env = process.env.CYRENE_CONVERSATION_ASSISTANT_ENABLED;
+  if (env !== undefined && env !== 'true' && env !== 'false') {
+    throw new TypeError('CYRENE_CONVERSATION_ASSISTANT_ENABLED must be true or false');
+  }
+  if (option !== undefined && typeof option !== 'boolean') {
+    throw new TypeError('enableConversationAssistant must be true or false');
+  }
+  if (option !== undefined && env !== undefined && option !== (env === 'true')) {
+    throw new TypeError('enableConversationAssistant and CYRENE_CONVERSATION_ASSISTANT_ENABLED must agree');
+  }
+  return option ?? env === 'true';
 }
 
 /** Reject a private connector catalog that would expose any model-callable provider tool. */

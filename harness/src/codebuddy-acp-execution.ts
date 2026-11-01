@@ -23,6 +23,7 @@ import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 import type { Context } from '@deepseek-ai/cordis'
 import { AcpConversationExecutionBackend } from './acp-conversation-execution.js'
+import { appendBusinessAgentEvidencePolicy } from './business-agent-evidence-policy.js'
 import type {
   AcpConversationExecutionProfile,
   PreparedAcpConversation,
@@ -116,6 +117,7 @@ class CodeBuddyAcpProfile implements AcpConversationExecutionProfile {
   readonly backend = 'codebuddy-acp' as const
   readonly displayName = 'CodeBuddy'
   readonly migrationPrompt = migrationAwarePrompt
+  readonly promptPolicy = appendBusinessAgentEvidencePolicy
   private readonly command: string
   private readonly commandArgsPrefix: readonly string[]
   private readonly model: string
