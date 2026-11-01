@@ -71,6 +71,7 @@ from .records import canonical_json
 from .service import ConversationMigrationService
 
 _graph_wire: Any = graph_wire
+_MAX_MESSAGE_READBACK_SCAN = 100_000
 
 
 class GraphCompensationProvider(Protocol):
@@ -125,27 +126,76 @@ class CanonicalMemoryAdapter(MemoryProjectionPort):
     ) -> Mapping[str, object] | None:
         """Read by exact actor and target conversation, optionally observing its tombstone."""
 
+        if include_revoked:
+            return self._get_message_including_revoked(scope, message_id, context=context)
         try:
             reader: Any = cast(Any, self._store.get_message)
-            options: dict[str, object] = {
-                "conversation_kind": context.conversation_kind,
-                "persona_id": context.persona_id,
-            }
-            if include_revoked:
-                options["include_revoked"] = True
             value = reader(
                 scope.organization_id,
                 scope.workspace_id,
                 scope.actor_id,
                 context.conversation_id,
                 message_id,
-                **options,
+                conversation_kind=context.conversation_kind,
+                persona_id=context.persona_id,
             )
         except PersistenceError as error:
             if error.status == 404:
                 return None
             raise
         return _unwrap(value, "message")
+
+    def _get_message_including_revoked(
+        self,
+        scope: ActorScope,
+        message_id: str,
+        *,
+        context: AuthorizedConversationContext,
+    ) -> Mapping[str, object] | None:
+        """Find one tombstone through bounded pages in the exact actor conversation scope."""
+
+        cursor: str | None = None
+        scanned = 0
+        while scanned < _MAX_MESSAGE_READBACK_SCAN:
+            limit = min(100, _MAX_MESSAGE_READBACK_SCAN - scanned)
+            page = self._store.list_messages(
+                scope.organization_id,
+                scope.workspace_id,
+                scope.actor_id,
+                context.conversation_id,
+                conversation_kind=context.conversation_kind,
+                persona_id=context.persona_id,
+                order="asc",
+                limit=limit,
+                cursor=cursor,
+                include_revoked=True,
+            )
+            items = page.get("items")
+            if not isinstance(items, list) or len(items) > limit:
+                raise MigrationError(
+                    "CANONICAL_READBACK_INVALID", "Message tombstone page is invalid."
+                )
+            scanned += len(items)
+            for item in items:
+                if not isinstance(item, Mapping):
+                    raise MigrationError(
+                        "CANONICAL_READBACK_INVALID", "Message tombstone item is invalid."
+                    )
+                if item.get("id") == message_id:
+                    return item
+            next_cursor = page.get("nextCursor")
+            if next_cursor is None:
+                return None
+            if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
+                raise MigrationError(
+                    "CANONICAL_READBACK_CURSOR_INVALID", "Message tombstone cursor stalled."
+                )
+            cursor = next_cursor
+        raise PersistenceError(
+            "CONVERSATION_MEMORY_READBACK_LIMIT",
+            413,
+            "Message tombstone lookup exceeded its bounded page scan.",
+        )
 
     def create_memory(self, scope: ActorScope, body: Mapping[str, object]) -> Mapping[str, object]:
         value = self._store.create_memory(
@@ -860,7 +910,8 @@ class CanonicalRollbackCapabilities(RollbackCapabilityPort):
         del scope
         checks = {
             "conversation.message.revoke.v1": callable(getattr(self._memory, "revoke_source", None))
-            and _accepts_keyword(getattr(self._memory, "get_message", None), "include_revoked"),
+            and callable(getattr(self._memory, "list_messages", None))
+            and _accepts_keyword(getattr(self._memory, "list_messages", None), "include_revoked"),
             "conversation.memory.tombstone.v1": callable(
                 getattr(self._memory, "delete_memory", None)
             )

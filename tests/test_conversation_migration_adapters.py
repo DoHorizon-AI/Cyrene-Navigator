@@ -22,6 +22,7 @@ from cyrene_navigator.work.conversation_capabilities.knowledge_graph import (
 from cyrene_navigator.work.conversation_memory.domains import ConversationDomainStore
 from cyrene_navigator.work.conversation_memory.store import ConversationMemoryStore
 from cyrene_navigator.work.conversation_migration import (
+    ActorBackupSource,
     ActorScope,
     AuthorizedConversationContext,
     ConversationMigrationService,
@@ -394,6 +395,10 @@ def test_canonical_memory_and_profile_adapters_use_actor_scoped_public_stores(
     tombstone = memory.get_memory(SCOPE, memory_id, include_deleted=True)
     assert tombstone is not None
     assert tombstone["state"] == "deleted"
+    memory.revoke_message(SCOPE, message_id)
+    revoked = memory.get_message(SCOPE, message_id, context=CONTEXT, include_revoked=True)
+    assert revoked is not None
+    assert revoked["status"] == "revoked"
 
 
 class _RestoreAuthorization:
@@ -684,7 +689,7 @@ def test_fresh_sqlite_restore_reconciles_profile_activation_after_process_loss(
 
 
 def test_mount_factory_exports_only_the_portable_actor_backup_subset(tmp_path: Path) -> None:
-    """The core mount factory exports through canonical stores without another ledger."""
+    """The mount factory restores and rolls back through canonical stores and WorkStore."""
 
     memory_store = ConversationMemoryStore(tmp_path / "portable.sqlite")
     domain_store = ConversationDomainStore(tmp_path / "portable.sqlite")
@@ -695,7 +700,7 @@ def test_mount_factory_exports_only_the_portable_actor_backup_subset(tmp_path: P
         SCOPE.actor_id,
         {
             "eventId": "portable-fixture-message",
-            "conversationId": CONTEXT.conversation_id,
+            "conversationId": "legacy-adapter-conversation",
             "conversationKind": CONTEXT.conversation_kind,
             "visibility": "private",
             "role": "user",
@@ -703,15 +708,80 @@ def test_mount_factory_exports_only_the_portable_actor_backup_subset(tmp_path: P
             "occurredAt": 1_700_000_000_000,
         },
     )
-    host = build_conversation_migration_host(
+    export_host = build_conversation_migration_host(
         memory_store=memory_store,
         domain_store=domain_store,
         work_store=work_store,
         authorization=object(),  # type: ignore[arg-type]
     )
-    assert isinstance(host, ConversationMigrationHost)
-
-    backup = host.create_actor_backup(SCOPE, created_at=1_700_000_000_100)
+    backup = export_host.create_actor_backup(SCOPE, created_at=1_700_000_000_100)
 
     assert backup.record_counts == {"message": 1}
     assert backup.quarantined_count == 0
+
+    artifact_id = "portable-real-artifact"
+    authorization = _RestoreAuthorization(memory_store, artifact_id, backup.sha256)
+    host = build_conversation_migration_host(
+        memory_store=memory_store,
+        domain_store=domain_store,
+        work_store=work_store,
+        authorization=authorization,
+    )
+    assert isinstance(host, ConversationMigrationHost)
+    task_id = "portable-real-restore-task"
+    work_store.create_task(
+        SCOPE.organization_id,
+        SCOPE.workspace_id,
+        {"id": task_id, "sessionId": "portable-session", "prompt": "restore fixture"},
+        actor_id=SCOPE.actor_id,
+        actor_private_scope=True,
+    )
+    work_store.claim_task(
+        SCOPE.organization_id,
+        SCOPE.workspace_id,
+        task_id,
+        actor_id=SCOPE.actor_id,
+        actor_private_scope=True,
+    )
+    restored_backup, preview = host.service.preview_backup(
+        SCOPE,
+        artifact_id=artifact_id,
+        content=backup.content,
+        expected_sha256=backup.sha256,
+    )
+    source = ActorBackupSource(restored_backup, artifact_id=artifact_id)
+    receipt = host.service.restore_backup(
+        SCOPE,
+        task_id=task_id,
+        artifact_id=artifact_id,
+        content=backup.content,
+        expected_sha256=backup.sha256,
+        approval_ref="import-approved",
+    )
+    assert receipt.projected_count == 1
+
+    rolled_back = host.service.rollback(SCOPE, task_id=task_id, source=source, preview=preview)
+    assert rolled_back.status == "rolled_back"
+    replay = host.service.rollback(SCOPE, task_id=task_id, source=source, preview=preview)
+    assert replay.status == "rolled_back"
+    messages = memory_store.list_messages(
+        SCOPE.organization_id,
+        SCOPE.workspace_id,
+        SCOPE.actor_id,
+        CONTEXT.conversation_id,
+        conversation_kind=CONTEXT.conversation_kind,
+        order="asc",
+        limit=10,
+        include_revoked=True,
+    )["items"]
+    imported_id = next(
+        str(item["id"]) for item in messages if item["content"] == "Synthetic adapter fixture."
+    )
+    imported = CanonicalMemoryAdapter(memory_store).get_message(
+        SCOPE,
+        imported_id,
+        context=CONTEXT,
+        include_revoked=True,
+    )
+    assert imported is not None
+    assert imported["status"] == "revoked"
