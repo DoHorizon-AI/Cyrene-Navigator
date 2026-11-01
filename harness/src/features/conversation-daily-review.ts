@@ -403,8 +403,9 @@ async function executeReview(input: {
   const checkpoint = parseReviewCheckpoint(input.job.details.dailyReviewV1, cursor);
   const window = checkpoint.window;
   const previousReport = cursor?.previousReport;
+  let priorCoverage = { chunkIndex: 0, totalProcessedMessageCount: 0, totalPageCount: 0 };
   if (previousReport !== undefined) {
-    await readPreviousReviewReport(input.artifacts, input.api, input.context, previousReport, window, input.signal);
+    priorCoverage = await readPreviousReviewReport(input.artifacts, input.api, input.context, previousReport, window, input.signal);
   }
   let pageCursor = cursor?.messageCursor ?? null;
   let scannedPages = cursor?.scannedPages ?? 0;
@@ -597,6 +598,9 @@ async function executeReview(input: {
     coverage: {
       processedMessageCount: processedCount,
       pageCount: pageDocuments.length,
+      chunkIndex: priorCoverage.chunkIndex + 1,
+      totalProcessedMessageCount: priorCoverage.totalProcessedMessageCount + processedCount,
+      totalPageCount: priorCoverage.totalPageCount + pageDocuments.length,
       complete: pageCursor === null && gaps.length === 0,
       gaps: stableUnique(gaps),
     },
@@ -916,7 +920,7 @@ async function readPreviousReviewReport(
   pointer: { readonly artifactId: string; readonly sha256: string },
   window: ConversationReviewWindow,
   signal: AbortSignal,
-): Promise<void> {
+): Promise<{ readonly chunkIndex: number; readonly totalProcessedMessageCount: number; readonly totalPageCount: number }> {
   const artifact = await port.read({
     context: { workspaceId: context.workspaceId, actorId: context.actorId },
     artifactId: pointer.artifactId,
@@ -931,14 +935,30 @@ async function readPreviousReviewReport(
   if (manifest.schema !== 'cyrene.conversation-daily-review.v1'
     || canonicalJson(manifest.scope) !== canonicalJson(reviewScope(context))
     || canonicalJson(manifest.window) !== canonicalJson(window)
-    || !Array.isArray(manifest.sourceRefs)) {
+    || !Array.isArray(manifest.sourceRefs)
+    || typeof manifest.coverage !== 'object' || manifest.coverage === null || Array.isArray(manifest.coverage)) {
     fail('DAILY_REVIEW_PREVIOUS_REPORT_INVALID', 409, false, 'Previous report belongs to another window or conversation');
+  }
+  const coverage = manifest.coverage as Record<string, unknown>;
+  if (!Number.isSafeInteger(coverage.chunkIndex) || (coverage.chunkIndex as number) < 1
+    || !Number.isSafeInteger(coverage.totalProcessedMessageCount) || (coverage.totalProcessedMessageCount as number) < 0
+    || !Number.isSafeInteger(coverage.totalPageCount) || (coverage.totalPageCount as number) < 0
+    || !Number.isSafeInteger(coverage.processedMessageCount) || (coverage.processedMessageCount as number) < 0
+    || !Number.isSafeInteger(coverage.pageCount) || (coverage.pageCount as number) < 0
+    || (coverage.totalProcessedMessageCount as number) < (coverage.processedMessageCount as number)
+    || (coverage.totalPageCount as number) < (coverage.pageCount as number)) {
+    fail('DAILY_REVIEW_PREVIOUS_REPORT_INVALID', 409, false, 'Previous report coverage totals are invalid');
   }
   const sourceRefs = normalizeRefs(manifest.sourceRefs);
   if (artifact.sourceRefsDigest !== hashText(canonicalJson(sourceRefs))) {
     fail('DAILY_REVIEW_PREVIOUS_REPORT_INVALID', 409, false, 'Previous report provenance metadata does not match its content');
   }
   await requireCurrentSources(api, context, sourceRefs, 'DAILY_REVIEW_SOURCE_REVOKED');
+  return {
+    chunkIndex: coverage.chunkIndex as number,
+    totalProcessedMessageCount: coverage.totalProcessedMessageCount as number,
+    totalPageCount: coverage.totalPageCount as number,
+  };
 }
 
 async function readVerifiedPageArtifact(

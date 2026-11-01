@@ -371,7 +371,13 @@ test('daily review recovers continuation creation and pages the full window acro
     signal: context.signal,
   })).bytes).toString('utf8'));
   assert.equal(firstReport.coverage.complete, false);
+  assert.equal(firstReport.coverage.chunkIndex, 1);
+  assert.equal(firstReport.coverage.totalProcessedMessageCount, 16);
   assert.equal(finalReport.coverage.complete, true);
+  assert.equal(finalReport.coverage.chunkIndex, 2);
+  assert.equal(finalReport.coverage.processedMessageCount, 14);
+  assert.equal(finalReport.coverage.totalProcessedMessageCount, 30);
+  assert.equal(finalReport.coverage.totalPageCount, 30);
   assert.deepEqual(finalReport.previousReport, {
     artifactId: firstEvent.report.artifactId,
     sha256: firstEvent.report.sha256,
