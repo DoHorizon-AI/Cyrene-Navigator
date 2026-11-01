@@ -1850,7 +1850,10 @@ export class NavigatorExecutor {
         ? 'aborted'
         : task.agentError || (task.blocked?.size ?? 0) > 0 ? 'failed' : 'completed';
       if (task.conversationTurn !== undefined) {
-        const assistantText = this.extractLatestAssistantText(agent.session);
+        // The Work conversation-memory API stores normalized (trimmed) message text, so deliver the
+        // same normalized value; otherwise the authoritative exact readback rejects model replies
+        // that only carry surrounding whitespace. 中文：按存储归一化后的文本投递，避免回读校验误判。
+        const assistantText = this.extractLatestAssistantText(agent.session).trim();
         if (preliminaryStatus === 'completed' && assistantText.length > 0) {
           task.output = assistantText;
           const decision = await this.finishConversationAssistantTurn(task, assistantText);

@@ -19,10 +19,11 @@ const EXECUTOR_TOKEN = 'conversation-executor-test-token';
 process.env.CYRENE_CONVERSATION_TEST_TOKEN = EXECUTOR_TOKEN;
 
 class ConversationAdapter extends LlmAdapter {
-  constructor() {
+  constructor({ trailingWhitespace = '' } = {}) {
     super();
     this.summaryCalls = 0;
     this.prompts = [];
+    this.trailingWhitespace = trailingWhitespace;
   }
 
   async *stream(options) {
@@ -36,9 +37,10 @@ class ConversationAdapter extends LlmAdapter {
       : currentMessage.includes('Repeat the earlier marker.')
         ? 'Earlier assistant-only finding: RESPONSE-SIDE-ALDER-92'
         : `Answer for ${currentMessage}`;
+    const delivered = reply + this.trailingWhitespace;
     yield { type: 'block-start', index: 0, blockType: 'text' };
-    yield { type: 'text-delta', index: 0, text: reply };
-    yield { type: 'block-end', index: 0, block: { type: 'text', text: reply } };
+    yield { type: 'text-delta', index: 0, text: delivered };
+    yield { type: 'block-end', index: 0, block: { type: 'text', text: delivered } };
     yield { type: 'finish', reason: { kind: 'stop' } };
   }
 }
@@ -172,10 +174,10 @@ function webTurn(taskId, sessionId, prompt) {
   };
 }
 
-async function makeApp(denyDelivery) {
+async function makeApp(denyDelivery, adapterOptions = {}) {
   const store = new InMemoryWorkStateStore(ACTOR_ID);
   const { calls, messages, memories, deniedSources } = installConversationApi(store, { denyDelivery });
-  const adapter = new ConversationAdapter();
+  const adapter = new ConversationAdapter(adapterOptions);
   const app = await createExecutorApp({
     testMode: true,
     workStateStore: store,
@@ -231,6 +233,24 @@ test('conversation assistant persists the user turn and emits text only after th
     const task = await store.getTask(outcome.taskId);
     assert.equal(task.status, 'completed');
     assert.equal(task.output, outcome.output);
+  } finally {
+    await app.executor.dispose();
+    await app.pluginManager?.dispose();
+    await app.ctx.fiber.dispose();
+  }
+});
+
+test('conversation assistant trims surrounding model whitespace before the exact Work readback', async () => {
+  const { app, messages } = await makeApp(false, { trailingWhitespace: '\n\n  ' });
+  try {
+    const outcome = await app.executor.executeTask(
+      webTurn('conversation-trimmed', 'web-conversation-trimmed', 'Keep the reply clean.'),
+      () => {},
+    );
+    assert.equal(outcome.status, 'completed');
+    assert.equal(outcome.output, 'Answer for Keep the reply clean.');
+    const assistant = messages.find(message => message.role === 'assistant');
+    assert.equal(assistant.content, outcome.output);
   } finally {
     await app.executor.dispose();
     await app.pluginManager?.dispose();
