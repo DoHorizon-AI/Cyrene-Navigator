@@ -76,6 +76,8 @@ export interface AcpConversationExecutionProfile {
   readonly backend: NativeAcpBackendName;
   readonly displayName: string;
   readonly migrationPrompt?: (prompt: string) => string;
+  /** Provider-owned guidance applied on every turn, including restored sessions. */
+  readonly promptPolicy?: (prompt: string) => string;
   prepare(bridge: AcpMcpBridge): Promise<PreparedAcpConversation> | PreparedAcpConversation;
   answerPermission(
     params: Record<string, unknown>,
@@ -302,9 +304,10 @@ export class AcpConversationExecutionBackend implements ConversationExecutionBac
         legacyDshHistoryImported: false,
       })
       currentTurn = true
-      const prompt = prior === undefined
+      const userPrompt = prior === undefined
         ? (this.options.profile.migrationPrompt?.(input.prompt) ?? input.prompt)
         : input.prompt
+      const prompt = this.options.profile.promptPolicy?.(userPrompt) ?? userPrompt
       const promptValue = await withRunDeadline(peer.request('session/prompt', {
         sessionId: conversationId,
         prompt: [{ type: 'text', text: prompt }],

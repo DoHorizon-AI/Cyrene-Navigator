@@ -99,6 +99,10 @@ test('CodeBuddy runs as a restricted structured-output planner and preserves DSH
   assert.match(request.input, /must call the allowed CodeBuddy CLI StructuredOutput tool exactly once/u);
   assert.match(request.input, /Never call or simulate a business tool, connector tool, or MCP tool/u);
   assert.match(request.input, /Return exactly one flat structured envelope/u);
+  assert.match(request.input, /rely on successful tool results or explicit user-supplied facts/u);
+  assert.match(request.input, /Do not infer commit ancestry, merge reachability, CI outcome/u);
+  assert.match(request.input, /retryable:false result means stop/u);
+  assert.match(request.input, /Keep connector binding or connection UUIDs distinct from provider resource IDs/u);
   assert.match(request.input, /"tool_name":"","args":\{\}/u);
   assert.ok(args.includes('--print'));
   assert.deepEqual(args.slice(args.indexOf('--tools'), args.indexOf('--tools') + 2), ['--tools', 'StructuredOutput']);
@@ -118,6 +122,23 @@ test('CodeBuddy runs as a restricted structured-output planner and preserves DSH
   assert.deepEqual(schema.properties.args, { type: 'object' });
   assert.deepEqual(schema.required, ['kind', 'text', 'tool_name', 'args']);
   assert.equal(schema.additionalProperties, false);
+});
+
+test('CodeBuddy labels failed tool history as failed evidence and receives retry guidance', async t => {
+  const instance = await fixture(terminal({ kind: 'final', text: 'The read failed.', tool_name: '', args: {} }));
+  t.after(instance.cleanup);
+  const requestOptions = modelRequest({
+    messages: modelRequest().messages.map(message => message.role === 'tool'
+      ? { ...message, isError: true, content: [{ type: 'text', text: 'repository lookup failed; retryable:false' }] }
+      : message),
+  });
+
+  await collect(instance.adapter, requestOptions);
+  const request = JSON.parse(await readFile(instance.record, 'utf8'));
+  assert.match(request.input, /"is_error":true/u);
+  assert.match(request.input, /repository lookup failed; retryable:false/u);
+  assert.match(request.input, /An error or is_error tool result proves only that the observation failed/u);
+  assert.match(request.input, /when retryability is missing, do not mechanically repeat the same tool/u);
 });
 
 test('CodeBuddy receives the provider profile but not Cyrene connector environment variables', async t => {
