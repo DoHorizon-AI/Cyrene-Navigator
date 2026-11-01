@@ -27,6 +27,7 @@ from cyrene_navigator import Product
 from cyrene_navigator import create_app as create_product_api_app
 from cyrene_navigator.persistence import PersistencePrincipal, create_persistence_app
 from cyrene_navigator.work.api import ConnectorBridge, TeamsPrivateConversationPolicy
+from cyrene_navigator.work.conversation_capabilities import build_conversation_capabilities
 
 PERSISTENCE_TLS_CERT_FILE_ENV = "CYRENE_PERSISTENCE_TLS_CERT_FILE"
 PERSISTENCE_TLS_KEY_FILE_ENV = "CYRENE_PERSISTENCE_TLS_KEY_FILE"
@@ -188,15 +189,25 @@ def main() -> None:
     private_policy = _teams_private_conversation_policy(
         config.teams_private_conversations, os.environ
     )
-    app = create_persistence_app(
-        args.database,
-        principals,
-        lease_seconds=args.lease_seconds,
-        artifact_root=args.artifact_root,
-        echo_url=args.echo_url,
-        work_connector_bridges=_load_work_connectors(config.work_connectors, principals),
-        private_conversation_policy=private_policy,
-    )
+    capabilities = build_conversation_capabilities(environment=os.environ)
+    try:
+        app = create_persistence_app(
+            args.database,
+            principals,
+            lease_seconds=args.lease_seconds,
+            artifact_root=args.artifact_root,
+            echo_url=args.echo_url,
+            work_connector_bridges=_load_work_connectors(config.work_connectors, principals),
+            private_conversation_policy=private_policy,
+            conversation_memory_embedding_client=capabilities.embedding_client,
+            conversation_memory_provider=capabilities.memory_provider,
+            conversation_graph_provider=capabilities.knowledge_graph_provider,
+        )
+    except BaseException:
+        capabilities.close()
+        raise
+    app.state.work_conversation_capabilities = capabilities
+    app.router.add_event_handler("shutdown", capabilities.close)
 
     @app.get("/healthz", include_in_schema=False)
     def healthz() -> dict[str, str]:

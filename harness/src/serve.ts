@@ -117,6 +117,8 @@ import type { TrustedUserBearerProvider } from './integrations/exchange-integrat
 export interface CreateExecutorAppOptions {
   readonly persistenceUrl?: string;
   readonly workspaceId?: string;
+  /** Server-bound single-owner identity for local Web conversation admission. */
+  readonly workspaceOwnerActorId?: string;
   readonly exchangeUrl?: string;
   readonly exchangeIntegrationUrl?: string;
   readonly exchangeIntegrationWorkspaceId?: string;
@@ -162,6 +164,8 @@ export interface CreateExecutorAppOptions {
   readonly cloudConnectionConfigPath?: string;
   readonly subagentConfigPath?: string;
   readonly teams?: TeamsExecutorConfig;
+  /** Opt in to the static, actor-private P2 conversation assistant profile. */
+  readonly enableConversationAssistant?: boolean;
   /** Restrict a Teams deployment to authenticated text conversations with no model tools. | 仅允许通过身份校验的纯文字对话，不向模型开放工具。 */
   readonly teamsChatOnly?: boolean;
   readonly connectorBindingsPath?: string;
@@ -189,9 +193,18 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
   }
   if (options.enableTestEchoAdapter && !testMode) throw new Error('The echo adapter is test-only');
   const executionBackend = resolveExecutionBackend(options.executionBackend, testMode);
+  const conversationAssistantEnabled = resolveConversationAssistantEnabled(options.enableConversationAssistant);
+  if (conversationAssistantEnabled && executionBackend !== 'dsh') {
+    throw new Error('The conversation-assistant profile requires the DSH execution backend');
+  }
 
   const persistenceUrl = options.persistenceUrl ?? process.env.CYRENE_PERSISTENCE_URL;
   const workspaceId = options.workspaceId ?? process.env.CYRENE_WORKSPACE_ID;
+  const workspaceOwnerActorId = options.workspaceOwnerActorId
+    ?? process.env.CYRENE_WORKSPACE_OWNER_ACTOR_ID;
+  if (workspaceOwnerActorId !== undefined) {
+    boundedHostText(workspaceOwnerActorId, 'CYRENE_WORKSPACE_OWNER_ACTOR_ID', 512);
+  }
   const configuredTeams = options.teams ?? await createTeamsExecutorConfig(workspaceId);
   const privateTeamsMessageSender = configuredTeams?.personalChatEnabled === true && workspaceId !== undefined
     ? createPrivateTeamsMessageSender(configuredTeams, workspaceId)
@@ -610,6 +623,15 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
     allowedOrigins: options.allowedOrigins,
     ...(revalidateExchangeAuthorization === undefined ? {} : { revalidateExchangeAuthorization }),
     ...(readExchangeOperationState === undefined ? {} : { readExchangeOperationState }),
+    ...(conversationAssistantEnabled
+      ? {
+        conversationAssistant: {
+          enabled: true,
+          personaId: 'conversation-assistant',
+          ...(workspaceOwnerActorId === undefined ? {} : { webActorId: workspaceOwnerActorId }),
+        },
+      }
+      : {}),
   });
 
   const executor = ctx.get('executor');
@@ -1169,6 +1191,20 @@ function resolveTeamsChatOnly(option: boolean | undefined): boolean {
     throw new TypeError('CYRENE_TEAMS_CHAT_ONLY and TEAMS_CHAT_ONLY must agree');
   }
   return option ?? environmentValues[0] === 'true';
+}
+
+function resolveConversationAssistantEnabled(option: boolean | undefined): boolean {
+  const env = process.env.CYRENE_CONVERSATION_ASSISTANT_ENABLED;
+  if (env !== undefined && env !== 'true' && env !== 'false') {
+    throw new TypeError('CYRENE_CONVERSATION_ASSISTANT_ENABLED must be true or false');
+  }
+  if (option !== undefined && typeof option !== 'boolean') {
+    throw new TypeError('enableConversationAssistant must be true or false');
+  }
+  if (option !== undefined && env !== undefined && option !== (env === 'true')) {
+    throw new TypeError('enableConversationAssistant and CYRENE_CONVERSATION_ASSISTANT_ENABLED must agree');
+  }
+  return option ?? env === 'true';
 }
 
 /** Reject a private connector catalog that would expose any model-callable provider tool. */

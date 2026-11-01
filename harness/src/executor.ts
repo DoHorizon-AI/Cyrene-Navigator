@@ -10,15 +10,24 @@ import { createServer } from 'node:http';
 import type { IncomingMessage, ServerResponse, Server } from 'node:http';
 import type { Context } from '@deepseek-ai/cordis';
 import { brandString } from '@deepseek-ai/dsh-brand';
-import type { Agent, AgentOptions, ModelSelection, ModelSelectionRef } from '@deepseek-ai/dsh-agent';
+import type { Agent, AgentHandle, AgentOptions, ModelSelection, ModelSelectionRef } from '@deepseek-ai/dsh-agent';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
 import type { TokenUsage } from '@deepseek-ai/dsh-llm';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { SessionId, SessionSeq } from '@deepseek-ai/dsh-session';
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
 import type { DynamicPluginManager } from './plugin-manager.js';
-import { WorkStateHttpError } from './work-state-client.js';
-import type { CredentialHealthSnapshot, ExecutionStatus, NotificationLease, TaskRecord, WorkStateStore } from './work-state-client.js';
+import { WorkStateClient, WorkStateHttpError } from './work-state-client.js';
+import type {
+  ConversationMaintenanceCheckpoint,
+  ConversationMaintenanceJobRecord,
+  CredentialHealthSnapshot,
+  DurableTaskEvent,
+  ExecutionStatus,
+  NotificationLease,
+  TaskRecord,
+  WorkStateStore,
+} from './work-state-client.js';
 import type { WorkActorClientRegistry } from './work-state-client.js';
 import type { ExchangeAuthorizationWaitReceipt } from './integrations/exchange-authorization.js';
 import {
@@ -40,6 +49,15 @@ import type { ModelRoute } from './model-policy.js';
 import type { ConversationExecutionBackend } from './codebuddy-acp-execution.js';
 import type { WorkflowSourceTaskReceipt } from './workflows/store.js';
 import { getConnectorToolCatalog } from './tool-providers.js';
+import { VOLATILE_CONVERSATION_SESSION_PREFIX } from './persistence.js';
+import { ConversationFeatureError, createConversationMemoryFeature } from './features/conversation-memory.js';
+import type {
+  ConversationMemoryApiV1,
+  ConversationMemoryFeature,
+  ConversationSourceRef,
+  ConversationSummaryProviderV1,
+  TrustedTurnContext,
+} from './features/conversation-memory.js';
 
 export type TaskStatus = ExecutionStatus;
 export type TaskExecutionClass = 'foreground' | 'background';
@@ -56,6 +74,13 @@ export interface ExecuteTaskParams {
   readonly executionClass?: TaskExecutionClass;
   /** Host-owned provenance and policy facts persisted with the Work Task. */
   readonly metadata?: Readonly<Record<string, unknown>>;
+  /** Host-only browser ingress marker; the public request parser never accepts this field. */
+  readonly conversationOrigin?: {
+    readonly kind: 'web';
+    readonly conversationKind: 'direct';
+    readonly conversationId?: string;
+    readonly eventId?: string;
+  };
 }
 
 /** Host-only durable background task that invokes fixed registered tools without an LLM turn. */
@@ -92,6 +117,31 @@ export interface TaskOutcome {
   readonly durationMs: number;
 }
 
+export interface DshWorkTaskRequestV1 {
+  readonly taskId: string;
+  readonly sessionId: string;
+  readonly prompt: string;
+  readonly metadata: Readonly<Record<string, unknown>>;
+}
+
+export interface DshWorkTaskExecutionPortV1 {
+  run<T>(
+    context: { readonly workspaceId: string; readonly actorId: string },
+    request: DshWorkTaskRequestV1,
+    operation: (
+      agent: Agent,
+      signal: AbortSignal,
+      checkpoint: (value: ConversationMaintenanceCheckpoint) => Promise<void>,
+    ) => Promise<string>,
+    signal: AbortSignal,
+  ): Promise<TaskOutcome>;
+  cancel(
+    context: { readonly workspaceId: string; readonly actorId: string },
+    taskId: string,
+    signal: AbortSignal,
+  ): Promise<boolean>;
+}
+
 /** Provider-reported usage aggregated by the actual provider/model route. */
 export interface TaskModelUsageRoute {
   readonly provider: string;
@@ -117,6 +167,8 @@ interface InternalTaskState {
   record: TaskRecord;
   workState?: WorkStateStore;
   actorAadObjectId?: string;
+  /** DSH-only per-task session id; Work keeps the stable conversation session id. */
+  dshSessionId?: string;
   output: string;
   reasoning: string;
   blocked?: Map<string, Extract<ExecutorStreamEvent, { type: 'subagent-blocked' }>>;
@@ -128,12 +180,37 @@ interface InternalTaskState {
   modelSelection?: ModelSelectionRef;
   modelRoute?: ModelSelection;
   fixedToolTask?: boolean;
+  /** Active static-profile turn. Output remains private until its source gate passes. */
+  conversationTurn?: {
+    readonly feature: ConversationMemoryFeature;
+    readonly context: TrustedTurnContext;
+    readonly userEventId: string;
+    readonly userMessageId: string;
+    readonly sourceRefs: readonly ConversationSourceRef[];
+    assistantMessageId?: string;
+    assistantEventId?: string;
+  };
+  conversationDeliveryText?: string;
+  conversationDeliveryHoldCode?: string;
   authorizationPause?: boolean;
   eventChain: Promise<void>;
   eventFailure?: unknown;
   patchChain: Promise<void>;
   patchFailure?: unknown;
   completion?: Promise<TaskOutcome>;
+}
+
+interface ConversationAssistantSourceProof {
+  readonly assistantMessageId: string;
+  readonly assistantEventId: string;
+  readonly conversationId: string;
+  readonly conversationKind: 'direct' | 'group';
+  readonly personaId: string;
+  readonly visibility: 'private' | 'conversation';
+  readonly userEventId: string;
+  readonly contentSha256: string;
+  readonly sourceRefsSha256: string;
+  readonly authorizationEpoch: number;
 }
 
 export interface ExecutorConfig {
@@ -169,6 +246,13 @@ export interface ExecutorConfig {
     sessionId: string,
     operationId: string,
   ) => Promise<string>;
+  /** Enable the static actor-private conversation assistant profile for chat tasks. */
+  readonly conversationAssistant?: {
+    readonly enabled: boolean;
+    readonly personaId: string;
+    /** Static local Web owner only; multi-actor Web identity must be supplied by a trusted caller port. */
+    readonly webActorId?: string;
+  };
 }
 
 /** Process-local drain state; durable queued rows remain in the Work service. */
@@ -459,6 +543,26 @@ export class NavigatorExecutor {
     this.ready = this.recoverInterruptedTasks();
   }
 
+  /** Expose maintenance execution through this executor's durable Work Tasks and DSH Agent. */
+  dshWorkTaskExecutionPortV1(): DshWorkTaskExecutionPortV1 {
+    const port: DshWorkTaskExecutionPortV1 = {
+      run: <T>(
+        context: { readonly workspaceId: string; readonly actorId: string },
+        request: DshWorkTaskRequestV1,
+        operation: (
+          agent: Agent,
+          signal: AbortSignal,
+          checkpoint: (value: ConversationMaintenanceCheckpoint) => Promise<void>,
+        ) => Promise<string>,
+        signal: AbortSignal,
+      ) =>
+        this.runConversationMaintenanceTask(context, request, operation, signal),
+      cancel: (context, taskId, signal) =>
+        this.cancelConversationMaintenanceTask(context, taskId, signal),
+    };
+    return Object.freeze(port);
+  }
+
   /** Stop new claims and cancel limiter waiters while leaving durable admission open. */
   startDrain(): { readonly instanceId: string; readonly generation: number; readonly token: string; readonly startedAt: number } {
     if (this.shutdownRequested || this.disposePromise !== undefined) {
@@ -625,12 +729,16 @@ export class NavigatorExecutor {
       const timestamp = Date.now();
       if (chunk.type === 'text-delta' && chunk.text) {
         task.output += chunk.text;
-        this.publish(task, { type: 'text-delta', taskId: task.id, text: chunk.text, timestamp });
-        void this.patch(task, { output: task.output }).catch(() => undefined);
+        if (task.conversationTurn === undefined) {
+          this.publish(task, { type: 'text-delta', taskId: task.id, text: chunk.text, timestamp });
+          void this.patch(task, { output: task.output }).catch(() => undefined);
+        }
       } else if (chunk.type === 'reasoning-delta' && chunk.text) {
         task.reasoning += chunk.text;
-        this.publish(task, { type: 'reasoning-delta', taskId: task.id, text: chunk.text, timestamp });
-        void this.patch(task, { reasoning: task.reasoning }).catch(() => undefined);
+        if (task.conversationTurn === undefined) {
+          this.publish(task, { type: 'reasoning-delta', taskId: task.id, text: chunk.text, timestamp });
+          void this.patch(task, { reasoning: task.reasoning }).catch(() => undefined);
+        }
       } else if (chunk.type === 'usage' && task.modelRoute !== undefined) {
         void this.publish(task, {
           type: 'model-usage',
@@ -641,10 +749,12 @@ export class NavigatorExecutor {
           timestamp,
         }).catch(() => undefined);
       } else if (chunk.type === 'block-end' && chunk.block?.type === 'tool-call') {
-        this.publish(task, {
-          type: 'tool-call', taskId: task.id, callId: String(chunk.block.id),
-          tool: chunk.block.name, args: chunk.block.arguments, timestamp,
-        });
+        if (task.conversationTurn === undefined) {
+          this.publish(task, {
+            type: 'tool-call', taskId: task.id, callId: String(chunk.block.id),
+            tool: chunk.block.name, args: chunk.block.arguments, timestamp,
+          });
+        }
       }
     });
 
@@ -661,6 +771,7 @@ export class NavigatorExecutor {
       const task = taskId ? this.tasks.get(taskId) : undefined;
       if (!task || (task.record.status !== 'running' && task.record.status !== 'awaiting_user_authorization')) return;
       if (event.type === 'tool/result') {
+        if (task.conversationTurn !== undefined) return;
         const data = event.data as SessionEvent<'tool/result'>['data'];
         const blocks = data.message.content;
         const result = blocks.flatMap(block => block.type === 'text' ? [block.text] : []).join('');
@@ -967,6 +1078,183 @@ export class NavigatorExecutor {
     return task.completion;
   }
 
+  private async runConversationMaintenanceTask<T>(
+    context: { readonly workspaceId: string; readonly actorId: string },
+    request: DshWorkTaskRequestV1,
+    operation: (
+      agent: Agent,
+      signal: AbortSignal,
+      checkpoint: (value: ConversationMaintenanceCheckpoint) => Promise<void>,
+    ) => Promise<string>,
+    signal: AbortSignal,
+  ): Promise<TaskOutcome> {
+    await this.ready;
+    signal.throwIfAborted();
+    if (context.workspaceId !== this.config.workspaceId) {
+      throw new ExecutorRequestError(403, 'CONVERSATION_WORKSPACE_MISMATCH', 'Conversation task is outside the configured Workspace.');
+    }
+    const actorId = uuidText(context.actorId, 'conversation task actor id');
+    const actorWorkState = this.config.workActorClients?.forActor(actorId);
+    if (!(actorWorkState instanceof WorkStateClient)) {
+      throw new ExecutorRequestError(503, 'CONVERSATION_ACTOR_WORK_UNAVAILABLE', 'An actor-private Harness Work principal is unavailable.');
+    }
+    const metadata = objectValue(request.metadata, 'conversation maintenance Task metadata');
+    const metadataKeys = [
+      'actorId', 'idempotencyKey', 'jobVersion', 'kind', 'maintenanceJobId', 'source', 'workspaceId',
+    ];
+    if (!isExactObjectKeys(metadata, metadataKeys)
+      || metadata.source !== 'conversation-maintenance'
+      || metadata.actorId !== actorId
+      || metadata.workspaceId !== context.workspaceId
+      || !['dream', 'forget', 'daily_review', 'backup', 'import'].includes(String(metadata.kind))) {
+      throw new ExecutorRequestError(403, 'CONVERSATION_TASK_PROVENANCE_INVALID', 'Conversation maintenance Task metadata is invalid.');
+    }
+    const jobId = boundedText(metadata.maintenanceJobId, 'maintenance job id', 200);
+    const idempotencyKey = boundedText(metadata.idempotencyKey, 'maintenance idempotency key', 200);
+    const jobVersion = maintenanceSafeInteger(metadata.jobVersion, 'maintenance queued version', 1);
+    const taskId = conversationMaintenanceTaskId(context.workspaceId, actorId, jobId);
+    if (request.taskId !== taskId || request.sessionId !== taskId
+      || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/u.test(request.taskId)) {
+      throw new ExecutorRequestError(409, 'CONVERSATION_TASK_IDENTITY_INVALID', 'Task identity does not match its durable job scope.');
+    }
+    const job = await actorWorkState.getConversationMaintenanceJob(jobId, signal);
+    if (job === undefined
+      || job.id !== jobId
+      || job.idempotencyKey !== idempotencyKey
+      || job.kind !== metadata.kind
+      || job.queuedVersion !== jobVersion) {
+      throw new ExecutorRequestError(409, 'CONVERSATION_TASK_JOB_MISMATCH', 'Task provenance does not match the actor-owned maintenance job.');
+    }
+    if (job.state === 'cancelled' || job.state === 'completed' || job.state === 'failed') {
+      const prior = await actorWorkState.getTask(taskId);
+      if (prior === undefined || !TERMINAL_STATUSES.has(prior.status)) {
+        throw new ExecutorRequestError(409, 'CONVERSATION_JOB_NOT_RUNNABLE', 'A terminal maintenance job has no matching terminal Work Task.');
+      }
+    } else if (job.state === 'running') {
+      const prior = await actorWorkState.getTask(taskId);
+      if (prior === undefined) {
+        throw new ExecutorRequestError(409, 'CONVERSATION_JOB_TASK_MISSING', 'A running maintenance job has no durable Work Task to reconcile.');
+      }
+    }
+
+    const expectedMetadata = Object.freeze({ ...metadata });
+    const reportCheckpoint = async (value: ConversationMaintenanceCheckpoint): Promise<void> => {
+      signal.throwIfAborted();
+      const checkpoint = validateConversationMaintenanceCheckpoint(value);
+      if (checkpoint.details.state !== undefined && checkpoint.details.state !== 'running') {
+        throw new ExecutorRequestError(400, 'CONVERSATION_CHECKPOINT_STATE_INVALID', 'Only the host may set a terminal maintenance state.');
+      }
+      const current = await actorWorkState.getConversationMaintenanceJob(jobId, signal);
+      if (current === undefined || current.state !== 'running') {
+        throw new ExecutorRequestError(409, 'CONVERSATION_JOB_NOT_RUNNING', 'Maintenance job is no longer running.');
+      }
+      await actorWorkState.checkpointConversationMaintenanceJob(
+        jobId,
+        current.version,
+        { ...checkpoint, details: { ...checkpoint.details, state: 'running' } },
+        signal,
+      );
+    };
+
+    if (signal.aborted) signal.throwIfAborted();
+    const onAbort = (): void => { void this.cancelTask(taskId).catch(() => undefined); };
+    signal.addEventListener('abort', onAbort, { once: true });
+    try {
+      const outcome = await this.executeFixedToolTask(
+        {
+          taskId,
+          sessionId: taskId,
+          prompt: boundedText(request.prompt, 'maintenance task prompt', 20_000),
+          metadata: expectedMetadata,
+        },
+        async (agent, taskSignal) => {
+          let current = await actorWorkState.getConversationMaintenanceJob(jobId, taskSignal);
+          if (current === undefined) throw new Error('Conversation maintenance job disappeared.');
+          if (current.state === 'queued') {
+            const startDigest = current.checkpointDigest
+              ?? sha256(`conversation-maintenance-start-v1\0${jobId}\0${current.version}`);
+            current = await actorWorkState.checkpointConversationMaintenanceJob(
+              jobId,
+              current.version,
+              {
+                cursor: current.cursor,
+                processedCount: current.processedCount,
+                checkpointDigest: startDigest,
+                details: { state: 'running', phase: 'started', taskId },
+              },
+              taskSignal,
+            );
+          }
+          if (current.state !== 'running') {
+            throw new Error('Conversation maintenance job is not in a runnable state.');
+          }
+          return operation(agent, taskSignal, reportCheckpoint);
+        },
+        actorId,
+        actorWorkState,
+      );
+
+      const finalState = outcome.status === 'completed'
+        ? 'completed'
+        : outcome.status === 'failed'
+          ? 'failed'
+            : undefined;
+      if (outcome.status === 'aborted') return outcome;
+      if (finalState === undefined) {
+        throw new ExecutorRequestError(409, 'CONVERSATION_TASK_NOT_TERMINAL', 'DSH maintenance Task did not reach a terminal state.');
+      }
+      const current = await actorWorkState.getConversationMaintenanceJob(jobId).catch(() => undefined);
+      if (current === undefined) {
+        throw new ExecutorRequestError(503, 'CONVERSATION_JOB_READBACK_FAILED', 'Maintenance job status could not be read back.');
+      }
+      if (current.state === finalState) {
+        const outputDigest = sha256(outcome.output);
+        if (current.details.taskId !== taskId || current.details.taskOutputSha256 !== outputDigest) {
+          throw new ExecutorRequestError(409, 'CONVERSATION_JOB_RECEIPT_MISMATCH', 'Terminal job state does not match the durable DSH Task output.');
+        }
+        return outcome;
+      }
+      if (current.state === 'completed' || current.state === 'failed' || current.state === 'cancelled') {
+        throw new ExecutorRequestError(409, 'CONVERSATION_JOB_STATE_CONFLICT', 'Maintenance job reached a different terminal state.');
+      }
+      const outputDigest = sha256(outcome.output);
+      const terminalCheckpoint: ConversationMaintenanceCheckpoint = {
+        cursor: current.cursor,
+        processedCount: current.processedCount,
+        checkpointDigest: outputDigest,
+        details: { state: finalState, taskId, taskOutputSha256: outputDigest },
+      };
+      await actorWorkState.checkpointConversationMaintenanceJob(
+        jobId,
+        current.version,
+        terminalCheckpoint,
+      );
+      return outcome;
+    } finally {
+      signal.removeEventListener('abort', onAbort);
+    }
+  }
+
+  private async cancelConversationMaintenanceTask(
+    context: { readonly workspaceId: string; readonly actorId: string },
+    taskId: string,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    signal.throwIfAborted();
+    if (context.workspaceId !== this.config.workspaceId) return false;
+    const actorId = uuidText(context.actorId, 'conversation task actor id');
+    const actorTask = await this.config.workActorClients?.resolveTask(taskId);
+    if (actorTask === undefined
+      || actorTask.actorAadObjectId.toLowerCase() !== actorId
+      || actorTask.task.metadata?.source !== 'conversation-maintenance'
+      || actorTask.task.metadata.actorId !== actorId
+      || actorTask.task.metadata.workspaceId !== context.workspaceId) {
+      return false;
+    }
+    signal.throwIfAborted();
+    return this.cancelTask(taskId);
+  }
+
   /** Admit a task asynchronously for the task-control API and return its durable queued record.  中文：供任务控制 API 异步接收任务并返回持久排队记录。 */
   async startTask(params: ExecuteTaskParams): Promise<TaskRecord> {
     await this.ready;
@@ -1019,7 +1307,7 @@ export class NavigatorExecutor {
   /** Select persistence credentials only for an active verified task matching the private session owner. */
   workTokenEnvForSession(sessionId: string): string | undefined {
     const expectedActor = this.sessionActorById.get(sessionId);
-    const active = [...this.tasks.values()].find(task => task.sessionId === sessionId
+    const active = [...this.tasks.values()].find(task => (task.sessionId === sessionId || task.dshSessionId === sessionId)
       && task.actorAadObjectId !== undefined && !TERMINAL_STATUSES.has(task.record.status));
     if (expectedActor === undefined || active?.actorAadObjectId !== expectedActor) return undefined;
     return this.config.workActorClients?.tokenEnvForActor(expectedActor)
@@ -1031,7 +1319,8 @@ export class NavigatorExecutor {
   /** Identify actor-private persistence sessions without accepting caller-supplied task metadata. */
   actorPrivateSession(sessionId: string): boolean {
     return this.config.workActorClients !== undefined
-      && (sessionId.startsWith('teams-') || this.sessionActorById.has(sessionId));
+      && (sessionId.startsWith('teams-') || sessionId.startsWith(VOLATILE_CONVERSATION_SESSION_PREFIX)
+        || this.sessionActorById.has(sessionId));
   }
 
   /** Read task event receipts through its selected owner-scoped Work client. */
@@ -1063,6 +1352,7 @@ export class NavigatorExecutor {
       - Number(recordExecutionClass(left.task) === 'foreground'));
     for (const { task: record, workState, actorAadObjectId } of queued) {
       if (this.drainToken !== undefined) return started;
+      if (record.metadata?.source === 'conversation-maintenance') continue;
       // V3 fixed-tool source tasks are resumed by their durable Schedule row only;
       // adopting them here as freeform Agent tasks would cross the no-LLM boundary.
       const authorizationRef = record.metadata?.authorizationRef;
@@ -1206,7 +1496,18 @@ export class NavigatorExecutor {
       ? undefined
       : normalizeExecutionClass(params.executionClass);
     const executionClass = requestedExecutionClass ?? 'foreground';
-    const metadata = params.metadata === undefined ? undefined : normalizeTaskMetadata(params.metadata);
+    const metadataValue: Record<string, unknown> = params.metadata === undefined
+      ? {}
+      : { ...params.metadata };
+    if (params.conversationOrigin !== undefined) {
+      if (metadataValue.navigatorConversationOrigin !== undefined) {
+        throw new TypeError('Conversation ingress provenance is host-owned');
+      }
+      metadataValue.navigatorConversationOrigin = params.conversationOrigin;
+    }
+    const metadata = Object.keys(metadataValue).length === 0
+      ? undefined
+      : normalizeTaskMetadata(metadataValue);
     if (params.timeoutMs !== undefined && (!Number.isSafeInteger(params.timeoutMs) || params.timeoutMs <= 0)) {
       throw new TypeError('timeoutMs must be a positive integer');
     }
@@ -1402,6 +1703,7 @@ export class NavigatorExecutor {
       ? undefined
       : setTimeout(() => task.abortController.abort(new Error(`Task timed out after ${timeoutMs}ms`)), timeoutMs);
     let disposeContinuationGuard: (() => void) | undefined;
+    let ownedAgentHandle: AgentHandle | undefined;
     let claimed = false;
     try {
       task.abortController.signal.throwIfAborted();
@@ -1413,6 +1715,19 @@ export class NavigatorExecutor {
         return outcome(claim.task);
       }
       claimed = true;
+      const taskOrigin = task.record.metadata?.navigatorConversationOrigin;
+      const taskOriginKind = taskOrigin !== null && typeof taskOrigin === 'object'
+        && !Array.isArray(taskOrigin)
+        ? (taskOrigin as Record<string, unknown>).kind
+        : undefined;
+      const teamsConversationTask = task.record.origin?.kind === 'teams_private'
+        || taskOriginKind === 'teams_channel';
+      if (this.config.conversationAssistant?.enabled === true && teamsConversationTask
+        && task.actorAadObjectId === undefined && task.record.createdByActorId !== undefined) {
+        task.actorAadObjectId = uuidText(task.record.createdByActorId, 'conversation assistant Work actor');
+        this.taskActorById.set(task.id, task.actorAadObjectId);
+        this.sessionActorById.set(task.sessionId, task.actorAadObjectId);
+      }
       task.blocked = await this.readBlockedReceipts(task.id, workState);
       const startedAt = claim.task.startedAt ?? Date.now();
       await this.flushEvents(task);
@@ -1434,19 +1749,28 @@ export class NavigatorExecutor {
       const agentOptions: AgentOptions = defaultSelection
         ? { provider: defaultSelection.provider, model: defaultSelection.model }
         : {};
+      const volatileConversationTurn = this.config.conversationAssistant?.enabled === true
+        && isTrustedConversationAssistantTask(task.record);
+      const sessionId = brandString<SessionId>(volatileConversationTurn
+        ? `${VOLATILE_CONVERSATION_SESSION_PREFIX}${randomUUID()}`
+        : task.sessionId);
+      if (volatileConversationTurn) {
+        task.dshSessionId = sessionId;
+        this.activeTaskBySessionId.set(sessionId, task.id);
+        if (task.actorAadObjectId !== undefined) this.sessionActorById.set(sessionId, task.actorAadObjectId);
+      }
       let selectionRef: ModelSelectionRef | undefined;
       const setup = (agentCtx: Context): void => {
         if (defaultSelection === undefined) return;
         selectionRef = { current: defaultSelection, assembled: undefined };
-        this.installAgentModelSelection(agentCtx, selectionRef, task.sessionId);
+        this.installAgentModelSelection(agentCtx, selectionRef, sessionId);
       };
 
-      const sessionId = brandString<SessionId>(task.sessionId);
-      const existing = agents.get(sessionId);
+      const existing = volatileConversationTurn ? undefined : agents.get(sessionId);
       let agent: Agent;
       if (existing) agent = existing;
       else {
-        const persisted = this.ctx.get('sessionPersistence')
+        const persisted = !volatileConversationTurn && this.ctx.get('sessionPersistence')
           ? await this.ctx.sessionPersistence.stat(sessionId, { signal: task.abortController.signal })
           : undefined;
         const handle = persisted
@@ -1458,13 +1782,14 @@ export class NavigatorExecutor {
             setup,
             signal: task.abortController.signal,
           });
+        if (volatileConversationTurn) ownedAgentHandle = handle;
         agent = handle.agent;
       }
 
       selectionRef ??= this.agentModelSelections.get(agent);
       if (selectionRef === undefined && defaultSelection !== undefined) {
         selectionRef = { current: defaultSelection, assembled: undefined };
-        this.installAgentModelSelection(agent.ctx, selectionRef, task.sessionId);
+        this.installAgentModelSelection(agent.ctx, selectionRef, sessionId);
       }
       if (selectionRef !== undefined && defaultSelection !== undefined) {
         // A newly admitted task uses the configured default; a failure may move this live Session to a backup.
@@ -1477,6 +1802,7 @@ export class NavigatorExecutor {
       this.agentTaskMap.set(agent, task.id);
       this.sessionTaskMap.set(agent.session, task.id);
       this.activeTaskBySessionId.set(task.sessionId, task.id);
+      this.activeTaskBySessionId.set(sessionId, task.id);
       if (isReadOnlyContinuation(task.record)) {
         // Agent-scoped guards are inherited by child-agent contexts, without blocking unrelated sessions.
         disposeContinuationGuard = agent.ctx.tools.guard(execution => {
@@ -1487,8 +1813,9 @@ export class NavigatorExecutor {
         });
       }
       task.abortController.signal.throwIfAborted();
+      const conversationPrompt = await this.beginConversationAssistantTurn(task, params.prompt);
       agent.followup(createUserMessage({
-        content: [{ type: 'text', text: params.prompt }],
+        content: [{ type: 'text', text: conversationPrompt }],
         source: { kind: 'user' },
       }));
 
@@ -1513,20 +1840,51 @@ export class NavigatorExecutor {
       if (TERMINAL_STATUSES.has(task.record.status)) return outcome(task.record);
 
       if (!task.output) task.output = this.extractLatestAssistantText(agent.session);
+      const preliminaryStatus: TaskStatus = task.abortController.signal.aborted
+        ? 'aborted'
+        : task.agentError || (task.blocked?.size ?? 0) > 0 ? 'failed' : 'completed';
+      if (task.conversationTurn !== undefined) {
+        const assistantText = this.extractLatestAssistantText(agent.session);
+        if (preliminaryStatus === 'completed' && assistantText.length > 0) {
+          task.output = assistantText;
+          const decision = await this.finishConversationAssistantTurn(task, assistantText);
+          if (decision === 'allow') {
+            task.conversationDeliveryText = assistantText;
+          } else {
+            task.conversationDeliveryHoldCode = decision;
+            task.output = '';
+            task.reasoning = '';
+          }
+        } else {
+          task.output = '';
+        }
+        task.reasoning = '';
+      }
       const finishedAt = Date.now();
       const isAborted = task.abortController.signal.aborted;
       // Let the agent finish all remaining work before reporting partial failure.
       // 中文：先完成其余可执行工作，再汇总无法执行项并记录部分失败。
       task.output = appendBlockedSummary(task.output, task.blocked);
       const hasBlocked = (task.blocked?.size ?? 0) > 0;
-      const status: TaskStatus = isAborted ? 'aborted' : task.agentError || hasBlocked ? 'failed' : 'completed';
-      const error = task.error ?? task.agentError ?? (isAborted ? 'Task was cancelled'
+      const status: TaskStatus = isAborted ? 'aborted'
+        : task.agentError || hasBlocked || task.conversationDeliveryHoldCode !== undefined ? 'failed' : 'completed';
+      if (task.conversationTurn !== undefined && status !== 'completed') {
+        task.output = '';
+        task.reasoning = '';
+      }
+      const error = task.error ?? task.conversationDeliveryHoldCode ?? task.agentError ?? (isAborted ? 'Task was cancelled'
         : hasBlocked ? '部分子任务无法执行；已继续完成其余可执行工作，详见结果中的无法执行项。' : undefined);
       const durationMs = finishedAt - (task.record.startedAt ?? task.record.createdAt);
       await this.patch(task, {
         status, output: task.output, reasoning: task.reasoning,
         ...(error === undefined ? {} : { error }),
       });
+      if (status === 'completed' && task.conversationDeliveryText !== undefined) {
+        await this.publish(task, {
+          type: 'text-delta', taskId: task.id, text: task.conversationDeliveryText, timestamp: Date.now(),
+        });
+        task.conversationDeliveryText = undefined;
+      }
       await this.publish(task, {
         type: 'status', taskId: task.id, sessionId: task.sessionId, status, timestamp: finishedAt,
       });
@@ -1568,7 +1926,14 @@ export class NavigatorExecutor {
           : task.record.error ?? 'Exchange connection authorization is required. Progress is preserved and automatic replay is disabled.'
         : isAborted ? abortMessage(task.abortController.signal.reason) : safeErrorMessage(err));
       const durationMs = endedAt - (task.record.startedAt ?? task.record.createdAt);
+      if (task.record.status !== 'completed' && task.conversationTurn?.assistantMessageId !== undefined) {
+        await this.revokeUnsentConversationAssistantMessage(task).catch(() => undefined);
+      }
       task.output ||= task.agent ? this.extractLatestAssistantText(task.agent.session) : '';
+      if (task.conversationTurn !== undefined) {
+        task.output = '';
+        task.reasoning = '';
+      }
       task.output = appendBlockedSummary(task.output, task.blocked);
       try {
         // Close a failed write chain with an independent terminal reconciliation.
@@ -1598,6 +1963,402 @@ export class NavigatorExecutor {
     } finally {
       disposeContinuationGuard?.();
       if (timeoutId !== undefined) clearTimeout(timeoutId);
+      if (ownedAgentHandle !== undefined) {
+        if (task.agent !== undefined) {
+          if (this.agentTaskMap.get(task.agent) === task.id) this.agentTaskMap.delete(task.agent);
+          if (this.sessionTaskMap.get(task.agent.session) === task.id) this.sessionTaskMap.delete(task.agent.session);
+        }
+        await ownedAgentHandle.dispose().catch(() => undefined);
+        task.agent = undefined;
+      }
+      const volatileSessionId = task.dshSessionId;
+      if (volatileSessionId !== undefined) {
+        if (this.activeTaskBySessionId.get(volatileSessionId) === task.id) this.activeTaskBySessionId.delete(volatileSessionId);
+        if (task.actorAadObjectId !== undefined
+          && this.sessionActorById.get(volatileSessionId) === task.actorAadObjectId) {
+          this.sessionActorById.delete(volatileSessionId);
+        }
+        task.dshSessionId = undefined;
+      }
+    }
+  }
+
+  /** Persist and authorize one actor-private conversation turn before it enters DSH context. */
+  private async beginConversationAssistantTurn(task: InternalTaskState, prompt: string): Promise<string> {
+    const profile = this.config.conversationAssistant;
+    if (profile?.enabled !== true) return prompt;
+    if (!isTrustedConversationAssistantTask(task.record)) return prompt;
+    if (this.config.conversationBackend !== undefined) {
+      throw new ExecutorRequestError(
+        503,
+        'CONVERSATION_ASSISTANT_BACKEND_UNAVAILABLE',
+        'The conversation assistant profile requires the configured DSH model runtime.',
+      );
+    }
+
+    const workState = task.workState ?? this.config.workState;
+    const actorId = task.actorAadObjectId ?? task.record.createdByActorId;
+    if (actorId === undefined || task.record.createdByActorId?.toLowerCase() !== actorId.toLowerCase()) {
+      throw new ExecutorRequestError(
+        403,
+        'CONVERSATION_ASSISTANT_ACTOR_UNVERIFIED',
+        'The persisted Work Task has no matching server-derived actor identity.',
+      );
+    }
+    if (this.config.workActorClients !== undefined
+      && this.config.workActorClients.forActor(actorId) !== workState) {
+      throw new ExecutorRequestError(
+        403,
+        'CONVERSATION_ASSISTANT_ACTOR_SCOPE_MISMATCH',
+        'The Work Task is not bound to its dedicated actor Work principal.',
+      );
+    }
+    const api: ConversationMemoryApiV1 | undefined = workState.conversationMemoryApiV1?.(actorId);
+    const overview = await workState.getConversationMemoryOverview?.(task.abortController.signal);
+    if (api === undefined || overview === undefined) {
+      throw new ExecutorRequestError(
+        503,
+        'CONVERSATION_MEMORY_API_UNAVAILABLE',
+        'The actor-scoped conversation memory Work API is unavailable.',
+      );
+    }
+
+    const metadata = task.record.metadata ?? {};
+    const thread = metadata.teamsThread;
+    const ingress = metadata.conversationIngress;
+    const isTeamsPrivate = task.record.origin?.kind === 'teams_private';
+    const origin = metadata.navigatorConversationOrigin;
+    const originRow = origin !== null && typeof origin === 'object' && !Array.isArray(origin)
+      ? origin as Record<string, unknown>
+      : undefined;
+    const isWeb = originRow?.kind === 'web' && originRow.conversationKind === 'direct';
+    const isTeamsGroup = originRow?.kind === 'teams_channel' && originRow.conversationKind === 'group'
+      && thread !== null && typeof thread === 'object' && !Array.isArray(thread);
+    if (task.executionClass !== 'foreground' || (!isTeamsPrivate && !isTeamsGroup && !isWeb)) return prompt;
+    const conversationKind = isTeamsGroup ? 'group' as const : 'direct' as const;
+    const visibility = isTeamsGroup ? 'conversation' as const : 'private' as const;
+    const ingressRow = (isTeamsPrivate || isTeamsGroup)
+      && ingress !== null && typeof ingress === 'object' && !Array.isArray(ingress)
+      ? ingress as Record<string, unknown>
+      : undefined;
+    const ingressEventId = typeof ingressRow?.eventId === 'string' ? ingressRow.eventId : undefined;
+    const ingressContent = typeof ingressRow?.content === 'string' ? ingressRow.content : undefined;
+    const originEventId = isWeb && typeof originRow?.eventId === 'string' ? originRow.eventId : undefined;
+    const userEventId = originEventId ?? ingressEventId
+      ?? (isTeamsPrivate ? `teams-private-${task.record.origin!.messageId}` : `navigator-task-${task.id}`);
+    if (userEventId.length < 1 || userEventId.length > 512 || /[\u0000-\u001f\u007f]/u.test(userEventId)) {
+      throw new ExecutorRequestError(422, 'CONVERSATION_INGRESS_INVALID', 'Conversation event identity is invalid.');
+    }
+    const userText = ingressContent ?? prompt;
+    if (userText.length < 1 || Buffer.byteLength(userText, 'utf8') > 32_000) {
+      throw new ExecutorRequestError(422, 'CONVERSATION_INGRESS_INVALID', 'Conversation message content is invalid.');
+    }
+    const conversationId = isWeb && typeof originRow?.conversationId === 'string'
+      ? originRow.conversationId
+      : task.sessionId;
+    const sourceId = isTeamsPrivate
+      ? task.record.origin!.messageId
+      : isTeamsGroup && typeof (thread as Record<string, unknown>).threadId === 'string'
+      ? (thread as Record<string, unknown>).threadId as string
+        : task.id;
+    const context: TrustedTurnContext = {
+      taskId: task.id,
+      sessionId: task.sessionId,
+      workspaceId: this.config.workspaceId,
+      actorId: actorId.toLowerCase(),
+      conversationId,
+      conversationKind,
+      personaId: profile.personaId,
+      visibility,
+      authorizationEpoch: overview.authorizationEpoch,
+      origin: {
+        kind: isTeamsPrivate ? 'teams_private' : isTeamsGroup ? 'teams_thread' : 'web',
+        sourceId,
+        externalEventId: userEventId,
+      },
+      signal: task.abortController.signal,
+    };
+
+    const event = await api.createMessage(context, {
+      eventId: userEventId,
+      conversationId,
+      conversationKind,
+      personaId: profile.personaId,
+      visibility,
+      role: 'user',
+      content: userText,
+      occurredAt: task.record.createdAt,
+    });
+    if (event.message.eventId !== userEventId || event.message.role !== 'user'
+      || event.message.scope.conversationId !== conversationId
+      || event.message.scope.conversationKind !== conversationKind
+      || event.message.scope.personaId !== profile.personaId) {
+      throw new ExecutorRequestError(
+        502,
+        'CONVERSATION_MESSAGE_SCOPE_MISMATCH',
+        'The conversation Work API returned a message outside the trusted turn scope.',
+      );
+    }
+
+    const historical = await api.listMessages(context, {
+      conversationId,
+      conversationKind,
+      order: 'desc',
+      limit: 100,
+    });
+    const candidates: {
+      readonly message: (typeof historical.items)[number];
+      readonly refs: readonly ConversationSourceRef[];
+    }[] = [];
+    let historyCharacters = 0;
+    let historySourceIds = 0;
+    for (const message of historical.items) {
+      if (message.status !== 'active' || message.eventId === userEventId
+        || message.scope.conversationId !== conversationId
+        || message.scope.conversationKind !== conversationKind
+        || message.scope.personaId !== profile.personaId
+        || (message.role !== 'user' && message.role !== 'assistant')) continue;
+      const refs: readonly ConversationSourceRef[] = [
+        ...(message.sourceRefs ?? []),
+        {
+          memoryId: null,
+          memoryVersion: null,
+          sourceMessageIds: [message.id],
+        },
+      ];
+      if (candidates.length >= 48 || historyCharacters + message.content.length > 16_000) continue;
+      const messageSourceCount = refs.reduce((count, ref) => count + ref.sourceMessageIds.length, 0);
+      if (candidates.reduce((count, item) => count + item.refs.length, 0) + refs.length > 256
+        || historySourceIds + messageSourceCount > 32_768) continue;
+      candidates.push({ message, refs });
+      historyCharacters += message.content.length;
+      historySourceIds += messageSourceCount;
+    }
+    const allHistoryRefs = candidates.flatMap(item => item.refs);
+    const authorizedHistory: { role: 'user' | 'assistant'; content: string; occurredAt: number }[] = [];
+    const historySourceRefs: ConversationSourceRef[] = [];
+    let historyAllowed = true;
+    if (allHistoryRefs.length > 0) {
+      const proof = await api.authorizeSources(context, {
+        conversationId,
+        conversationKind,
+        authorizationEpoch: context.authorizationEpoch,
+        personaId: profile.personaId,
+        sourceRefs: allHistoryRefs,
+      });
+      if (proof.currentAuthorizationEpoch !== context.authorizationEpoch) {
+        throw new ExecutorRequestError(
+          409,
+          'CONVERSATION_AUTHORIZATION_EPOCH_CHANGED',
+          'Conversation source authorization changed while history was being prepared.',
+        );
+      }
+      historyAllowed = proof.allowed;
+    }
+    for (const candidate of candidates) {
+      let allowed = historyAllowed || candidate.refs.length === 0;
+      if (!historyAllowed && candidate.refs.length > 0) {
+        const proof = await api.authorizeSources(context, {
+          conversationId,
+          conversationKind,
+          authorizationEpoch: context.authorizationEpoch,
+          personaId: profile.personaId,
+          sourceRefs: candidate.refs,
+        });
+        if (proof.currentAuthorizationEpoch !== context.authorizationEpoch) {
+          throw new ExecutorRequestError(
+            409,
+            'CONVERSATION_AUTHORIZATION_EPOCH_CHANGED',
+            'Conversation source authorization changed while history was being prepared.',
+          );
+        }
+        allowed = proof.allowed;
+      }
+      if (!allowed) continue;
+      authorizedHistory.push({
+        role: candidate.message.role as 'user' | 'assistant',
+        content: candidate.message.content,
+        occurredAt: candidate.message.occurredAt,
+      });
+      historySourceRefs.push(...candidate.refs);
+    }
+
+    const summaryProvider: ConversationSummaryProviderV1 = {
+      apiVersion: 1,
+      summarize: async input => {
+        input.signal.throwIfAborted();
+        const agent = task.agent;
+        const selection = task.modelSelection?.current;
+        if (agent === undefined || selection === undefined) {
+          throw new ConversationFeatureError('MODEL_UNAVAILABLE', 'The active DSH model route is unavailable');
+        }
+        const sourceText = input.messages.map(message =>
+          `${message.role} (${new Date(message.occurredAt).toISOString()}): ${message.content}`
+        ).join('\n');
+        if (Buffer.byteLength(sourceText, 'utf8') > 48_000) {
+          throw new ConversationFeatureError('MODEL_UNAVAILABLE', 'Conversation summary input exceeds the bounded model request');
+        }
+        const stream = agent.ctx.llm.stream({
+          provider: selection.provider,
+          model: selection.model,
+          ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort }),
+          system: 'Summarize only durable facts, preferences, commitments, and unresolved points explicitly present in the supplied conversation. Preserve uncertainty. Do not infer identity or add advice. Return only a concise summary.',
+          messages: [{ role: 'user', content: [{ type: 'text', text: sourceText }] }],
+          temperature: 0.1,
+          maxTokens: 512,
+          signal: input.signal,
+          sessionId: brandString<SessionId>(task.sessionId),
+        });
+        let summary = '';
+        for await (const chunk of stream) {
+          input.signal.throwIfAborted();
+          if (chunk.type === 'text-delta') summary += chunk.text;
+          if (Buffer.byteLength(summary, 'utf8') > 8_000) {
+            throw new ConversationFeatureError('MODEL_UNAVAILABLE', 'Conversation summary exceeded its bounded output');
+          }
+        }
+        const normalized = summary.trim();
+        if (!normalized) {
+          throw new ConversationFeatureError('MODEL_UNAVAILABLE', 'The configured model returned an empty conversation summary');
+        }
+        return normalized;
+      },
+    };
+    const feature = createConversationMemoryFeature({ api, summaryProvider });
+    const contextResult = await feature.beforeContext(context, { query: userText });
+    const userSourceRef: ConversationSourceRef = {
+      memoryId: null,
+      memoryVersion: null,
+      sourceMessageIds: [event.message.id],
+    };
+    const sourceRefs = [
+      userSourceRef,
+      ...historySourceRefs,
+      ...contextResult.contributions.flatMap(contribution => contribution.sourceRefs),
+    ];
+    const totalSourceMessageIds = sourceRefs.reduce((count, ref) => count + ref.sourceMessageIds.length, 0);
+    if (sourceRefs.length > 256 || totalSourceMessageIds > 32_768) {
+      throw new ExecutorRequestError(
+        422,
+        'CONVERSATION_SOURCE_PROOF_LIMIT_EXCEEDED',
+        'The complete conversation source lineage exceeds the supported safe bound.',
+      );
+    }
+    task.conversationTurn = {
+      feature,
+      context,
+      userEventId,
+      userMessageId: event.message.id,
+      sourceRefs,
+    };
+    const promptParts: string[] = [];
+    if (authorizedHistory.length > 0) {
+      promptParts.push(`Prior authorized conversation:\n${authorizedHistory.reverse()
+        .map(message => `${message.role}: ${message.content}`).join('\n\n')}`);
+    }
+    if (contextResult.contributions.length > 0) {
+      promptParts.push(`Authorized conversation memory:\n${contextResult.contributions
+        .map(contribution => contribution.content).join('\n')}`);
+    }
+    promptParts.push(`Current user message:\n${userText}`);
+    return promptParts.join('\n\n');
+  }
+
+  /** Archive a completed turn, then perform the authoritative final source check. */
+  private async finishConversationAssistantTurn(task: InternalTaskState, assistantText: string): Promise<'allow' | string> {
+    const turn = task.conversationTurn;
+    if (turn === undefined) return 'allow';
+    const decision = await turn.feature.beforeDelivery(turn.context, {
+      text: assistantText,
+      sourceRefs: turn.sourceRefs,
+    });
+    if (decision.decision !== 'allow') {
+      return decision.code ?? 'SOURCE_AUTHORIZATION_UNAVAILABLE';
+    }
+    try {
+      const receipt = await turn.feature.afterTurn(turn.context, {
+        userEventId: turn.userEventId,
+        assistantText,
+        status: 'completed',
+        sourceRefs: turn.sourceRefs,
+      });
+      if (receipt === undefined || !isConversationMessageId(receipt.assistantMessageId)
+        || typeof receipt.assistantEventId !== 'string' || receipt.assistantEventId.length > 512) {
+        throw new ExecutorRequestError(
+          502,
+          'CONVERSATION_ASSISTANT_MESSAGE_UNAVAILABLE',
+          'Conversation archive did not return its exact assistant message receipt.',
+        );
+      }
+      turn.assistantMessageId = receipt.assistantMessageId;
+      turn.assistantEventId = receipt.assistantEventId;
+      const workState = task.workState ?? this.config.workState;
+      const api = workState.conversationMemoryApiV1?.(turn.context.actorId);
+      const exactRead = workState.getConversationMemoryMessage;
+      if (api === undefined || exactRead === undefined) {
+        throw new ExecutorRequestError(
+          503,
+          'CONVERSATION_MEMORY_API_UNAVAILABLE',
+          'The actor-scoped exact-message API disappeared before delivery.',
+        );
+      }
+      const message = await exactRead.call(workState, {
+        messageId: receipt.assistantMessageId,
+        conversationId: turn.context.conversationId,
+        conversationKind: turn.context.conversationKind,
+        personaId: turn.context.personaId,
+      }, turn.context.signal);
+      if (message === undefined || message.id !== receipt.assistantMessageId
+        || message.eventId !== receipt.assistantEventId || message.status !== 'active'
+        || message.role !== 'assistant' || message.content !== assistantText
+        || !conversationSourceRefsCover(message.sourceRefs ?? [], turn.sourceRefs)) {
+        throw new ExecutorRequestError(
+          409,
+          'CONVERSATION_ASSISTANT_MESSAGE_MISMATCH',
+          'Exact Work message readback differs from the completed assistant response.',
+        );
+      }
+      const finalDecision = await turn.feature.beforeDelivery(turn.context, {
+        text: assistantText,
+        sourceRefs: turn.sourceRefs,
+        assistantEventId: receipt.assistantEventId,
+      });
+      if (finalDecision.decision !== 'allow') {
+        await api.revokeSource(turn.context, message.id);
+        turn.assistantMessageId = undefined;
+        turn.assistantEventId = undefined;
+        return finalDecision.code ?? 'SOURCE_AUTHORIZATION_UNAVAILABLE';
+      }
+      await workState.appendEvent(task.id, {
+        type: 'conversation-assistant-source.v1',
+        assistantMessageId: receipt.assistantMessageId,
+        assistantEventId: receipt.assistantEventId,
+        conversationId: turn.context.conversationId,
+        conversationKind: turn.context.conversationKind,
+        personaId: turn.context.personaId,
+        visibility: turn.context.visibility,
+        userEventId: turn.userEventId,
+        contentSha256: sha256(assistantText),
+        sourceRefsSha256: sha256(canonicalJson(message.sourceRefs ?? [])),
+        authorizationEpoch: finalDecision.authorizationEpoch,
+      });
+      return 'allow';
+    } catch (error: unknown) {
+      await this.revokeUnsentConversationAssistantMessage(task);
+      throw error;
+    }
+  }
+
+  private async revokeUnsentConversationAssistantMessage(task: InternalTaskState): Promise<void> {
+    const turn = task.conversationTurn;
+    if (turn === undefined || turn.assistantMessageId === undefined) return;
+    const workState = task.workState ?? this.config.workState;
+    const api = workState.conversationMemoryApiV1?.(turn.context.actorId);
+    if (api === undefined) return;
+    try {
+      await api.revokeSource(turn.context, turn.assistantMessageId);
+    } catch {
+      // The task remains held; the exact source id is preserved for controlled reconciliation.
     }
   }
 
@@ -1701,23 +2462,24 @@ export class NavigatorExecutor {
     const task = this.tasks.get(taskId);
     const message = `Task ${taskId} was cancelled by caller`;
     if (!task) {
-      const record = await this.getTask(taskId);
+      const workState = await this.resolveTaskWorkState(taskId);
+      const record = await workState.getTask(taskId);
       if (!record || TERMINAL_STATUSES.has(record.status)) return false;
       const endedAt = Date.now();
       const durationMs = endedAt - (record.startedAt ?? record.createdAt);
       try {
-        await this.config.workState.patchTask(taskId, {
+        await workState.patchTask(taskId, {
           status: 'aborted', error: message,
         });
-        await this.config.workState.appendEvent(taskId, {
+        await workState.appendEvent(taskId, {
           type: 'error', taskId, message, code: 'TASK_ABORTED', timestamp: endedAt,
         });
-        await this.config.workState.appendEvent(taskId, {
+        await workState.appendEvent(taskId, {
           type: 'finish', taskId, status: 'aborted', output: record.output, durationMs, timestamp: endedAt,
         });
         return true;
       } catch {
-        return (await this.getTask(taskId))?.status === 'aborted';
+        return (await workState.getTask(taskId))?.status === 'aborted';
       }
     }
     if (TERMINAL_STATUSES.has(task.record.status)) return false;
@@ -2013,7 +2775,8 @@ export class NavigatorExecutor {
     const taskId = this.activeTaskBySessionId.get(sessionId);
     if (taskId === undefined) return undefined;
     const task = this.tasks.get(taskId);
-    if (!task || task.sessionId !== sessionId || TERMINAL_STATUSES.has(task.record.status)) return undefined;
+    if (!task || (task.sessionId !== sessionId && task.dshSessionId !== sessionId)
+      || TERMINAL_STATUSES.has(task.record.status)) return undefined;
     return task.agent !== undefined || this.config.conversationBackend !== undefined ? task.id : undefined;
   }
 
@@ -2318,6 +3081,10 @@ export class NavigatorExecutor {
         prompt: buildTeamsTaskPrompt(priorThread?.messages ?? [], normalized.text, normalized.actorSubject),
         title: 'Teams request',
         metadata: {
+          navigatorConversationOrigin: {
+            kind: 'teams_channel',
+            conversationKind: 'group',
+          },
           teamsCaller: {
             issuer: normalized.actorIssuer,
             subject: normalized.actorSubject,
@@ -2331,6 +3098,10 @@ export class NavigatorExecutor {
             channelId: normalized.route.channelId,
             conversationId: normalized.route.conversationId,
             rootThreadId: normalized.route.rootThreadId,
+          },
+          conversationIngress: {
+            eventId,
+            content: normalized.text,
           },
           notification: {
             type: 'teams.message',
@@ -2443,7 +3214,17 @@ export class NavigatorExecutor {
         sessionId,
         prompt: normalized.text,
         title: 'Private Teams request',
-        metadata: {},
+        metadata: {
+          conversationIngress: {
+            eventId: `teams-private-event-${sha256(canonicalJson({
+              tenantId: normalized.tenantId,
+              botAppId: normalized.botAppId,
+              actorAadObjectId: normalized.actorSubject,
+              messageId: normalized.messageId,
+            }))}`,
+            content: normalized.text,
+          },
+        },
       },
     });
     if (receipt.task !== undefined) {
@@ -2716,6 +3497,7 @@ export class NavigatorExecutor {
       const route = readTeamsNotificationRoute(notification.payload);
       if (route.tenantId !== caller.tenantId) throw new TypeError('Teams notification tenant does not match its task actor');
       const text = boundedTeamsMessageText(notification.payload.text, 'Teams notification text', 20_000);
+      await this.authorizeConversationTaskDelivery(workState, task, expectedActorId, text);
       const conversation = {
         tenantId: route.tenantId,
         teamId: route.teamId,
@@ -2813,6 +3595,7 @@ export class NavigatorExecutor {
       if (!authorized.includes(route.actorAadObjectId)) throw new TypeError('Private notification owner is no longer authorized');
       const serviceUrl = validateTeamsServiceUrl(route.serviceUrl, route.tenantId);
       const text = boundedTeamsMessageText(notification.payload.text, 'private notification text', 20_000);
+      await this.authorizeConversationTaskDelivery(workState, task, route.actorAadObjectId, text);
       const retryCount = notification.result.retryCount ?? 0;
       if (typeof retryCount !== 'number' || !Number.isSafeInteger(retryCount) || retryCount < 0) {
         throw new TypeError('Private notification retry counter is invalid');
@@ -2863,6 +3646,200 @@ export class NavigatorExecutor {
       const uncertain = providerCallStarted && isUncertainConnectorOutcome(error);
       await finish.call(this.config.workState, notification.id, lease.leaseToken,
         uncertain ? 'uncertain' : 'failed', { code: safeErrorCode(error) }).catch(() => undefined);
+    }
+  }
+
+  /** Recheck the persisted assistant event immediately before an asynchronous Teams send. */
+  private async authorizeConversationTaskDelivery(
+    workState: WorkStateStore,
+    task: TaskRecord,
+    expectedActorId: string | undefined,
+    text: string,
+  ): Promise<void> {
+    if (!isTrustedConversationAssistantTask(task)) return;
+    const actorId = task.createdByActorId?.toLowerCase();
+    if (task.status !== 'completed' || actorId === undefined
+      || (expectedActorId !== undefined && actorId !== expectedActorId.toLowerCase())) {
+      throw new ExecutorRequestError(
+        409,
+        'CONVERSATION_ASSISTANT_REPLY_NOT_READY',
+        'A conversation-assistant reply without a completed actor-owned Work Task cannot be delivered.',
+      );
+    }
+    if (this.config.workActorClients !== undefined
+      && this.config.workActorClients.forActor(actorId) !== workState) {
+      throw new ExecutorRequestError(
+        403,
+        'CONVERSATION_ASSISTANT_ACTOR_SCOPE_MISMATCH',
+        'The Teams reply is not bound to its dedicated actor Work principal.',
+      );
+    }
+    const api = workState.conversationMemoryApiV1?.(actorId);
+    const overview = await workState.getConversationMemoryOverview?.(AbortSignal.timeout(10_000));
+    if (api === undefined || overview === undefined) {
+      throw new ExecutorRequestError(
+        503,
+        'CONVERSATION_MEMORY_API_UNAVAILABLE',
+        'Current conversation source authorization is unavailable at Teams delivery.',
+      );
+    }
+    const profile = this.config.conversationAssistant;
+    if (profile === undefined) {
+      throw new ExecutorRequestError(
+        503,
+        'CONVERSATION_ASSISTANT_UNAVAILABLE',
+        'The static conversation-assistant profile is unavailable for source revalidation.',
+      );
+    }
+    const signal = AbortSignal.timeout(10_000);
+    const proof = await this.readConversationAssistantSourceProof(task.id, workState);
+    if (proof === undefined || proof.contentSha256 !== sha256(text)
+      || proof.personaId !== profile.personaId) {
+      throw new ExecutorRequestError(
+        409,
+        'CONVERSATION_ASSISTANT_RESPONSE_SOURCE_MISSING',
+        'The exact assistant response has no durable Task source proof.',
+      );
+    }
+    const metadata = task.metadata ?? {};
+    const origin = metadata.navigatorConversationOrigin;
+    const originRow = origin !== null && typeof origin === 'object' && !Array.isArray(origin)
+      ? origin as Record<string, unknown>
+      : undefined;
+    const isGroup = originRow?.kind === 'teams_channel' && originRow.conversationKind === 'group';
+    const conversationKind = isGroup ? 'group' as const : 'direct' as const;
+    const visibility = isGroup ? 'conversation' as const : 'private' as const;
+    const webActorId = this.config.conversationAssistant?.webActorId?.toLowerCase();
+    if (originRow?.kind === 'web' && webActorId !== undefined && actorId !== webActorId) {
+      throw new ExecutorRequestError(
+        403,
+        'CONVERSATION_ASSISTANT_ACTOR_SCOPE_MISMATCH',
+        'The Web conversation Task does not belong to the configured local owner actor.',
+      );
+    }
+    const expectedConversationId = originRow?.kind === 'web' && typeof originRow.conversationId === 'string'
+      ? originRow.conversationId
+      : task.sessionId;
+    if (proof.conversationId !== expectedConversationId || proof.conversationKind !== conversationKind
+      || proof.visibility !== visibility) {
+      throw new ExecutorRequestError(
+        409,
+        'CONVERSATION_ASSISTANT_SCOPE_MISMATCH',
+        'Task receipt is outside its authenticated Web or Teams conversation scope.',
+      );
+    }
+    const context: TrustedTurnContext = {
+      taskId: task.id,
+      sessionId: task.sessionId,
+      workspaceId: this.config.workspaceId,
+      actorId,
+      conversationId: proof.conversationId,
+      conversationKind,
+      personaId: proof.personaId,
+      visibility,
+      authorizationEpoch: overview.authorizationEpoch,
+      signal,
+    };
+    const exactRead = workState.getConversationMemoryMessage;
+    if (exactRead === undefined) {
+      throw new ExecutorRequestError(
+        503,
+        'CONVERSATION_MEMORY_API_UNAVAILABLE',
+        'Exact message readback is unavailable at Teams delivery.',
+      );
+    }
+    const response = await exactRead.call(workState, {
+      messageId: proof.assistantMessageId,
+      conversationId: proof.conversationId,
+      conversationKind,
+      personaId: proof.personaId,
+    }, signal);
+    if (response === undefined || response.id !== proof.assistantMessageId
+      || response.eventId !== proof.assistantEventId || response.status !== 'active'
+      || response.role !== 'assistant' || sha256(response.content) !== proof.contentSha256
+      || sha256(canonicalJson(response.sourceRefs ?? [])) !== proof.sourceRefsSha256) {
+      throw new ExecutorRequestError(
+        409,
+        'CONVERSATION_ASSISTANT_SOURCE_MISSING',
+        'The exact assistant source is no longer active or differs from its Task receipt.',
+      );
+    }
+    const authorization = await api.authorizeSources(context, {
+      conversationId: context.conversationId,
+      conversationKind,
+      authorizationEpoch: overview.authorizationEpoch,
+      personaId: profile.personaId,
+      sourceRefs: response.sourceRefs ?? [],
+    });
+    if (!authorization.allowed || authorization.currentAuthorizationEpoch !== context.authorizationEpoch) {
+      await api.revokeSource(context, response.id).catch(() => undefined);
+      throw new ExecutorRequestError(
+        409,
+        'CONVERSATION_ASSISTANT_SOURCE_REVOKED',
+        'Conversation sources changed before the Teams reply could be sent.',
+      );
+    }
+  }
+
+  /** Read the one immutable assistant source receipt without searching by reply text. */
+  private async readConversationAssistantSourceProof(
+    taskId: string,
+    workState: WorkStateStore,
+  ): Promise<ConversationAssistantSourceProof | undefined> {
+    let cursor = 0;
+    let proof: ConversationAssistantSourceProof | undefined;
+    for (;;) {
+      const page = await workState.getEvents(taskId, cursor);
+      for (const row of page.events) {
+        if (row.event.type !== 'conversation-assistant-source.v1') continue;
+        const value = row.event;
+        const keys = [
+          'assistantMessageId', 'assistantEventId', 'conversationId', 'conversationKind', 'personaId',
+          'visibility', 'userEventId', 'contentSha256', 'sourceRefsSha256', 'authorizationEpoch', 'type',
+        ].sort();
+        if (Object.keys(value).sort().join('\0') !== keys.join('\0')
+          || value.type !== 'conversation-assistant-source.v1'
+          || typeof value.assistantMessageId !== 'string' || !isConversationMessageId(value.assistantMessageId)
+          || typeof value.assistantEventId !== 'string' || value.assistantEventId.length < 1 || value.assistantEventId.length > 512
+          || typeof value.conversationId !== 'string' || value.conversationId.length < 1 || value.conversationId.length > 512
+          || (value.conversationKind !== 'direct' && value.conversationKind !== 'group')
+          || typeof value.personaId !== 'string' || value.personaId.length < 1 || value.personaId.length > 512
+          || (value.visibility !== 'private' && value.visibility !== 'conversation')
+          || typeof value.userEventId !== 'string' || value.userEventId.length < 1 || value.userEventId.length > 512
+          || typeof value.contentSha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(value.contentSha256)
+          || typeof value.sourceRefsSha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(value.sourceRefsSha256)
+          || typeof value.authorizationEpoch !== 'number' || !Number.isSafeInteger(value.authorizationEpoch)
+          || value.authorizationEpoch < 0) {
+          throw new ExecutorRequestError(
+            409,
+            'CONVERSATION_ASSISTANT_RECEIPT_INVALID',
+            'The durable assistant source receipt has an invalid shape.',
+          );
+        }
+        const candidate: ConversationAssistantSourceProof = {
+          assistantMessageId: value.assistantMessageId,
+          assistantEventId: value.assistantEventId,
+          conversationId: value.conversationId,
+          conversationKind: value.conversationKind,
+          personaId: value.personaId,
+          visibility: value.visibility,
+          userEventId: value.userEventId,
+          contentSha256: value.contentSha256,
+          sourceRefsSha256: value.sourceRefsSha256,
+          authorizationEpoch: value.authorizationEpoch,
+        };
+        if (proof !== undefined && canonicalJson(proof) !== canonicalJson(candidate)) {
+          throw new ExecutorRequestError(
+            409,
+            'CONVERSATION_ASSISTANT_RECEIPT_CONFLICT',
+            'Task contains conflicting assistant source receipts.',
+          );
+        }
+        proof = candidate;
+      }
+      const last = page.events.at(-1)?.seq;
+      if (last === undefined || last <= cursor) return proof;
+      cursor = last;
     }
   }
 
@@ -3216,13 +4193,100 @@ export class NavigatorExecutor {
           this.sendJson(res, 400, { error: 'Invalid task page limit' });
           return;
         }
-        this.sendJson(res, 200, await this.listTasks({ cursor, limit }));
+        const page = await this.listTasks({ cursor, limit });
+        const items: TaskRecord[] = [];
+        for (const record of page.items) {
+          items.push(await this.projectConversationAssistantTaskRead(record));
+        }
+        this.sendJson(res, 200, { items, nextCursor: page.nextCursor });
         return;
       }
       if (method === 'POST' && url.pathname === '/api/v1/tasks') {
         const body = await this.readJsonBody(req);
         const record = await this.startTask(taskParams(body));
         this.sendJson(res, 202, record);
+        return;
+      }
+      if (method === 'POST' && url.pathname === '/api/v1/conversation-assistant/turns') {
+        if (this.config.conversationAssistant?.enabled !== true) {
+          throw new ExecutorRequestError(
+            503,
+            'CONVERSATION_ASSISTANT_UNAVAILABLE',
+            'The static conversation-assistant profile is not enabled.',
+          );
+        }
+        const webActorId = this.config.conversationAssistant.webActorId?.toLowerCase();
+        if (webActorId === undefined) {
+          throw new ExecutorRequestError(
+            503,
+            'CONVERSATION_ASSISTANT_WEB_ACTOR_UNAVAILABLE',
+            'The local Web conversation requires a server-configured owner actor.',
+          );
+        }
+        const idempotencyKey = req.headers['idempotency-key'];
+        if (typeof idempotencyKey !== 'string' || !/^[\x21-\x7e]{1,200}$/u.test(idempotencyKey)) {
+          throw new ExecutorRequestError(400, 'IDEMPOTENCY_KEY_REQUIRED', 'A bounded Idempotency-Key is required.');
+        }
+        const body = await this.readJsonBody(req);
+        if (!isExactObjectKeys(body, ['conversationId', 'text'])) {
+          throw new ExecutorRequestError(
+            400,
+            'CONVERSATION_ASSISTANT_REQUEST_INVALID',
+            'A conversation turn requires exactly conversationId and text.',
+          );
+        }
+        const conversationId = boundedText(body.conversationId, 'conversation id', 200);
+        if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/u.test(conversationId)) {
+          throw new ExecutorRequestError(400, 'CONVERSATION_ASSISTANT_REQUEST_INVALID', 'Conversation id is invalid.');
+        }
+        const text = boundedTeamsMessageText(body.text, 'conversation message', 20_000);
+        const eventDigest = sha256(canonicalJson({
+          actorId: webActorId,
+          conversationId,
+          idempotencyKey,
+          workspaceId: this.config.workspaceId,
+        }));
+        const sessionDigest = sha256(canonicalJson({
+          actorId: webActorId,
+          conversationId,
+          workspaceId: this.config.workspaceId,
+        }));
+        const sessionId = `conversation-${sessionDigest.slice(0, 40)}`;
+        const taskId = `conversation-${eventDigest.slice(0, 40)}`;
+        const eventId = `web-event-${eventDigest}`;
+        const record = await this.startTask({
+          taskId,
+          sessionId,
+          prompt: text,
+          metadata: { source: 'conversation-assistant-web-ingress-v1' },
+          conversationOrigin: {
+            kind: 'web',
+            conversationKind: 'direct',
+            conversationId,
+            eventId,
+          },
+        });
+        if (record.createdByActorId?.toLowerCase() !== webActorId) {
+          void this.cancelTask(record.id).catch(() => undefined);
+          throw new ExecutorRequestError(
+            503,
+            'CONVERSATION_ASSISTANT_ACTOR_SCOPE_MISMATCH',
+            'The configured Web owner actor does not match the actor-private Work principal.',
+          );
+        }
+        if (record.status === 'queued' && this.drainToken === undefined) {
+          void this.dispatchTask(record.id).catch(error => {
+            this.ctx.logger.warn(`Conversation assistant task dispatch failed (${safeErrorMessage(error)})`);
+          });
+        }
+        this.sendJson(res, 202, {
+          conversationId,
+          taskId: record.id,
+          sessionId: record.sessionId,
+          status: record.status,
+          eventsUrl: `/api/v1/tasks/${encodeURIComponent(record.id)}/events?after=0`,
+          statusUrl: `/api/v1/tasks/${encodeURIComponent(record.id)}/status`,
+        });
         return;
       }
       if (method === 'POST' && url.pathname === '/api/v1/tasks/dispatch') {
@@ -3300,12 +4364,17 @@ export class NavigatorExecutor {
           this.sendJson(res, 400, { error: 'Invalid event cursor' });
           return;
         }
-        if (!await this.getTask(taskId)) {
+        const task = await this.getTask(taskId);
+        if (!task) {
           this.sendJson(res, 404, { error: 'Task not found' });
           return;
         }
         this.openEventStream(res);
-        await this.streamTaskEvents(taskId, after, res);
+        if (isTrustedConversationAssistantTask(task)) {
+          await this.streamConversationAssistantTaskEvents(taskId, after, res);
+        } else {
+          await this.streamTaskEvents(taskId, after, res);
+        }
         if (!res.writableEnded) res.end();
         return;
       }
@@ -3331,7 +4400,10 @@ export class NavigatorExecutor {
       if (method === 'GET' && statusMatch) {
         const taskId = decodeURIComponent(statusMatch[1]!);
         const record = await this.getTask(taskId);
-        this.sendJson(res, record ? 200 : 404, record ?? { error: 'Task not found' });
+        const projected = record === undefined
+          ? undefined
+          : await this.projectConversationAssistantTaskRead(record);
+        this.sendJson(res, projected ? 200 : 404, projected ?? { error: 'Task not found' });
         return;
       }
 
@@ -3346,7 +4418,7 @@ export class NavigatorExecutor {
         if (task.status === 'queued' && !this.tasks.has(taskId)) {
           this.adoptQueuedTask(task, { taskId, sessionId: task.sessionId, prompt: task.prompt });
         }
-        this.sendJson(res, 202, task);
+        this.sendJson(res, 202, await this.projectConversationAssistantTaskRead(task));
         return;
       }
 
@@ -3416,6 +4488,241 @@ export class NavigatorExecutor {
         lastHeartbeat = Date.now();
       }
       await delay(250);
+    }
+  }
+
+  /** Delay chat event replay until a terminal turn has a fresh, exact-source authorization. */
+  private async streamConversationAssistantTaskEvents(
+    taskId: string,
+    after: number,
+    res: ServerResponse,
+  ): Promise<void> {
+    const workState = this.taskWorkStateById.get(taskId) ?? this.config.workState;
+    let announcedStatus = false;
+    let lastHeartbeat = Date.now();
+    let closed = false;
+    res.once('close', () => { closed = true; });
+
+    while (!closed && !res.writableEnded) {
+      const record = await workState.getTask(taskId);
+      if (record === undefined) return;
+      if (TERMINAL_STATUSES.has(record.status) || PAUSED_STATUSES.has(record.status)) {
+        if (record.status !== 'completed') {
+          this.writeConversationAssistantHeld(res, record, 'CONVERSATION_ASSISTANT_NOT_DELIVERED');
+          return;
+        }
+        try {
+          await this.authorizeConversationTaskDelivery(
+            workState,
+            record,
+            record.createdByActorId,
+            record.output,
+          );
+        } catch (error: unknown) {
+          this.writeConversationAssistantHeld(
+            res,
+            record,
+            error instanceof ExecutorRequestError
+              ? error.code
+              : 'CONVERSATION_ASSISTANT_SOURCE_UNAVAILABLE',
+          );
+          return;
+        }
+
+        const replay: DurableTaskEvent[] = [];
+        let scanCursor = 0;
+        let replayBytes = 0;
+        let concatenatedText = '';
+        let finishCount = 0;
+        for (;;) {
+          const page = await workState.getEvents(taskId, scanCursor);
+          let advanced = false;
+          for (const row of page.events) {
+            if (row.seq <= scanCursor) {
+              this.writeConversationAssistantHeld(res, record, 'CONVERSATION_ASSISTANT_EVENTS_INVALID');
+              return;
+            }
+            advanced = true;
+            scanCursor = row.seq;
+            replayBytes += Buffer.byteLength(canonicalJson(row.event), 'utf8');
+            if (replayBytes > 10_000_000 || replay.length >= 10_000) {
+              this.writeConversationAssistantHeld(res, record, 'CONVERSATION_ASSISTANT_EVENTS_TOO_LARGE');
+              return;
+            }
+            if (row.event.type === 'text-delta') {
+              if (typeof row.event.text !== 'string') {
+                this.writeConversationAssistantHeld(res, record, 'CONVERSATION_ASSISTANT_EVENTS_INVALID');
+                return;
+              }
+              concatenatedText += row.event.text;
+            } else if (row.event.type === 'finish') {
+              finishCount += 1;
+              if (row.event.status !== 'completed' || row.event.output !== record.output) {
+                this.writeConversationAssistantHeld(res, record, 'CONVERSATION_ASSISTANT_EVENTS_INVALID');
+                return;
+              }
+            }
+            if (row.seq > after) replay.push(row);
+          }
+          if (scanCursor >= page.nextSeq - 1) break;
+          if (!advanced) {
+            this.writeConversationAssistantHeld(res, record, 'CONVERSATION_ASSISTANT_EVENTS_INVALID');
+            return;
+          }
+        }
+        if (concatenatedText !== record.output || finishCount !== 1) {
+          this.writeConversationAssistantHeld(res, record, 'CONVERSATION_ASSISTANT_EVENTS_INVALID');
+          return;
+        }
+
+        for (const row of replay) {
+          if (res.writableEnded || res.destroyed) return;
+          const event = row.event;
+          const type = typeof event.type === 'string' ? event.type : 'message';
+          if (type === 'text-delta' || type === 'finish') {
+            const current = await workState.getTask(taskId);
+            if (current === undefined || current.status !== 'completed') {
+              this.writeConversationAssistantHeld(res, record, 'CONVERSATION_ASSISTANT_NOT_DELIVERED');
+              return;
+            }
+            try {
+              await this.authorizeConversationTaskDelivery(
+                workState,
+                current,
+                current.createdByActorId,
+                current.output,
+              );
+            } catch (error: unknown) {
+              this.writeConversationAssistantHeld(
+                res,
+                current,
+                error instanceof ExecutorRequestError
+                  ? error.code
+                  : 'CONVERSATION_ASSISTANT_SOURCE_UNAVAILABLE',
+              );
+              return;
+            }
+            if (type === 'text-delta') {
+              this.writeSseEvent(res, row.seq, type, {
+                type,
+                taskId,
+                seq: row.seq,
+                text: event.text,
+                ...(typeof event.index === 'number' ? { index: event.index } : {}),
+                ...(typeof event.timestamp === 'number' ? { timestamp: event.timestamp } : {}),
+              });
+            } else {
+              this.writeSseEvent(res, row.seq, type, {
+                type,
+                taskId,
+                seq: row.seq,
+                status: 'completed',
+                output: current.output,
+                durationMs: current.durationMs,
+                ...(typeof event.timestamp === 'number' ? { timestamp: event.timestamp } : {}),
+              });
+            }
+          } else if (type === 'status') {
+            this.writeSseEvent(res, row.seq, type, {
+              type,
+              taskId,
+              seq: row.seq,
+              sessionId: record.sessionId,
+              status: typeof event.status === 'string' ? event.status : record.status,
+              ...(typeof event.timestamp === 'number' ? { timestamp: event.timestamp } : {}),
+            });
+          } else if (type === 'model-route') {
+            this.writeSseEvent(res, row.seq, type, {
+              type,
+              taskId,
+              seq: row.seq,
+              provider: typeof event.provider === 'string' ? event.provider : 'unknown',
+              model: typeof event.model === 'string' ? event.model : 'unknown',
+              ...(typeof event.timestamp === 'number' ? { timestamp: event.timestamp } : {}),
+            });
+          }
+        }
+        return;
+      }
+
+      if (!announcedStatus) {
+        this.writeSseEvent(res, undefined, 'status', {
+          type: 'status',
+          taskId,
+          sessionId: record.sessionId,
+          status: record.status,
+          timestamp: Date.now(),
+        });
+        announcedStatus = true;
+      }
+      if (Date.now() - lastHeartbeat >= 15_000 && !res.writableEnded) {
+        res.write(': keep-alive\n\n');
+        lastHeartbeat = Date.now();
+      }
+      await delay(250);
+    }
+  }
+
+  /** Return a safe terminal event when authorization no longer permits chat content. */
+  private writeConversationAssistantHeld(
+    res: ServerResponse,
+    record: TaskRecord,
+    code: string,
+  ): void {
+    const timestamp = Date.now();
+    this.writeSseEvent(res, undefined, 'status', {
+      type: 'status',
+      taskId: record.id,
+      sessionId: record.sessionId,
+      status: record.status,
+      deliveryState: 'held',
+      timestamp,
+    });
+    this.writeSseEvent(res, undefined, 'finish', {
+      type: 'finish',
+      taskId: record.id,
+      status: 'failed',
+      output: '',
+      error: code,
+      durationMs: record.durationMs,
+      timestamp,
+    });
+  }
+
+  /** Hide every source-derived Task field from direct browser reads unless its lineage is current. */
+  private async projectConversationAssistantTaskRead(record: TaskRecord): Promise<TaskRecord> {
+    if (!isTrustedConversationAssistantTask(record)) return record;
+    const safeRecord = (overrides: Partial<TaskRecord>): TaskRecord => ({
+      ...record,
+      metadata: {},
+      ...overrides,
+    });
+    const workState = this.taskWorkStateById.get(record.id) ?? this.config.workState;
+    if (record.status !== 'completed') {
+      return safeRecord({
+        prompt: '',
+        output: '',
+        reasoning: '',
+        error: TERMINAL_STATUSES.has(record.status) || PAUSED_STATUSES.has(record.status)
+          ? 'CONVERSATION_ASSISTANT_NOT_DELIVERED'
+          : undefined,
+      });
+    }
+    try {
+      await this.authorizeConversationTaskDelivery(
+        workState,
+        record,
+        record.createdByActorId,
+        record.output,
+      );
+      return safeRecord({});
+    } catch {
+      return safeRecord({
+        prompt: '',
+        output: '',
+        reasoning: '',
+        error: 'CONVERSATION_ASSISTANT_SOURCE_REVOKED',
+      });
     }
   }
 
@@ -3654,6 +4961,43 @@ function assertTaskActorScope(record: TaskRecord, actorAadObjectId?: string): vo
   if (record.createdByActorId?.toLowerCase() !== actorAadObjectId.toLowerCase()) {
     throw new Error('Work Task creator does not match the verified Teams actor.');
   }
+}
+
+/** Recognize only foreground Web/Teams conversation ingress, never arbitrary Work prompts. */
+function isTrustedConversationAssistantTask(record: TaskRecord): boolean {
+  if (record.executionClass !== 'foreground') return false;
+  if (record.origin?.kind === 'teams_private') return true;
+  const value = record.metadata?.navigatorConversationOrigin;
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const origin = value as Record<string, unknown>;
+  if (origin.kind === 'web') return origin.conversationKind === 'direct';
+  if (origin.kind === 'teams_channel') {
+    return origin.conversationKind === 'group' && record.metadata?.teamsThread !== undefined;
+  }
+  return false;
+}
+
+/** Ensure the persisted assistant lineage covers every host-retained context reference. */
+function conversationSourceRefsCover(
+  actual: readonly ConversationSourceRef[],
+  expected: readonly ConversationSourceRef[],
+): boolean {
+  const idsByLineage = new Map<string, Set<string>>();
+  for (const reference of actual) {
+    const key = `${reference.memoryId ?? ''}\0${reference.memoryVersion ?? ''}`;
+    const ids = idsByLineage.get(key) ?? new Set<string>();
+    for (const messageId of reference.sourceMessageIds) ids.add(messageId);
+    idsByLineage.set(key, ids);
+  }
+  return expected.every(reference => {
+    const key = `${reference.memoryId ?? ''}\0${reference.memoryVersion ?? ''}`;
+    const actualIds = idsByLineage.get(key);
+    return actualIds !== undefined && reference.sourceMessageIds.every(messageId => actualIds.has(messageId));
+  });
+}
+
+function isConversationMessageId(value: string): boolean {
+  return /^[a-f0-9]{32}$/u.test(value);
 }
 
 /** Treat an explicit persisted marker or server-reserved ID prefix as read-only. */
@@ -4231,6 +5575,43 @@ function parseTeamsJsonObject(value: string, label: string): Record<string, unkn
 
 function isExactObjectKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
   return Object.keys(value).length === expected.length && expected.every(key => Object.hasOwn(value, key));
+}
+
+function conversationMaintenanceTaskId(workspaceId: string, actorId: string, jobId: string): string {
+  const digest = sha256(`cyrene-maintenance-v1\0${workspaceId}\0${actorId}\0${jobId}`).slice(0, 32);
+  return `maintenance-${digest}`;
+}
+
+function maintenanceSafeInteger(value: unknown, label: string, minimum: number): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < minimum) {
+    throw new ExecutorRequestError(400, 'CONVERSATION_TASK_METADATA_INVALID', `${label} is invalid.`);
+  }
+  return value;
+}
+
+function validateConversationMaintenanceCheckpoint(
+  value: ConversationMaintenanceCheckpoint,
+): ConversationMaintenanceCheckpoint {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)
+    || !isExactObjectKeys(value as unknown as Record<string, unknown>, [
+      'cursor', 'processedCount', 'checkpointDigest', 'details',
+    ])) {
+    throw new ExecutorRequestError(400, 'CONVERSATION_CHECKPOINT_INVALID', 'Maintenance checkpoint shape is invalid.');
+  }
+  const cursor = value.cursor;
+  if (cursor !== null && (typeof cursor !== 'string' || cursor.length > 1_024
+    || /[\u0000-\u001f\u007f]/u.test(cursor))) {
+    throw new ExecutorRequestError(400, 'CONVERSATION_CHECKPOINT_INVALID', 'Maintenance cursor is invalid.');
+  }
+  const processedCount = maintenanceSafeInteger(value.processedCount, 'processedCount', 0);
+  if (typeof value.checkpointDigest !== 'string' || !/^[0-9a-f]{64}$/u.test(value.checkpointDigest)) {
+    throw new ExecutorRequestError(400, 'CONVERSATION_CHECKPOINT_INVALID', 'Maintenance digest is invalid.');
+  }
+  const details = objectValue(value.details, 'maintenance checkpoint details');
+  if (Buffer.byteLength(JSON.stringify(details), 'utf8') > 8_192) {
+    throw new ExecutorRequestError(400, 'CONVERSATION_CHECKPOINT_INVALID', 'Maintenance details exceed their safe bound.');
+  }
+  return { cursor, processedCount, checkpointDigest: value.checkpointDigest, details };
 }
 
 function boundedText(value: unknown, label: string, maximum: number): string {

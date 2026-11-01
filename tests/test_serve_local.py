@@ -10,8 +10,10 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -119,6 +121,25 @@ def test_executor_profile_environment_contains_only_declared_references(tmp_path
     assert "CYRENE_EXCHANGE_INTEGRATION_SESSION_ID" not in web_environment
     assert "CYRENE_EXCHANGE_INTEGRATION_WORKSPACE_ID" not in web_environment
     assert "CYRENE_SUBAGENT_CONFIG" not in web_environment
+
+
+def test_executor_startup_redaction_includes_exchange_bearers() -> None:
+    """Executor readiness checks the model and delegated Product bearer values."""
+
+    secrets = serve_local._executor_startup_secrets(
+        "session-private",
+        "executor-private",
+        {
+            "CYRENE_EXCHANGE_TOKEN": "model-provider-private",
+            "CYRENE_EXCHANGE_INTEGRATION_USER_TOKEN": "delegated-user-private",
+        },
+    )
+    assert secrets == (
+        "session-private",
+        "executor-private",
+        "model-provider-private",
+        "delegated-user-private",
+    )
 
 
 def test_executor_profile_environment_fails_closed_for_malformed_config(tmp_path: Path) -> None:
@@ -311,6 +332,45 @@ def test_exchange_cli_bearer_requires_a_trusted_single_session_binding() -> None
         )
 
 
+def test_conversation_assistant_flag_reaches_only_the_executor() -> None:
+    """The static P2 profile switch reaches DSH, never Persistence or Web Host."""
+
+    forwarded = serve_local._executor_integration_environment(
+        {"CYRENE_CONVERSATION_ASSISTANT_ENABLED": "true"},
+        workspace_id="round1-workspace",
+    )
+    executor = serve_local._executor_child_environment(
+        repository=Path("/tmp/navigator"),
+        persistence_url="http://127.0.0.1:18681",
+        workspace_id="round1-workspace",
+        session_token="private-work-token",
+        executor_token="executor-token",
+        workspace_owner_actor_id="round1-owner",
+        dsh_home=Path("/tmp/navigator/dsh"),
+        plugins_dir=Path("/tmp/navigator/plugins"),
+        node="node",
+        integration_environment=forwarded,
+    )
+    assert executor["CYRENE_CONVERSATION_ASSISTANT_ENABLED"] == "true"
+    with pytest.raises(ValueError, match="must be 'true' or 'false'"):
+        serve_local._executor_integration_environment(
+            {"CYRENE_CONVERSATION_ASSISTANT_ENABLED": "yes"},
+            workspace_id="round1-workspace",
+        )
+
+
+def test_shutdown_stdin_is_opt_in_and_uses_the_launcher_command() -> None:
+    """The explicit launcher flag accepts only shutdown and treats closed stdin as exit."""
+
+    requested = threading.Event()
+    serve_local._watch_shutdown_stdin(requested, io.StringIO("diagnostic\nshutdown\n"))
+    assert requested.is_set()
+
+    closed = threading.Event()
+    serve_local._watch_shutdown_stdin(closed, io.StringIO(""))
+    assert closed.is_set()
+
+
 def test_generated_owner_is_harness_writer_and_custom_owner_must_opt_in(tmp_path: Path) -> None:
     """The launcher grants its scoped owner writes and requires that grant in custom config."""
 
@@ -323,6 +383,11 @@ def test_generated_owner_is_harness_writer_and_custom_owner_must_opt_in(tmp_path
     )
     assert path is None and is_temporary
     assert generated["principals"][0]["can_write_harness"] is True
+    worker = generated["principals"][1]
+    assert worker["token_env"] == "CYRENE_EXECUTOR_WORK_TOKEN"
+    assert worker["actor_private_scope"] is True
+    assert worker["can_write_harness"] is True
+    assert worker["actor_id"] == "round1-owner"
 
     custom_path = tmp_path / "principal.json"
     custom_path.write_text(
@@ -427,6 +492,111 @@ def test_tls_file_references_and_trust_roots_reach_only_required_children(
     assert executor["SSL_CERT_FILE"] == "/run/config/system-plus-internal-ca.pem"
     for environment in (persistence, web, executor):
         assert "UNRELATED_TLS_SECRET" not in environment
+
+
+def test_capability_profiles_reach_only_persistence_and_signing_secret_is_redacted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fixed local plugin bindings stay in persistence and signer bytes stay private."""
+
+    monkeypatch.setenv("CYRENE_NAVIGATOR_MODEL_PROVIDER_CONNECTION_REF", "grpc://127.0.0.1:18683")
+    monkeypatch.setenv("CYRENE_NAVIGATOR_MEMORY_PROVIDER_CONNECTION_REF", "grpc://127.0.0.1:18686")
+    monkeypatch.setenv("CYRENE_NAVIGATOR_KNOWLEDGE_GRAPH_CONNECTION_REF", "grpc://127.0.0.1:18687")
+    monkeypatch.setenv("CYRENE_NAVIGATOR_EMBEDDING_MODEL_ID", "intfloat/multilingual-e5-small")
+    monkeypatch.setenv("CYRENE_NAVIGATOR_EMBEDDING_PROFILE_ID", "e5-passage-query-v1")
+    monkeypatch.setenv("CYRENE_NAVIGATOR_EMBEDDING_DIMENSIONS", "384")
+    monkeypatch.setenv("CYRENE_NAVIGATOR_EMBEDDING_DOCUMENT_PREFIX", "passage: ")
+    monkeypatch.setenv("CYRENE_NAVIGATOR_EMBEDDING_QUERY_PREFIX", "query: ")
+    monkeypatch.setenv("CYRENE_NAVIGATOR_TOOL_SIGNING_KEY_ENV", "CYRENE_TOOL_SIGNING_KEY")
+    monkeypatch.setenv("CYRENE_TOOL_SIGNING_KEY", "private-tool-signer-value")
+    monkeypatch.setenv("CYRENE_EXCHANGE_TOKEN", "executor-only-exchange-token")
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-cross-process-boundary")
+
+    persistence = serve_local._persistence_child_environment(
+        tmp_path, "owner-session", "CYRENE_SESSION_TOKEN", set()
+    )
+    executor = serve_local._executor_child_environment(
+        repository=tmp_path,
+        persistence_url="http://127.0.0.1:18681",
+        workspace_id="workspace-a",
+        session_token="owner-session",
+        executor_token="executor-private",
+        dsh_home=tmp_path / "dsh",
+        plugins_dir=tmp_path / "plugins",
+        node="node",
+    )
+    web = serve_local._web_child_environment(
+        repository=tmp_path,
+        session_token="owner-session",
+        executor_token="executor-private",
+        workspace_id="workspace-a",
+    )
+
+    assert persistence["CYRENE_NAVIGATOR_MEMORY_PROVIDER_CONNECTION_REF"] == (
+        "grpc://127.0.0.1:18686"
+    )
+    assert persistence["CYRENE_NAVIGATOR_EMBEDDING_DOCUMENT_PREFIX"] == "passage: "
+    assert persistence["CYRENE_NAVIGATOR_EMBEDDING_QUERY_PREFIX"] == "query: "
+    assert persistence["CYRENE_TOOL_SIGNING_KEY"] == "private-tool-signer-value"
+    assert "CYRENE_EXCHANGE_TOKEN" not in persistence
+    assert "UNRELATED_SECRET" not in persistence
+    assert "CYRENE_NAVIGATOR_MEMORY_PROVIDER_CONNECTION_REF" not in executor
+    assert "CYRENE_TOOL_SIGNING_KEY" not in executor
+    assert "CYRENE_NAVIGATOR_MEMORY_PROVIDER_CONNECTION_REF" not in web
+    redacted = serve_local._persistence_startup_secrets(
+        "owner-session", "executor-private", persistence, set()
+    )
+    assert "private-tool-signer-value" in redacted
+    assert "executor-only-exchange-token" not in redacted
+
+
+def test_local_executor_uses_a_separate_actor_private_work_bearer(
+    tmp_path: Path,
+) -> None:
+    """The Web owner bearer cannot read actor-private Executor conversation Tasks."""
+
+    owner_token = "local-owner-session"
+    work_token = "local-executor-private-work"
+    executor_token = "local-executor-api"
+    actor_id = "0722b287-fb57-500d-9a17-7c48f2c524ef"
+    persistence = serve_local._persistence_child_environment(
+        tmp_path,
+        owner_token,
+        "CYRENE_SESSION_TOKEN",
+        set(),
+        executor_work_token=work_token,
+    )
+    executor = serve_local._executor_child_environment(
+        repository=tmp_path,
+        persistence_url="http://127.0.0.1:18681",
+        workspace_id="workspace-a",
+        session_token=work_token,
+        executor_token=executor_token,
+        workspace_owner_actor_id=actor_id,
+        dsh_home=tmp_path / "dsh",
+        plugins_dir=tmp_path / "plugins",
+        node="node",
+    )
+    web = serve_local._web_child_environment(
+        repository=tmp_path,
+        session_token=owner_token,
+        executor_token=executor_token,
+        workspace_id="workspace-a",
+    )
+    assert persistence["CYRENE_SESSION_TOKEN"] == owner_token
+    assert persistence["CYRENE_EXECUTOR_WORK_TOKEN"] == work_token
+    assert executor["CYRENE_SESSION_TOKEN"] == work_token
+    assert executor["CYRENE_WORKSPACE_OWNER_ACTOR_ID"] == actor_id
+    assert "CYRENE_EXECUTOR_WORK_TOKEN" not in web
+    assert owner_token not in executor.values()
+    assert work_token not in web.values()
+    assert work_token in serve_local._persistence_startup_secrets(
+        owner_token,
+        executor_token,
+        persistence,
+        set(),
+        executor_work_token=work_token,
+    )
 
 
 def test_persistence_url_preserves_https_and_rejects_unknown_schemes() -> None:
