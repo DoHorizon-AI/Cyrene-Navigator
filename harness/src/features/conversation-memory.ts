@@ -136,6 +136,7 @@ export interface ConversationMemoryApiV1 {
       readonly conversationKind: ConversationKind;
       readonly personaId: string | null;
       readonly state: 'active';
+      readonly memoryIds?: readonly string[];
       readonly limit: number;
     },
   ): Promise<{ readonly items: readonly ConversationMemory[]; readonly authorizationEpoch: number }>;
@@ -245,13 +246,16 @@ export interface ConversationAfterTurnInput {
 export interface ConversationDeliveryInput {
   readonly text: string;
   readonly sourceRefs: readonly ConversationSourceRef[];
+  /** Host message identity so proactive cooldown checks can exclude this pending response. */
+  readonly assistantEventId?: string;
 }
 
 /** Fail-closed result consumed before the host performs connector delivery. */
 export interface ConversationDeliveryDecision {
   readonly decision: 'allow' | 'hold';
   readonly code?: 'SOURCE_AUTHORIZATION_REVOKED' | 'SOURCE_AUTHORIZATION_EPOCH_CHANGED'
-    | 'SOURCE_AUTHORIZATION_UNAVAILABLE' | 'SOURCE_PROOF_MISSING';
+    | 'SOURCE_AUTHORIZATION_UNAVAILABLE' | 'SOURCE_PROOF_MISSING'
+    | 'PROACTIVE_POLICY_BLOCKED' | 'PROACTIVE_QUIET_HOURS' | 'PROACTIVE_COOLDOWN' | 'PROACTIVE_PROOF_MISSING';
   readonly authorizationEpoch: number;
 }
 
