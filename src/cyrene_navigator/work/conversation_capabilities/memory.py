@@ -171,7 +171,7 @@ class DirectMemoryProvider:
         return tuple(hits)
 
     def delete(self, *, memory_ids: Sequence[str], scope: MemoryProviderScope) -> None:
-        """Delete only records that read back under the same organization, actor, and workspace."""
+        """Delete exact actor-owned rows and verify absence through a separate get RPC."""
 
         tenant_id, _ = _scope_key(scope)
         seen: set[str] = set()
@@ -182,18 +182,42 @@ class DirectMemoryProvider:
             seen.add(identifier)
             item = self._get_item(tenant_id, identifier)
             if item is None:
+                # A repeated delete is successful only after the independent GET above
+                # confirms the desired absent state.
                 continue
             _verify_actor_workspace(item, scope, tenant_id)
-            response = self._call(
-                contract.METHOD_DELETE,
-                contract.DeleteMemoryRequest(tenant_id=tenant_id, item_id=identifier),
-            )
-            if not isinstance(response, contract.DeleteMemoryResponse):
-                raise _memory_failure("MEMORY_PROVIDER_RESPONSE_INVALID", 502)
-            if response.error is not None:
-                _raise_contract_error(response.error)
-            if response.deleted is None:
-                raise _memory_failure("MEMORY_PROVIDER_RESPONSE_INVALID", 502)
+            delete_error: PersistenceError | None = None
+            deleted: bool | None = None
+            try:
+                response = self._call(
+                    contract.METHOD_DELETE,
+                    contract.DeleteMemoryRequest(tenant_id=tenant_id, item_id=identifier),
+                )
+                if not isinstance(response, contract.DeleteMemoryResponse):
+                    raise _memory_failure("MEMORY_PROVIDER_RESPONSE_INVALID", 502)
+                if response.error is not None:
+                    _raise_contract_error(response.error)
+                deleted = response.deleted
+            except PersistenceError as error:
+                delete_error = error
+
+            # The DELETE response alone is never treated as proof. This read is
+            # a separate RPC so an in-flight/ambiguous result cannot become success.
+            try:
+                remaining = self._get_item(tenant_id, identifier)
+            except PersistenceError as error:
+                raise _memory_failure("MEMORY_PROVIDER_DELETE_UNCERTAIN", 503) from error
+            if remaining is None:
+                continue
+            _verify_actor_workspace(remaining, scope, tenant_id)
+            if delete_error is not None:
+                if delete_error.retryable:
+                    raise _memory_failure("MEMORY_PROVIDER_DELETE_UNCERTAIN", 503) from delete_error
+                raise _memory_failure("MEMORY_PROVIDER_DELETE_NOT_CONFIRMED", 502) from delete_error
+            if deleted is True:
+                raise _memory_failure("MEMORY_PROVIDER_DELETE_READBACK_MISMATCH", 502)
+            else:
+                raise _memory_failure("MEMORY_PROVIDER_DELETE_NOT_CONFIRMED", 502)
 
     def get_memory(
         self, *, memory_id: str, scope: MemoryProviderScope
@@ -371,12 +395,22 @@ def _scope_key(scope: MemoryProviderScope) -> tuple[str, str]:
     tenant_id = _required_text(scope.organization_id, "organization id", 256)
     actor_id = _required_text(scope.actor_id, "actor id", 256)
     workspace_id = _required_text(scope.workspace_id, "workspace id", 256)
+    conversation_id: str | None = None
+    if scope.conversation_kind in {"group", "channel"}:
+        if not isinstance(scope.conversation_id, str) or not scope.conversation_id.strip():
+            raise _memory_failure("MEMORY_GROUP_CONVERSATION_ID_REQUIRED", 503)
+        conversation_id = _required_text(scope.conversation_id, "group conversation id", 256)
+    if scope.conversation_kind is not None:
+        _required_text(scope.conversation_kind, "conversation kind", 64)
+    if scope.persona_id is not None:
+        _required_text(scope.persona_id, "persona id", 256)
     scope_document = _canonical_json(
         {
             "schemaVersion": 1,
             "actorId": actor_id,
             "workspaceId": workspace_id,
             "conversationKind": scope.conversation_kind or "_none",
+            "conversationId": conversation_id,
             "personaId": scope.persona_id or "_none",
         }
     )
@@ -449,6 +483,12 @@ def _verify_item_scope(
         or len(item.embedding) != profile.dimensions
         or not all(math.isfinite(value) for value in item.embedding)
         or not any(value != 0 for value in item.embedding)
+    ):
+        raise _memory_failure("MEMORY_PROVIDER_SCOPE_MISMATCH", 502)
+    if scope.conversation_kind in {"group", "channel"} and (
+        item.metadata.get(_CONVERSATION_KEY) != scope.conversation_id
+        or item.metadata.get(_KIND_KEY) != scope.conversation_kind
+        or item.metadata.get(_PERSONA_KEY) != scope.persona_id
     ):
         raise _memory_failure("MEMORY_PROVIDER_SCOPE_MISMATCH", 502)
 

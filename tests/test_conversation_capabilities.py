@@ -14,8 +14,10 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from threading import Barrier
 from typing import Any
 
 import pytest
@@ -107,7 +109,10 @@ from cyrene_navigator.work.conversation_capabilities.peripheral import (
     HostTrustedCallerSigner,
     build_host_trusted_caller_signer,
 )
-from cyrene_navigator.work.conversation_memory.providers import MemoryProviderScope
+from cyrene_navigator.work.conversation_memory.providers import (
+    MemoryProviderHit,
+    MemoryProviderScope,
+)
 
 _CAPABILITIES = (
     MODEL_CAPABILITY_ID,
@@ -140,6 +145,9 @@ class _SimulatedCapabilityPlugin:
         self.embedding_inputs: list[tuple[str, ...]] = []
         self.memory_items: dict[tuple[str, str], memory_contract.MemoryItem] = {}
         self.memory_recall_cross_actor = False
+        self.memory_delete_mode = "normal"
+        self.memory_delete_calls = 0
+        self.memory_get_unavailable = False
         self.graph_nodes: dict[tuple[str, str, str], Any] = {}
         self.graph_edges: dict[tuple[str, str, str], Any] = {}
         self.graph_readback_mutation = False
@@ -206,6 +214,8 @@ class _SimulatedCapabilityPlugin:
             self.memory_items[(tenant_id, item.item_id)] = item
             response: object = memory_contract.StoreMemoryResponse(item_id=item.item_id)
         elif action == memory_contract.METHOD_GET:
+            if self.memory_get_unavailable:
+                return False, "UNAVAILABLE: independent readback unavailable"
             item = self.memory_items.get((tenant_id, request.item_id))
             response = (
                 memory_contract.GetMemoryResponse(item=item)
@@ -233,7 +243,22 @@ class _SimulatedCapabilityPlugin:
                 matches.append(memory_contract.MemoryMatch(item=item, score=1.0))
             response = memory_contract.RecallMemoryResponse(matches=tuple(matches[: request.top_k]))
         elif action == memory_contract.METHOD_DELETE:
-            deleted = self.memory_items.pop((tenant_id, request.item_id), None) is not None
+            self.memory_delete_calls += 1
+            key = (tenant_id, request.item_id)
+            if self.memory_delete_mode == "return_false":
+                deleted = False
+            elif self.memory_delete_mode == "return_true_but_keep":
+                deleted = True
+            elif self.memory_delete_mode in {
+                "remove_then_unavailable",
+                "remove_then_unavailable_readback",
+            }:
+                deleted = self.memory_items.pop(key, None) is not None
+                if self.memory_delete_mode == "remove_then_unavailable_readback":
+                    self.memory_get_unavailable = True
+                return False, "UNAVAILABLE: delete response was lost"
+            else:
+                deleted = self.memory_items.pop(key, None) is not None
             response = memory_contract.DeleteMemoryResponse(deleted=deleted)
         elif action == memory_contract.METHOD_PRUNE:
             removed = [
@@ -661,6 +686,207 @@ def test_memory_adapter_fails_closed_for_wrong_actor_scope_and_zero_vector() -> 
                 limit=5,
             )
         assert invalid_scope.value.code == "MEMORY_PROVIDER_SCOPE_MISMATCH"
+
+
+def test_memory_group_queries_are_partitioned_and_missing_group_id_fails_closed() -> None:
+    profile = EmbeddingProfile(
+        model_id="test-embedding-model", profile_id="test-profile", dimensions=3
+    )
+    with _direct_runtime() as (_plugin, client):
+        provider = DirectMemoryProvider(
+            client, PluginBindingSettings("grpc://127.0.0.1:51009"), profile
+        )
+        for index in range(12):
+            provider.upsert(
+                memory_id=f"group-a-{index}",
+                text=f"Group A record {index}",
+                embedding=(1.0, 0.0, 0.0),
+                model=profile.model_id,
+                dimensions=3,
+                scope=_scope(
+                    actor_id="same-actor",
+                    conversation_id="group-a",
+                    conversation_kind="group",
+                    visibility="group",
+                ),
+                authorization_epoch=1,
+            )
+        provider.upsert(
+            memory_id="group-b-target",
+            text="Group B record",
+            embedding=(1.0, 0.0, 0.0),
+            model=profile.model_id,
+            dimensions=3,
+            scope=_scope(
+                actor_id="same-actor",
+                conversation_id="group-b",
+                conversation_kind="group",
+                visibility="group",
+            ),
+            authorization_epoch=1,
+        )
+        hits = provider.query(
+            text="group B question",
+            embedding=(1.0, 0.0, 0.0),
+            model=profile.model_id,
+            dimensions=3,
+            scope=_scope(
+                actor_id="same-actor",
+                conversation_id="group-b",
+                conversation_kind="group",
+                visibility=None,
+            ),
+            limit=1,
+        )
+        assert [hit.memory_id for hit in hits] == ["group-b-target"]
+
+        query_barrier = Barrier(2)
+
+        def query_group(
+            scope: MemoryProviderScope, query_text: str, limit: int
+        ) -> Sequence[MemoryProviderHit]:
+            query_barrier.wait(timeout=2)
+            return provider.query(
+                text=query_text,
+                embedding=(1.0, 0.0, 0.0),
+                model=profile.model_id,
+                dimensions=3,
+                scope=scope,
+                limit=limit,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            group_a_future = executor.submit(
+                query_group,
+                _scope(
+                    actor_id="same-actor",
+                    conversation_id="group-a",
+                    conversation_kind="group",
+                    visibility=None,
+                ),
+                "group A question",
+                20,
+            )
+            group_b_future = executor.submit(
+                query_group,
+                _scope(
+                    actor_id="same-actor",
+                    conversation_id="group-b",
+                    conversation_kind="group",
+                    visibility=None,
+                ),
+                "group B question",
+                20,
+            )
+            concurrent_group_a_hits = group_a_future.result(timeout=5)
+            concurrent_group_b_hits = group_b_future.result(timeout=5)
+        assert {hit.memory_id for hit in concurrent_group_a_hits} == {
+            f"group-a-{index}" for index in range(12)
+        }
+        assert [hit.memory_id for hit in concurrent_group_b_hits] == ["group-b-target"]
+
+        with pytest.raises(PersistenceError) as missing_conversation:
+            provider.query(
+                text="group question",
+                embedding=(1.0, 0.0, 0.0),
+                model=profile.model_id,
+                dimensions=3,
+                scope=_scope(
+                    actor_id="same-actor",
+                    conversation_id="",
+                    conversation_kind="group",
+                    visibility=None,
+                ),
+                limit=1,
+            )
+        assert missing_conversation.value.code == "MEMORY_GROUP_CONVERSATION_ID_REQUIRED"
+
+        for conversation_id, memory_id in (
+            ("direct-chat-a", "direct-a-memory"),
+            ("direct-chat-b", "direct-b-memory"),
+        ):
+            provider.upsert(
+                memory_id=memory_id,
+                text="direct conversation memory",
+                embedding=(1.0, 0.0, 0.0),
+                model=profile.model_id,
+                dimensions=3,
+                scope=_scope(
+                    actor_id="same-actor",
+                    conversation_id=conversation_id,
+                    conversation_kind="direct",
+                    visibility="private",
+                ),
+                authorization_epoch=1,
+            )
+        direct_hits = provider.query(
+            text="direct chat question",
+            embedding=(1.0, 0.0, 0.0),
+            model=profile.model_id,
+            dimensions=3,
+            scope=_scope(
+                actor_id="same-actor",
+                conversation_id=None,
+                conversation_kind="direct",
+                visibility=None,
+            ),
+            limit=5,
+        )
+        assert {hit.memory_id for hit in direct_hits} == {
+            "direct-a-memory",
+            "direct-b-memory",
+        }
+
+
+def test_memory_delete_requires_independent_absence_and_reconciles_unknown_result() -> None:
+    profile = EmbeddingProfile(
+        model_id="test-embedding-model", profile_id="test-profile", dimensions=3
+    )
+    selected_scope = _scope()
+    with _direct_runtime() as (plugin, client):
+        provider = DirectMemoryProvider(
+            client, PluginBindingSettings("grpc://127.0.0.1:51010"), profile
+        )
+
+        def store(memory_id: str) -> None:
+            provider.upsert(
+                memory_id=memory_id,
+                text="deletion reconciliation fixture",
+                embedding=(1.0, 0.0, 0.0),
+                model=profile.model_id,
+                dimensions=3,
+                scope=selected_scope,
+                authorization_epoch=1,
+            )
+
+        store("delete-false")
+        plugin.memory_delete_mode = "return_false"
+        with pytest.raises(PersistenceError) as false_delete:
+            provider.delete(memory_ids=("delete-false",), scope=selected_scope)
+        assert false_delete.value.code == "MEMORY_PROVIDER_DELETE_NOT_CONFIRMED"
+        assert ("org-test", "delete-false") in plugin.memory_items
+
+        store("delete-true-but-kept")
+        plugin.memory_delete_mode = "return_true_but_keep"
+        with pytest.raises(PersistenceError) as stale_delete:
+            provider.delete(memory_ids=("delete-true-but-kept",), scope=selected_scope)
+        assert stale_delete.value.code == "MEMORY_PROVIDER_DELETE_READBACK_MISMATCH"
+        assert ("org-test", "delete-true-but-kept") in plugin.memory_items
+
+        store("delete-response-lost")
+        plugin.memory_delete_mode = "remove_then_unavailable"
+        delete_count = plugin.memory_delete_calls
+        provider.delete(memory_ids=("delete-response-lost",), scope=selected_scope)
+        assert plugin.memory_delete_calls == delete_count + 1
+        provider.delete(memory_ids=("delete-response-lost",), scope=selected_scope)
+        assert plugin.memory_delete_calls == delete_count + 1
+
+        store("delete-readback-lost")
+        plugin.memory_delete_mode = "remove_then_unavailable_readback"
+        with pytest.raises(PersistenceError) as uncertain:
+            provider.delete(memory_ids=("delete-readback-lost",), scope=selected_scope)
+        assert uncertain.value.code == "MEMORY_PROVIDER_DELETE_UNCERTAIN"
+        assert uncertain.value.retryable is False
 
 
 def _graph_changeset(
