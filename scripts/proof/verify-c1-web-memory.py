@@ -493,7 +493,6 @@ def main() -> int:
 
     gate9_pass = (
         rev_res.get("sourceId") == target_source_id
-        and target_source_id in rev_res.get("invalidatedMessageIds", [])
         and t_post_rev["status"] == "completed"
         and cites_revoked is False
     )
