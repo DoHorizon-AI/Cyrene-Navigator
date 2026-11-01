@@ -817,11 +817,11 @@ def _executor_integration_environment(
             raise ValueError("CYRENE_WORKFLOWS_ENABLED must be 'true' or 'false'")
         result["CYRENE_WORKFLOWS_ENABLED"] = workflows_enabled
 
-    concurrency = environment.get("CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS", "1")
+    concurrency = environment.get("CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS", "2")
     if not re.fullmatch(r"[0-9]{1,2}", concurrency):
         raise ValueError("CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS must be an integer")
-    if not 1 <= int(concurrency) <= _MAX_TASK_CONCURRENCY:
-        raise ValueError("CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS must be between 1 and 32")
+    if not 2 <= int(concurrency) <= _MAX_TASK_CONCURRENCY:
+        raise ValueError("CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS must be between 2 and 32")
     result["CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS"] = concurrency
 
     integration_url = environment.get("CYRENE_EXCHANGE_INTEGRATION_URL")

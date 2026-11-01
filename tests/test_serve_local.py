@@ -164,6 +164,23 @@ def test_workflow_flag_accepts_only_explicit_boolean_values() -> None:
         )
 
 
+def test_executor_concurrency_default_matches_minimum_and_rejects_one() -> None:
+    """The local supervisor must not start an Executor with an invalid default."""
+
+    defaulted = serve_local._executor_integration_environment({}, workspace_id="round1-workspace")
+    assert defaulted["CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS"] == "2"
+    explicit = serve_local._executor_integration_environment(
+        {"CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS": "4"},
+        workspace_id="round1-workspace",
+    )
+    assert explicit["CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS"] == "4"
+    with pytest.raises(ValueError, match="must be between 2 and 32"):
+        serve_local._executor_integration_environment(
+            {"CYRENE_EXECUTOR_MAX_CONCURRENT_TASKS": "1"},
+            workspace_id="round1-workspace",
+        )
+
+
 def test_teams_owner_projection_file_is_forwarded_without_static_actor_env(tmp_path: Path) -> None:
     """Forward scoped owner/catalog files without static actors or unrelated child values."""
 
