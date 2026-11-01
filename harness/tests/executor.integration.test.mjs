@@ -982,6 +982,10 @@ test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and p
     }
     if (req.url === '/internal/v1/teams/messages') {
       privateBodies.push({ body, grant: req.headers['x-cyrene-connector-grant-bin'] });
+      if (body.requestId === 'accepted-no-id:attempt:1') {
+        respond(200, { requestId: body.requestId, status: 'accepted' });
+        return;
+      }
       const status = outcomes.shift() ?? 'accepted';
       respond(200, {
         requestId: body.requestId,
@@ -1030,9 +1034,9 @@ test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and p
   });
   const privateLeases = [
     leaseFor('ack-multiline', ownerId, multilineAck), leaseFor('revoked'),
-    leaseFor('accepted', ownerId, multilineFinal), leaseFor('uncertain'),
+    leaseFor('accepted', ownerId, multilineFinal), leaseFor('accepted-no-id'), leaseFor('uncertain'),
     leaseFor('actor-mismatch', actorIds[1]), leaseFor('grant-no-response'),
-    leaseFor('invalid-control', ownerId, 'Private owner\u000bstatus.'),
+    leaseFor('invalid-control', ownerId, 'Private owner\u000bstatus.'), leaseFor('blank-text', ownerId, '\n\t  \r '),
   ];
   const privateFinished = [];
   const workStateStore = new InMemoryWorkStateStore();
@@ -1081,9 +1085,11 @@ test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and p
     await app.executor['drainTeamsNotifications']();
     await app.executor['drainTeamsNotifications']();
     await app.executor['drainTeamsNotifications']();
+    await app.executor['drainTeamsNotifications']();
+    await app.executor['drainTeamsNotifications']();
 
-    assert.equal(grantRequests.length, 4, 'revoked, mismatched, and invalid-text routes fail before grant creation');
-    assert.equal(privateBodies.length, 3);
+    assert.equal(grantRequests.length, 5, 'revoked, mismatched, and invalid-text routes fail before grant creation');
+    assert.equal(privateBodies.length, 4);
     assert.equal(grantRequests.filter(item => item.requestId === 'grant-no-response:attempt:1').length, 1,
       'a grant transport failure is observed once and does not start a second send');
     const grant = grantRequests[1];
@@ -1119,6 +1125,7 @@ test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and p
       conversation: route,
       text: multilineFinal,
     });
+    assert.equal(privateBodies[2].body.requestId, 'accepted-no-id:attempt:1');
     assert.equal(privateFinished[0].result.vendorMessageId, 'private-delivery-1');
     assert.equal(privateFinished[2].result.vendorMessageId, 'private-delivery-1');
     assert.ok(privateBodies.every(item => item.grant === 'AQ=='));
@@ -1126,19 +1133,28 @@ test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and p
       ['ack-multiline', 'delivered'],
       ['revoked', 'failed'],
       ['accepted', 'delivered'],
+      ['accepted-no-id', 'uncertain'],
       ['uncertain', 'uncertain'],
       ['actor-mismatch', 'failed'],
       ['grant-no-response', 'failed'],
       ['invalid-control', 'failed'],
+      ['blank-text', 'failed'],
     ]);
     assert.equal(privateFinished[3].result.vendorMessageId, null,
+      'an accepted status without a vendor message ID cannot be recorded as delivered');
+    assert.equal(privateFinished[3].result.reasonCode, 'teams_accepted_receipt_missing_vendor_message_id');
+    assert.equal(privateFinished[4].result.vendorMessageId, null,
       'an uncertain receipt cannot persist a provider message ID as an accepted finish');
     assert.equal(privateFinished.find(item => item.id === 'grant-no-response').result.code, 'EXCHANGE_GRANT_NO_RESPONSE',
       'a lost authorization-grant response is known to precede Teams invocation');
-    assert.equal(privateFinished.at(-1).id, 'invalid-control');
-    assert.equal(privateFinished.at(-1).result.code, 'TEAMS_EVENT_INVALID',
+    const invalidControlFinish = privateFinished.find(item => item.id === 'invalid-control');
+    assert.equal(invalidControlFinish.result.code, 'TEAMS_EVENT_INVALID',
       'invalid message controls fail before grant or Teams invocation');
     assert.equal(grantRequests.some(item => item.requestId === 'invalid-control:attempt:1'), false);
+    const blankTextFinish = privateFinished.find(item => item.id === 'blank-text');
+    assert.equal(blankTextFinish.result.code, 'TEAMS_EVENT_INVALID',
+      'whitespace-only message text fails before grant or Teams invocation');
+    assert.equal(grantRequests.some(item => item.requestId === 'blank-text:attempt:1'), false);
     assert.ok(workRequests.some(item => item.url?.endsWith('/work/tasks/private-owner-task')
       && item.authorization === `Bearer ${tokens[0]}`));
     assert.ok(workRequests.some(item => item.url?.endsWith('/work/tasks/private-owner-task')
@@ -1146,7 +1162,7 @@ test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and p
 
     app.executor.config.teams.sendPrivateMessage = undefined;
     await app.executor['drainTeamsNotifications']();
-    assert.equal(privateClaimCalls, 7, 'private notices are not claimed if the fixed Exchange sender becomes unavailable');
+    assert.equal(privateClaimCalls, 9, 'private notices are not claimed if the fixed Exchange sender becomes unavailable');
   } finally {
     if (app !== undefined) await disposeApp(app);
     exchangeServer.closeAllConnections();

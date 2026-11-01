@@ -171,6 +171,32 @@ test('sends only the Work-resolved owner-private route through the existing Team
   });
 });
 
+test('owner-private accepted receipts without a nonblank vendor ID stay uncertain', async () => {
+  for (const [index, vendorMessageId] of [undefined, '', ' \t '].entries()) {
+    const input = {
+      requestId: `private-notification-missing-id-${index}:attempt:1`,
+      targetKind: 'owner_private',
+      conversation: privateConversation,
+      text: 'Private owner status.',
+    };
+    const responseBody = {
+      requestId: input.requestId,
+      status: 'accepted',
+      ...(vendorMessageId === undefined ? {} : { vendorMessageId }),
+    };
+    await withHttpResponse(200, {}, responseBody, async (client, received) => {
+      const result = await client.sendPrivateTeamsMessage(
+        input, privateGrantFor(input), connectionRef, profileRef, new AbortController().signal,
+      );
+      assert.deepEqual(result, {
+        outcome: 'uncertain',
+        reasonCode: 'teams_accepted_receipt_missing_vendor_message_id',
+      });
+      assert.equal(received.length, 1);
+    });
+  }
+});
+
 test('owner-private send rejects actor or grant route mismatch before Exchange invocation', async () => {
   const input = {
     requestId: 'private-notification-mismatch:attempt:1',
@@ -207,6 +233,16 @@ test('owner-private send rejects actor or grant route mismatch before Exchange i
       ), error => error instanceof ExchangeConnectorRequestError
         && !error.outcomeUnknown && error.safeCode === 'TEAMS_PRIVATE_SEND_NOT_STARTED',
     );
+    for (const [index, text] of ['   ', '\n', '\r\n\t '].entries()) {
+      const whitespaceInput = { ...input, requestId: `private-notification-blank-${index}:attempt:1`, text };
+      await assert.rejects(
+        client.sendPrivateTeamsMessage(
+          whitespaceInput, privateGrantFor(whitespaceInput), connectionRef, profileRef,
+          new AbortController().signal,
+        ), error => error instanceof ExchangeConnectorRequestError
+          && !error.outcomeUnknown && error.safeCode === 'TEAMS_PRIVATE_SEND_NOT_STARTED',
+      );
+    }
     assert.equal(received.length, 0);
   });
 });
@@ -272,6 +308,75 @@ test('owner-private response body deadline is uncertain and never causes a secon
     );
     assert.ok(performance.now() - startedAt < 350, 'body reading must remain inside the bounded request deadline');
     assert.equal(received, 1, 'an incomplete accepted response must not trigger a duplicate send');
+  } finally {
+    if (responseTimer !== undefined) clearTimeout(responseTimer);
+    server.closeAllConnections();
+    await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
+});
+
+test('owner-private HTTP 408 is uncertain while explicit 403 remains a definite rejection', async () => {
+  const input = {
+    requestId: 'private-notification-http-status:attempt:1',
+    targetKind: 'owner_private',
+    conversation: privateConversation,
+    text: 'Private owner status.',
+  };
+  for (const [status, outcomeUnknown] of [[408, true], [403, false]]) {
+    await withHttpResponse(status, {}, { code: 'fixture_rejection' }, async (client, received) => {
+      await assert.rejects(
+        client.sendPrivateTeamsMessage(input, privateGrantFor(input), connectionRef, profileRef,
+          new AbortController().signal),
+        error => error instanceof ExchangeConnectorRequestError
+          && error.status === status && error.outcomeUnknown === outcomeUnknown,
+      );
+      assert.equal(received.length, 1, 'a rejected or uncertain response must not trigger a second POST');
+    });
+  }
+});
+
+test('owner-private HTTP 408 body timeout keeps its uncertain classification and safe code', async () => {
+  const input = {
+    requestId: 'private-notification-http-408-body-timeout:attempt:1',
+    targetKind: 'owner_private',
+    conversation: privateConversation,
+    text: 'Private owner status.',
+  };
+  let received = 0;
+  let responseTimer;
+  const server = createServer((request, response) => {
+    request.resume();
+    request.on('end', () => {
+      received += 1;
+      response.writeHead(408, { 'content-type': 'application/json' });
+      response.write('{"code":"upstream_timeout",');
+      response.once('close', () => {
+        if (responseTimer !== undefined) clearTimeout(responseTimer);
+      });
+      responseTimer = setTimeout(() => response.end('"detail":"late body"}'), 500);
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = server.address();
+    const client = new ExchangeConnectorAuthorizationClient({
+      baseUrl: `http://127.0.0.1:${address.port}`,
+      hmacKeyFile: '/unused-for-provider-grant-fixture',
+      hmacKeyId: 'test-key',
+      audience: 'exchange',
+      requestTimeoutMs: 100,
+    });
+    const startedAt = performance.now();
+    await assert.rejects(
+      client.sendPrivateTeamsMessage(input, privateGrantFor(input), connectionRef, profileRef,
+        new AbortController().signal),
+      error => error instanceof ExchangeConnectorRequestError
+        && error.status === 408
+        && error.outcomeUnknown
+        && error.safeCode === 'EXCHANGE_RESPONSE_BODY_TIMEOUT',
+    );
+    assert.ok(performance.now() - startedAt < 350, '408 response-body reads remain inside the request deadline');
+    assert.equal(received, 1, 'an uncertain 408 must not trigger a duplicate POST');
   } finally {
     if (responseTimer !== undefined) clearTimeout(responseTimer);
     server.closeAllConnections();

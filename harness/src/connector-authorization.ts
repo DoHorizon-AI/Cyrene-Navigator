@@ -91,12 +91,11 @@ export interface TeamsPrivateMessageSend {
   readonly text: string;
 }
 
-export interface TeamsMessageDeliveryOutcome {
-  readonly outcome: 'accepted' | 'rejected' | 'rate_limited' | 'uncertain';
-  readonly vendorMessageId?: string;
-  readonly reasonCode?: string;
-  readonly retryAfterSeconds?: number;
-}
+export type TeamsMessageDeliveryOutcome =
+  | { readonly outcome: 'accepted'; readonly vendorMessageId: string; readonly reasonCode?: string }
+  | { readonly outcome: 'rejected'; readonly reasonCode?: string; readonly retryAfterSeconds?: number }
+  | { readonly outcome: 'rate_limited'; readonly reasonCode?: string; readonly retryAfterSeconds: number }
+  | { readonly outcome: 'uncertain'; readonly reasonCode?: string };
 
 export interface ProviderOperationCall {
   readonly requestId: string;
@@ -380,9 +379,22 @@ export class ExchangeConnectorAuthorizationClient {
           ...(typeof row.reasonCode === 'string' ? { reasonCode: row.reasonCode } : {}),
         };
       }
+      if (outcome === 'accepted') {
+        const rawVendorMessageId = row.vendorMessageId;
+        if (typeof rawVendorMessageId !== 'string' || rawVendorMessageId.trim().length === 0) {
+          return {
+            outcome: 'uncertain',
+            reasonCode: 'teams_accepted_receipt_missing_vendor_message_id',
+          };
+        }
+        return {
+          outcome,
+          vendorMessageId: safeText(rawVendorMessageId, 'private Teams vendor message id', 512),
+          ...(typeof row.reasonCode === 'string' ? { reasonCode: row.reasonCode } : {}),
+        };
+      }
       return {
         outcome,
-        ...(typeof row.vendorMessageId === 'string' ? { vendorMessageId: row.vendorMessageId } : {}),
         ...(typeof row.reasonCode === 'string' ? { reasonCode: row.reasonCode } : {}),
         ...(boundedRetryAfter(row.retryAfterSeconds) === undefined
           ? {} : { retryAfterSeconds: boundedRetryAfter(row.retryAfterSeconds) }),
@@ -593,17 +605,25 @@ export class ExchangeConnectorAuthorizationClient {
     }
     responseDeadlines.set(response, { callerSignal: signal, requestTimeoutSignal });
     if (!response.ok && !(acceptRateLimited && response.status === 429)) {
-      const errorBody = await readJson(response).catch(() => ({}));
+      let errorBody: unknown = {};
+      let responseBodyError: ExchangeConnectorRequestError | undefined;
+      try {
+        errorBody = await readJson(response);
+      } catch (error: unknown) {
+        if (error instanceof ExchangeConnectorRequestError) responseBodyError = error;
+      }
       const code = errorBody && typeof errorBody === 'object' && !Array.isArray(errorBody)
         && typeof (errorBody as Record<string, unknown>).code === 'string'
         ? String((errorBody as Record<string, unknown>).code)
         : 'EXCHANGE_CONNECTOR_REJECTED';
+      const outcomeUnknown = uncertainOnServerError && (response.status === 408 || response.status >= 500);
       throw new ExchangeConnectorRequestError(
         `Exchange connector call was rejected (${response.status}, ${code})`,
         response.status,
-        uncertainOnServerError && response.status >= 500,
+        outcomeUnknown,
         undefined,
         response.status === 429 ? boundedRetryAfter(response.headers.get('retry-after')) : undefined,
+        outcomeUnknown ? responseBodyError?.safeCode : undefined,
       );
     }
     return response;
@@ -846,6 +866,7 @@ function safeText(value: unknown, label: string, limit: number): string {
 /** Validate bounded Teams body text while preserving ordinary multiline formatting. | 保留正文换行和制表符，拒绝其他控制字符。 */
 export function validateTeamsMessageText(value: unknown, label: string, limit: number): string {
   if (typeof value !== 'string' || value.length < 1 || value.length > limit
+    || value.trim().length === 0
     || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)) {
     throw new TypeError(`Invalid ${label}`);
   }
@@ -891,7 +912,7 @@ async function readJson(response: Response): Promise<unknown> {
     const safeCode = deadline?.requestTimeoutSignal.aborted
       ? 'EXCHANGE_RESPONSE_BODY_TIMEOUT'
       : deadline?.callerSignal.aborted ? 'EXCHANGE_CONNECTOR_ABORTED' : 'EXCHANGE_RESPONSE_BODY_INCOMPLETE';
-    const outcomeUnknown = response.ok || response.status === 429 || response.status >= 500;
+    const outcomeUnknown = response.ok || response.status === 408 || response.status === 429 || response.status >= 500;
     throw new ExchangeConnectorRequestError(
       'Exchange response body was incomplete',
       response.status,

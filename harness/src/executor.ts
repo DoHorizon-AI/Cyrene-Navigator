@@ -30,7 +30,7 @@ import {
   validateTeamsMessageText,
   validateTeamsServiceUrl,
 } from './connector-authorization.ts';
-import type { ConnectorGrantRequest, TeamsMessageRoute } from './connector-authorization.ts';
+import type { ConnectorGrantRequest, TeamsMessageDeliveryOutcome, TeamsMessageRoute } from './connector-authorization.ts';
 import {
   decodeProviderTokenUsage,
   isModelAvailabilityFailure,
@@ -236,12 +236,7 @@ export interface TeamsPersonalMessageSendRequest {
   readonly text: string;
 }
 
-export interface TeamsPersonalMessageSendOutcome {
-  readonly outcome: 'accepted' | 'rejected' | 'rate_limited' | 'uncertain';
-  readonly vendorMessageId?: string;
-  readonly reasonCode?: string;
-  readonly retryAfterSeconds?: number;
-}
+export type TeamsPersonalMessageSendOutcome = TeamsMessageDeliveryOutcome;
 
 /** Fixed host-owned health selectors and the only Teams route for credential notices. */
 export interface CredentialNotificationsConfig {
@@ -2841,11 +2836,16 @@ export class NavigatorExecutor {
         }, Math.min(Math.max(Math.ceil(result.retryAfterSeconds), 1), 300));
         return;
       }
-      const outcome = result.outcome === 'accepted' ? 'delivered'
-        : result.outcome === 'uncertain' ? 'uncertain' : 'failed';
+      const acceptedVendorMessageId = result.outcome === 'accepted'
+        && typeof result.vendorMessageId === 'string' && result.vendorMessageId.trim().length > 0
+        ? result.vendorMessageId : undefined;
+      const hasAcceptedReceipt = acceptedVendorMessageId !== undefined;
+      const outcome = hasAcceptedReceipt ? 'delivered'
+        : result.outcome === 'uncertain' || result.outcome === 'accepted' ? 'uncertain' : 'failed';
       await finish.call(this.config.workState, notification.id, lease.leaseToken, outcome, {
-        reasonCode: result.reasonCode ?? null,
-        vendorMessageId: result.outcome === 'accepted' ? result.vendorMessageId ?? null : null,
+        reasonCode: result.reasonCode ?? (result.outcome === 'accepted' && !hasAcceptedReceipt
+          ? 'teams_accepted_receipt_missing_vendor_message_id' : null),
+        vendorMessageId: acceptedVendorMessageId ?? null,
       });
     } catch (error: unknown) {
       if (!started) return;
@@ -2931,11 +2931,16 @@ export class NavigatorExecutor {
         }, Math.min(Math.max(Math.ceil(result.retryAfterSeconds), 1), 300));
         return;
       }
-      const outcome = result.outcome === 'accepted' ? 'delivered'
-        : result.outcome === 'uncertain' ? 'uncertain' : 'failed';
+      const acceptedVendorMessageId = result.outcome === 'accepted'
+        && typeof result.vendorMessageId === 'string' && result.vendorMessageId.trim().length > 0
+        ? result.vendorMessageId : undefined;
+      const hasAcceptedReceipt = acceptedVendorMessageId !== undefined;
+      const outcome = hasAcceptedReceipt ? 'delivered'
+        : result.outcome === 'uncertain' || result.outcome === 'accepted' ? 'uncertain' : 'failed';
       await finish.call(this.config.workState, notification.id, lease.leaseToken, outcome, {
-        reasonCode: result.reasonCode ?? null,
-        vendorMessageId: result.vendorMessageId ?? null,
+        reasonCode: result.reasonCode ?? (result.outcome === 'accepted' && !hasAcceptedReceipt
+          ? 'teams_accepted_receipt_missing_vendor_message_id' : null),
+        vendorMessageId: acceptedVendorMessageId ?? null,
       });
     } catch (error: unknown) {
       if (!started) return;
