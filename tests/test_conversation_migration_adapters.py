@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,8 @@ from cyrene_navigator.work.conversation_migration import (
     AuthorizedConversationContext,
     ConversationMigrationService,
     DirectGraphCompensator,
+    JsonLinesMigrationSource,
+    MigrationError,
     MigrationSettings,
     build_actor_backup,
 )
@@ -785,3 +789,128 @@ def test_mount_factory_exports_only_the_portable_actor_backup_subset(tmp_path: P
     )
     assert imported is not None
     assert imported["status"] == "revoked"
+
+
+@pytest.mark.parametrize("record_kind", ["profile", "graph"])
+def test_mount_factory_fails_closed_before_message_write_when_later_kind_lacks_rollback(
+    tmp_path: Path, record_kind: str
+) -> None:
+    """Production capability preflight prevents partial writes for unrollbackable plans."""
+
+    database = tmp_path / f"missing-{record_kind}-rollback.sqlite"
+    memory_store = ConversationMemoryStore(database)
+    domain_store = ConversationDomainStore(database)
+    work_store = WorkStore(database)
+    rows: list[dict[str, object]] = [
+        {
+            "recordType": "message",
+            "recordId": "message-record-1",
+            "conversationId": "legacy-adapter-conversation",
+            "conversationKind": "direct",
+            "personaId": None,
+            "visibility": "private",
+            "sourceRecordIds": [],
+            "validUntil": None,
+            "role": "user",
+            "content": "Synthetic preflight source.",
+            "occurredAt": 1_700_000_000_000,
+        }
+    ]
+    if record_kind == "profile":
+        rows.append(
+            {
+                "recordType": "profile",
+                "recordId": "profile-record-1",
+                "conversationId": "legacy-adapter-conversation",
+                "conversationKind": "direct",
+                "personaId": None,
+                "visibility": "private",
+                "sourceRecordIds": ["message-record-1"],
+                "validUntil": None,
+                "subjectKind": "user",
+                "category": "preference",
+                "text": "Synthetic profile candidate.",
+                "confidence": 0.9,
+            }
+        )
+    else:
+        rows.append(
+            {
+                "recordType": "graph",
+                "recordId": "graph-record-1",
+                "conversationId": "legacy-adapter-conversation",
+                "conversationKind": "direct",
+                "personaId": None,
+                "visibility": "private",
+                "sourceRecordIds": ["message-record-1"],
+                "validUntil": None,
+                "nodes": [
+                    {
+                        "id": "node-1",
+                        "label": "Synthetic graph node",
+                        "sourceRecordIds": ["message-record-1"],
+                    }
+                ],
+                "edges": [],
+            }
+        )
+    content = (
+        b"\n".join(
+            [
+                json.dumps(
+                    {
+                        "recordType": "header",
+                        "schemaVersion": 1,
+                        "sourceKind": "test.fixture",
+                        "recordCount": len(rows),
+                    },
+                    separators=(",", ":"),
+                ).encode(),
+                *(json.dumps(row, separators=(",", ":")).encode() for row in rows),
+            ]
+        )
+        + b"\n"
+    )
+    artifact_id = f"missing-{record_kind}-artifact"
+    artifact_digest = hashlib.sha256(content).hexdigest()
+    source = JsonLinesMigrationSource(
+        io.BytesIO(content), artifact_id=artifact_id, expected_sha256=artifact_digest
+    )
+    authorization = _RestoreAuthorization(memory_store, artifact_id, artifact_digest)
+    host = build_conversation_migration_host(
+        memory_store=memory_store,
+        domain_store=domain_store,
+        work_store=work_store,
+        authorization=authorization,
+    )
+    task_id = f"missing-{record_kind}-rollback-task"
+    work_store.create_task(
+        SCOPE.organization_id,
+        SCOPE.workspace_id,
+        {"id": task_id, "sessionId": f"missing-{record_kind}", "prompt": "fixture"},
+        actor_id=SCOPE.actor_id,
+        actor_private_scope=True,
+    )
+    work_store.claim_task(
+        SCOPE.organization_id,
+        SCOPE.workspace_id,
+        task_id,
+        actor_id=SCOPE.actor_id,
+        actor_private_scope=True,
+    )
+    preview = host.service.preview(SCOPE, source)
+
+    with pytest.raises(MigrationError) as error:
+        host.service.apply(
+            SCOPE,
+            task_id=task_id,
+            source=source,
+            preview=preview,
+            approval_ref="import-approved",
+            profile_approval_ref=("profile-approved" if record_kind == "profile" else None),
+        )
+
+    assert error.value.code == "ROLLBACK_CAPABILITY_UNAVAILABLE"
+    assert memory_store.overview(SCOPE.organization_id, SCOPE.workspace_id, SCOPE.actor_id)[
+        "counts"
+    ] == {"messages": 0, "memories": 0, "sources": 0}
