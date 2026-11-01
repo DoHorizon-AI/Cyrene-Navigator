@@ -817,7 +817,7 @@ export class WorkStateClient implements WorkStateStore {
     const token = process.env[tokenEnv];
     if (!token) throw new Error(`Missing persistence credential in ${tokenEnv}`);
     const url = `${this.workUrl}/attachments/${encodeURIComponent(artifactId)}`;
-    const timeout = AbortSignal.timeout(this.connection.requestTimeoutMs ?? 10_000);
+    const timeout = AbortSignal.timeout(this.connection.requestTimeoutMs ?? Number(process.env.CYRENE_PERSISTENCE_REQUEST_TIMEOUT_MS ?? 45_000));
     const requestSignal = signal === undefined ? timeout : AbortSignal.any([signal, timeout]);
     const response = await fetch(url, {
       method: 'GET',
@@ -987,6 +987,7 @@ export class WorkStateClient implements WorkStateStore {
       readonly conversationId: string;
       readonly conversationKind: string;
       readonly order: 'desc';
+      readonly personaId?: string | null;
       readonly cursor?: string;
       readonly limit: number;
       readonly includeRevoked?: boolean;
@@ -997,6 +998,7 @@ export class WorkStateClient implements WorkStateStore {
         order: input.order,
         limit: String(Math.min(input.limit, 100)),
       });
+      if (input.personaId !== undefined && input.personaId !== null) query.set('personaId', input.personaId);
       if (input.cursor !== undefined) query.set('cursor', input.cursor);
       if (input.includeRevoked !== undefined) query.set('includeRevoked', String(input.includeRevoked));
       return query.toString();
@@ -1652,7 +1654,7 @@ export class WorkStateClient implements WorkStateStore {
     const tokenEnv = tokenEnvOverride ?? this.connection.tokenEnv ?? 'CYRENE_SESSION_TOKEN';
     const token = process.env[tokenEnv];
     if (!token) throw new Error(`Missing persistence credential in ${tokenEnv}`);
-    const requestTimeoutMs = timeoutMs ?? this.connection.requestTimeoutMs ?? 10_000;
+    const requestTimeoutMs = timeoutMs ?? this.connection.requestTimeoutMs ?? Number(process.env.CYRENE_PERSISTENCE_REQUEST_TIMEOUT_MS ?? 45_000);
     const timeoutSignal = AbortSignal.timeout(requestTimeoutMs);
     const requestSignal = signal === undefined ? timeoutSignal : AbortSignal.any([signal, timeoutSignal]);
     const response = await fetch(url, {

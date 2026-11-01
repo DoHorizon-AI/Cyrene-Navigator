@@ -124,6 +124,7 @@ export interface ConversationMemoryApiV1 {
       readonly conversationId: string;
       readonly conversationKind: ConversationKind;
       readonly order: 'desc';
+      readonly personaId?: string | null;
       readonly cursor?: string;
       readonly limit: number;
       readonly includeRevoked?: boolean;
@@ -456,6 +457,7 @@ export function createConversationMemoryFeature(options: ConversationMemoryFeatu
           const page = await options.api.listMessages(context, {
             conversationId: context.conversationId,
             conversationKind: context.conversationKind,
+            personaId: context.personaId,
             order: 'desc',
             ...(cursor === undefined ? {} : { cursor }),
             limit: 100,

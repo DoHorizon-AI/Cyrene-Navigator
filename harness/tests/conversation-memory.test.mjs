@@ -539,3 +539,28 @@ test('correction and deletion read an active version and issue one compare-and-s
   });
   assert.equal(calls.revocation.length, 1);
 });
+
+test('afterTurn supplies personaId in listMessages to match scoped unarchived messages', async () => {
+  let listMessagesInput;
+  const { api } = baseApi({
+    async listMessages(context, input) {
+      listMessagesInput = input;
+      return { items: [], nextCursor: null };
+    },
+  });
+  const feature = createConversationMemoryFeature({ api, summaryProvider: summaryProvider() });
+  const context = trustedContext({ personaId: 'persona-alpha' });
+
+  await feature.beforeContext(context, { query: 'query' });
+  await feature.afterTurn(context, {
+    userEventId: 'evt-user-persona',
+    assistantText: 'Assistant answer',
+    status: 'completed',
+    sourceRefs: [],
+  });
+
+  assert.ok(listMessagesInput);
+  assert.equal(listMessagesInput.conversationId, context.conversationId);
+  assert.equal(listMessagesInput.conversationKind, context.conversationKind);
+  assert.equal(listMessagesInput.personaId, 'persona-alpha');
+});

@@ -375,7 +375,12 @@ test('signed personal Teams intake creates only actor-owned route-free tasks and
     );
     assert.ok(firstTask);
     assert.equal(firstTask.prompt, firstText);
-    assert.deepEqual(firstTask.metadata, {});
+    // The private Teams turn carries its conversation ingress identity so the owner-scoped
+    // memory feature can archive the exact user event. No route, thread or channel target may
+    // be attached, which is what keeps the task route-free.
+    assert.deepEqual(Object.keys(firstTask.metadata), ['conversationIngress']);
+    assert.equal(firstTask.metadata.conversationIngress.content, firstText);
+    assert.match(firstTask.metadata.conversationIngress.eventId, /^teams-private-event-[0-9a-f]{64}$/u);
     assert.deepEqual(firstTask.origin, {
       kind: 'teams_private',
       messageId: 'private-owner-1',

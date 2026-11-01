@@ -19,10 +19,11 @@ const EXECUTOR_TOKEN = 'conversation-executor-test-token';
 process.env.CYRENE_CONVERSATION_TEST_TOKEN = EXECUTOR_TOKEN;
 
 class ConversationAdapter extends LlmAdapter {
-  constructor() {
+  constructor({ trailingWhitespace = '' } = {}) {
     super();
     this.summaryCalls = 0;
     this.prompts = [];
+    this.trailingWhitespace = trailingWhitespace;
   }
 
   async *stream(options) {
@@ -36,9 +37,10 @@ class ConversationAdapter extends LlmAdapter {
       : currentMessage.includes('Repeat the earlier marker.')
         ? 'Earlier assistant-only finding: RESPONSE-SIDE-ALDER-92'
         : `Answer for ${currentMessage}`;
+    const delivered = reply + this.trailingWhitespace;
     yield { type: 'block-start', index: 0, blockType: 'text' };
-    yield { type: 'text-delta', index: 0, text: reply };
-    yield { type: 'block-end', index: 0, block: { type: 'text', text: reply } };
+    yield { type: 'text-delta', index: 0, text: delivered };
+    yield { type: 'block-end', index: 0, block: { type: 'text', text: delivered } };
     yield { type: 'finish', reason: { kind: 'stop' } };
   }
 }
@@ -172,10 +174,10 @@ function webTurn(taskId, sessionId, prompt) {
   };
 }
 
-async function makeApp(denyDelivery) {
+async function makeApp(denyDelivery, adapterOptions = {}) {
   const store = new InMemoryWorkStateStore(ACTOR_ID);
   const { calls, messages, memories, deniedSources } = installConversationApi(store, { denyDelivery });
-  const adapter = new ConversationAdapter();
+  const adapter = new ConversationAdapter(adapterOptions);
   const app = await createExecutorApp({
     testMode: true,
     workStateStore: store,
@@ -231,6 +233,24 @@ test('conversation assistant persists the user turn and emits text only after th
     const task = await store.getTask(outcome.taskId);
     assert.equal(task.status, 'completed');
     assert.equal(task.output, outcome.output);
+  } finally {
+    await app.executor.dispose();
+    await app.pluginManager?.dispose();
+    await app.ctx.fiber.dispose();
+  }
+});
+
+test('conversation assistant trims surrounding model whitespace before the exact Work readback', async () => {
+  const { app, messages } = await makeApp(false, { trailingWhitespace: '\n\n  ' });
+  try {
+    const outcome = await app.executor.executeTask(
+      webTurn('conversation-trimmed', 'web-conversation-trimmed', 'Keep the reply clean.'),
+      () => {},
+    );
+    assert.equal(outcome.status, 'completed');
+    assert.equal(outcome.output, 'Answer for Keep the reply clean.');
+    const assistant = messages.find(message => message.role === 'assistant');
+    assert.equal(assistant.content, outcome.output);
   } finally {
     await app.executor.dispose();
     await app.pluginManager?.dispose();
@@ -492,6 +512,69 @@ test('conversation assistant summaries use the active DSH model route and persis
     assert.equal(memories[0].kind, 'episode');
     assert.ok(memories[0].sourceMessageIds.length >= 8);
     assert.ok(calls.includes('create-memory'));
+  } finally {
+    await app.executor.dispose();
+    await app.pluginManager?.dispose();
+    await app.ctx.fiber.dispose();
+  }
+});
+
+test('projectConversationAssistantTaskRead projects safe error codes and falls back to CONVERSATION_ASSISTANT_NOT_DELIVERED', async () => {
+  const { app, store } = await makeApp(false);
+  const server = await app.executor.startServer(0, '127.0.0.1');
+  try {
+    const origin = { kind: 'web', conversationKind: 'direct', conversationId: 'conv-safe-err' };
+
+    const taskSafe = await store.createTask({
+      id: 'task-safe-err-1',
+      sessionId: 'session-safe-1',
+      prompt: 'Top secret prompt 1',
+      executionClass: 'foreground',
+      metadata: { navigatorConversationOrigin: origin },
+    });
+    await store.patchTask(taskSafe.id, { status: 'failed', error: 'MEMORY_PROVIDER_UNAVAILABLE' });
+
+    const taskEmbedded = await store.createTask({
+      id: 'task-safe-err-2',
+      sessionId: 'session-safe-2',
+      prompt: 'Top secret prompt 2',
+      executionClass: 'foreground',
+      metadata: { navigatorConversationOrigin: origin },
+    });
+    await store.patchTask(taskEmbedded.id, { status: 'failed', error: 'task aborted with code=EXECUTION_FAILED internally' });
+
+    const taskUnsafe = await store.createTask({
+      id: 'task-unsafe-err-3',
+      sessionId: 'session-safe-3',
+      prompt: 'Top secret prompt 3',
+      executionClass: 'foreground',
+      metadata: { navigatorConversationOrigin: origin },
+    });
+    await store.patchTask(taskUnsafe.id, { status: 'failed', error: 'unhandled exception at /internal/secrets/crypto.ts:88 with sensitive token dump' });
+
+    const read = async id => (await fetch(`${server.url}/api/v1/tasks/${id}`, {
+      headers: { Authorization: `Bearer ${EXECUTOR_TOKEN}` },
+    })).json();
+
+    const readSafe = await read(taskSafe.id);
+    assert.equal(readSafe.status, 'failed');
+    assert.equal(readSafe.error, 'MEMORY_PROVIDER_UNAVAILABLE');
+    assert.equal(readSafe.prompt, '');
+    assert.equal(readSafe.output, '');
+    assert.equal(readSafe.reasoning, '');
+    assert.deepEqual(readSafe.metadata, {});
+
+    const readEmbedded = await read(taskEmbedded.id);
+    assert.equal(readEmbedded.status, 'failed');
+    assert.equal(readEmbedded.error, 'EXECUTION_FAILED');
+    assert.equal(readEmbedded.prompt, '');
+
+    const readUnsafe = await read(taskUnsafe.id);
+    assert.equal(readUnsafe.status, 'failed');
+    assert.equal(readUnsafe.error, 'CONVERSATION_ASSISTANT_NOT_DELIVERED');
+    assert.equal(readUnsafe.prompt, '');
+    assert.equal(readUnsafe.output, '');
+    assert.equal(readUnsafe.reasoning, '');
   } finally {
     await app.executor.dispose();
     await app.pluginManager?.dispose();

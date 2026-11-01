@@ -16,7 +16,8 @@ import json
 import re
 import sqlite3
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -345,12 +346,18 @@ class ConversationMemoryStore:
                        actor_id,message_id,source_message_id) VALUES(?,?,?,?,?)""",
                     (org, workspace, actor, message_id, source_id),
                 )
+            seen_message_memory_ids: set[str] = set()
             for ref in memory_refs:
+                mid = str(ref["memoryId"])
+                if mid in seen_message_memory_ids:
+                    continue
+                seen_message_memory_ids.add(mid)
                 conn.execute(
-                    """INSERT INTO conversation_memory_message_memory_sources(organization_id,
+                    """INSERT OR REPLACE INTO
+                       conversation_memory_message_memory_sources(organization_id,
                        workspace_id,actor_id,message_id,source_memory_id,source_memory_version)
                        VALUES(?,?,?,?,?,?)""",
-                    (org, workspace, actor, message_id, ref["memoryId"], ref["memoryVersion"]),
+                    (org, workspace, actor, message_id, mid, ref["memoryVersion"]),
                 )
             row = conn.execute(
                 """SELECT * FROM conversation_memory_messages WHERE organization_id=?
@@ -587,12 +594,18 @@ class ConversationMemoryStore:
                        actor_id,memory_id,source_message_id) VALUES(?,?,?,?,?)""",
                     (org, workspace, actor, memory_id, source_id),
                 )
+            seen_item_memory_ids: set[str] = set()
             for ref in memory_refs:
+                mid = str(ref["memoryId"])
+                if mid in seen_item_memory_ids:
+                    continue
+                seen_item_memory_ids.add(mid)
                 conn.execute(
-                    """INSERT INTO conversation_memory_item_memory_sources(organization_id,
+                    """INSERT OR REPLACE INTO
+                       conversation_memory_item_memory_sources(organization_id,
                        workspace_id,actor_id,memory_id,source_memory_id,source_memory_version)
                        VALUES(?,?,?,?,?,?)""",
-                    (org, workspace, actor, memory_id, ref["memoryId"], ref["memoryVersion"]),
+                    (org, workspace, actor, memory_id, mid, ref["memoryVersion"]),
                 )
             row = conn.execute(
                 """SELECT * FROM conversation_memory_items WHERE organization_id=?
@@ -1706,7 +1719,9 @@ class ConversationMemoryStore:
         if row is None or str(row["status"]) != "active":
             return False
         source_persona = row["persona_id"]
-        if source_persona is not None and source_persona != persona_id:
+        # An explicit persona read stays inside that persona. An owner read without a persona
+        # is the host-bound conversation scope, which must still return its own messages.
+        if persona_id is not None and source_persona is not None and source_persona != persona_id:
             return False
         owner = str(row["actor_id"])
         if owner == actor:
@@ -1772,7 +1787,8 @@ class ConversationMemoryStore:
         if owner != requester_actor and visibility == "private":
             return False
         memory_persona = row["persona_id"]
-        if memory_persona is not None and memory_persona != persona_id:
+        # Same rule as message lineage: only an explicit persona narrows the read scope.
+        if persona_id is not None and memory_persona is not None and memory_persona != persona_id:
             return False
         source_ids = json.loads(str(row["source_message_ids_json"]))
         if not all(
@@ -1901,57 +1917,56 @@ class ConversationMemoryStore:
     def _invalidate_source_dependents(
         self, conn: sqlite3.Connection, org: str, workspace: str, source_id: str, now: int
     ) -> tuple[list[str], list[str]]:
-        affected_sources = {source_id}
+        visited_sources: set[str] = set()
+        pending_sources: set[str] = {source_id}
         message_ids: set[str] = set()
         memory_ids: set[str] = set()
-        while True:
-            placeholders = ",".join("?" for _ in affected_sources)
+        while pending_sources:
+            current_sources = pending_sources - visited_sources
+            if not current_sources:
+                break
+            visited_sources.update(current_sources)
+            placeholders = ",".join("?" for _ in current_sources)
             found_messages = conn.execute(
                 f"""SELECT DISTINCT message_id FROM conversation_memory_message_sources
                     WHERE organization_id=? AND workspace_id=?
                       AND source_message_id IN ({placeholders})""",
-                (org, workspace, *sorted(affected_sources)),
+                (org, workspace, *sorted(current_sources)),
             ).fetchall()
-            new_messages = {str(row[0]) for row in found_messages} - message_ids - affected_sources
+            new_messages = {str(row[0]) for row in found_messages} - message_ids - visited_sources
             found_memories = conn.execute(
                 f"""SELECT DISTINCT memory_id FROM conversation_memory_item_sources
                     WHERE organization_id=? AND workspace_id=?
                       AND source_message_id IN ({placeholders})""",
-                (org, workspace, *sorted(affected_sources)),
+                (org, workspace, *sorted(current_sources)),
             ).fetchall()
             new_memories = {str(row[0]) for row in found_memories} - memory_ids
-            memory_refs = (
-                conn.execute(
-                    f"""SELECT DISTINCT message_id FROM conversation_memory_message_memory_sources
-                    WHERE organization_id=? AND workspace_id=? AND source_memory_id IN
-                    (SELECT memory_id FROM conversation_memory_items WHERE organization_id=?
-                     AND workspace_id=? AND memory_id IN ({placeholders}))""",
-                    (org, workspace, org, workspace, *sorted(memory_ids | new_memories)),
+            if new_memories:
+                mem_placeholders = ",".join("?" for _ in new_memories)
+                memory_refs = conn.execute(
+                    f"""SELECT DISTINCT message_id
+                        FROM conversation_memory_message_memory_sources
+                        WHERE organization_id=? AND workspace_id=?
+                          AND source_memory_id IN ({mem_placeholders})""",
+                    (org, workspace, *sorted(new_memories)),
                 ).fetchall()
-                if memory_ids or new_memories
-                else []
-            )
-            new_messages.update(str(row[0]) for row in memory_refs)
-            memory_dependents = (
-                conn.execute(
-                    f"""SELECT DISTINCT i.memory_id FROM conversation_memory_item_memory_sources s
-                    JOIN conversation_memory_items i ON i.organization_id=s.organization_id
-                     AND i.workspace_id=s.workspace_id AND i.actor_id=s.actor_id
-                     AND i.memory_id=s.memory_id
-                    WHERE s.organization_id=? AND s.workspace_id=? AND s.source_memory_id IN
-                    (SELECT memory_id FROM conversation_memory_items WHERE organization_id=?
-                     AND workspace_id=? AND memory_id IN ({placeholders}))""",
-                    (org, workspace, org, workspace, *sorted(memory_ids | new_memories)),
+                unseen_refs = {str(row[0]) for row in memory_refs} - message_ids - visited_sources
+                new_messages.update(unseen_refs)
+                memory_dependents = conn.execute(
+                    f"""SELECT DISTINCT i.memory_id
+                        FROM conversation_memory_item_memory_sources s
+                        JOIN conversation_memory_items i ON i.organization_id=s.organization_id
+                         AND i.workspace_id=s.workspace_id AND i.actor_id=s.actor_id
+                         AND i.memory_id=s.memory_id
+                        WHERE s.organization_id=? AND s.workspace_id=?
+                          AND s.source_memory_id IN ({mem_placeholders})""",
+                    (org, workspace, *sorted(new_memories)),
                 ).fetchall()
-                if memory_ids or new_memories
-                else []
-            )
-            new_memories.update(str(row[0]) for row in memory_dependents)
-            if not new_messages and not new_memories:
-                break
+                new_memories.update({str(row[0]) for row in memory_dependents} - memory_ids)
+
             message_ids.update(new_messages)
             memory_ids.update(new_memories)
-            affected_sources.update(new_messages)
+            pending_sources = new_messages
         if message_ids:
             placeholders = ",".join("?" for _ in message_ids)
             conn.execute(
@@ -2125,14 +2140,24 @@ class ConversationMemoryStore:
             "status": str(row["status"]),
         }
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         """Open a short-lived SQLite connection with strict timeout and foreign-key policy."""
 
         conn = sqlite3.connect(self._db_path, timeout=10, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=10000")
-        return conn
+        try:
+            yield conn
+            if conn.in_transaction:
+                conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
 
 
 def _scope(organization_id: str | None, workspace_id: str, actor_id: str) -> tuple[str, str, str]:

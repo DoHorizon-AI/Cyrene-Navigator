@@ -190,6 +190,10 @@ def main() -> None:
         config.teams_private_conversations, os.environ
     )
     capabilities = build_conversation_capabilities(environment=os.environ)
+    summarizer_available = (
+        os.environ.get("CYRENE_CONVERSATION_ASSISTANT_ENABLED") == "true"
+        or os.environ.get("CYRENE_CONVERSATION_SUMMARIZER_AVAILABLE") == "true"
+    )
     try:
         app = create_persistence_app(
             args.database,
@@ -202,6 +206,7 @@ def main() -> None:
             conversation_memory_embedding_client=capabilities.embedding_client,
             conversation_memory_provider=capabilities.memory_provider,
             conversation_graph_provider=capabilities.knowledge_graph_provider,
+            conversation_memory_summarizer_available=summarizer_available,
         )
     except BaseException:
         capabilities.close()
