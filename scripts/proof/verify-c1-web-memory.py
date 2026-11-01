@@ -222,7 +222,12 @@ def main() -> int:
             if last.get("status") == "completed":
                 return last
             message = str(last.get("error") or last.get("message") or "")
-            if "Deadline Exceeded" not in message and "before terminal completion" not in message:
+            is_transient = (
+                "timeout" in message.lower()
+                or "deadline" in message.lower()
+                or "before terminal completion" in message.lower()
+            )
+            if not is_transient:
                 return last
             model_retries.append({"task_id": str(receipt["taskId"]), "error": message[:120]})
         return last
