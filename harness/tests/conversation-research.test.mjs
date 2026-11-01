@@ -15,12 +15,28 @@ const scope = {
 };
 const now = Date.UTC(2026, 9, 31, 12);
 const sourceRefs = [{ memoryId: null, memoryVersion: null, sourceMessageIds: ['source-message-1'] }];
+const sourceEvidence = [{
+  sourceRef: `sha256:${sha('source-reference-1')}`,
+  kind: 'web',
+  title: 'Release guide',
+  url: 'https://example.test/release-guide',
+  sourceSha256: sha('source bytes'),
+  retrievedAt: now,
+}];
 
 function context(overrides = {}) {
   return { ...scope, taskId: 'task-1', sessionId: 'session-1', signal: new AbortController().signal, ...overrides };
 }
 
 function sha(value) { return createHash('sha256').update(value).digest('hex'); }
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
 
 function userMessage() {
   return {
@@ -32,18 +48,20 @@ function userMessage() {
 
 function receipt(id, overrides = {}) {
   return {
-    id, workspaceId: scope.workspaceId, actorId: scope.actorId, taskId: 'task-with-verified-work-result',
+    id, trustedProducer: 'conversation-research-runtime', workspaceId: scope.workspaceId, actorId: scope.actorId,
+    taskId: 'task-with-verified-work-result',
     taskStatus: 'completed', taskOutputSha256: sha(`task-output:${id}`),
-    status: 'verified', operationType: 'tool.provider.v1:documents.read', effect: 'read',
+    status: 'verified', operationType: 'conversation.research.read.v1', effect: 'read',
     resultSha256: sha(`result:${id}`), contentSha256: sha(`content:${id}`), targetDigestSha256: sha('target'),
-    sourceRefs, verifiedAt: now, ...overrides,
+    sourceRefs, sourceEvidence, verifiedAt: now, ...overrides,
   };
 }
 
 function makeDependencies(overrides = {}) {
-  const calls = { notes: [], skills: [], watches: [], scheduleUpdates: [], authorizations: [], taskRuns: [], schedules: [], cancellations: [] };
+  const calls = { notes: [], skills: [], watches: [], scheduleUpdates: [], authorizations: [], taskRuns: [], finalizations: [], watchObservations: [], schedules: [], cancellations: [] };
   let watches = [];
   let nextReceiptById = new Map();
+  const completedTasks = new Map();
   let messages = [userMessage()];
   const api = {
     apiVersion: 1,
@@ -82,13 +100,41 @@ function makeDependencies(overrides = {}) {
     async listResearchNotes() { return { items: [] }; },
     async createVerifiedSkill(_ctx, input) {
       calls.skills.push(input);
-      return { skill: { id: 'skill-1', revision: 1, verified: true, verifiedBy: 'server-actor', verifiedAt: now, createdAt: now, ...input }, duplicate: false };
+      const write = nextReceiptById.get(input.operationReceiptId);
+      const readback = nextReceiptById.get(input.independentReadReceiptId);
+      const writeEvidence = write.skillWriteEvidence;
+      const readbackEvidence = readback.skillReadbackEvidence;
+      return {
+        skill: {
+          id: 'skill-1', revision: 1, verified: true, verifiedBy: 'server-actor', verifiedAt: now, createdAt: now,
+          evidence: {
+            actionId: writeEvidence.actionId,
+            targetDigestSha256: writeEvidence.targetDigestSha256,
+            inputSha256: writeEvidence.inputSha256,
+            guideVersion: writeEvidence.guideVersion,
+            guideSha256: writeEvidence.guideSha256,
+            effectOutcome: writeEvidence.effectOutcome,
+            effectResultSha256: writeEvidence.effectResultSha256,
+            effectReadbackOutcome: readbackEvidence.effectReadbackOutcome,
+            effectReadbackSha256: readbackEvidence.effectReadbackSha256,
+            readbackVerified: readbackEvidence.readbackVerified,
+            sourceRef: writeEvidence.sourceRef,
+            canonicalUrl: writeEvidence.canonicalUrl,
+            sourceSha256: writeEvidence.sourceSha256,
+            workArtifactSha256: writeEvidence.workArtifactSha256,
+          },
+          ...input,
+        },
+        duplicate: false,
+      };
     },
     async listVerifiedSkills() { return { items: [] }; },
     async createWatch(_ctx, input) {
       calls.watches.push(input);
       const watch = {
         id: 'watch-1', version: 1, state: 'active', nextCheckAt: input.nextCheckAt,
+        lastResultSha256: null, lastOperationReceiptId: null,
+        ownerTaskId: _ctx.taskId, ownerSessionId: _ctx.sessionId,
         createdAt: now, updatedAt: now, ...input,
       };
       watches = [watch];
@@ -113,6 +159,20 @@ function makeDependencies(overrides = {}) {
       watches = [updated];
       return { watch: updated };
     },
+    async recordWatchObservation(_ctx, id, input) {
+      calls.scheduleUpdates.push({ id, input });
+      const current = watches.find(watch => watch.id === id);
+      if (!current || current.version !== input.expectedVersion) throw new Error('watch CAS mismatch');
+      const updated = {
+        ...current,
+        nextCheckAt: input.nextCheckAt,
+        lastResultSha256: input.resultSha256,
+        lastOperationReceiptId: input.operationReceiptId,
+        version: current.version + 1,
+      };
+      watches = [updated];
+      return { watch: updated };
+    },
     async createFocusItem() { throw new Error('not used'); },
     async listFocusItems() { return { items: [] }; },
     async transitionFocusItem() { throw new Error('not used'); },
@@ -129,12 +189,36 @@ function makeDependencies(overrides = {}) {
       if (!value) throw new Error(`missing receipt ${id}`);
       return value;
     },
+    async finalize(_ctx, childTask, input) {
+      calls.finalizations.push({ childTask, input });
+      const completed = completedTasks.get(childTask.taskId);
+      if (!completed) throw new Error('finalizer requires a completed Task');
+      assert.equal(completed.outcome.status, 'completed');
+      assert.deepEqual(input.sourceRefs, completed.request.metadata.sourceRefs);
+      const envelope = JSON.parse(completed.outcome.output);
+      const operationId = completed.request.metadata.source === 'conversation-watch'
+        ? 'operation-watch-1' : 'operation-read-1';
+      const prior = nextReceiptById.get(operationId);
+      nextReceiptById.set(operationId, {
+        ...prior,
+        taskId: childTask.taskId,
+        taskStatus: 'completed',
+        taskOutputSha256: sha(completed.outcome.output),
+        resultSha256: envelope.resultSha256,
+        contentSha256: overrides.finalizedReceiptContentSha256 ?? envelope.contentSha256,
+        sourceRefs: input.sourceRefs,
+        sourceEvidence: envelope.sourceEvidence,
+      });
+      return { operationId };
+    },
   };
   const tasks = {
     async runFeatureTask(_ctx, request, operation, signal) {
       calls.taskRuns.push(request);
       const output = await operation({ id: request.sessionId }, signal);
-      return { taskId: request.taskId, sessionId: request.sessionId, status: 'completed', output, reasoning: '', durationMs: 1 };
+      const outcome = { taskId: request.taskId, sessionId: request.sessionId, status: 'completed', output, reasoning: '', durationMs: 1 };
+      completedTasks.set(request.taskId, { request, outcome });
+      return outcome;
     },
     async cancelFeatureTask(_ctx, taskId) { calls.cancellations.push(taskId); return true; },
   };
@@ -146,73 +230,150 @@ function makeDependencies(overrides = {}) {
     async cancel(marker) { calls.cancellations.push(marker); return 1; },
   };
   const readResult = {
-    operationId: 'operation-read-1', title: 'Release guide', content: 'A sourced release guide result.',
+    artifactId: 'research-artifact-1', title: 'Release guide', content: 'A sourced release guide result.',
     resultSha256: sha('result:operation-read-1'), contentSha256: sha('A sourced release guide result.'),
+    sourceEvidence,
   };
   nextReceiptById.set('operation-read-1', receipt('operation-read-1', { contentSha256: readResult.contentSha256 }));
   const readerProvider = { apiVersion: 1, async read() { return readResult; } };
   const watcher = {
     apiVersion: 1,
-    async observe() {
+    async observe(input) {
+      calls.watchObservations.push(input);
       const result = {
-        operationId: 'operation-watch-1', title: 'Release changed', content: 'The release guide changed.',
+        artifactId: 'watch-artifact-1', title: 'Release changed', content: 'The release guide changed.',
         resultSha256: sha('result:operation-watch-1'), contentSha256: sha('The release guide changed.'),
-        changed: true, nextCheckAt: now + 60 * 60_000,
+        sourceEvidence,
       };
-      nextReceiptById.set('operation-watch-1', receipt('operation-watch-1', { contentSha256: result.contentSha256 }));
+      nextReceiptById.set('operation-watch-1', receipt('operation-watch-1', {
+        contentSha256: result.contentSha256,
+        sourceRefs: input.sourceRefs,
+      }));
       return result;
     },
   };
+  const skillEvidenceProducer = {
+    apiVersion: 1,
+    async execute(_ctx, _childTask, input) {
+      const targetDigestSha256 = sha(canonicalJson(input.target));
+      const inputSha256 = sha(canonicalJson(input.actionInput));
+      const guideSha256 = sha(input.guideText);
+      const effectResultSha256 = sourceEvidence[0].sourceSha256;
+      const workArtifactSha256 = sha('verified guide artifact bytes');
+      const writeId = 'operation-write-1';
+      const readbackId = 'operation-readback-1';
+      nextReceiptById.set(writeId, receipt(writeId, {
+        taskId: 'skill-write-task',
+        operationType: 'conversation.skill.verify',
+        effect: 'write',
+        independentReadOperationId: readbackId,
+        targetDigestSha256,
+        sourceRefs: input.sourceRefs,
+        skillWriteEvidence: {
+          actionId: input.actionId,
+          targetDigestSha256,
+          inputSha256,
+          guideVersion: input.guideVersion,
+          guideSha256,
+          effectOperationId: 'effect-operation-1',
+          effectOutcome: 'verified',
+          effectResultSha256,
+          readbackReceiptId: readbackId,
+          sourceRef: sourceEvidence[0].sourceRef,
+          canonicalUrl: sourceEvidence[0].url,
+          sourceSha256: sourceEvidence[0].sourceSha256,
+          workArtifactSha256,
+        },
+      }));
+      nextReceiptById.set(readbackId, receipt(readbackId, {
+        taskId: 'skill-readback-task',
+        operationType: 'conversation.skill.readback',
+        effect: 'read',
+        targetDigestSha256,
+        sourceRefs: input.sourceRefs,
+        skillReadbackEvidence: {
+          actionId: input.actionId,
+          targetDigestSha256,
+          inputSha256,
+          guideVersion: input.guideVersion,
+          guideSha256,
+          effectOperationId: 'effect-operation-1',
+          sourceRef: sourceEvidence[0].sourceRef,
+          canonicalUrl: sourceEvidence[0].url,
+          sourceSha256: sourceEvidence[0].sourceSha256,
+          workArtifactSha256,
+          effectReadbackOutcome: 'verified',
+          effectReadbackSha256: effectResultSha256,
+          readbackVerified: true,
+        },
+      }));
+      return { writeOperationId: writeId, readbackOperationId: readbackId };
+    },
+  };
   const feature = createResearchWorkFeature({
-    api, receipts: reader, reader: readerProvider, watcher, tasks, scheduler, now: () => now,
+    api, receipts: reader, reader: readerProvider, watcher, skillEvidenceProducer, tasks, scheduler, now: () => now,
   });
-  return { feature, calls, api, reader, readerProvider, watcher, tasks, scheduler, setReceipt(id, value) { nextReceiptById.set(id, value); } };
+  return { feature, calls, api, reader, readerProvider, watcher, skillEvidenceProducer, tasks, scheduler, setReceipt(id, value) { nextReceiptById.set(id, value); } };
 }
 
 test('research notes require a completed DSH read task and exact verified Work receipt source', async () => {
   const env = makeDependencies();
-  const note = await env.feature.research(context(), { query: 'Read the release guide.', idempotencyKey: 'research-1' });
+  const note = await env.feature.research(context(), { query: 'Read the release guide.', idempotencyKey: 'research-1', sourceRefs });
   assert.equal(note.id, 'note-1');
   assert.equal(env.calls.taskRuns.length, 1);
+  assert.equal(env.calls.taskRuns[0].metadata.parentTaskId, context().taskId);
+  assert.equal(env.calls.taskRuns[0].metadata.parentSessionId, context().sessionId);
+  assert.equal(env.calls.taskRuns[0].metadata.conversationKind, 'direct');
+  assert.deepEqual(env.calls.taskRuns[0].metadata.sourceRefs, sourceRefs);
+  assert.equal(env.calls.finalizations[0].childTask.taskId, env.calls.taskRuns[0].taskId);
   assert.deepEqual(env.calls.notes[0].sourceRefs, sourceRefs);
+  assert.equal(env.calls.notes[0].researchOperationReceiptId, 'operation-read-1');
   assert.equal(env.calls.notes[0].conversationKind, 'direct');
   assert.equal(env.calls.authorizations.at(-1).sourceRefs[0].sourceMessageIds[0], 'source-message-1');
 });
 
 test('research does not save text that differs from its completed Work receipt', async () => {
   const env = makeDependencies({
+    finalizedReceiptContentSha256: sha('different content'),
     api: {
       async createResearchNote() { throw new Error('must not store unverified text'); },
     },
   });
-  env.setReceipt('operation-read-1', receipt('operation-read-1', { contentSha256: sha('different content') }));
-  await assert.rejects(env.feature.research(context(), { query: 'Read it.', idempotencyKey: 'research-2' }), /does not match its Work operation receipt/u);
+  await assert.rejects(env.feature.research(context(), { query: 'Read it.', idempotencyKey: 'research-2', sourceRefs }), /does not match its Work operation receipt/u);
   assert.equal(env.calls.notes.length, 0);
 });
 
-test('verified skill requires a successful write receipt and independent readback of the exact skill content', async () => {
+test('verified skill requires a host-produced action and independent effect readback', async () => {
   const env = makeDependencies();
   const content = 'Use the approved release procedure.';
-  const write = receipt('operation-write-1', {
-    effect: 'write',
-    operationType: 'tool.provider.v1:documents.write',
-    independentReadOperationId: 'operation-readback-1',
-    resultSha256: sha('write result'),
-    contentSha256: sha('write result'),
-  });
-  const readback = receipt('operation-readback-1', {
-    contentSha256: sha(content),
-    resultSha256: sha('readback result'),
-  });
-  env.setReceipt(write.id, write);
-  env.setReceipt(readback.id, readback);
+  const target = { documentId: 'release-plan-1' };
+  const actionInput = { approvedText: 'new release checklist' };
   const skill = await env.feature.createVerifiedSkill(context(), {
-    operationId: write.id, readbackOperationId: readback.id, name: 'Release procedure', content,
+    actionId: 'public-web.lookup', target, actionInput, guideVersion: 4,
+    sourceRefs, name: 'Release procedure', content,
   });
   assert.equal(skill.verified, true);
-  assert.equal(env.calls.skills[0].operationReceiptId, write.id);
-  assert.equal(env.calls.skills[0].independentReadReceiptId, readback.id);
+  assert.equal(env.calls.skills[0].operationReceiptId, 'operation-write-1');
+  assert.equal(env.calls.skills[0].independentReadReceiptId, 'operation-readback-1');
+  assert.equal(env.calls.skills[0].actionId, 'public-web.lookup');
+  assert.equal(env.calls.skills[0].guideVersion, '4');
+  assert.equal(skill.evidence.effectOutcome, 'verified');
+  assert.equal(skill.evidence.effectReadbackSha256, skill.evidence.effectResultSha256);
   assert.deepEqual(env.calls.skills[0].sourceRefs, sourceRefs);
+});
+
+test('verified skill fails closed without a real action and readback producer', async () => {
+  const env = makeDependencies();
+  const feature = createResearchWorkFeature({
+    api: env.api, receipts: env.reader, reader: env.readerProvider, watcher: env.watcher,
+    tasks: env.tasks, scheduler: env.scheduler, now: () => now,
+  });
+  await assert.rejects(feature.createVerifiedSkill(context(), {
+    actionId: 'public-web.lookup', target: { documentId: 'release-plan-1' },
+    actionInput: { approvedText: 'new release checklist' }, guideVersion: 4,
+    sourceRefs, name: 'Release procedure', content: 'Use the approved release procedure.',
+  }), error => error.code === 'SKILL_EVIDENCE_PRODUCER_UNAVAILABLE');
+  assert.equal(env.calls.skills.length, 0);
 });
 
 test('scheduled watch verifies its read receipt before saving a sourced note and reschedules by CAS', async () => {
@@ -229,9 +390,20 @@ test('scheduled watch verifies its read receipt before saving a sourced note and
   assert.equal(env.calls.scheduleUpdates.length, 1);
   assert.equal(env.calls.schedules.length, 2);
   assert.equal(env.calls.scheduleUpdates[0].input.expectedVersion, 1);
+  assert.equal(env.calls.taskRuns.at(-1).metadata.parentTaskId, context().taskId);
+  assert.equal(env.calls.taskRuns.at(-1).metadata.parentSessionId, watch.ownerSessionId);
+  assert.deepEqual(env.calls.taskRuns.at(-1).metadata.sourceRefs, watch.sourceRefs);
+  assert.equal(env.calls.finalizations.at(-1).childTask.taskId, env.calls.taskRuns.at(-1).taskId);
+  assert.equal(env.calls.taskRuns.at(-1).metadata.sourceRefsDigest, sha(canonicalJson(watch.sourceRefs)));
+  const priorResultSha256 = sha('result:operation-watch-1');
+  const repeated = await env.feature.runScheduledWatch(context(), watch.id);
+  assert.equal(repeated.note, undefined, 'a repeated result digest does not create a second note');
+  assert.equal(env.calls.notes.length, 1);
+  assert.equal(env.calls.watchObservations[1].previousResultSha256, priorResultSha256);
   assert.equal(env.calls.notes[0].sourceRefs.length, 1);
-  assert.deepEqual(env.calls.notes[0].sourceRefs[0].sourceMessageIds, ['source-message-1', 'user-message-1'],
-    'note retains the union of user authorization and verified read result lineage');
+  assert.equal(env.calls.notes[0].researchOperationReceiptId, 'operation-watch-1');
+  assert.deepEqual(env.calls.notes[0].sourceRefs[0].sourceMessageIds, ['user-message-1'],
+    'read receipt lineage comes from the exact source refs attached to the watch Task');
 });
 
 test('watch recovery pages through more than 500 actor-owned records', async () => {
@@ -272,7 +444,7 @@ test('disabled research modules retain data and refuse new reads or watches', as
     enabled: false,
     now: () => now,
   });
-  await assert.rejects(disabled.research(context(), { query: 'read', idempotencyKey: 'disabled' }), /disabled/u);
+  await assert.rejects(disabled.research(context(), { query: 'read', idempotencyKey: 'disabled', sourceRefs }), /disabled/u);
   await assert.rejects(disabled.createWatch(context(), { userEventId: 'user-event-1', title: 'x', condition: 'y' }), /disabled/u);
   assert.equal(env.calls.notes.length, 0);
   assert.equal(env.calls.watches.length, 0);
