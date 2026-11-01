@@ -164,6 +164,30 @@ export interface ConversationMemoryApiV1 {
       readonly validUntil?: number;
     },
   ): Promise<{ readonly memory: ConversationMemory; readonly duplicate: boolean }>;
+  updateMemory(
+    context: TrustedTurnContext,
+    memoryId: string,
+    input: {
+      readonly expectedVersion: number;
+      readonly text?: string;
+      readonly validUntil?: number;
+    },
+  ): Promise<{ readonly memory: ConversationMemory; readonly duplicate: boolean }>;
+  deleteMemory(
+    context: TrustedTurnContext,
+    memoryId: string,
+    expectedVersion: number,
+  ): Promise<{ readonly deleted: boolean; readonly duplicate: boolean; readonly authorizationEpoch: number }>;
+  revokeSource(
+    context: TrustedTurnContext,
+    sourceId: string,
+  ): Promise<{
+    readonly sourceId: string;
+    readonly authorizationEpoch: number;
+    readonly invalidatedCount: number;
+    readonly invalidatedMessageIds: readonly string[];
+    readonly invalidatedMemoryIds: readonly string[];
+  }>;
   authorizeSources(
     context: TrustedTurnContext,
     input: {
@@ -233,9 +257,14 @@ export interface ConversationDeliveryDecision {
 
 /** Typed feature error separating provider and provenance failures. */
 export class ConversationFeatureError extends Error {
-  readonly code: 'INVALID_SCOPE' | 'INVALID_SOURCE_PROOF' | 'MODEL_UNAVAILABLE' | 'MEMORY_API_UNAVAILABLE';
+  readonly code: 'INVALID_SCOPE' | 'INVALID_SOURCE_PROOF' | 'INVALID_MEMORY_UPDATE'
+    | 'MEMORY_NOT_FOUND' | 'MODEL_UNAVAILABLE' | 'MEMORY_API_UNAVAILABLE';
 
-  constructor(code: 'INVALID_SCOPE' | 'INVALID_SOURCE_PROOF' | 'MODEL_UNAVAILABLE' | 'MEMORY_API_UNAVAILABLE', message: string) {
+  constructor(
+    code: 'INVALID_SCOPE' | 'INVALID_SOURCE_PROOF' | 'INVALID_MEMORY_UPDATE' | 'MEMORY_NOT_FOUND'
+      | 'MODEL_UNAVAILABLE' | 'MEMORY_API_UNAVAILABLE',
+    message: string,
+  ) {
     super(message);
     this.name = 'ConversationFeatureError';
     this.code = code;
@@ -250,6 +279,19 @@ export interface ConversationMemoryFeature {
   }>;
   afterTurn(context: TrustedTurnContext, input: ConversationAfterTurnInput): Promise<void>;
   beforeDelivery(context: TrustedTurnContext, input: ConversationDeliveryInput): Promise<ConversationDeliveryDecision>;
+  correctMemory(context: TrustedTurnContext, memoryId: string, text: string): Promise<ConversationMemory>;
+  deleteMemory(context: TrustedTurnContext, memoryId: string): Promise<{
+    readonly deleted: boolean;
+    readonly duplicate: boolean;
+    readonly authorizationEpoch: number;
+  }>;
+  revokeSource(context: TrustedTurnContext, sourceId: string): Promise<{
+    readonly sourceId: string;
+    readonly authorizationEpoch: number;
+    readonly invalidatedCount: number;
+    readonly invalidatedMessageIds: readonly string[];
+    readonly invalidatedMemoryIds: readonly string[];
+  }>;
 }
 
 const DEFAULT_MINIMUM_MESSAGES = 8;
@@ -503,6 +545,45 @@ export function createConversationMemoryFeature(options: ConversationMemoryFeatu
         return { decision: 'hold', code: 'SOURCE_AUTHORIZATION_UNAVAILABLE', authorizationEpoch: context.authorizationEpoch };
       }
     },
+
+    async correctMemory(context, memoryId, text) {
+      assertTrustedScope(context);
+      context.signal.throwIfAborted();
+      if (!isIdentifier(memoryId)) {
+        throw new ConversationFeatureError('INVALID_MEMORY_UPDATE', 'Memory id is invalid');
+      }
+      const replacement = boundedText(text, MAX_MEMORY_LENGTH);
+      if (!replacement) {
+        throw new ConversationFeatureError('INVALID_MEMORY_UPDATE', 'Corrected memory text is empty');
+      }
+      const current = await findActiveMemory(options.api, context, memoryId);
+      context.signal.throwIfAborted();
+      const result = await options.api.updateMemory(context, memoryId, {
+        expectedVersion: current.version,
+        text: replacement,
+      });
+      return result.memory;
+    },
+
+    async deleteMemory(context, memoryId) {
+      assertTrustedScope(context);
+      context.signal.throwIfAborted();
+      if (!isIdentifier(memoryId)) {
+        throw new ConversationFeatureError('INVALID_MEMORY_UPDATE', 'Memory id is invalid');
+      }
+      const current = await findActiveMemory(options.api, context, memoryId);
+      context.signal.throwIfAborted();
+      return options.api.deleteMemory(context, memoryId, current.version);
+    },
+
+    async revokeSource(context, sourceId) {
+      assertTrustedScope(context);
+      context.signal.throwIfAborted();
+      if (!isIdentifier(sourceId)) {
+        throw new ConversationFeatureError('INVALID_SOURCE_PROOF', 'Source id is invalid');
+      }
+      return options.api.revokeSource(context, sourceId);
+    },
   };
   return Object.freeze(feature);
 }
@@ -534,6 +615,32 @@ export async function authorizeConversationSourcesV1(
       unavailable: true,
     };
   }
+}
+
+/** Read the current active revision before a CAS correction or deletion. */
+async function findActiveMemory(
+  api: ConversationMemoryApiV1,
+  context: TrustedTurnContext,
+  memoryId: string,
+): Promise<ConversationMemory> {
+  const result = await api.listMemories(context, {
+    conversationId: context.conversationId,
+    conversationKind: context.conversationKind,
+    personaId: context.personaId,
+    state: 'active',
+    limit: DEFAULT_MEMORY_LIST_LIMIT,
+  });
+  if (result.authorizationEpoch !== context.authorizationEpoch) {
+    throw new ConversationFeatureError('MEMORY_API_UNAVAILABLE', 'Authorization changed while reading memory');
+  }
+  const current = result.items.find(memory => memory.memoryId === memoryId || memory.id === memoryId);
+  if (current === undefined || current.state !== 'active' || !matchesScope(current, context)) {
+    throw new ConversationFeatureError('MEMORY_NOT_FOUND', 'Active memory was not found in this trusted scope');
+  }
+  if (!Number.isSafeInteger(current.version) || current.version < 1) {
+    throw new ConversationFeatureError('MEMORY_API_UNAVAILABLE', 'Memory revision is invalid');
+  }
+  return current;
 }
 
 /** Reject untrusted or malformed context before it can influence a cross-conversation query. */
