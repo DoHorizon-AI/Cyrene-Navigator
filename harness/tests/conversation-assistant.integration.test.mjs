@@ -64,6 +64,14 @@ function installConversationApi(store, { denyDelivery = false } = {}) {
       apiVersion: 1,
       async createMessage(context, input) {
         calls.push(`message:${input.role}`);
+        const relatedSourceRefs = (input.relatedEventIds ?? [])
+          .map(eventId => messages.find(message => message.eventId === eventId))
+          .filter(message => message !== undefined)
+          .map(message => ({
+            memoryId: null,
+            memoryVersion: null,
+            sourceMessageIds: [message.id],
+          }));
         const message = {
           id: String(messages.length + 1).toString(16).padStart(32, '0'),
           eventId: input.eventId,
@@ -71,7 +79,7 @@ function installConversationApi(store, { denyDelivery = false } = {}) {
           content: input.content,
           occurredAt: input.occurredAt ?? Date.now(),
           status: 'active',
-          sourceRefs: input.sourceRefs ?? [],
+          sourceRefs: [...(input.sourceRefs ?? []), ...relatedSourceRefs],
           scope: {
             conversationId: input.conversationId,
             conversationKind: input.conversationKind,
@@ -173,6 +181,7 @@ async function makeApp(denyDelivery) {
     workStateStore: store,
     authTokenEnv: 'CYRENE_CONVERSATION_TEST_TOKEN',
     enableConversationAssistant: true,
+    workspaceOwnerActorId: ACTOR_ID,
     customLlmAdapter: { provider: 'conversation-test', adapter },
     model: 'conversation-test-v1',
   });
@@ -278,6 +287,74 @@ test('same-origin Web ingress creates an idempotent trusted chat task and expose
     assert.equal(status.status, 'completed', status.error);
     assert.equal(messages[0].scope.conversationId, 'browser-chat-1');
     assert.equal(messages[0].scope.personaId, 'conversation-assistant');
+  } finally {
+    await server.close();
+    await app.executor.dispose();
+    await app.pluginManager?.dispose();
+    await app.ctx.fiber.dispose();
+  }
+});
+
+test('completed conversation content is redacted from Task status and SSE after source revocation', async () => {
+  const { app, messages, revokeSource } = await makeApp(false);
+  const server = await app.executor.startServer(0, '127.0.0.1');
+  try {
+    const accepted = await fetch(`${server.url}/api/v1/conversation-assistant/turns`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${EXECUTOR_TOKEN}`,
+        'Content-Type': 'application/json',
+        'Idempotency-Key': 'web-turn-redaction-1',
+      },
+      body: JSON.stringify({
+        conversationId: 'browser-chat-redaction',
+        text: 'The response contains a private replay marker.',
+      }),
+    });
+    assert.equal(accepted.status, 202);
+    const receipt = await accepted.json();
+    let task;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const response = await fetch(`${server.url}${receipt.statusUrl}`, {
+        headers: { Authorization: `Bearer ${EXECUTOR_TOKEN}` },
+      });
+      task = await response.json();
+      if (task.status === 'completed' || task.status === 'failed') break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(task.status, 'completed', task.error);
+    const originalOutput = task.output;
+    assert.match(originalOutput, /private replay marker/u);
+    const originalUser = messages.find(message => message.role === 'user');
+    assert.ok(originalUser);
+    revokeSource(originalUser.id);
+
+    const statusResponse = await fetch(`${server.url}${receipt.statusUrl}`, {
+      headers: { Authorization: `Bearer ${EXECUTOR_TOKEN}` },
+    });
+    const redacted = await statusResponse.json();
+    assert.equal(redacted.status, 'completed');
+    assert.equal(redacted.prompt, '');
+    assert.equal(redacted.output, '');
+    assert.equal(redacted.reasoning, '');
+    assert.equal(redacted.error, 'CONVERSATION_ASSISTANT_SOURCE_REVOKED');
+    assert.deepEqual(redacted.metadata, {});
+    assert.doesNotMatch(JSON.stringify(redacted), /The response contains a private replay marker\./u);
+
+    const listedResponse = await fetch(`${server.url}/api/v1/tasks?limit=10`, {
+      headers: { Authorization: `Bearer ${EXECUTOR_TOKEN}` },
+    });
+    const listed = await listedResponse.json();
+    const listedTask = listed.items.find(item => item.id === receipt.taskId);
+    assert.ok(listedTask);
+    assert.equal(listedTask.output, '');
+
+    const eventResponse = await fetch(`${server.url}${receipt.eventsUrl}`, {
+      headers: { Authorization: `Bearer ${EXECUTOR_TOKEN}` },
+    });
+    const eventText = await eventResponse.text();
+    assert.doesNotMatch(eventText, new RegExp(originalOutput.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&'), 'u'));
+    assert.match(eventText, /CONVERSATION_ASSISTANT_SOURCE_MISSING/u);
   } finally {
     await server.close();
     await app.executor.dispose();

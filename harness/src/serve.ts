@@ -117,6 +117,8 @@ import type { TrustedUserBearerProvider } from './integrations/exchange-integrat
 export interface CreateExecutorAppOptions {
   readonly persistenceUrl?: string;
   readonly workspaceId?: string;
+  /** Server-bound single-owner identity for local Web conversation admission. */
+  readonly workspaceOwnerActorId?: string;
   readonly exchangeUrl?: string;
   readonly exchangeIntegrationUrl?: string;
   readonly exchangeIntegrationWorkspaceId?: string;
@@ -198,6 +200,11 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
 
   const persistenceUrl = options.persistenceUrl ?? process.env.CYRENE_PERSISTENCE_URL;
   const workspaceId = options.workspaceId ?? process.env.CYRENE_WORKSPACE_ID;
+  const workspaceOwnerActorId = options.workspaceOwnerActorId
+    ?? process.env.CYRENE_WORKSPACE_OWNER_ACTOR_ID;
+  if (workspaceOwnerActorId !== undefined) {
+    boundedHostText(workspaceOwnerActorId, 'CYRENE_WORKSPACE_OWNER_ACTOR_ID', 512);
+  }
   const configuredTeams = options.teams ?? await createTeamsExecutorConfig(workspaceId);
   const privateTeamsMessageSender = configuredTeams?.personalChatEnabled === true && workspaceId !== undefined
     ? createPrivateTeamsMessageSender(configuredTeams, workspaceId)
@@ -617,7 +624,13 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
     ...(revalidateExchangeAuthorization === undefined ? {} : { revalidateExchangeAuthorization }),
     ...(readExchangeOperationState === undefined ? {} : { readExchangeOperationState }),
     ...(conversationAssistantEnabled
-      ? { conversationAssistant: { enabled: true, personaId: 'conversation-assistant' } }
+      ? {
+        conversationAssistant: {
+          enabled: true,
+          personaId: 'conversation-assistant',
+          ...(workspaceOwnerActorId === undefined ? {} : { webActorId: workspaceOwnerActorId }),
+        },
+      }
       : {}),
   });
 

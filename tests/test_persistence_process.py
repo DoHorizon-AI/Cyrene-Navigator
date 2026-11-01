@@ -428,4 +428,19 @@ def _generate_tls_pair(directory: Path, openssl: str, prefix: str) -> tuple[Path
         timeout=15,
         check=True,
     )
+    start_date = (
+        subprocess.run(
+            [openssl, "x509", "-in", str(certificate), "-noout", "-startdate"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        .stdout.strip()
+        .removeprefix("notBefore=")
+    )
+    not_before = datetime.strptime(start_date, "%b %d %H:%M:%S %Y GMT").replace(tzinfo=UTC)
+    validity_delay = (not_before - datetime.now(UTC)).total_seconds()
+    if validity_delay > 0:
+        time.sleep(validity_delay + 0.25)
     return certificate, private_key

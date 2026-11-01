@@ -670,6 +670,119 @@ class ConversationMemoryStore:
         with self._connect() as conn:
             return self._query_owner_ids(conn, org, workspace, actor, conversation)
 
+    def query_provider_scopes(
+        self,
+        organization_id: str | None,
+        workspace_id: str,
+        actor_id: str,
+        conversation_id: str,
+        *,
+        conversation_kind: str,
+        persona_id: str | None = None,
+        limit: int = 100,
+    ) -> list[tuple[str, str, str]]:
+        """Return bounded source scopes that are currently authorized in one target chat."""
+
+        org, workspace, actor = _scope(organization_id, workspace_id, actor_id)
+        conversation = _identifier(conversation_id, "conversationId")
+        kind = _choice(conversation_kind, "conversationKind", {"group", "channel"})
+        persona = _optional_identifier(persona_id, "personaId")
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise _invalid(
+                "CONVERSATION_MEMORY_INVALID_PAGE",
+                "Provider scope limit must be between 1 and 100.",
+            )
+        with self._connect() as conn:
+            owner_ids = self._query_owner_ids(conn, org, workspace, actor, conversation)
+            owner_placeholders = ",".join("?" for _ in owner_ids)
+            persona_filter = ""
+            scope_params: list[Any] = [org, workspace, *owner_ids, _unix_ms()]
+            if persona is not None:
+                persona_filter = " AND (persona_id IS NULL OR persona_id=?)"
+                scope_params.append(persona)
+            scope_params.extend(
+                [
+                    conversation,
+                    kind,
+                    persona,
+                    actor,
+                    conversation,
+                    kind,
+                    org,
+                    workspace,
+                    _unix_ms(),
+                    conversation,
+                    limit + 1,
+                ]
+            )
+            scope_rows = conn.execute(
+                """SELECT DISTINCT memory.actor_id,memory.conversation_id,memory.conversation_kind
+                   FROM conversation_memory_items AS memory WHERE memory.organization_id=?
+                     AND memory.workspace_id=?
+                     AND memory.actor_id IN ("""
+                + owner_placeholders
+                + ") AND memory.state='active' AND (memory.valid_until IS NULL "
+                + "OR memory.valid_until>?)"
+                + persona_filter
+                + " AND ((memory.visibility='conversation' AND memory.conversation_id=? "
+                + "AND memory.conversation_kind=?) OR (memory.visibility='workspace' AND EXISTS ("
+                + "SELECT 1 FROM conversation_memory_item_sources AS lineage "
+                + "JOIN conversation_memory_messages AS source ON "
+                + "source.organization_id=lineage.organization_id AND "
+                + "source.workspace_id=lineage.workspace_id AND "
+                + "source.message_id=lineage.source_message_id "
+                + "WHERE lineage.organization_id=memory.organization_id AND "
+                + "lineage.workspace_id=memory.workspace_id AND lineage.actor_id=memory.actor_id "
+                + "AND lineage.memory_id=memory.memory_id AND source.status='active' "
+                + "AND (source.persona_id IS NULL OR source.persona_id=?) AND (("
+                + "source.actor_id=? AND (source.visibility NOT IN ('private','conversation') OR "
+                + "(source.visibility='conversation' AND source.conversation_id=? AND "
+                + "source.conversation_kind=?))) OR EXISTS (SELECT 1 FROM "
+                + "conversation_memory_source_grants AS grant_row WHERE "
+                + "grant_row.organization_id=? AND grant_row.workspace_id=? AND "
+                + "grant_row.owner_actor_id=source.actor_id AND "
+                + "grant_row.source_message_id=source.message_id AND grant_row.status='active' "
+                + "AND (grant_row.expires_at IS NULL OR grant_row.expires_at>?) AND "
+                + "((grant_row.visibility='conversation' AND "
+                + "grant_row.target_conversation_id=?) OR (grant_row.visibility='workspace' "
+                + "AND grant_row.target_conversation_id='')))))))"
+                + " ORDER BY memory.actor_id,memory.conversation_id,memory.conversation_kind "
+                + "LIMIT ?",
+                scope_params,
+            ).fetchall()
+            if len(scope_rows) > limit:
+                raise PersistenceError(
+                    "CONVERSATION_MEMORY_SCOPE_TOO_BROAD",
+                    503,
+                    "Too many source conversation scopes are authorized for this query.",
+                    retryable=True,
+                )
+            result: list[tuple[str, str, str]] = []
+            for scope_row in scope_rows:
+                owner = str(scope_row["actor_id"])
+                source_conversation = str(scope_row["conversation_id"])
+                source_kind = str(scope_row["conversation_kind"])
+                memory_cursor = conn.execute(
+                    """SELECT * FROM conversation_memory_items WHERE organization_id=?
+                       AND workspace_id=? AND actor_id=? AND conversation_id=?
+                       AND conversation_kind=? AND state='active'
+                       AND (valid_until IS NULL OR valid_until>?)""",
+                    (org, workspace, owner, source_conversation, source_kind, _unix_ms()),
+                )
+                accessible = False
+                while rows := memory_cursor.fetchmany(64):
+                    if any(
+                        self._can_access_memory(
+                            conn, org, workspace, actor, conversation, kind, persona, memory
+                        )
+                        for memory in rows
+                    ):
+                        accessible = True
+                        break
+                if accessible:
+                    result.append((owner, source_conversation, source_kind))
+            return result
+
     def validate_source_message_ids(
         self,
         organization_id: str | None,

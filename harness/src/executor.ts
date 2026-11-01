@@ -22,6 +22,7 @@ import type {
   ConversationMaintenanceCheckpoint,
   ConversationMaintenanceJobRecord,
   CredentialHealthSnapshot,
+  DurableTaskEvent,
   ExecutionStatus,
   NotificationLease,
   TaskRecord,
@@ -249,6 +250,8 @@ export interface ExecutorConfig {
   readonly conversationAssistant?: {
     readonly enabled: boolean;
     readonly personaId: string;
+    /** Static local Web owner only; multi-actor Web identity must be supplied by a trusted caller port. */
+    readonly webActorId?: string;
   };
 }
 
@@ -1712,8 +1715,15 @@ export class NavigatorExecutor {
         return outcome(claim.task);
       }
       claimed = true;
-      if (this.config.conversationAssistant?.enabled === true && task.actorAadObjectId === undefined
-        && task.record.createdByActorId !== undefined) {
+      const taskOrigin = task.record.metadata?.navigatorConversationOrigin;
+      const taskOriginKind = taskOrigin !== null && typeof taskOrigin === 'object'
+        && !Array.isArray(taskOrigin)
+        ? (taskOrigin as Record<string, unknown>).kind
+        : undefined;
+      const teamsConversationTask = task.record.origin?.kind === 'teams_private'
+        || taskOriginKind === 'teams_channel';
+      if (this.config.conversationAssistant?.enabled === true && teamsConversationTask
+        && task.actorAadObjectId === undefined && task.record.createdByActorId !== undefined) {
         task.actorAadObjectId = uuidText(task.record.createdByActorId, 'conversation assistant Work actor');
         this.taskActorById.set(task.id, task.actorAadObjectId);
         this.sessionActorById.set(task.sessionId, task.actorAadObjectId);
@@ -3646,7 +3656,7 @@ export class NavigatorExecutor {
     expectedActorId: string | undefined,
     text: string,
   ): Promise<void> {
-    if (this.config.conversationAssistant?.enabled !== true) return;
+    if (!isTrustedConversationAssistantTask(task)) return;
     const actorId = task.createdByActorId?.toLowerCase();
     if (task.status !== 'completed' || actorId === undefined
       || (expectedActorId !== undefined && actorId !== expectedActorId.toLowerCase())) {
@@ -3674,6 +3684,13 @@ export class NavigatorExecutor {
       );
     }
     const profile = this.config.conversationAssistant;
+    if (profile === undefined) {
+      throw new ExecutorRequestError(
+        503,
+        'CONVERSATION_ASSISTANT_UNAVAILABLE',
+        'The static conversation-assistant profile is unavailable for source revalidation.',
+      );
+    }
     const signal = AbortSignal.timeout(10_000);
     const proof = await this.readConversationAssistantSourceProof(task.id, workState);
     if (proof === undefined || proof.contentSha256 !== sha256(text)
@@ -3692,6 +3709,14 @@ export class NavigatorExecutor {
     const isGroup = originRow?.kind === 'teams_channel' && originRow.conversationKind === 'group';
     const conversationKind = isGroup ? 'group' as const : 'direct' as const;
     const visibility = isGroup ? 'conversation' as const : 'private' as const;
+    const webActorId = this.config.conversationAssistant?.webActorId?.toLowerCase();
+    if (originRow?.kind === 'web' && webActorId !== undefined && actorId !== webActorId) {
+      throw new ExecutorRequestError(
+        403,
+        'CONVERSATION_ASSISTANT_ACTOR_SCOPE_MISMATCH',
+        'The Web conversation Task does not belong to the configured local owner actor.',
+      );
+    }
     const expectedConversationId = originRow?.kind === 'web' && typeof originRow.conversationId === 'string'
       ? originRow.conversationId
       : task.sessionId;
@@ -4168,7 +4193,12 @@ export class NavigatorExecutor {
           this.sendJson(res, 400, { error: 'Invalid task page limit' });
           return;
         }
-        this.sendJson(res, 200, await this.listTasks({ cursor, limit }));
+        const page = await this.listTasks({ cursor, limit });
+        const items: TaskRecord[] = [];
+        for (const record of page.items) {
+          items.push(await this.projectConversationAssistantTaskRead(record));
+        }
+        this.sendJson(res, 200, { items, nextCursor: page.nextCursor });
         return;
       }
       if (method === 'POST' && url.pathname === '/api/v1/tasks') {
@@ -4183,6 +4213,14 @@ export class NavigatorExecutor {
             503,
             'CONVERSATION_ASSISTANT_UNAVAILABLE',
             'The static conversation-assistant profile is not enabled.',
+          );
+        }
+        const webActorId = this.config.conversationAssistant.webActorId?.toLowerCase();
+        if (webActorId === undefined) {
+          throw new ExecutorRequestError(
+            503,
+            'CONVERSATION_ASSISTANT_WEB_ACTOR_UNAVAILABLE',
+            'The local Web conversation requires a server-configured owner actor.',
           );
         }
         const idempotencyKey = req.headers['idempotency-key'];
@@ -4203,11 +4241,13 @@ export class NavigatorExecutor {
         }
         const text = boundedTeamsMessageText(body.text, 'conversation message', 20_000);
         const eventDigest = sha256(canonicalJson({
+          actorId: webActorId,
           conversationId,
           idempotencyKey,
           workspaceId: this.config.workspaceId,
         }));
         const sessionDigest = sha256(canonicalJson({
+          actorId: webActorId,
           conversationId,
           workspaceId: this.config.workspaceId,
         }));
@@ -4226,6 +4266,14 @@ export class NavigatorExecutor {
             eventId,
           },
         });
+        if (record.createdByActorId?.toLowerCase() !== webActorId) {
+          void this.cancelTask(record.id).catch(() => undefined);
+          throw new ExecutorRequestError(
+            503,
+            'CONVERSATION_ASSISTANT_ACTOR_SCOPE_MISMATCH',
+            'The configured Web owner actor does not match the actor-private Work principal.',
+          );
+        }
         if (record.status === 'queued' && this.drainToken === undefined) {
           void this.dispatchTask(record.id).catch(error => {
             this.ctx.logger.warn(`Conversation assistant task dispatch failed (${safeErrorMessage(error)})`);
@@ -4316,12 +4364,17 @@ export class NavigatorExecutor {
           this.sendJson(res, 400, { error: 'Invalid event cursor' });
           return;
         }
-        if (!await this.getTask(taskId)) {
+        const task = await this.getTask(taskId);
+        if (!task) {
           this.sendJson(res, 404, { error: 'Task not found' });
           return;
         }
         this.openEventStream(res);
-        await this.streamTaskEvents(taskId, after, res);
+        if (isTrustedConversationAssistantTask(task)) {
+          await this.streamConversationAssistantTaskEvents(taskId, after, res);
+        } else {
+          await this.streamTaskEvents(taskId, after, res);
+        }
         if (!res.writableEnded) res.end();
         return;
       }
@@ -4347,7 +4400,10 @@ export class NavigatorExecutor {
       if (method === 'GET' && statusMatch) {
         const taskId = decodeURIComponent(statusMatch[1]!);
         const record = await this.getTask(taskId);
-        this.sendJson(res, record ? 200 : 404, record ?? { error: 'Task not found' });
+        const projected = record === undefined
+          ? undefined
+          : await this.projectConversationAssistantTaskRead(record);
+        this.sendJson(res, projected ? 200 : 404, projected ?? { error: 'Task not found' });
         return;
       }
 
@@ -4362,7 +4418,7 @@ export class NavigatorExecutor {
         if (task.status === 'queued' && !this.tasks.has(taskId)) {
           this.adoptQueuedTask(task, { taskId, sessionId: task.sessionId, prompt: task.prompt });
         }
-        this.sendJson(res, 202, task);
+        this.sendJson(res, 202, await this.projectConversationAssistantTaskRead(task));
         return;
       }
 
@@ -4432,6 +4488,241 @@ export class NavigatorExecutor {
         lastHeartbeat = Date.now();
       }
       await delay(250);
+    }
+  }
+
+  /** Delay chat event replay until a terminal turn has a fresh, exact-source authorization. */
+  private async streamConversationAssistantTaskEvents(
+    taskId: string,
+    after: number,
+    res: ServerResponse,
+  ): Promise<void> {
+    const workState = this.taskWorkStateById.get(taskId) ?? this.config.workState;
+    let announcedStatus = false;
+    let lastHeartbeat = Date.now();
+    let closed = false;
+    res.once('close', () => { closed = true; });
+
+    while (!closed && !res.writableEnded) {
+      const record = await workState.getTask(taskId);
+      if (record === undefined) return;
+      if (TERMINAL_STATUSES.has(record.status) || PAUSED_STATUSES.has(record.status)) {
+        if (record.status !== 'completed') {
+          this.writeConversationAssistantHeld(res, record, 'CONVERSATION_ASSISTANT_NOT_DELIVERED');
+          return;
+        }
+        try {
+          await this.authorizeConversationTaskDelivery(
+            workState,
+            record,
+            record.createdByActorId,
+            record.output,
+          );
+        } catch (error: unknown) {
+          this.writeConversationAssistantHeld(
+            res,
+            record,
+            error instanceof ExecutorRequestError
+              ? error.code
+              : 'CONVERSATION_ASSISTANT_SOURCE_UNAVAILABLE',
+          );
+          return;
+        }
+
+        const replay: DurableTaskEvent[] = [];
+        let scanCursor = 0;
+        let replayBytes = 0;
+        let concatenatedText = '';
+        let finishCount = 0;
+        for (;;) {
+          const page = await workState.getEvents(taskId, scanCursor);
+          let advanced = false;
+          for (const row of page.events) {
+            if (row.seq <= scanCursor) {
+              this.writeConversationAssistantHeld(res, record, 'CONVERSATION_ASSISTANT_EVENTS_INVALID');
+              return;
+            }
+            advanced = true;
+            scanCursor = row.seq;
+            replayBytes += Buffer.byteLength(canonicalJson(row.event), 'utf8');
+            if (replayBytes > 10_000_000 || replay.length >= 10_000) {
+              this.writeConversationAssistantHeld(res, record, 'CONVERSATION_ASSISTANT_EVENTS_TOO_LARGE');
+              return;
+            }
+            if (row.event.type === 'text-delta') {
+              if (typeof row.event.text !== 'string') {
+                this.writeConversationAssistantHeld(res, record, 'CONVERSATION_ASSISTANT_EVENTS_INVALID');
+                return;
+              }
+              concatenatedText += row.event.text;
+            } else if (row.event.type === 'finish') {
+              finishCount += 1;
+              if (row.event.status !== 'completed' || row.event.output !== record.output) {
+                this.writeConversationAssistantHeld(res, record, 'CONVERSATION_ASSISTANT_EVENTS_INVALID');
+                return;
+              }
+            }
+            if (row.seq > after) replay.push(row);
+          }
+          if (scanCursor >= page.nextSeq - 1) break;
+          if (!advanced) {
+            this.writeConversationAssistantHeld(res, record, 'CONVERSATION_ASSISTANT_EVENTS_INVALID');
+            return;
+          }
+        }
+        if (concatenatedText !== record.output || finishCount !== 1) {
+          this.writeConversationAssistantHeld(res, record, 'CONVERSATION_ASSISTANT_EVENTS_INVALID');
+          return;
+        }
+
+        for (const row of replay) {
+          if (res.writableEnded || res.destroyed) return;
+          const event = row.event;
+          const type = typeof event.type === 'string' ? event.type : 'message';
+          if (type === 'text-delta' || type === 'finish') {
+            const current = await workState.getTask(taskId);
+            if (current === undefined || current.status !== 'completed') {
+              this.writeConversationAssistantHeld(res, record, 'CONVERSATION_ASSISTANT_NOT_DELIVERED');
+              return;
+            }
+            try {
+              await this.authorizeConversationTaskDelivery(
+                workState,
+                current,
+                current.createdByActorId,
+                current.output,
+              );
+            } catch (error: unknown) {
+              this.writeConversationAssistantHeld(
+                res,
+                current,
+                error instanceof ExecutorRequestError
+                  ? error.code
+                  : 'CONVERSATION_ASSISTANT_SOURCE_UNAVAILABLE',
+              );
+              return;
+            }
+            if (type === 'text-delta') {
+              this.writeSseEvent(res, row.seq, type, {
+                type,
+                taskId,
+                seq: row.seq,
+                text: event.text,
+                ...(typeof event.index === 'number' ? { index: event.index } : {}),
+                ...(typeof event.timestamp === 'number' ? { timestamp: event.timestamp } : {}),
+              });
+            } else {
+              this.writeSseEvent(res, row.seq, type, {
+                type,
+                taskId,
+                seq: row.seq,
+                status: 'completed',
+                output: current.output,
+                durationMs: current.durationMs,
+                ...(typeof event.timestamp === 'number' ? { timestamp: event.timestamp } : {}),
+              });
+            }
+          } else if (type === 'status') {
+            this.writeSseEvent(res, row.seq, type, {
+              type,
+              taskId,
+              seq: row.seq,
+              sessionId: record.sessionId,
+              status: typeof event.status === 'string' ? event.status : record.status,
+              ...(typeof event.timestamp === 'number' ? { timestamp: event.timestamp } : {}),
+            });
+          } else if (type === 'model-route') {
+            this.writeSseEvent(res, row.seq, type, {
+              type,
+              taskId,
+              seq: row.seq,
+              provider: typeof event.provider === 'string' ? event.provider : 'unknown',
+              model: typeof event.model === 'string' ? event.model : 'unknown',
+              ...(typeof event.timestamp === 'number' ? { timestamp: event.timestamp } : {}),
+            });
+          }
+        }
+        return;
+      }
+
+      if (!announcedStatus) {
+        this.writeSseEvent(res, undefined, 'status', {
+          type: 'status',
+          taskId,
+          sessionId: record.sessionId,
+          status: record.status,
+          timestamp: Date.now(),
+        });
+        announcedStatus = true;
+      }
+      if (Date.now() - lastHeartbeat >= 15_000 && !res.writableEnded) {
+        res.write(': keep-alive\n\n');
+        lastHeartbeat = Date.now();
+      }
+      await delay(250);
+    }
+  }
+
+  /** Return a safe terminal event when authorization no longer permits chat content. */
+  private writeConversationAssistantHeld(
+    res: ServerResponse,
+    record: TaskRecord,
+    code: string,
+  ): void {
+    const timestamp = Date.now();
+    this.writeSseEvent(res, undefined, 'status', {
+      type: 'status',
+      taskId: record.id,
+      sessionId: record.sessionId,
+      status: record.status,
+      deliveryState: 'held',
+      timestamp,
+    });
+    this.writeSseEvent(res, undefined, 'finish', {
+      type: 'finish',
+      taskId: record.id,
+      status: 'failed',
+      output: '',
+      error: code,
+      durationMs: record.durationMs,
+      timestamp,
+    });
+  }
+
+  /** Hide every source-derived Task field from direct browser reads unless its lineage is current. */
+  private async projectConversationAssistantTaskRead(record: TaskRecord): Promise<TaskRecord> {
+    if (!isTrustedConversationAssistantTask(record)) return record;
+    const safeRecord = (overrides: Partial<TaskRecord>): TaskRecord => ({
+      ...record,
+      metadata: {},
+      ...overrides,
+    });
+    const workState = this.taskWorkStateById.get(record.id) ?? this.config.workState;
+    if (record.status !== 'completed') {
+      return safeRecord({
+        prompt: '',
+        output: '',
+        reasoning: '',
+        error: TERMINAL_STATUSES.has(record.status) || PAUSED_STATUSES.has(record.status)
+          ? 'CONVERSATION_ASSISTANT_NOT_DELIVERED'
+          : undefined,
+      });
+    }
+    try {
+      await this.authorizeConversationTaskDelivery(
+        workState,
+        record,
+        record.createdByActorId,
+        record.output,
+      );
+      return safeRecord({});
+    } catch {
+      return safeRecord({
+        prompt: '',
+        output: '',
+        reasoning: '',
+        error: 'CONVERSATION_ASSISTANT_SOURCE_REVOKED',
+      });
     }
   }
 
