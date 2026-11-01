@@ -19,6 +19,7 @@ host ports.
 | `dream-maintenance.ts` | Bounded paged Dream plans with persisted recovery state and idempotent writes / 有界分页 Dream 计划、持久恢复状态与幂等写入 |
 | `research-work.ts` | Work-receipt-backed notes and scheduled read-only watches / Work 回执支持的研究笔记与定时只读观察 |
 | `nous-active.ts` | Sourced focus/handoff context, policy-gated follow-ups and retraction / 带来源的焦点与交接上下文、策略门控跟进及撤回 |
+| `conversation-daily-review.ts` | Resumable, source-authorized daily review artifacts with independent Work readback / 可恢复、来源授权的对话每日复盘制品及 Work 独立回读 |
 
 All modules use the authenticated Work API and current source authorization.
 Background maintenance uses the existing DSH Work Task and Schedule; proactive
