@@ -53,7 +53,7 @@ function policy(overrides = {}) {
 }
 
 function dependencies(overrides = {}) {
-  const calls = { focusCreates: [], focusTransitions: [], handoffs: [], authorizations: [], schedules: [], cancels: [], dispatches: [], taskReads: [], taskCancels: [], retractions: [], policies: [] };
+  const calls = { focusCreates: [], focusTransitions: [], followupDeliveryReceipts: [], handoffs: [], authorizations: [], schedules: [], cancels: [], dispatches: [], taskReads: [], taskCancels: [], retractions: [], policies: [] };
   let currentFocus = focus();
   let currentPolicy = policy();
   let messages = [userMessage()];
@@ -109,6 +109,12 @@ function dependencies(overrides = {}) {
       calls.focusTransitions.push({ id, input });
       if (currentFocus.version !== input.expectedVersion) throw new Error('CAS mismatch');
       currentFocus = { ...currentFocus, state: input.state, version: currentFocus.version + 1, updatedAt: fixedNow + 1 };
+      return { item: currentFocus };
+    },
+    async recordFollowupDelivery(_ctx, id, input) {
+      calls.followupDeliveryReceipts.push({ id, input });
+      if (currentFocus.version !== input.expectedVersion) throw new Error('follow-up delivery CAS mismatch');
+      currentFocus = { ...currentFocus, state: 'waiting', version: currentFocus.version + 1, updatedAt: fixedNow + 1 };
       return { item: currentFocus };
     },
     async createHandoff(_ctx, input) {
@@ -213,7 +219,9 @@ test('scheduled follow-up uses the existing DSH conversation task, marks origin 
   assert.equal(env.calls.dispatches[0].input.origin.kind, 'conversation-followup');
   assert.equal(env.calls.dispatches[0].input.executionClass, 'background');
   assert.deepEqual(env.calls.dispatches[0].input.sourceRefs, sourceRefs);
-  assert.deepEqual(env.calls.focusTransitions[0].input, { state: 'waiting', expectedVersion: 1 });
+  assert.deepEqual(env.calls.followupDeliveryReceipts[0].input, {
+    expectedVersion: 1, taskId: env.calls.dispatches[0].input.taskId, deliveryReceiptId: 'delivery-1',
+  });
 });
 
 test('queued and unknown follow-ups reconcile by durable Task read and never dispatch twice', async () => {
@@ -240,7 +248,8 @@ test('queued and unknown follow-ups reconcile by durable Task read and never dis
   const recovered = await env.feature.runScheduledFollowup(context(), 'focus-1');
   assert.equal(recovered.status, 'dispatched');
   assert.equal(env.calls.dispatches.length, 1, 'completed send is reconciled without another executor invocation');
-  assert.equal(env.calls.focusTransitions.at(-1).input.state, 'waiting');
+  assert.equal(env.calls.followupDeliveryReceipts.at(-1).input.deliveryReceiptId, 'platform-delivery-2');
+  assert.equal(env.calls.focusTransitions.length, 0, 'automatic delivery uses the worker-only receipt CAS');
   assert.equal(env.calls.cancels.at(-1).kind, 'followup');
 });
 

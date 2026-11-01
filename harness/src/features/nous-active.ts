@@ -444,7 +444,11 @@ async function markFollowupWaiting(
   }
   const latest = await findFocusItem(api, context, item.id);
   if (latest.item.state === 'open' && latest.item.version === item.version) {
-    const changed = await api.transitionFocusItem(context, item.id, { state: 'waiting', expectedVersion: item.version });
+    const changed = await api.recordFollowupDelivery(context, item.id, {
+      expectedVersion: item.version,
+      taskId: outcome.taskId,
+      deliveryReceiptId: outcome.deliveryReceiptId!,
+    });
     if (changed.item.state !== 'waiting' || changed.item.version <= item.version) {
       throw new ConversationDomainApiError('FOLLOWUP_FOCUS_READBACK_MISMATCH', 409, false, 'Work did not persist the waiting transition');
     }

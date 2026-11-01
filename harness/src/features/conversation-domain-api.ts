@@ -471,6 +471,12 @@ export interface ConversationDomainApiV1 extends ConversationMemoryApiV1 {
     readonly state: FocusItem['state'];
     readonly expectedVersion: number;
   }): Promise<{ readonly item: FocusItem }>;
+  /** Worker-only CAS accepted only after the server verifies the DSH Task and delivery receipt. */
+  recordFollowupDelivery(context: TrustedTurnContext, focusItemId: string, input: {
+    readonly expectedVersion: number;
+    readonly taskId: string;
+    readonly deliveryReceiptId: string;
+  }): Promise<{ readonly item: FocusItem }>;
   createHandoff(context: TrustedTurnContext, input: {
     readonly idempotencyKey: string;
     readonly taskId: string;
