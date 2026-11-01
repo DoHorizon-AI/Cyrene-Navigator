@@ -10,6 +10,10 @@ The service has no route of its own. The Navigator core owner adapts Work attach
 
 本服务不自行挂载路由。Navigator core owner 负责把 Work 附件读取、Work Task 检查点事件和 Work Operation 适配到 `ports.py`。进度与恢复复用同一个 Work Task，不增加迁移专用 SQL 表。`preview` 只读；`apply` 必须有绑定精确 plan digest 的宿主审批。
 
+`build_conversation_migration_host(...)` binds `ConversationMemoryStore`, `ConversationDomainStore`, `WorkStore`, a live host authorization adapter, and optional configured graph ports. Core supplies the authenticated scope and artifact reader and mounts the returned service. The portable conversation backup here is separate from the host's full operational backup.
+
+`build_conversation_migration_host(...)` 将 `ConversationMemoryStore`、`ConversationDomainStore`、`WorkStore`、实时宿主授权适配器和可选图谱端口接线。Core 提供已认证 scope 与制品读取器，并挂载返回的 service。这里的对话便携备份与宿主完整运维备份分开管理。
+
 ## Portable source formats / 便携来源格式
 
 Historical input is UTF-8 JSONL. Its first line has exactly `recordType`, `schemaVersion: 1`, `sourceKind`, and `recordCount`. Data rows use one of four closed record types: `message`, `memory`, `profile`, or `graph`. Every non-message record names earlier `sourceRecordIds`; a row cannot introduce an actor, identity, credential, login state, authorization grant, approval, or running task. Graph edges must terminate at nodes in the same changeset. Unknown fields, duplicate JSON keys, non-finite numbers, oversized lines, cycles, and missing lineage become count-only quarantines or fail the archive header closed.
@@ -30,11 +34,15 @@ Before `apply` or `rollback` starts a batch mutation, the host rollback-capabili
 
 `apply` 或 `rollback` 开始批次变更前，宿主补偿能力适配器会检查所有已接受记录类型。若记忆墓碑回读、画像候选/生效状态 CAS 回滚或 provider 图谱补偿接口缺失，包含对应记录的计划会在首个规范写入前拒绝。该预检只表示宿主适配器报告所需路径可用，不等同于已成功回滚或产品验收通过。
 
+Projected graph replay uses read-only per-node and per-edge `get` calls through the configured Direct graph client; it does not replay an upsert to satisfy a stale checkpoint. Graph rollback deletes edges before nodes, then independently reads every exact ID and requires `NOT_FOUND` before the domain CAS can mark the changeset rolled back. Unknown or incomplete provider results remain unresolved.
+
+已投影图谱的重放通过配置好的 Direct graph client 逐节点/边只读 `get` 核验，不通过重放 upsert 满足旧检查点。图谱回滚先删边再删节点，再逐 ID 独立读回并要求 `NOT_FOUND`，域 CAS 才能将 changeset 标记 rolled_back。未知或不完整的 provider 结果会保持未解决。
+
 ## Validation evidence / 验收证据
 
-`tests/test_conversation_migration.py` covers strict fixture parsing, pagination, read-only previews, portable backup filtering, and required compensation-capability mapping. `tests/test_conversation_migration_sqlite.py` uses temporary real `ConversationMemoryStore`, `ConversationDomainStore`, and `WorkStore` SQLite databases to exercise a message-only fresh restore, restart recovery, source-message rollback, and fail-closed memory preflight when tombstone readback is absent. Its host authorization/capability adapter is explicitly a test fixture; it does not prove the authenticated Work route or external graph provider. Profile and graph rollback remain unverified until their canonical host APIs are installed and mounted.
+`tests/test_conversation_migration.py` covers strict fixture parsing, pagination, read-only previews, portable backup filtering, and required compensation-capability mapping. `tests/test_conversation_migration_sqlite.py` uses temporary real `ConversationMemoryStore`, `ConversationDomainStore`, and `WorkStore` SQLite databases to exercise a message-only fresh restore, restart recovery, source-message rollback, and fail-closed memory preflight when tombstone readback is absent. Adapter tests distinguish the real typed Direct graph client wrapper from its simulated RPC peer. Host authorization/capability adapters are explicitly test fixtures; they do not prove the authenticated Work route or external graph deployment. Multi-type restore/rollback remains NOT_RUN until candidate and graph compensation CAS APIs land in a clean core tip.
 
-`tests/test_conversation_migration.py` 覆盖 fixture 严格解析、分页、只读预演、便携备份过滤及所需补偿能力映射。`tests/test_conversation_migration_sqlite.py` 使用临时真实 `ConversationMemoryStore`、`ConversationDomainStore` 和 `WorkStore` SQLite 数据库，验证仅消息记录的全新恢复、重启续跑、消息来源撤销，以及缺少墓碑回读时记忆预检 fail closed。测试授权/能力适配器明确属于 fixture，不能证明已认证 Work 路由或外部图谱 provider。画像和图谱回滚仍需等待规范宿主 API 安装并挂载后验收。
+`tests/test_conversation_migration.py` 覆盖 fixture 严格解析、分页、只读预演、便携备份过滤及所需补偿能力映射。`tests/test_conversation_migration_sqlite.py` 使用临时真实 `ConversationMemoryStore`、`ConversationDomainStore` 和 `WorkStore` SQLite 数据库，验证仅消息记录的全新恢复、重启续跑、消息来源撤销，以及缺少墓碑回读时记忆预检 fail closed。图谱 adapter 测试会将真实 Direct graph 客户端适配器与模拟 RPC peer 的证据分开。授权/能力适配器属于测试 fixture，不能证明已认证 Work 路由或外部图谱部署。完整多类型恢复/回滚须等候选与图谱补偿 CAS API 合入干净 core tip 后验收。
 
 The host integration also needs a scope-bound memory tombstone readback for `delete_memory`, a version-checked rollback for unactivated profile candidates, and provider-backed graph compensation with independent deletion readback. Until the core/domain owners expose these APIs, those rollback paths remain fail-closed and are not acceptance passes. Active-profile rollback and message-source revoke use the existing canonical APIs.
 

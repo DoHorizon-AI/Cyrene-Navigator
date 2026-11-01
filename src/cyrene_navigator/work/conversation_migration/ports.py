@@ -170,8 +170,15 @@ class MemoryProjectionPort(Protocol):
         """Idempotently write one message using the host-derived actor scope."""
         ...
 
-    def get_message(self, scope: ActorScope, message_id: str) -> Mapping[str, object] | None:
-        """Read back one message by canonical ID in the same actor scope."""
+    def get_message(
+        self,
+        scope: ActorScope,
+        message_id: str,
+        *,
+        context: AuthorizedConversationContext,
+        include_revoked: bool = False,
+    ) -> Mapping[str, object] | None:
+        """Read one exact message in actor/conversation scope, optionally its revoke state."""
         ...
 
     def create_memory(self, scope: ActorScope, body: Mapping[str, object]) -> Mapping[str, object]:

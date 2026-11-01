@@ -67,20 +67,27 @@ class _MemoryPort:
             scope.organization_id, scope.workspace_id, scope.actor_id, body
         )
 
-    def get_message(self, scope: ActorScope, message_id: str) -> Mapping[str, object] | None:
+    def get_message(
+        self,
+        scope: ActorScope,
+        message_id: str,
+        *,
+        context: AuthorizedConversationContext,
+        include_revoked: bool = False,
+    ) -> Mapping[str, object] | None:
         cursor: str | None = None
         while True:
             page = self.store.list_messages(
                 scope.organization_id,
                 scope.workspace_id,
                 scope.actor_id,
-                CONTEXT.conversation_id,
-                conversation_kind=CONTEXT.conversation_kind,
-                persona_id=CONTEXT.persona_id,
+                context.conversation_id,
+                conversation_kind=context.conversation_kind,
+                persona_id=context.persona_id,
                 order="asc",
                 limit=100,
                 cursor=cursor,
-                include_revoked=True,
+                include_revoked=include_revoked,
             )
             for item in page["items"]:
                 if item.get("id") == message_id:
@@ -636,10 +643,38 @@ def test_actor_backup_restores_to_fresh_sqlite_and_recovers_from_task_events(
     )
     assert replay.status == "applied"
     assert replay.read_count == 1
-    assert replay.replayed_count >= 1
+    assert replay.replayed_count == 0
     assert reopened_memory.overview(SCOPE.organization_id, SCOPE.workspace_id, SCOPE.actor_id)[
         "counts"
     ] == {"messages": 1, "memories": 0, "sources": 1}
+
+    message_page = reopened_memory.list_messages(
+        SCOPE.organization_id,
+        SCOPE.workspace_id,
+        SCOPE.actor_id,
+        CONTEXT.conversation_id,
+        conversation_kind=CONTEXT.conversation_kind,
+        persona_id=CONTEXT.persona_id,
+        order="asc",
+        limit=10,
+    )
+    imported_message_id = message_page["items"][0]["id"]
+    reopened_memory.revoke_source(
+        SCOPE.organization_id,
+        SCOPE.workspace_id,
+        SCOPE.actor_id,
+        imported_message_id,
+    )
+    with pytest.raises(MigrationError) as changed:
+        restarted.restore_backup(
+            SCOPE,
+            task_id=task_id,
+            artifact_id=artifact_id,
+            content=backup.content,
+            expected_sha256=backup.sha256,
+            approval_ref="fixture-import-approved",
+        )
+    assert changed.value.code == "APPLIED_PROJECTION_CHANGED"
 
 
 def test_restore_preflight_blocks_memory_without_tombstone_readback(
