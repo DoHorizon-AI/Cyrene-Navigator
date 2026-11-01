@@ -907,16 +907,79 @@ def test_owner_message_list_without_persona_returns_persona_scoped_rows(tmp_path
         assert unfiltered.status_code == 200, unfiltered.text
         assert [item["id"] for item in unfiltered.json()["items"]] == [message["id"]]
 
-        explicit = client.get(
-            BASE + "/messages?conversationId=direct-alice&conversationKind=direct&personaId=persona-a&limit=100",
-            headers=_headers(),
+        explicit_query = (
+            "?conversationId=direct-alice&conversationKind=direct&personaId=persona-a&limit=100"
         )
+        explicit = client.get(BASE + "/messages" + explicit_query, headers=_headers())
         assert explicit.status_code == 200, explicit.text
         assert [item["id"] for item in explicit.json()["items"]] == [message["id"]]
 
-        denied = client.get(
-            BASE + "/messages?conversationId=direct-alice&conversationKind=direct&personaId=persona-b&limit=100",
-            headers=_headers(),
+        denied_query = (
+            "?conversationId=direct-alice&conversationKind=direct&personaId=persona-b&limit=100"
         )
+        denied = client.get(BASE + "/messages" + denied_query, headers=_headers())
         assert denied.status_code == 200, denied.text
         assert denied.json()["items"] == []
+
+
+def test_create_message_and_memory_with_duplicate_memory_refs(tmp_path: Path) -> None:
+    """Duplicate memory refs in messages or memories do not trigger UNIQUE constraint."""
+
+    with _client(tmp_path / "duplicate-memory-refs.sqlite3") as client:
+        msg1 = _post_message(client, event_id="root-event", content="Root source fact")["message"]
+        ref_msg1 = [{"memoryId": None, "memoryVersion": None, "sourceMessageIds": [msg1["id"]]}]
+
+        resp1 = client.post(
+            BASE + "/memories",
+            json={
+                "idempotencyKey": "mem-dup-1",
+                "conversationId": "direct-alice",
+                "conversationKind": "direct",
+                "personaId": "persona-a",
+                "kind": "preference",
+                "text": "Fact 1",
+                "sourceMessageIds": [msg1["id"]],
+                "sourceRefs": ref_msg1,
+            },
+            headers=_headers(),
+        )
+        assert resp1.status_code == 201, resp1.text
+        mem1 = resp1.json()["memory"]
+
+        # Duplicate refs citing mem1 (e.g. from chunked sourceMessageIds)
+        ref_mem_dup = [
+            {"memoryId": mem1["id"], "memoryVersion": 1, "sourceMessageIds": [msg1["id"]]},
+            {"memoryId": mem1["id"], "memoryVersion": 1, "sourceMessageIds": [msg1["id"]]},
+        ]
+
+        resp_msg2 = client.post(
+            BASE + "/messages",
+            json={
+                "eventId": "assistant-event-with-dup-refs",
+                "conversationId": "direct-alice",
+                "conversationKind": "direct",
+                "personaId": "persona-a",
+                "visibility": "private",
+                "role": "assistant",
+                "content": "Assistant message with duplicate memory refs",
+                "sourceRefs": ref_mem_dup,
+            },
+            headers=_headers(),
+        )
+        assert resp_msg2.status_code == 201, resp_msg2.text
+
+        resp_mem2 = client.post(
+            BASE + "/memories",
+            json={
+                "idempotencyKey": "mem-dup-2",
+                "conversationId": "direct-alice",
+                "conversationKind": "direct",
+                "personaId": "persona-a",
+                "kind": "fact",
+                "text": "Fact 2 citing mem1 with duplicate refs",
+                "sourceMessageIds": [msg1["id"]],
+                "sourceRefs": ref_mem_dup,
+            },
+            headers=_headers(),
+        )
+        assert resp_mem2.status_code == 201, resp_mem2.text

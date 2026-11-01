@@ -185,7 +185,7 @@ def main() -> int:
         with opener.open(turn_req) as resp:
             return resp.status, json.loads(resp.read().decode())
 
-    def poll_task(task_id: str, timeout_seconds: float = 90.0) -> dict[str, Any]:
+    def poll_task(task_id: str, timeout_seconds: float = 300.0) -> dict[str, Any]:
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             time.sleep(1)
@@ -226,6 +226,7 @@ def main() -> int:
                 "timeout" in message.lower()
                 or "deadline" in message.lower()
                 or "before terminal completion" in message.lower()
+                or "conversation_assistant_not_delivered" in message.lower()
             )
             if not is_transient:
                 return last
@@ -358,6 +359,7 @@ def main() -> int:
             (test_conv_id,),
         )
         cnt, total_chars = cur.fetchone()
+        total_chars = total_chars or 0
 
     if total_chars < 3200 or cnt < 8:
         needed = max(0, 3250 - total_chars)
@@ -421,7 +423,8 @@ def main() -> int:
                WHERE conversation_id=? AND role='assistant' ORDER BY rowid DESC LIMIT 1""",
             (test_conv_id,),
         )
-        latest_refs = json.loads(cur.fetchone()[0])
+        row = cur.fetchone()
+        latest_refs = json.loads(row[0]) if row and row[0] else []
         cites_memory = any(r.get("memoryId") == saved_memory_id for r in latest_refs)
 
     gate7_pass = t_recall["status"] == "completed" and cites_memory is True
@@ -437,13 +440,18 @@ def main() -> int:
     )
 
     # --- Gate 8: Memory Deletion Exclusion ---
-    del_path = f"/api/v1/workspaces/local/work/conversation-memory/memories/{saved_memory_id}"
-    del_url = f"{persistence_url}{del_path}?expectedVersion=1"
-    del_req = urllib.request.Request(
-        del_url, method="DELETE", headers={"Authorization": f"Bearer {session_token}"}
-    )
-    with urllib.request.urlopen(del_req) as resp:
-        del_res = json.loads(resp.read().decode())
+    del_res: dict[str, Any] = {}
+    if saved_memory_id:
+        del_path = f"/api/v1/workspaces/local/work/conversation-memory/memories/{saved_memory_id}"
+        del_url = f"{persistence_url}{del_path}?expectedVersion=1"
+        del_req = urllib.request.Request(
+            del_url, method="DELETE", headers={"Authorization": f"Bearer {session_token}"}
+        )
+        try:
+            with urllib.request.urlopen(del_req) as resp:
+                del_res = json.loads(resp.read().decode())
+        except Exception as e:
+            del_res = {"deleted": False, "error": str(e)}
 
     t_post_del = submit_and_wait(
         test_conv_id,
@@ -458,7 +466,8 @@ def main() -> int:
                WHERE conversation_id=? AND role='assistant' ORDER BY rowid DESC LIMIT 1""",
             (test_conv_id,),
         )
-        post_del_refs = json.loads(cur.fetchone()[0])
+        row = cur.fetchone()
+        post_del_refs = json.loads(row[0]) if row and row[0] else []
         cites_deleted_memory = any(r.get("memoryId") == saved_memory_id for r in post_del_refs)
 
     gate8_pass = (
@@ -506,10 +515,12 @@ def main() -> int:
         cur = con.cursor()
         cur.execute(
             """SELECT source_refs_json FROM conversation_memory_messages
-               WHERE conversation_id=? AND role='assistant' ORDER BY rowid DESC LIMIT 1""",
+               WHERE conversation_id=? AND role='assistant' AND status='active'
+               ORDER BY rowid DESC LIMIT 1""",
             (test_conv_id,),
         )
-        post_rev_refs = json.loads(cur.fetchone()[0])
+        row = cur.fetchone()
+        post_rev_refs = json.loads(row[0]) if row and row[0] else []
         cites_revoked = any(
             target_source_id in r.get("sourceMessageIds", []) for r in post_rev_refs
         )

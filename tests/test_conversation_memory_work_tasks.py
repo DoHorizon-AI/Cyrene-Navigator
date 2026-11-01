@@ -26,9 +26,7 @@ def test_conversation_maintenance_tasks_require_trusted_actor_binding(tmp_path: 
         ),
     }
     with TestClient(create_persistence_app(tmp_path / "tasks.sqlite3", principals)) as client:
-        conversation_base = (
-            "/api/v1/workspaces/workspace-a/work/conversation-memory"
-        )
+        conversation_base = "/api/v1/workspaces/workspace-a/work/conversation-memory"
         job_response = client.post(
             conversation_base + "/maintenance/jobs",
             json={"idempotencyKey": "dream-key-1", "kind": "dream"},

@@ -295,7 +295,7 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
         workspaceId,
         tokenEnv: 'CYRENE_SESSION_TOKEN',
         privateBridgeTokenEnv: 'CYRENE_PRIVATE_TEAMS_BRIDGE_TOKEN',
-        requestTimeoutMs: 10_000,
+        requestTimeoutMs: Number(process.env.CYRENE_PERSISTENCE_REQUEST_TIMEOUT_MS ?? 45_000),
       })
       : testMode ? new InMemoryWorkStateStore() : (() => { throw new Error('Durable work-state configuration is required'); })());
   if (production && (workState instanceof InMemoryWorkStateStore || options.workStateStore === undefined && !persistenceUrl)) {
@@ -331,7 +331,7 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
         || value === process.env.CYRENE_PRIVATE_TEAMS_BRIDGE_TOKEN)) {
       throw new Error('Work actor token environment references must resolve to distinct dedicated credentials');
     }
-    workActorClients = new WorkActorClientRegistry({ baseUrl: persistenceUrl, workspaceId, requestTimeoutMs: 10_000 }, workActorReferences);
+    workActorClients = new WorkActorClientRegistry({ baseUrl: persistenceUrl, workspaceId, requestTimeoutMs: Number(process.env.CYRENE_PERSISTENCE_REQUEST_TIMEOUT_MS ?? 45_000) }, workActorReferences);
   }
   if (teams?.personalChatEnabled === true) {
     if (workActorReferences === undefined || workActorReferences.length < 1 || workActorReferences.length > 5) {
@@ -406,7 +406,7 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
       tokenEnvForSession: (sessionId: string) => persistenceTokenEnvForSession(sessionId),
       actorPrivateScopeForSession: (sessionId: string) => actorPrivateScopeForSession(sessionId),
       clientId: process.env.CYRENE_DEVICE_ID ?? 'navigator-cloud-daemon',
-      requestTimeoutMs: 10_000,
+      requestTimeoutMs: Number(process.env.CYRENE_PERSISTENCE_REQUEST_TIMEOUT_MS ?? 45_000),
       heartbeatMs: 1_000,
       batchDelayMs: 10,
       maxPendingEvents: 128,
@@ -644,7 +644,7 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
   const pluginManager = ctx.get('pluginManager');
   const workflowStore = workflowsEnabled
     ? new WorkflowsClient({
-      baseUrl: persistenceUrl!, workspaceId: workspaceId!, tokenEnv: 'CYRENE_SESSION_TOKEN', requestTimeoutMs: 10_000,
+      baseUrl: persistenceUrl!, workspaceId: workspaceId!, tokenEnv: 'CYRENE_SESSION_TOKEN', requestTimeoutMs: Number(process.env.CYRENE_PERSISTENCE_REQUEST_TIMEOUT_MS ?? 45_000),
     })
     : undefined;
   const workflowStoresByActor = new Map<string, WorkflowsClient>();
@@ -653,7 +653,7 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
       const tokenEnv = workActorClients.tokenEnvForActor(actorId);
       if (tokenEnv === undefined) continue;
       workflowStoresByActor.set(actorId, new WorkflowsClient({
-        baseUrl: persistenceUrl, workspaceId, tokenEnv, requestTimeoutMs: 10_000,
+        baseUrl: persistenceUrl, workspaceId, tokenEnv, requestTimeoutMs: Number(process.env.CYRENE_PERSISTENCE_REQUEST_TIMEOUT_MS ?? 45_000),
       }));
     }
   }

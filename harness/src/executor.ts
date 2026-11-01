@@ -3674,6 +3674,7 @@ export class NavigatorExecutor {
     text: string,
   ): Promise<void> {
     if (!isTrustedConversationAssistantTask(task)) return;
+    if (this.config.conversationAssistant?.enabled !== true) return;
     const actorId = task.createdByActorId?.toLowerCase();
     if (task.status !== 'completed' || actorId === undefined
       || (expectedActorId !== undefined && actorId !== expectedActorId.toLowerCase())) {
@@ -3692,7 +3693,8 @@ export class NavigatorExecutor {
       );
     }
     const api = workState.conversationMemoryApiV1?.(actorId);
-    const overview = await workState.getConversationMemoryOverview?.(AbortSignal.timeout(10_000));
+    const deliveryTimeoutMs = Number(process.env.CYRENE_PERSISTENCE_REQUEST_TIMEOUT_MS ?? 45_000);
+    const overview = await workState.getConversationMemoryOverview?.(AbortSignal.timeout(deliveryTimeoutMs));
     if (api === undefined || overview === undefined) {
       throw new ExecutorRequestError(
         503,
@@ -3708,7 +3710,7 @@ export class NavigatorExecutor {
         'The static conversation-assistant profile is unavailable for source revalidation.',
       );
     }
-    const signal = AbortSignal.timeout(10_000);
+    const signal = AbortSignal.timeout(deliveryTimeoutMs);
     const proof = await this.readConversationAssistantSourceProof(task.id, workState);
     if (proof === undefined || proof.contentSha256 !== sha256(text)
       || proof.personaId !== profile.personaId) {

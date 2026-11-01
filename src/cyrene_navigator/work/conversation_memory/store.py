@@ -346,12 +346,18 @@ class ConversationMemoryStore:
                        actor_id,message_id,source_message_id) VALUES(?,?,?,?,?)""",
                     (org, workspace, actor, message_id, source_id),
                 )
+            seen_message_memory_ids: set[str] = set()
             for ref in memory_refs:
+                mid = str(ref["memoryId"])
+                if mid in seen_message_memory_ids:
+                    continue
+                seen_message_memory_ids.add(mid)
                 conn.execute(
-                    """INSERT INTO conversation_memory_message_memory_sources(organization_id,
+                    """INSERT OR REPLACE INTO
+                       conversation_memory_message_memory_sources(organization_id,
                        workspace_id,actor_id,message_id,source_memory_id,source_memory_version)
                        VALUES(?,?,?,?,?,?)""",
-                    (org, workspace, actor, message_id, ref["memoryId"], ref["memoryVersion"]),
+                    (org, workspace, actor, message_id, mid, ref["memoryVersion"]),
                 )
             row = conn.execute(
                 """SELECT * FROM conversation_memory_messages WHERE organization_id=?
@@ -588,12 +594,18 @@ class ConversationMemoryStore:
                        actor_id,memory_id,source_message_id) VALUES(?,?,?,?,?)""",
                     (org, workspace, actor, memory_id, source_id),
                 )
+            seen_item_memory_ids: set[str] = set()
             for ref in memory_refs:
+                mid = str(ref["memoryId"])
+                if mid in seen_item_memory_ids:
+                    continue
+                seen_item_memory_ids.add(mid)
                 conn.execute(
-                    """INSERT INTO conversation_memory_item_memory_sources(organization_id,
+                    """INSERT OR REPLACE INTO
+                       conversation_memory_item_memory_sources(organization_id,
                        workspace_id,actor_id,memory_id,source_memory_id,source_memory_version)
                        VALUES(?,?,?,?,?,?)""",
-                    (org, workspace, actor, memory_id, ref["memoryId"], ref["memoryVersion"]),
+                    (org, workspace, actor, memory_id, mid, ref["memoryVersion"]),
                 )
             row = conn.execute(
                 """SELECT * FROM conversation_memory_items WHERE organization_id=?
@@ -2138,6 +2150,12 @@ class ConversationMemoryStore:
         conn.execute("PRAGMA busy_timeout=10000")
         try:
             yield conn
+            if conn.in_transaction:
+                conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
         finally:
             conn.close()
 
