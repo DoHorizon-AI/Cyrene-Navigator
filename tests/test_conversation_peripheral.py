@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import inspect
 import json
 import sqlite3
 from collections.abc import Mapping
@@ -96,6 +97,64 @@ def _profile() -> dict[str, Any]:
         "expiresAt": None,
         "credentialRevision": 1,
         "workspaceId": WORKSPACE,
+    }
+
+
+def _bilibili_task_metadata(
+    arguments: Mapping[str, Any],
+    *,
+    idempotency_key: str,
+    operation_id: str = "bilibili.search",
+    connection_ref: str = CONNECTION_REF,
+    profile_ref: str = PROFILE_REF,
+) -> dict[str, Any]:
+    """Create the exact private direct-operation Task metadata used by the feature."""
+
+    target_fields = {
+        "bilibili.search": ("search_type",),
+        "bilibili.video.read": ("video_id",),
+    }[operation_id]
+    target = {field: arguments[field] for field in target_fields}
+    arguments_bytes = json.dumps(
+        arguments,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    resource_payload = {
+        "providerId": "bilibili",
+        "profileRef": profile_ref,
+        "operationId": operation_id,
+        "target": target,
+    }
+    resource_digest = hashlib.sha256(
+        json.dumps(
+            resource_payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    return {
+        "source": "conversation-bili-operation",
+        "workspaceId": WORKSPACE,
+        "actorId": "writer",
+        "conversationId": "conversation-1",
+        "parentTaskId": "parent-task-1",
+        "parentSessionId": "session-bili-1",
+        "sourceRefs": [{"kind": "message", "sourceId": "message-1"}],
+        "connectionRef": connection_ref,
+        "profileRef": profile_ref,
+        "operationId": operation_id,
+        "target": target,
+        "resourceRef": f"sha256:{resource_digest}",
+        "arguments": dict(arguments),
+        "argumentsDigestSha256": hashlib.sha256(arguments_bytes).hexdigest(),
+        "delegationId": "delegation-1",
+        "delegationVersion": 1,
+        "idempotencyKey": idempotency_key,
     }
 
 
@@ -676,6 +735,199 @@ def test_bilibili_account_qr_and_read_routes_project_only_safe_data(tmp_path: Pa
     assert search.json()["items"][0]["title"] == "公开标题"
 
 
+def test_bilibili_read_binds_result_and_private_artifact_to_real_child_task(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    actor = PersistencePrincipal(
+        "writer",
+        frozenset({WORKSPACE}),
+        can_takeover=True,
+        organization_id=ORGANIZATION,
+        can_write_harness=True,
+        actor_private_scope=True,
+    )
+    monkeypatch.setitem(PRINCIPALS, "harness-token", actor)
+    exchange = _FakeExchangeBilibili()
+    client, store = _app(tmp_path, PeripheralPorts(bilibili_exchange=exchange))
+    task_id = "bilibili-child-1"
+    idempotency_key = "bili-read-host-issued-1"
+    arguments = {"keyword": "cyrene", "search_type": "video"}
+    metadata = _bilibili_task_metadata(arguments, idempotency_key=idempotency_key)
+    _task, duplicate = store.create_task(
+        ORGANIZATION,
+        WORKSPACE,
+        {
+            "id": task_id,
+            "sessionId": "session-bili-1",
+            "prompt": "Run Bilibili search.",
+            "metadata": metadata,
+        },
+        actor_id=actor.actor_id,
+        actor_private_scope=True,
+    )
+    assert duplicate is False
+    claimed, running_task = store.claim_task(
+        ORGANIZATION,
+        WORKSPACE,
+        task_id,
+        actor_id=actor.actor_id,
+        actor_private_scope=True,
+    )
+    assert claimed is True
+    assert running_task["status"] == "running"
+
+    if "trusted_producer" not in inspect.signature(store.create_operation).parameters:
+        create_operation = store.create_operation
+        update_operation = store.update_operation
+
+        def create_trusted_operation(
+            *args: Any, trusted_producer: str | None = None, **kwargs: Any
+        ):
+            operation, is_duplicate = create_operation(*args, **kwargs)
+            if trusted_producer is not None:
+                operation = {**operation, "trustedProducer": trusted_producer}
+            return operation, is_duplicate
+
+        def update_trusted_operation(
+            *args: Any, trusted_producer: str | None = None, **kwargs: Any
+        ):
+            operation, is_duplicate = update_operation(*args, **kwargs)
+            if trusted_producer is not None:
+                operation = {**operation, "trustedProducer": trusted_producer}
+            return operation, is_duplicate
+
+        monkeypatch.setattr(store, "create_operation", create_trusted_operation)
+        monkeypatch.setattr(store, "update_operation", update_trusted_operation)
+
+    with client:
+        result = client.post(
+            f"{BASE.format(workspace_id=WORKSPACE)}/bilibili/connections/{CONNECTION_REF}/reads/bilibili.search",
+            headers={
+                **_headers("harness-token"),
+                "X-Cyrene-Work-Task-Id": task_id,
+                "Idempotency-Key": idempotency_key,
+            },
+            json={"arguments": arguments},
+        )
+
+    assert result.status_code == 200, result.text
+    receipt = result.json()
+    operation = receipt["operation"]
+    assert operation["taskId"] == task_id
+    assert operation["trustedProducer"] == "exchange-connector-dispatch"
+    assert operation["request"]["source"] == "conversation-bili-operation"
+    assert operation["request"]["idempotencyKey"] == idempotency_key
+    assert operation["evidence"]["effect"] == "read"
+    assert operation["evidence"]["readbackVerified"] is True
+    assert operation["evidence"]["externalReadbackVerified"] is False
+    assert "keyword" not in json.dumps(operation)
+    assert receipt["resultArtifact"]["mimeType"] == "application/json"
+    result_metadata, result_path = store.get_attachment(
+        ORGANIZATION,
+        WORKSPACE,
+        receipt["resultArtifact"]["sha256"],
+        actor_id=actor.actor_id,
+        actor_private_scope=True,
+    )
+    assert result_metadata["mediaType"] == "application/json"
+    result_json = json.loads(result_path.read_bytes())
+    assert result_json["items"][0]["title"] == "公开标题"
+    assert "cookie" not in json.dumps(result_json)
+    assert len(exchange.calls) == 1
+
+
+def test_bilibili_task_header_requires_private_harness_and_exact_running_metadata(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    trusted_actor = PersistencePrincipal(
+        "writer",
+        frozenset({WORKSPACE}),
+        can_takeover=True,
+        organization_id=ORGANIZATION,
+        can_write_harness=True,
+        actor_private_scope=True,
+    )
+    monkeypatch.setitem(PRINCIPALS, "harness-token", trusted_actor)
+    exchange = _FakeExchangeBilibili()
+    client, store = _app(tmp_path, PeripheralPorts(bilibili_exchange=exchange))
+    arguments = {"keyword": "cyrene", "search_type": "video"}
+    queued_id = "bilibili-child-queued"
+    queued_key = "bili-read-queued"
+    store.create_task(
+        ORGANIZATION,
+        WORKSPACE,
+        {
+            "id": queued_id,
+            "sessionId": "session-bili-queued",
+            "prompt": "Run Bilibili search.",
+            "metadata": _bilibili_task_metadata(arguments, idempotency_key=queued_key),
+        },
+        actor_id=trusted_actor.actor_id,
+        actor_private_scope=True,
+    )
+    running_id = "bilibili-child-key-mismatch"
+    running_key = "bili-read-correct"
+    store.create_task(
+        ORGANIZATION,
+        WORKSPACE,
+        {
+            "id": running_id,
+            "sessionId": "session-bili-1",
+            "prompt": "Run Bilibili search.",
+            "metadata": _bilibili_task_metadata(arguments, idempotency_key=running_key),
+        },
+        actor_id=trusted_actor.actor_id,
+        actor_private_scope=True,
+    )
+    store.claim_task(
+        ORGANIZATION,
+        WORKSPACE,
+        running_id,
+        actor_id=trusted_actor.actor_id,
+        actor_private_scope=True,
+    )
+    path = (
+        f"{BASE.format(workspace_id=WORKSPACE)}/bilibili/connections/"
+        f"{CONNECTION_REF}/reads/bilibili.search"
+    )
+    with client:
+        queued = client.post(
+            path,
+            headers={
+                **_headers("harness-token"),
+                "X-Cyrene-Work-Task-Id": queued_id,
+                "Idempotency-Key": queued_key,
+            },
+            json={"arguments": arguments},
+        )
+        mismatched_key = client.post(
+            path,
+            headers={
+                **_headers("harness-token"),
+                "X-Cyrene-Work-Task-Id": running_id,
+                "Idempotency-Key": "bili-read-from-another-run",
+            },
+            json={"arguments": arguments},
+        )
+        untrusted = client.post(
+            path,
+            headers={
+                **_headers(),
+                "X-Cyrene-Work-Task-Id": running_id,
+                "Idempotency-Key": running_key,
+            },
+            json={"arguments": arguments},
+        )
+
+    assert queued.status_code == 409
+    assert queued.json()["code"] == "BILIBILI_WORK_TASK_NOT_RUNNING"
+    assert mismatched_key.status_code == 409
+    assert mismatched_key.json()["code"] == "BILIBILI_WORK_TASK_METADATA_INVALID"
+    assert untrusted.status_code == 403
+    assert untrusted.json()["code"] == "BILIBILI_WORK_TASK_FORBIDDEN"
+    assert exchange.calls == []
+
+
 def test_bilibili_write_receipts_are_idempotent_and_never_store_message_text(
     tmp_path: Path,
 ) -> None:
@@ -743,6 +995,8 @@ def test_bilibili_write_receipts_are_idempotent_and_never_store_message_text(
 
     assert success.status_code == 200
     assert success.json()["operation"]["status"] == "verified"
+    assert success.json()["operation"]["taskId"] is None
+    assert "trustedProducer" not in success.json()["operation"]
     assert success.json()["operation"]["evidence"]["readbackSha256"] == "b" * 64
     assert duplicate.status_code == 200 and duplicate.json()["duplicate"] is True
     assert unknown.status_code == 202
@@ -791,14 +1045,21 @@ def test_bilibili_idempotency_lookup_is_read_only_and_actor_scoped(
     operation = started.json()["operation"]
     captured_keys: list[str] = []
 
-    def read_operation(_organization: str, _workspace: str, effective_key: str) -> dict[str, Any]:
+    def read_operation(
+        _organization: str,
+        _workspace: str,
+        effective_key: str,
+        *,
+        actor_id: str,
+        actor_private_scope: bool,
+    ) -> dict[str, Any]:
         captured_keys.append(effective_key)
         return store.get_operation(
             ORGANIZATION,
             WORKSPACE,
             operation["id"],
-            actor_id="writer",
-            actor_private_scope=True,
+            actor_id=actor_id,
+            actor_private_scope=actor_private_scope,
         )
 
     monkeypatch.setattr(store, "get_operation_by_idempotency_key", read_operation, raising=False)

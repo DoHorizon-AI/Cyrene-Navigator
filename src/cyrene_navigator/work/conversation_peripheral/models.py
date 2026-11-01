@@ -262,6 +262,23 @@ class BilibiliWriteRequest(WorkModel):
         return value
 
 
+class BilibiliResultArtifact(WorkModel):
+    """Actor-private JSON attachment containing one safe Bilibili read result."""
+
+    artifact_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    mime_type: Literal["application/json"]
+    size: int = Field(ge=1, le=1_500_000)
+
+
+class BilibiliOperationReceipt(WorkModel):
+    """Canonical Work operation receipt with an optional read-result artifact."""
+
+    operation: dict[str, Any]
+    result_artifact: BilibiliResultArtifact | None = None
+    duplicate: bool
+
+
 class BackupCreate(WorkModel):
     """Create a bounded backup attachment through the configured host port."""
 
@@ -292,7 +309,9 @@ __all__ = [
     "BilibiliLinkStatusRequest",
     "BilibiliLinkedProfile",
     "BilibiliOperationList",
+    "BilibiliOperationReceipt",
     "BilibiliReadRequest",
+    "BilibiliResultArtifact",
     "BilibiliWriteRequest",
     "MediaAsset",
     "MediaAssetDeleteReceipt",

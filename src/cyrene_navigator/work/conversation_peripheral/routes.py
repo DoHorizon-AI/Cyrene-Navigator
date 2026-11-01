@@ -19,6 +19,7 @@ import hashlib
 import json
 import re
 from collections.abc import Callable, Collection, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
 from urllib.parse import quote
@@ -39,7 +40,6 @@ from cyrene_navigator.work.conversation_artifact_bridge.routes import (
 )
 from cyrene_navigator.work.models import (
     AttachmentRecord,
-    OperationReceipt,
 )
 from cyrene_navigator.work.store import WorkStore
 
@@ -53,6 +53,7 @@ from .models import (
     BilibiliLinkStatus,
     BilibiliLinkStatusRequest,
     BilibiliOperationList,
+    BilibiliOperationReceipt,
     BilibiliReadRequest,
     BilibiliWriteRequest,
     MediaAsset,
@@ -99,9 +100,26 @@ _BILIBILI_WRITE_OPERATIONS = (
     "bilibili.dynamic.publish",
     "bilibili.dm.send",
 )
+_BILIBILI_TASK_HEADER = "X-Cyrene-Work-Task-Id"
+_BILIBILI_TASK_SOURCES = frozenset(
+    {"conversation-bili-operation", "conversation-bili-subscription-read"}
+)
 
 
 PrincipalFor = Callable[..., PersistencePrincipal]
+
+
+@dataclass(frozen=True, slots=True)
+class _BilibiliChildTask:
+    """A verified running actor-private Task authorized for one exact Bili call."""
+
+    task_id: str
+    source: str
+    profile_ref: str
+    idempotency_key: str
+    resource_ref: str
+    target: Mapping[str, Any]
+    operation_request: Mapping[str, Any]
 
 
 def mount_peripheral_routes(
@@ -578,14 +596,25 @@ def mount_peripheral_routes(
 
     @app.get(
         base + "/bilibili/operations/by-idempotency-key",
-        response_model=OperationReceipt,
+        response_model=BilibiliOperationReceipt,
     )
     async def get_bilibili_operation_by_idempotency_key(
         workspace_id: str,
         request: Request,
+        response: Response,
         idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
     ) -> dict[str, Any]:
         principal = principal_for(request, workspace_id)
+        task_id = request.headers.get(_BILIBILI_TASK_HEADER.lower())
+        task_source: str | None = None
+        if task_id is not None:
+            task_source, task_metadata = _require_bilibili_task_for_lookup(
+                store,
+                principal,
+                workspace_id,
+                task_id,
+                idempotency_key,
+            )
         effective_key = _bilibili_effective_operation_key(principal, workspace_id, idempotency_key)
         lookup = getattr(store, "get_operation_by_idempotency_key", None)
         if not callable(lookup):
@@ -596,7 +625,13 @@ def mount_peripheral_routes(
                 True,
             )
         try:
-            operation = lookup(principal.organization_id, workspace_id, effective_key)
+            operation = lookup(
+                principal.organization_id,
+                workspace_id,
+                effective_key,
+                actor_id=principal.actor_id,
+                actor_private_scope=principal.actor_private_scope,
+            )
         except PersistenceError as error:
             if error.code == "WORK_OPERATION_NOT_FOUND":
                 raise PersistenceError(
@@ -611,7 +646,12 @@ def mount_peripheral_routes(
             not isinstance(operation_request, Mapping)
             or operation_request.get("actorScopeSha256")
             != actor_scope_sha256(principal, workspace_id)
-            or stored_operation_id not in _BILIBILI_WRITE_OPERATIONS
+            or stored_operation_id
+            not in (
+                _BILIBILI_WRITE_OPERATIONS
+                if task_id is None
+                else (*_BILIBILI_READ_OPERATIONS, *_BILIBILI_WRITE_OPERATIONS)
+            )
             or operation.get("operationType") != f"tool.provider.v1:{stored_operation_id}"
             or not isinstance(operation_request.get("argumentsSha256"), str)
             or _DIGEST.fullmatch(operation_request["argumentsSha256"]) is None
@@ -621,7 +661,54 @@ def mount_peripheral_routes(
             raise PersistenceError(
                 "BILIBILI_OPERATION_NOT_FOUND", 404, "Bilibili operation not found."
             )
-        return {"operation": operation, "duplicate": True}
+        if task_id is not None:
+            operation_request = operation.get("request")
+            if (
+                task_source not in _BILIBILI_TASK_SOURCES
+                or operation.get("taskId") != task_id
+                or operation.get("trustedProducer") != "exchange-connector-dispatch"
+                or not isinstance(operation_request, Mapping)
+                or operation_request.get("source") != task_source
+                or operation_request.get("taskId") != task_id
+                or operation_request.get("idempotencyKey") != idempotency_key
+                or operation_request.get("actorScopeSha256")
+                != actor_scope_sha256(principal, workspace_id)
+                or not _bilibili_task_metadata_matches_operation(
+                    task_metadata, operation_request, idempotency_key
+                )
+            ):
+                raise PersistenceError(
+                    "BILIBILI_OPERATION_NOT_FOUND", 404, "Bilibili operation not found."
+                )
+            artifact = _bilibili_result_artifact_from_operation(
+                store,
+                principal,
+                workspace_id,
+                operation,
+                _BilibiliChildTask(
+                    task_id=task_id,
+                    source=task_source,
+                    profile_ref=str(operation_request.get("profileRef") or ""),
+                    idempotency_key=idempotency_key,
+                    resource_ref=str(operation_request.get("resourceRef") or ""),
+                    target={},
+                    operation_request=operation_request,
+                ),
+            )
+            evidence = operation.get("evidence")
+            outcome = evidence.get("outcome") if isinstance(evidence, Mapping) else None
+            response.status_code = (
+                202
+                if operation.get("status") in {"started", "uncertain"}
+                or outcome in {"pending", "uncertain"}
+                else 200
+            )
+            return {
+                "operation": operation,
+                "resultArtifact": artifact,
+                "duplicate": True,
+            }
+        return {"operation": operation, "resultArtifact": None, "duplicate": True}
 
     @app.post(base + "/bilibili/connections/{connection_ref}/reads/{operation_id}")
     async def bilibili_read(
@@ -630,14 +717,80 @@ def mount_peripheral_routes(
         operation_id: str,
         body: BilibiliReadRequest,
         request: Request,
+        response: Response,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=200),
     ) -> dict[str, Any]:
         if operation_id not in _BILIBILI_READ_OPERATIONS:
             raise PersistenceError(
                 "BILIBILI_OPERATION_NOT_FOUND", 404, "Read operation unavailable."
             )
         principal = principal_for(request, workspace_id)
+        task = _require_bilibili_child_task(
+            store,
+            principal,
+            workspace_id,
+            request,
+            connection_ref=connection_ref,
+            operation_id=operation_id,
+            arguments=body.arguments,
+            idempotency_key=idempotency_key,
+        )
         port = _bilibili_exchange_port(ports)
-        await _require_bilibili_connection(port, principal, workspace_id, connection_ref)
+        connection = await _require_bilibili_connection(
+            port, principal, workspace_id, connection_ref
+        )
+        normalized_connection = str(UUID(connection_ref))
+        profile_ref = _value(connection, "profile_ref", "profileRef")
+        if task is not None and profile_ref != task.profile_ref:
+            raise _bilibili_task_metadata_error()
+
+        work_operation: dict[str, Any] | None = None
+        operation_duplicate = False
+        if task is not None:
+            effective_key = _bilibili_effective_operation_key(
+                principal, workspace_id, task.idempotency_key
+            )
+            actor_scope = actor_scope_sha256(principal, workspace_id)
+            connection_digest = hashlib.sha256(normalized_connection.encode()).hexdigest()
+            connection_scope = hashlib.sha256(
+                f"{actor_scope}\0{connection_digest}".encode()
+            ).hexdigest()
+            work_operation, operation_duplicate = _create_bilibili_work_operation(
+                store,
+                principal,
+                workspace_id,
+                {
+                    "idempotencyKey": effective_key,
+                    "operationType": f"tool.provider.v1:{operation_id}",
+                    "taskId": task.task_id,
+                    "target": f"connector-target:{connection_scope}",
+                    "request": {
+                        **dict(task.operation_request),
+                        "connectionRef": normalized_connection,
+                        "profileRef": task.profile_ref,
+                    },
+                },
+                task,
+            )
+            if operation_duplicate:
+                artifact = _bilibili_result_artifact_from_operation(
+                    store, principal, workspace_id, work_operation, task
+                )
+                evidence = work_operation.get("evidence")
+                operation_outcome = (
+                    evidence.get("outcome") if isinstance(evidence, Mapping) else None
+                )
+                response.status_code = (
+                    202
+                    if work_operation.get("status") in {"started", "uncertain"}
+                    or operation_outcome in {"pending", "uncertain"}
+                    else 200
+                )
+                return {
+                    "operation": work_operation,
+                    "resultArtifact": artifact,
+                    "duplicate": True,
+                }
         try:
             envelope = await invoke_port(
                 port.invoke_operation,
@@ -649,8 +802,60 @@ def mount_peripheral_routes(
                 work_operation_id=None,
             )
         except ExchangeBilibiliHttpError as error:
+            if task is not None and work_operation is not None:
+                failure_evidence = {
+                    **dict(task.operation_request),
+                    "effect": "read",
+                    "outcome": "uncertain" if error.side_effect_possible else "failed",
+                    "providerId": "bilibili",
+                    "connectionRef": normalized_connection,
+                    "profileRef": task.profile_ref,
+                    "operationId": operation_id,
+                    "resourceRef": task.resource_ref,
+                    "argumentsSha256": task.operation_request["argumentsSha256"],
+                    "resultArtifactId": None,
+                    "resultSha256": None,
+                    "readbackVerified": False,
+                    "externalReadbackVerified": False,
+                    "errorCode": error.code,
+                }
+                _update_bilibili_work_operation(
+                    store,
+                    principal,
+                    workspace_id,
+                    str(work_operation["id"]),
+                    "uncertain" if error.side_effect_possible else "verified",
+                    failure_evidence,
+                    task,
+                )
             raise _exchange_error(error) from None
         except PeripheralPortError as error:
+            if task is not None and work_operation is not None:
+                failure_evidence = {
+                    **dict(task.operation_request),
+                    "effect": "read",
+                    "outcome": "uncertain" if error.side_effect_possible else "failed",
+                    "providerId": "bilibili",
+                    "connectionRef": normalized_connection,
+                    "profileRef": task.profile_ref,
+                    "operationId": operation_id,
+                    "resourceRef": task.resource_ref,
+                    "argumentsSha256": task.operation_request["argumentsSha256"],
+                    "resultArtifactId": None,
+                    "resultSha256": None,
+                    "readbackVerified": False,
+                    "externalReadbackVerified": False,
+                    "errorCode": error.code,
+                }
+                _update_bilibili_work_operation(
+                    store,
+                    principal,
+                    workspace_id,
+                    str(work_operation["id"]),
+                    "uncertain" if error.side_effect_possible else "verified",
+                    failure_evidence,
+                    task,
+                )
             status = 503 if error.unavailable else 502
             raise PersistenceError(
                 error.code,
@@ -658,11 +863,137 @@ def mount_peripheral_routes(
                 "The configured Exchange connector service is unavailable.",
                 error.unavailable,
             ) from None
-        return _project_bilibili_read_result(operation_id, envelope)
+        except Exception:
+            if task is not None and work_operation is not None:
+                failure_evidence = {
+                    **dict(task.operation_request),
+                    "effect": "read",
+                    "outcome": "uncertain",
+                    "providerId": "bilibili",
+                    "connectionRef": normalized_connection,
+                    "profileRef": task.profile_ref,
+                    "operationId": operation_id,
+                    "resourceRef": task.resource_ref,
+                    "argumentsSha256": task.operation_request["argumentsSha256"],
+                    "resultArtifactId": None,
+                    "resultSha256": None,
+                    "readbackVerified": False,
+                    "externalReadbackVerified": False,
+                    "errorCode": "EXCHANGE_RESULT_UNKNOWN",
+                }
+                _update_bilibili_work_operation(
+                    store,
+                    principal,
+                    workspace_id,
+                    str(work_operation["id"]),
+                    "uncertain",
+                    failure_evidence,
+                    task,
+                )
+            raise PersistenceError(
+                "BILIBILI_READ_UNAVAILABLE",
+                502,
+                "Exchange could not verify the Bilibili read result.",
+                True,
+            ) from None
+        try:
+            result = _project_bilibili_read_result(operation_id, envelope)
+        except PersistenceError as error:
+            if task is not None and work_operation is not None:
+                failure_evidence = {
+                    **dict(task.operation_request),
+                    "effect": "read",
+                    "outcome": "failed",
+                    "providerId": "bilibili",
+                    "connectionRef": normalized_connection,
+                    "profileRef": task.profile_ref,
+                    "operationId": operation_id,
+                    "resourceRef": task.resource_ref,
+                    "argumentsSha256": task.operation_request["argumentsSha256"],
+                    "resultArtifactId": None,
+                    "resultSha256": None,
+                    "readbackVerified": False,
+                    "externalReadbackVerified": False,
+                    "errorCode": error.code,
+                }
+                _update_bilibili_work_operation(
+                    store,
+                    principal,
+                    workspace_id,
+                    str(work_operation["id"]),
+                    "verified",
+                    failure_evidence,
+                    task,
+                )
+            raise
+        if task is None or work_operation is None:
+            return result
+        try:
+            result_artifact = _store_bilibili_result_artifact(
+                store, principal, workspace_id, operation_id, result
+            )
+        except PersistenceError as error:
+            evidence = {
+                **dict(task.operation_request),
+                "effect": "read",
+                "outcome": "uncertain",
+                "providerId": "bilibili",
+                "connectionRef": normalized_connection,
+                "profileRef": task.profile_ref,
+                "operationId": operation_id,
+                "resourceRef": task.resource_ref,
+                "argumentsSha256": task.operation_request["argumentsSha256"],
+                "resultArtifactId": None,
+                "resultSha256": None,
+                "readbackVerified": False,
+                "externalReadbackVerified": False,
+                "errorCode": error.code,
+            }
+            _update_bilibili_work_operation(
+                store,
+                principal,
+                workspace_id,
+                str(work_operation["id"]),
+                "uncertain",
+                evidence,
+                task,
+            )
+            raise
+        result_digest = result_artifact["sha256"]
+        evidence = {
+            **dict(task.operation_request),
+            "effect": "read",
+            "outcome": "verified",
+            "providerId": "bilibili",
+            "connectionRef": normalized_connection,
+            "profileRef": task.profile_ref,
+            "operationId": operation_id,
+            "resourceRef": task.resource_ref,
+            "argumentsSha256": task.operation_request["argumentsSha256"],
+            "resultArtifactId": result_digest,
+            "resultSha256": result_digest,
+            "readbackVerified": True,
+            "externalReadbackVerified": False,
+        }
+        operation, _ = _update_bilibili_work_operation(
+            store,
+            principal,
+            workspace_id,
+            str(work_operation["id"]),
+            "verified",
+            evidence,
+            task,
+        )
+        response.status_code = 200
+        return {
+            "operation": operation,
+            "resultArtifact": result_artifact,
+            "duplicate": False,
+        }
 
     @app.post(
         base + "/bilibili/connections/{connection_ref}/writes/{operation_id}",
-        response_model=OperationReceipt,
+        response_model=BilibiliOperationReceipt,
     )
     async def bilibili_write(
         workspace_id: str,
@@ -677,10 +1008,26 @@ def mount_peripheral_routes(
             raise PersistenceError(
                 "BILIBILI_OPERATION_NOT_FOUND", 404, "Write operation unavailable."
             )
-        principal = principal_for(request, workspace_id, write=True)
+        task_header_present = request.headers.get(_BILIBILI_TASK_HEADER.lower()) is not None
+        principal = principal_for(request, workspace_id, write=not task_header_present)
+        task = _require_bilibili_child_task(
+            store,
+            principal,
+            workspace_id,
+            request,
+            connection_ref=connection_ref,
+            operation_id=operation_id,
+            arguments=body.arguments,
+            idempotency_key=idempotency_key,
+        )
         port = _bilibili_exchange_port(ports)
-        await _require_bilibili_connection(port, principal, workspace_id, connection_ref)
+        connection = await _require_bilibili_connection(
+            port, principal, workspace_id, connection_ref
+        )
         connection_ref = str(UUID(connection_ref))
+        profile_ref = _value(connection, "profile_ref", "profileRef")
+        if task is not None and profile_ref != task.profile_ref:
+            raise _bilibili_task_metadata_error()
         connection_digest = hashlib.sha256(connection_ref.encode()).hexdigest()
         actor_scope = actor_scope_sha256(principal, workspace_id)
         connection_scope = hashlib.sha256(
@@ -688,28 +1035,34 @@ def mount_peripheral_routes(
         ).hexdigest()
         effective_key = _bilibili_effective_operation_key(principal, workspace_id, idempotency_key)
         argument_digest = canonical_arguments_sha256(body.arguments)
-        operation, duplicate = store.create_operation(
-            principal.organization_id,
+        operation_request: dict[str, Any] = {
+            "actorScopeSha256": actor_scope,
+            "connectionRefDigest": connection_digest,
+            "operationId": operation_id,
+            "argumentsSha256": argument_digest,
+        }
+        if task is not None:
+            operation_request.update(task.operation_request)
+            operation_request["connectionRef"] = connection_ref
+            operation_request["profileRef"] = task.profile_ref
+        operation, duplicate = _create_bilibili_work_operation(
+            store,
+            principal,
             workspace_id,
             {
                 "idempotencyKey": effective_key,
                 "operationType": f"tool.provider.v1:{operation_id}",
+                "taskId": task.task_id if task is not None else None,
                 "target": f"connector-target:{connection_scope}",
-                "request": {
-                    "actorScopeSha256": actor_scope,
-                    "connectionRefDigest": connection_digest,
-                    "operationId": operation_id,
-                    "argumentsSha256": argument_digest,
-                },
+                "request": operation_request,
             },
-            actor_id=principal.actor_id,
-            actor_private_scope=principal.actor_private_scope,
+            task,
         )
         if duplicate:
             response.status_code = (
                 202 if operation.get("status") in {"started", "uncertain"} else 200
             )
-            return {"operation": operation, "duplicate": True}
+            return {"operation": operation, "resultArtifact": None, "duplicate": True}
 
         work_operation_id = str(UUID(str(operation["id"])))
         expected_operation_ref = f"work-operation:{work_operation_id}"
@@ -778,16 +1131,45 @@ def mount_peripheral_routes(
             final_status = "uncertain"
             response.status_code = 202
 
-        updated, update_duplicate = store.update_operation(
-            principal.organization_id,
+        if task is not None:
+            operation_outcome = (
+                "uncertain"
+                if final_status == "uncertain"
+                else "failed"
+                if evidence.get("status") == "REJECTED"
+                else "verified"
+            )
+            evidence = {
+                **dict(task.operation_request),
+                **evidence,
+                "effect": "write",
+                "outcome": operation_outcome,
+                "providerId": "bilibili",
+                "connectionRef": connection_ref,
+                "profileRef": task.profile_ref,
+                "operationId": operation_id,
+                "resourceRef": task.resource_ref,
+                "argumentsSha256": argument_digest,
+                "resultArtifactId": None,
+                "resultSha256": _bilibili_json_sha256(evidence),
+                "readbackVerified": evidence.get("readbackVerified") is True,
+                "externalReadbackVerified": evidence.get("readbackVerified") is True,
+            }
+
+        updated, update_duplicate = _update_bilibili_work_operation(
+            store,
+            principal,
             workspace_id,
             str(operation["id"]),
             final_status,
             evidence,
-            actor_id=principal.actor_id,
-            actor_private_scope=principal.actor_private_scope,
+            task,
         )
-        return {"operation": updated, "duplicate": update_duplicate}
+        return {
+            "operation": updated,
+            "resultArtifact": None,
+            "duplicate": update_duplicate,
+        }
 
     @app.post(base + "/backups", response_model=BackupReceipt, status_code=201)
     async def create_backup(
@@ -851,6 +1233,642 @@ def _bilibili_exchange_port(ports: PeripheralPorts) -> ExchangeBilibiliPort:
         ExchangeBilibiliPort,
         _require_port(ports.bilibili_exchange, "EXCHANGE_BILIBILI_UNAVAILABLE"),
     )
+
+
+def _require_bilibili_child_task(
+    store: WorkStore,
+    principal: PersistencePrincipal,
+    workspace_id: str,
+    request: Request,
+    *,
+    connection_ref: str,
+    operation_id: str,
+    arguments: Mapping[str, Any],
+    idempotency_key: str | None,
+) -> _BilibiliChildTask | None:
+    """Validate the real actor-private running Task carried by the host header.
+
+    Ordinary UI calls omit the host-only Task header and remain taskless Work
+    operations. A header-bearing call is accepted only for an exact Bilibili
+    feature Task created by the Harness, with matching account, operation,
+    arguments, target, and server-issued idempotency metadata.
+    """
+
+    task_id = request.headers.get(_BILIBILI_TASK_HEADER.lower())
+    if task_id is None:
+        return None
+    if principal.can_write_harness is not True or principal.actor_private_scope is not True:
+        raise PersistenceError(
+            "BILIBILI_WORK_TASK_FORBIDDEN",
+            403,
+            "A private Harness writer is required for task-bound Bilibili operations.",
+        )
+    if principal.organization_id is None:
+        raise PersistenceError(
+            "BILIBILI_WORK_TASK_UNAVAILABLE", 503, "Task provenance is unavailable.", True
+        )
+    if (
+        not task_id
+        or len(task_id) > 512
+        or any(ord(character) < 0x21 or ord(character) > 0x7E for character in task_id)
+    ):
+        raise PersistenceError(
+            "BILIBILI_WORK_TASK_NOT_FOUND", 404, "The Bilibili Work Task was not found."
+        )
+    if idempotency_key is None or not idempotency_key:
+        raise PersistenceError(
+            "BILIBILI_WORK_OPERATION_KEY_REQUIRED",
+            422,
+            "Task-bound Bilibili operations require the server-issued operation key.",
+        )
+    try:
+        task = store.get_task(
+            principal.organization_id,
+            workspace_id,
+            task_id,
+            actor_id=principal.actor_id,
+            actor_private_scope=True,
+        )
+    except PersistenceError:
+        raise
+    except Exception:
+        raise PersistenceError(
+            "BILIBILI_WORK_TASK_UNAVAILABLE", 503, "Task provenance is unavailable.", True
+        ) from None
+    if (
+        task.get("id") != task_id
+        or task.get("workspaceId") != workspace_id
+        or task.get("status") != "running"
+        or not isinstance(task.get("createdByActorId"), str)
+        or str(task["createdByActorId"]).lower() != principal.actor_id.lower()
+    ):
+        raise PersistenceError(
+            "BILIBILI_WORK_TASK_NOT_RUNNING",
+            409,
+            "The Bilibili operation must be bound to the current actor's running Task.",
+        )
+    metadata = task.get("metadata")
+    if not isinstance(metadata, Mapping):
+        raise _bilibili_task_metadata_error()
+    source = metadata.get("source")
+    if source not in _BILIBILI_TASK_SOURCES:
+        raise _bilibili_task_metadata_error()
+    normalized_connection = _exchange_uuid_ref(connection_ref, "BILIBILI_CONNECTION_NOT_FOUND")
+    profile_ref = metadata.get("profileRef")
+    try:
+        normalized_profile = _exchange_uuid_ref(profile_ref, "BILIBILI_TASK_METADATA_INVALID")
+        target = _bilibili_target_for_task(operation_id, arguments)
+        resource_ref = _bilibili_task_resource_ref(normalized_profile, operation_id, target)
+        arguments_digest = canonical_arguments_sha256(arguments)
+    except PersistenceError:
+        raise
+    except (TypeError, ValueError):
+        raise _bilibili_task_metadata_error() from None
+
+    if (
+        metadata.get("workspaceId") != workspace_id
+        or metadata.get("actorId") != principal.actor_id
+        or metadata.get("connectionRef") != normalized_connection
+        or metadata.get("operationId") != operation_id
+        or metadata.get("resourceRef") != resource_ref
+        or metadata.get("argumentsDigestSha256") != arguments_digest
+    ):
+        raise _bilibili_task_metadata_error()
+
+    source_refs_digest: str
+    task_key: Any
+    if source == "conversation-bili-operation":
+        parent_task_id = metadata.get("parentTaskId")
+        parent_session_id = metadata.get("parentSessionId")
+        delegation_id = metadata.get("delegationId")
+        delegation_version = metadata.get("delegationVersion")
+        source_refs = metadata.get("sourceRefs")
+        task_key = metadata.get("idempotencyKey")
+        if (
+            not _is_bounded_identifier(parent_task_id)
+            or not _is_bounded_identifier(parent_session_id)
+            or task.get("sessionId") != parent_session_id
+            or not _is_bounded_identifier(delegation_id)
+            or type(delegation_version) is not int
+            or delegation_version < 1
+            or not isinstance(source_refs, list)
+            or not source_refs
+            or len(source_refs) > 256
+            or not _bilibili_json_equal(metadata.get("target"), target)
+            or not _bilibili_json_equal(metadata.get("arguments"), arguments)
+            or task_key != idempotency_key
+        ):
+            raise _bilibili_task_metadata_error()
+        source_refs_digest = _bilibili_json_sha256(source_refs)
+        subscription_fields: dict[str, Any] = {}
+    else:
+        parent_task_id = metadata.get("ownerTaskId")
+        parent_session_id = metadata.get("ownerSessionId")
+        delegation_id = metadata.get("delegationId")
+        delegation_version = metadata.get("delegationVersion")
+        source_refs_digest_value = metadata.get("sourceRefsDigest")
+        task_key = metadata.get("operationIdempotencyKey")
+        runtime_plan_digest = metadata.get("runtimePlanDigest")
+        subscription_id = metadata.get("subscriptionId")
+        expected_version = metadata.get("expectedVersion")
+        run_key = metadata.get("runKey")
+        if (
+            not _is_bounded_identifier(parent_task_id)
+            or not _is_bounded_identifier(parent_session_id)
+            or task.get("sessionId") != parent_session_id
+            or not _is_bounded_identifier(delegation_id)
+            or type(delegation_version) is not int
+            or delegation_version < 1
+            or not isinstance(source_refs_digest_value, str)
+            or _DIGEST.fullmatch(source_refs_digest_value) is None
+            or not isinstance(runtime_plan_digest, str)
+            or _DIGEST.fullmatch(runtime_plan_digest) is None
+            or not _is_bounded_identifier(subscription_id)
+            or type(expected_version) is not int
+            or expected_version < 1
+            or not _is_bounded_identifier(run_key)
+            or task_key != idempotency_key
+        ):
+            raise _bilibili_task_metadata_error()
+        source_refs_digest = source_refs_digest_value
+        subscription_fields = {
+            "subscriptionId": subscription_id,
+            "subscriptionVersion": expected_version,
+            "expectedVersion": expected_version,
+            "runKey": run_key,
+            "runtimePlanDigest": runtime_plan_digest,
+        }
+
+    operation_request = {
+        "source": source,
+        "actorScopeSha256": actor_scope_sha256(principal, workspace_id),
+        "connectionRefDigest": hashlib.sha256(normalized_connection.encode()).hexdigest(),
+        "profileRefDigest": hashlib.sha256(normalized_profile.encode()).hexdigest(),
+        "operationId": operation_id,
+        "resourceRef": resource_ref,
+        "argumentsSha256": arguments_digest,
+        "taskId": task_id,
+        "parentTaskId": parent_task_id,
+        "parentSessionId": parent_session_id,
+        "delegationId": delegation_id,
+        "delegationVersion": delegation_version,
+        "sourceRefsSha256": source_refs_digest,
+        "idempotencyKey": idempotency_key,
+        **subscription_fields,
+    }
+    return _BilibiliChildTask(
+        task_id=task_id,
+        source=str(source),
+        profile_ref=normalized_profile,
+        idempotency_key=idempotency_key,
+        resource_ref=resource_ref,
+        target=target,
+        operation_request=operation_request,
+    )
+
+
+def _require_bilibili_task_for_lookup(
+    store: WorkStore,
+    principal: PersistencePrincipal,
+    workspace_id: str,
+    task_id: str,
+    idempotency_key: str,
+) -> tuple[str, Mapping[str, Any]]:
+    """Authenticate a task-bound GET without requiring the Task to still run."""
+
+    if principal.can_write_harness is not True or principal.actor_private_scope is not True:
+        raise PersistenceError(
+            "BILIBILI_WORK_TASK_FORBIDDEN",
+            403,
+            "A private Harness writer is required for task-bound Bilibili receipts.",
+        )
+    if principal.organization_id is None:
+        raise PersistenceError(
+            "BILIBILI_WORK_TASK_UNAVAILABLE", 503, "Task provenance is unavailable.", True
+        )
+    task = store.get_task(
+        principal.organization_id,
+        workspace_id,
+        task_id,
+        actor_id=principal.actor_id,
+        actor_private_scope=True,
+    )
+    if (
+        task.get("id") != task_id
+        or task.get("workspaceId") != workspace_id
+        or task.get("status") not in {"running", "completed", "failed", "aborted"}
+        or not isinstance(task.get("createdByActorId"), str)
+        or str(task["createdByActorId"]).lower() != principal.actor_id.lower()
+    ):
+        raise PersistenceError("BILIBILI_OPERATION_NOT_FOUND", 404, "Bilibili operation not found.")
+    metadata = task.get("metadata")
+    if not isinstance(metadata, Mapping):
+        raise PersistenceError("BILIBILI_OPERATION_NOT_FOUND", 404, "Bilibili operation not found.")
+    source = metadata.get("source")
+    task_key = (
+        metadata.get("idempotencyKey")
+        if source == "conversation-bili-operation"
+        else metadata.get("operationIdempotencyKey")
+    )
+    task_session = (
+        metadata.get("parentSessionId")
+        if source == "conversation-bili-operation"
+        else metadata.get("ownerSessionId")
+    )
+    if (
+        source not in _BILIBILI_TASK_SOURCES
+        or metadata.get("workspaceId") != workspace_id
+        or metadata.get("actorId") != principal.actor_id
+        or task_key != idempotency_key
+        or task_session != task.get("sessionId")
+    ):
+        raise PersistenceError("BILIBILI_OPERATION_NOT_FOUND", 404, "Bilibili operation not found.")
+    return str(source), metadata
+
+
+def _bilibili_task_metadata_matches_operation(
+    metadata: Mapping[str, Any],
+    operation_request: Mapping[str, Any],
+    idempotency_key: str,
+) -> bool:
+    """Recheck immutable Work receipt identity against the current exact Task view."""
+
+    source = metadata.get("source")
+    if (
+        source not in _BILIBILI_TASK_SOURCES
+        or metadata.get("connectionRef") != operation_request.get("connectionRef")
+        or metadata.get("profileRef") != operation_request.get("profileRef")
+        or metadata.get("operationId") != operation_request.get("operationId")
+        or metadata.get("resourceRef") != operation_request.get("resourceRef")
+        or metadata.get("argumentsDigestSha256") != operation_request.get("argumentsSha256")
+        or metadata.get("delegationId") != operation_request.get("delegationId")
+        or metadata.get("delegationVersion") != operation_request.get("delegationVersion")
+    ):
+        return False
+    if source == "conversation-bili-operation":
+        arguments = metadata.get("arguments")
+        source_refs = metadata.get("sourceRefs")
+        if not isinstance(arguments, Mapping) or not isinstance(source_refs, list):
+            return False
+        try:
+            target = _bilibili_target_for_task(str(metadata.get("operationId")), arguments)
+            resource_ref = _bilibili_task_resource_ref(
+                str(metadata.get("profileRef")), str(metadata.get("operationId")), target
+            )
+            arguments_digest = canonical_arguments_sha256(arguments)
+            source_refs_digest = _bilibili_json_sha256(source_refs)
+        except (PersistenceError, TypeError, ValueError):
+            return False
+        return (
+            metadata.get("idempotencyKey") == idempotency_key
+            and metadata.get("parentTaskId") == operation_request.get("parentTaskId")
+            and metadata.get("parentSessionId") == operation_request.get("parentSessionId")
+            and _bilibili_json_equal(metadata.get("target"), target)
+            and operation_request.get("sourceRefsSha256") == source_refs_digest
+            and operation_request.get("resourceRef") == resource_ref
+            and operation_request.get("argumentsSha256") == arguments_digest
+        )
+    return (
+        metadata.get("operationIdempotencyKey") == idempotency_key
+        and metadata.get("ownerTaskId") == operation_request.get("parentTaskId")
+        and metadata.get("ownerSessionId") == operation_request.get("parentSessionId")
+        and metadata.get("sourceRefsDigest") == operation_request.get("sourceRefsSha256")
+        and metadata.get("subscriptionId") == operation_request.get("subscriptionId")
+        and metadata.get("expectedVersion") == operation_request.get("expectedVersion")
+        and metadata.get("runKey") == operation_request.get("runKey")
+        and metadata.get("runtimePlanDigest") == operation_request.get("runtimePlanDigest")
+    )
+
+
+def _bilibili_task_metadata_error() -> PersistenceError:
+    """Hide malformed or mismatched feature Task provenance behind one code."""
+
+    return PersistenceError(
+        "BILIBILI_WORK_TASK_METADATA_INVALID",
+        409,
+        "The Bilibili Work Task metadata does not match this operation.",
+    )
+
+
+def _is_bounded_identifier(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 512
+        and all(0x21 <= ord(character) <= 0x7E for character in value)
+    )
+
+
+def _bilibili_target_for_task(operation_id: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the fixed directory target projection from exact operation arguments."""
+
+    selectors: dict[str, tuple[str, ...]] = {
+        "bilibili.search": ("search_type",),
+        "bilibili.user.find": ("user_id",),
+        "bilibili.video.read": ("video_id",),
+        "bilibili.comments.list": ("video_id", "root_comment_id"),
+        "bilibili.dynamics.list": ("user_id",),
+        "bilibili.dynamic.read": ("dynamic_id",),
+        "bilibili.dm.list": ("peer_user_id",),
+        "bilibili.dm.read": ("peer_user_id", "message_id"),
+        "bilibili.comment.create": (
+            "video_id",
+            "root_comment_id",
+            "parent_comment_id",
+        ),
+        "bilibili.dynamic.publish": ("user_id",),
+        "bilibili.dm.send": ("peer_user_id",),
+    }
+    fields = selectors.get(operation_id)
+    if fields is None:
+        raise ValueError("unsupported Bilibili operation")
+    if operation_id == "bilibili.comments.list":
+        if "video_id" not in arguments:
+            raise ValueError("video_id is required for comments")
+        target = {"video_id": arguments["video_id"]}
+        if "root_comment_id" in arguments:
+            target["root_comment_id"] = arguments["root_comment_id"]
+        return target
+    if any(field not in arguments for field in fields):
+        raise ValueError("Bilibili operation target is incomplete")
+    return {field: arguments[field] for field in fields}
+
+
+def _bilibili_task_resource_ref(
+    profile_ref: str, operation_id: str, target: Mapping[str, Any]
+) -> str:
+    value = {
+        "providerId": "bilibili",
+        "profileRef": profile_ref,
+        "operationId": operation_id,
+        "target": dict(target),
+    }
+    return "sha256:" + _bilibili_json_sha256(value)
+
+
+def _bilibili_json_sha256(value: Any) -> str:
+    try:
+        payload = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError):
+        raise _bilibili_task_metadata_error() from None
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _bilibili_json_equal(left: Any, right: Any) -> bool:
+    try:
+        return json.dumps(
+            left,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ) == json.dumps(
+            right,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError, UnicodeError):
+        return False
+
+
+def _create_bilibili_work_operation(
+    store: WorkStore,
+    principal: PersistencePrincipal,
+    workspace_id: str,
+    body: Mapping[str, Any],
+    task: _BilibiliChildTask | None,
+) -> tuple[dict[str, Any], bool]:
+    """Record one Bilibili intent using the immutable producer path for Tasks."""
+
+    create = getattr(store, "create_operation", None)
+    if not callable(create):
+        raise PersistenceError(
+            "WORK_OPERATION_UNAVAILABLE", 503, "Work operation receipts are unavailable.", True
+        )
+    kwargs: dict[str, Any] = {
+        "actor_id": principal.actor_id,
+        "actor_private_scope": principal.actor_private_scope,
+    }
+    if task is not None:
+        kwargs["trusted_producer"] = "exchange-connector-dispatch"
+    try:
+        operation, duplicate = create(
+            principal.organization_id,
+            workspace_id,
+            body,
+            **kwargs,
+        )
+    except TypeError as error:
+        if task is not None and "trusted_producer" in str(error):
+            raise PersistenceError(
+                "WORK_TRUSTED_OPERATION_UNAVAILABLE",
+                503,
+                "Trusted Bilibili Work operation receipts are unavailable.",
+                True,
+            ) from None
+        raise
+    if not isinstance(operation, dict) or not isinstance(duplicate, bool):
+        raise PersistenceError(
+            "WORK_OPERATION_RESPONSE_INVALID", 502, "Work operation receipt is invalid."
+        )
+    if task is not None and (
+        operation.get("trustedProducer") != "exchange-connector-dispatch"
+        or operation.get("taskId") != task.task_id
+    ):
+        raise PersistenceError(
+            "WORK_TRUSTED_OPERATION_INVALID",
+            502,
+            "Work did not return the exact trusted Bilibili Task operation.",
+        )
+    return operation, duplicate
+
+
+def _update_bilibili_work_operation(
+    store: WorkStore,
+    principal: PersistencePrincipal,
+    workspace_id: str,
+    operation_id: str,
+    status: str,
+    evidence: Mapping[str, Any],
+    task: _BilibiliChildTask | None,
+) -> tuple[dict[str, Any], bool]:
+    """Persist one closed outcome and retain the immutable producer attribution."""
+
+    update = getattr(store, "update_operation", None)
+    if not callable(update):
+        raise PersistenceError(
+            "WORK_OPERATION_UNAVAILABLE", 503, "Work operation receipts are unavailable.", True
+        )
+    kwargs: dict[str, Any] = {
+        "actor_id": principal.actor_id,
+        "actor_private_scope": principal.actor_private_scope,
+    }
+    if task is not None:
+        kwargs["trusted_producer"] = "exchange-connector-dispatch"
+    try:
+        operation, duplicate = update(
+            principal.organization_id,
+            workspace_id,
+            operation_id,
+            status,
+            evidence,
+            **kwargs,
+        )
+    except TypeError as error:
+        if task is not None and "trusted_producer" in str(error):
+            raise PersistenceError(
+                "WORK_TRUSTED_OPERATION_UNAVAILABLE",
+                503,
+                "Trusted Bilibili Work operation receipts are unavailable.",
+                True,
+            ) from None
+        raise
+    if not isinstance(operation, dict) or not isinstance(duplicate, bool):
+        raise PersistenceError(
+            "WORK_OPERATION_RESPONSE_INVALID", 502, "Work operation receipt is invalid."
+        )
+    if task is not None and (
+        operation.get("trustedProducer") != "exchange-connector-dispatch"
+        or operation.get("taskId") != task.task_id
+    ):
+        raise PersistenceError(
+            "WORK_TRUSTED_OPERATION_INVALID",
+            502,
+            "Work did not return the exact trusted Bilibili Task operation.",
+        )
+    return operation, duplicate
+
+
+def _store_bilibili_result_artifact(
+    store: WorkStore,
+    principal: PersistencePrincipal,
+    workspace_id: str,
+    operation_id: str,
+    result: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Persist and independently read back one safe Bilibili read result."""
+
+    if principal.organization_id is None or not principal.actor_private_scope:
+        raise PersistenceError(
+            "BILIBILI_RESULT_SCOPE_REQUIRED",
+            403,
+            "Bilibili read results require an actor-private Work attachment.",
+        )
+    try:
+        raw = json.dumps(
+            result,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError):
+        raise _provider_payload_error("BILIBILI_PROVIDER_INVALID_PAYLOAD") from None
+    if not raw or len(raw) > 1_500_000:
+        raise PersistenceError(
+            "BILIBILI_RESULT_TOO_LARGE", 413, "The Bilibili result exceeds the Work limit."
+        )
+    expected_digest = hashlib.sha256(raw).hexdigest()
+    attachment = store.put_attachment(
+        principal.organization_id,
+        workspace_id,
+        f"bilibili-{operation_id}.json",
+        "application/json",
+        raw,
+        actor_id=principal.actor_id,
+        actor_private_scope=True,
+    )
+    digest = attachment.get("sha256")
+    if digest != expected_digest:
+        raise PersistenceError(
+            "BILIBILI_RESULT_READBACK_MISMATCH", 502, "Work stored another Bilibili result."
+        )
+    metadata, path = store.get_attachment(
+        principal.organization_id,
+        workspace_id,
+        expected_digest,
+        actor_id=principal.actor_id,
+        actor_private_scope=True,
+    )
+    readback = path.read_bytes()
+    if (
+        metadata.get("sha256") != expected_digest
+        or metadata.get("mediaType") != "application/json"
+        or metadata.get("size") != len(raw)
+        or readback != raw
+        or hashlib.sha256(readback).hexdigest() != expected_digest
+    ):
+        raise PersistenceError(
+            "BILIBILI_RESULT_READBACK_MISMATCH",
+            502,
+            "The actor-private Bilibili result did not pass Work readback.",
+        )
+    return {
+        "artifactId": expected_digest,
+        "sha256": expected_digest,
+        "mimeType": "application/json",
+        "size": len(raw),
+    }
+
+
+def _bilibili_result_artifact_from_operation(
+    store: WorkStore,
+    principal: PersistencePrincipal,
+    workspace_id: str,
+    operation: Mapping[str, Any],
+    task: _BilibiliChildTask | None,
+) -> dict[str, Any] | None:
+    """Validate a prior result artifact before returning its opaque Work reference."""
+
+    if task is None:
+        return None
+    if (
+        operation.get("trustedProducer") != "exchange-connector-dispatch"
+        or operation.get("taskId") != task.task_id
+    ):
+        raise PersistenceError("BILIBILI_OPERATION_NOT_FOUND", 404, "Bilibili operation not found.")
+    evidence = operation.get("evidence")
+    if not isinstance(evidence, Mapping):
+        raise PersistenceError("BILIBILI_OPERATION_NOT_FOUND", 404, "Bilibili operation not found.")
+    digest = evidence.get("resultArtifactId")
+    result_sha = evidence.get("resultSha256")
+    if not isinstance(digest, str) or _DIGEST.fullmatch(digest) is None or result_sha != digest:
+        return None
+    if principal.organization_id is None or not principal.actor_private_scope:
+        raise PersistenceError(
+            "BILIBILI_RESULT_SCOPE_REQUIRED", 403, "Actor-private Work scope is required."
+        )
+    metadata, path = store.get_attachment(
+        principal.organization_id,
+        workspace_id,
+        digest,
+        actor_id=principal.actor_id,
+        actor_private_scope=True,
+    )
+    raw = path.read_bytes()
+    if (
+        metadata.get("sha256") != digest
+        or metadata.get("mediaType") != "application/json"
+        or hashlib.sha256(raw).hexdigest() != digest
+    ):
+        raise PersistenceError(
+            "BILIBILI_RESULT_READBACK_MISMATCH",
+            502,
+            "The actor-private Bilibili result did not pass Work readback.",
+        )
+    return {
+        "artifactId": digest,
+        "sha256": digest,
+        "mimeType": "application/json",
+        "size": len(raw),
+    }
 
 
 async def _call_bilibili_exchange(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
