@@ -208,6 +208,8 @@ export interface VerifiedSkillEvidence {
   readonly inputSha256: string;
   readonly guideVersion: string;
   readonly guideSha256: string;
+  readonly actionEffectOperationId: string;
+  readonly readbackEffectOperationId: string;
   readonly effectOutcome: 'verified';
   readonly effectResultSha256: string;
   readonly effectReadbackOutcome: 'verified';

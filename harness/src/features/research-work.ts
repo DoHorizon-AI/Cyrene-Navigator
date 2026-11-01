@@ -76,7 +76,7 @@ export interface SkillWriteOperationEvidenceV1 {
   readonly inputSha256: string;
   readonly guideVersion: string;
   readonly guideSha256: string;
-  readonly effectOperationId: string;
+  readonly actionEffectOperationId: string;
   readonly effectOutcome: 'verified';
   readonly effectResultSha256: string;
   readonly readbackReceiptId: string;
@@ -92,7 +92,8 @@ export interface SkillReadbackOperationEvidenceV1 {
   readonly inputSha256: string;
   readonly guideVersion: string;
   readonly guideSha256: string;
-  readonly effectOperationId: string;
+  readonly actionEffectOperationId: string;
+  readonly readbackEffectOperationId: string;
   readonly sourceRef: string;
   readonly canonicalUrl: string;
   readonly sourceSha256: string;
@@ -441,7 +442,8 @@ export function createResearchWorkFeature(options: ResearchWorkOptions): Researc
         || readbackEvidence.actionId !== actionId || readbackEvidence.targetDigestSha256 !== targetDigestSha256
         || readbackEvidence.inputSha256 !== inputSha256 || readbackEvidence.guideVersion !== guideVersion
         || readbackEvidence.guideSha256 !== guideSha256
-        || writeEvidence.effectOperationId !== readbackEvidence.effectOperationId
+        || writeEvidence.actionEffectOperationId !== readbackEvidence.actionEffectOperationId
+        || readbackEvidence.readbackEffectOperationId === readbackEvidence.actionEffectOperationId
         || writeEvidence.sourceRef !== readbackEvidence.sourceRef
         || writeEvidence.canonicalUrl !== readbackEvidence.canonicalUrl
         || writeEvidence.sourceSha256 !== readbackEvidence.sourceSha256
@@ -465,6 +467,8 @@ export function createResearchWorkFeature(options: ResearchWorkOptions): Researc
         guideSha256: writeEvidence.guideSha256,
         effectOutcome: writeEvidence.effectOutcome,
         effectResultSha256: writeEvidence.effectResultSha256,
+        actionEffectOperationId: writeEvidence.actionEffectOperationId,
+        readbackEffectOperationId: readbackEvidence.readbackEffectOperationId,
         effectReadbackOutcome: readbackEvidence.effectReadbackOutcome,
         effectReadbackSha256: readbackEvidence.effectReadbackSha256,
         readbackVerified: readbackEvidence.readbackVerified,
@@ -846,7 +850,7 @@ function validateSkillWriteEvidence(value: ResearchOperationReceiptV1['skillWrit
     || !/^[a-f0-9]{64}$/u.test(value.targetDigestSha256) || !/^[a-f0-9]{64}$/u.test(value.inputSha256)
     || !isIdentifier(value.guideVersion)
     || !/^[a-f0-9]{64}$/u.test(value.guideSha256) || value.effectOutcome !== 'verified'
-    || !isIdentifier(value.effectOperationId)
+    || !isIdentifier(value.actionEffectOperationId)
     || !/^[a-f0-9]{64}$/u.test(value.effectResultSha256) || !isIdentifier(value.readbackReceiptId)
     || !/^sha256:[a-f0-9]{64}$/u.test(value.sourceRef) || !isCanonicalPublicHttpsUrl(value.canonicalUrl)
     || !/^[a-f0-9]{64}$/u.test(value.sourceSha256) || !/^[a-f0-9]{64}$/u.test(value.workArtifactSha256)) {
@@ -860,7 +864,7 @@ function validateSkillReadbackEvidence(value: ResearchOperationReceiptV1['skillR
     || !/^[a-f0-9]{64}$/u.test(value.targetDigestSha256) || !/^[a-f0-9]{64}$/u.test(value.inputSha256)
     || !isIdentifier(value.guideVersion)
     || !/^[a-f0-9]{64}$/u.test(value.guideSha256) || value.effectReadbackOutcome !== 'verified'
-    || !isIdentifier(value.effectOperationId)
+    || !isIdentifier(value.actionEffectOperationId) || !isIdentifier(value.readbackEffectOperationId)
     || !/^sha256:[a-f0-9]{64}$/u.test(value.sourceRef) || !isCanonicalPublicHttpsUrl(value.canonicalUrl)
     || !/^[a-f0-9]{64}$/u.test(value.sourceSha256) || !/^[a-f0-9]{64}$/u.test(value.workArtifactSha256)
     || !/^[a-f0-9]{64}$/u.test(value.effectReadbackSha256) || value.readbackVerified !== true) {
