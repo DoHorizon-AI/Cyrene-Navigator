@@ -17,6 +17,7 @@ from cyrene_knowledge_graph_contracts import (
 from cyrene_knowledge_graph_contracts import knowledge_graph_pb2 as graph_wire
 from cyrene_plugin_runtime import DirectPayload
 
+from cyrene_navigator.persistence.errors import PersistenceError
 from cyrene_navigator.work.conversation_capabilities.config import PluginBindingSettings
 from cyrene_navigator.work.conversation_capabilities.knowledge_graph import (
     DirectKnowledgeGraphProvider,
@@ -167,6 +168,7 @@ def test_direct_graph_write_readback_and_compensation_are_exact_and_idempotent()
     compensator = DirectGraphCompensator(peer, binding)  # type: ignore[arg-type]
     changeset = _graph_changeset()
 
+    assert compensator.inspect_projection(SCOPE, changeset) == {"state": "absent"}
     applied = provider.apply_changeset(
         organization_id=str(SCOPE.organization_id),
         workspace_id=SCOPE.workspace_id,
@@ -178,6 +180,10 @@ def test_direct_graph_write_readback_and_compensation_are_exact_and_idempotent()
 
     current = compensator.verify_projection(SCOPE, changeset)
     assert current == applied
+    assert compensator.inspect_projection(SCOPE, changeset) == {
+        "state": "exact",
+        **applied,
+    }
     assert peer.upsert_count == writes_after_apply
 
     receipt = compensator.delete_changeset(
@@ -192,6 +198,7 @@ def test_direct_graph_write_readback_and_compensation_are_exact_and_idempotent()
         compensator.verify_absent(SCOPE, changeset, operation_id="stable-graph-rollback-operation")
         == receipt
     )
+    assert compensator.inspect_projection(SCOPE, changeset) == {"state": "absent"}
 
 
 class _FailOnceGraphApply:
@@ -239,6 +246,7 @@ def test_graph_adapter_recovers_exact_provider_write_after_domain_commit_interru
 
     assert len(peer.nodes) == 2
     assert len(peer.edges) == 1
+    writes_before_restart = peer.upsert_count
     restarted = CanonicalGraphAdapter(domains, provider, compensator)
     applied = restarted.project_changeset(SCOPE, body, operation_id="operation-graph-recovery")
     assert applied["state"] == "projected"
@@ -249,7 +257,47 @@ def test_graph_adapter_recovers_exact_provider_write_after_domain_commit_interru
 
     assert current is not None
     assert current["state"] == "projected"
-    assert peer.upsert_count == writes_after_recovery
+    assert peer.upsert_count == writes_before_restart == writes_after_recovery
+
+
+def test_graph_adapter_does_not_replay_partial_provider_state(tmp_path: Path) -> None:
+    """An ambiguous partial graph write fails closed without issuing another upsert."""
+
+    domains = ConversationDomainStore(tmp_path / "graph-partial.sqlite")
+    peer = _GraphRuntimePeer()
+    binding = PluginBindingSettings("grpc://127.0.0.1:18779")
+    provider = DirectKnowledgeGraphProvider(peer, binding)  # type: ignore[arg-type]
+    compensator = DirectGraphCompensator(peer, binding)  # type: ignore[arg-type]
+    graph = _graph_changeset()
+    body = {key: value for key, value in graph.items() if key != "digest"}
+    body["idempotencyKey"] = "graph-migration-partial-recovery-key"
+    proposal = domains.upsert_graph_entities(
+        str(SCOPE.organization_id), SCOPE.workspace_id, SCOPE.actor_id, body
+    )
+    provider.apply_changeset(
+        organization_id=str(SCOPE.organization_id),
+        workspace_id=SCOPE.workspace_id,
+        actor_id=SCOPE.actor_id,
+        changeset=proposal,
+    )
+    first_node_id = str(proposal["nodes"][0]["id"])
+    first_node_key = next(key for key in peer.nodes if key[2] == first_node_id)
+    del peer.nodes[first_node_key]
+    writes_before_reconciliation = peer.upsert_count
+
+    with pytest.raises(PersistenceError) as error:
+        CanonicalGraphAdapter(domains, provider, compensator).project_changeset(
+            SCOPE, body, operation_id="operation-graph-partial-recovery"
+        )
+
+    assert error.value.code == "GRAPH_PROVIDER_RECONCILIATION_REQUIRED"
+    assert peer.upsert_count == writes_before_reconciliation
+    assert (
+        domains.get_graph_changeset(
+            str(SCOPE.organization_id), SCOPE.workspace_id, SCOPE.actor_id, str(proposal["id"])
+        )["state"]
+        == "proposed"
+    )
 
 
 def test_work_store_adapters_persist_operation_and_task_checkpoint(tmp_path: Path) -> None:

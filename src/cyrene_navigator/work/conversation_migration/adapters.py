@@ -77,6 +77,12 @@ _MAX_MESSAGE_READBACK_SCAN = 100_000
 class GraphCompensationProvider(Protocol):
     """Exact graph deletion and independent absence-readback operations."""
 
+    def inspect_projection(
+        self, scope: ActorScope, changeset: Mapping[str, object]
+    ) -> Mapping[str, object]:
+        """Classify exact provider state as absent, exact, partial, or mismatched without writes."""
+        ...
+
     def verify_projection(
         self, scope: ActorScope, changeset: Mapping[str, object]
     ) -> Mapping[str, object]:
@@ -356,7 +362,29 @@ class CanonicalGraphAdapter(GraphProjectionPort):
             raise PersistenceError(
                 "CONVERSATION_DOMAIN_CONFLICT", 409, "Graph proposal is not projectable."
             )
-        provider_result = self._verify_provider_projection(scope, current)
+        if self._compensator is None:
+            raise PersistenceError(
+                "GRAPH_PROVIDER_RECONCILIATION_UNAVAILABLE",
+                503,
+                "Graph recovery requires a read-only provider inspection port.",
+                True,
+            )
+        inspection = self._compensator.inspect_projection(scope, current)
+        inspection_state = inspection.get("state")
+        provider_result: Mapping[str, object]
+        if inspection_state == "exact":
+            provider_result = {
+                key: inspection.get(key) for key in ("readbackDigest", "nodeCount", "edgeCount")
+            }
+            provider_result = _validate_provider_projection_result(current, provider_result)
+        elif inspection_state == "absent":
+            provider_result = self._verify_provider_projection(scope, current)
+        else:
+            raise PersistenceError(
+                "GRAPH_PROVIDER_RECONCILIATION_REQUIRED",
+                409,
+                "Graph provider state is partial or differs from the pending proposal.",
+            )
         provider_receipt = {
             "requestDigest": current.get("digest"),
             "readbackDigest": provider_result.get("readbackDigest"),
@@ -487,23 +515,7 @@ class CanonicalGraphAdapter(GraphProjectionPort):
             actor_id=scope.actor_id,
             changeset=changeset,
         )
-        nodes = changeset.get("nodes")
-        edges = changeset.get("edges")
-        digest = changeset.get("digest")
-        if (
-            set(result) != {"readbackDigest", "nodeCount", "edgeCount"}
-            or not isinstance(nodes, list)
-            or not isinstance(edges, list)
-            or result.get("readbackDigest") != digest
-            or result.get("nodeCount") != len(nodes)
-            or result.get("edgeCount") != len(edges)
-        ):
-            raise PersistenceError(
-                "GRAPH_PROVIDER_READBACK_MISMATCH",
-                502,
-                "Graph provider did not independently read back this exact changeset.",
-            )
-        return result
+        return _validate_provider_projection_result(changeset, result)
 
     def _verify_current_projection(
         self, scope: ActorScope, changeset: Mapping[str, object]
@@ -595,22 +607,49 @@ class DirectGraphCompensator(GraphCompensationProvider):
     ) -> Mapping[str, object]:
         """Get every node and edge and hash its normalized current content without mutation."""
 
+        inspection = self.inspect_projection(scope, changeset)
+        if inspection.get("state") != "exact":
+            raise PersistenceError(
+                "GRAPH_PROVIDER_READBACK_MISMATCH",
+                502,
+                "Current graph state does not exactly match its proposal.",
+            )
+        return {
+            "readbackDigest": inspection["readbackDigest"],
+            "nodeCount": inspection["nodeCount"],
+            "edgeCount": inspection["edgeCount"],
+        }
+
+    def inspect_projection(
+        self, scope: ActorScope, changeset: Mapping[str, object]
+    ) -> Mapping[str, object]:
+        """Classify exact graph state using reads only, without replaying an unknown write."""
+
         tenant, namespace, node_ids, edge_ids = _graph_deletion_scope(scope, changeset)
+        total = len(node_ids) + len(edge_ids)
+        if total == 0:
+            raise PersistenceError(
+                "GRAPH_PROVIDER_INPUT_INVALID", 422, "Graph changeset has no records."
+            )
         conversation_id = _required_text(changeset.get("conversationId"), "conversation id")
         conversation_kind = _required_text(changeset.get("conversationKind"), "conversation kind")
         persona_id_value = changeset.get("personaId")
         persona_id = persona_id_value if isinstance(persona_id_value, str) else None
         nodes: list[dict[str, object]] = []
         edges: list[dict[str, object]] = []
+        missing_count = 0
         for node_id in node_ids:
             response = self._call(
                 "get_node",
                 _graph_wire.GetNodeRequest(tenant_id=tenant, namespace=namespace, node_id=node_id),
                 allow_not_found=True,
             )
-            if response is None or not response.HasField("node"):
+            if response is None:
+                missing_count += 1
+                continue
+            if not response.HasField("node"):
                 raise PersistenceError(
-                    "GRAPH_PROVIDER_READBACK_MISMATCH", 502, "A projected graph node is missing."
+                    "GRAPH_PROVIDER_READBACK_INVALID", 502, "Graph node readback is malformed."
                 )
             nodes.append(
                 _decode_graph_node(
@@ -629,9 +668,12 @@ class DirectGraphCompensator(GraphCompensationProvider):
                 _graph_wire.GetEdgeRequest(tenant_id=tenant, namespace=namespace, edge_id=edge_id),
                 allow_not_found=True,
             )
-            if response is None or not response.HasField("edge"):
+            if response is None:
+                missing_count += 1
+                continue
+            if not response.HasField("edge"):
                 raise PersistenceError(
-                    "GRAPH_PROVIDER_READBACK_MISMATCH", 502, "A projected graph edge is missing."
+                    "GRAPH_PROVIDER_READBACK_INVALID", 502, "Graph edge readback is malformed."
                 )
             edges.append(
                 _decode_graph_edge(
@@ -644,6 +686,10 @@ class DirectGraphCompensator(GraphCompensationProvider):
                     persona_id=persona_id,
                 )
             )
+        if missing_count == total:
+            return {"state": "absent"}
+        if missing_count:
+            return {"state": "partial"}
         readback = {
             "conversationId": conversation_id,
             "conversationKind": conversation_kind,
@@ -651,8 +697,17 @@ class DirectGraphCompensator(GraphCompensationProvider):
             "nodes": nodes,
             "edges": edges,
         }
+        readback_digest = hashlib.sha256(canonical_json(readback)).hexdigest()
+        state = (
+            "exact"
+            if readback_digest == changeset.get("digest")
+            and len(nodes) == len(node_ids)
+            and len(edges) == len(edge_ids)
+            else "mismatch"
+        )
         return {
-            "readbackDigest": hashlib.sha256(canonical_json(readback)).hexdigest(),
+            "state": state,
+            "readbackDigest": readback_digest,
             "nodeCount": len(nodes),
             "edgeCount": len(edges),
         }
@@ -927,6 +982,7 @@ class CanonicalRollbackCapabilities(RollbackCapabilityPort):
             )
             and self._graph_provider is not None
             and self._graph_compensator is not None
+            and callable(getattr(self._graph_compensator, "inspect_projection", None))
             and callable(getattr(self._graph_compensator, "delete_changeset", None))
             and callable(getattr(self._graph_compensator, "verify_absent", None)),
         }
@@ -1024,6 +1080,33 @@ def _verify_graph_rollback_receipt(stored: object, current: Mapping[str, object]
             502,
             "Current graph absence differs from its canonical rollback receipt.",
         )
+
+
+def _validate_provider_projection_result(
+    changeset: Mapping[str, object], result: Mapping[str, object]
+) -> Mapping[str, object]:
+    """Require an exact typed receipt for one immutable graph proposal."""
+
+    nodes = changeset.get("nodes")
+    edges = changeset.get("edges")
+    digest = changeset.get("digest")
+    if (
+        set(result) != {"readbackDigest", "nodeCount", "edgeCount"}
+        or not isinstance(nodes, list)
+        or not isinstance(edges, list)
+        or not isinstance(digest, str)
+        or result.get("readbackDigest") != digest
+        or type(result.get("nodeCount")) is not int
+        or result.get("nodeCount") != len(nodes)
+        or type(result.get("edgeCount")) is not int
+        or result.get("edgeCount") != len(edges)
+    ):
+        raise PersistenceError(
+            "GRAPH_PROVIDER_READBACK_MISMATCH",
+            502,
+            "Graph provider did not independently read back this exact changeset.",
+        )
+    return result
 
 
 def _unwrap(value: object, key: str) -> Mapping[str, object]:
