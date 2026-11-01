@@ -480,3 +480,55 @@ test('disabled memory preserves stored data, skips retrieval and writes, and sti
   assert.equal(calls.createMemories.length, 0);
   assert.equal(calls.authorizations.length, 1);
 });
+
+test('correction and deletion read an active version and issue one compare-and-swap write', async () => {
+  const calls = { update: [], deletion: [], revocation: [] };
+  const { api } = baseApi({
+    async listMemories(context, input) {
+      return {
+        items: [memory({ version: 7 })],
+        authorizationEpoch: context.authorizationEpoch,
+      };
+    },
+    async updateMemory(context, memoryId, input) {
+      calls.update.push({ context, memoryId, input });
+      throw Object.assign(new Error('revision conflict'), { status: 409 });
+    },
+    async deleteMemory(context, memoryId, expectedVersion) {
+      calls.deletion.push({ context, memoryId, expectedVersion });
+      return { deleted: true, duplicate: false, authorizationEpoch: context.authorizationEpoch };
+    },
+    async revokeSource(context, sourceId) {
+      calls.revocation.push({ context, sourceId });
+      return {
+        sourceId,
+        authorizationEpoch: context.authorizationEpoch + 1,
+        invalidatedCount: 2,
+        invalidatedMessageIds: ['message-1'],
+        invalidatedMemoryIds: ['memory-1'],
+      };
+    },
+  });
+  const feature = createConversationMemoryFeature({ api, summaryProvider: summaryProvider() });
+  const context = trustedContext();
+
+  await assert.rejects(feature.correctMemory(context, 'memory-1', 'Corrected preference.'), /revision conflict/u);
+  assert.equal(calls.update.length, 1, 'a 409 is surfaced without a blind overwrite retry');
+  assert.equal(calls.update[0].input.expectedVersion, 7);
+  assert.equal(calls.update[0].input.text, 'Corrected preference.');
+
+  assert.deepEqual(await feature.deleteMemory(context, 'memory-1'), {
+    deleted: true,
+    duplicate: false,
+    authorizationEpoch: context.authorizationEpoch,
+  });
+  assert.equal(calls.deletion[0].expectedVersion, 7);
+  assert.deepEqual(await feature.revokeSource(context, 'message-1'), {
+    sourceId: 'message-1',
+    authorizationEpoch: context.authorizationEpoch + 1,
+    invalidatedCount: 2,
+    invalidatedMessageIds: ['message-1'],
+    invalidatedMemoryIds: ['memory-1'],
+  });
+  assert.equal(calls.revocation.length, 1);
+});
