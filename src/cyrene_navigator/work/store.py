@@ -1804,6 +1804,33 @@ class WorkStore:
                 )
             return self._operation_view(row)
 
+    def get_operation_by_idempotency_key(
+        self,
+        organization_id: str | None,
+        workspace_id: str,
+        idempotency_key: str,
+    ) -> JsonObject:
+        """Read an immutable operation by tenant-scoped effective idempotency key.
+
+        Callers should derive an actor-bound effective key and independently
+        verify the stored request's actor-scope digest before exposing it.
+        """
+
+        org, workspace = _scope(organization_id, workspace_id)
+        key = _identifier(idempotency_key, "idempotencyKey")
+        with self._read() as conn:
+            row = conn.execute(
+                """SELECT * FROM work_operations WHERE organization_id=? AND workspace_id=?
+                   AND idempotency_key=?""",
+                (org, workspace, key),
+            ).fetchone()
+            if row is None:
+                raise _not_found(
+                    "WORK_OPERATION_NOT_FOUND",
+                    "The operation does not exist in this Workspace.",
+                )
+            return self._operation_view(row)
+
     def list_unresolved_operations(
         self,
         organization_id: str | None,

@@ -4704,6 +4704,37 @@ def test_branch_scope_lock_serializes_provider_writes_across_tasks_and_restart(
     assert retry_operation["status"] == "started"
 
 
+def test_operation_can_be_read_by_tenant_scoped_effective_idempotency_key(
+    tmp_path: Path,
+) -> None:
+    """A reconciliation lookup returns the exact operation without replaying it."""
+
+    store = WorkStore(tmp_path / "operation-idempotency-readback.sqlite3")
+    effective_key = "bilibili:" + hashlib.sha256(b"actor-scope\0logical-key").hexdigest()
+    created, duplicate = store.create_operation(
+        "org-a",
+        "w1",
+        {
+            "idempotencyKey": effective_key,
+            "operationType": "tool.provider.v1:bilibili.auth.qr.begin",
+            "request": {"actorScopeSha256": "a" * 64, "idempotencyKey": "logical-key"},
+        },
+    )
+    assert duplicate is False
+
+    readback = store.get_operation_by_idempotency_key("org-a", "w1", effective_key)
+    assert readback["id"] == created["id"]
+    assert readback["status"] == "started"
+
+    with pytest.raises(PersistenceError) as missing:
+        store.get_operation_by_idempotency_key("org-a", "w1", "bilibili:missing")
+    assert missing.value.code == "WORK_OPERATION_NOT_FOUND"
+
+    with pytest.raises(PersistenceError) as other_scope:
+        store.get_operation_by_idempotency_key("org-b", "w1", effective_key)
+    assert other_scope.value.code == "WORK_OPERATION_NOT_FOUND"
+
+
 def test_human_input_pauses_resumes_once_and_survives_scope_checks(tmp_path: Path) -> None:
     """Input answers are durable, correlated and one-time. | 输入回答持久且一次性。"""
 
