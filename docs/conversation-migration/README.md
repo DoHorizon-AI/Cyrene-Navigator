@@ -24,6 +24,56 @@ The backup format is `cyrene.navigator.conversation-backup.v1`. It contains only
 
 备份格式为 `cyrene.navigator.conversation-backup.v1`。它仅包含 active 对话消息和记忆、画像候选、转换回候选的 active 画像，以及图谱 changeset。它排除来源授权 grant、派生 join rows、附件引用、维护任务、导入 staging 与其他域记录。恢复不信任归档画像的 active 状态或图谱 provider 回执。除非宿主另行提供当前审批，画像保持候选；图谱只有在真实 provider 写入并独立回读完全匹配的摘要和节点/边数量后才能标记 projected。
 
+### Optional Aether history conversion / 可选 Aether 历史转换
+
+The converter supports only rows from Aether `platform_message_history`; it does not open a database or connect to Aether. The source operator must create an offline JSONL export with an explicitly selected column set. For PostgreSQL, the equivalent of this read-only query selects the necessary source fields and no sender, checkpoint, or unrelated tables:
+
+```sql
+SELECT jsonb_build_object(
+    'id', id,
+    'platform_id', platform_id,
+    'user_id', user_id,
+    'content', content,
+    'created_at', created_at
+)
+FROM platform_message_history
+ORDER BY id;
+```
+
+Run the converter without `--output` first. This performs a bounded dry run and prints only aggregate counts, quarantine reasons, and the output digest:
+
+```bash
+uv run python -m cyrene_navigator.work.conversation_migration.aether_convert \
+  --input /path/to/offline-aether-export.jsonl \
+  --source-namespace opaque-export-alias-2026-10-31
+```
+
+Add `--output /path/to/new-migration.jsonl` only after reviewing the dry-run counts. The destination must not already exist. The converter keeps only one plain text `user` or `bot` message from a `private` or `group` row. It drops platform/user/sender identifiers, checkpoints, source-message arrays, source dependencies, native targets, attachments, and profile revisions. Source conversation/persona references become deterministic opaque hashes; use the same stable opaque namespace for replaying the same source export. Unsupported row fields, credentials/session/task fields, message types, modalities, and conversation kinds are omitted and reported by reason count. The resulting JSONL still passes through host-resolved actor scope, current authorization, approval, canonical readback, and rollback preflight. A converter dry run or fixture test is not evidence that real history was imported.
+
+转换器仅支持 Aether `platform_message_history` 行，不会打开数据库或连接 Aether。源端必须使用明确列白名单生成离线 JSONL。PostgreSQL 可执行等价的只读查询，只选择必要字段，不取发送者、checkpoint 或无关表：
+
+```sql
+SELECT jsonb_build_object(
+    'id', id,
+    'platform_id', platform_id,
+    'user_id', user_id,
+    'content', content,
+    'created_at', created_at
+)
+FROM platform_message_history
+ORDER BY id;
+```
+
+先省略 `--output` 执行有界 dry-run；它只打印聚合计数、隔离原因和输出摘要：
+
+```bash
+uv run python -m cyrene_navigator.work.conversation_migration.aether_convert \
+  --input /path/to/offline-aether-export.jsonl \
+  --source-namespace opaque-export-alias-2026-10-31
+```
+
+核对预演计数后才添加 `--output /path/to/new-migration.jsonl`；目标文件必须不存在。转换器只保留 `private` 或 `group` 行中的一条纯文本 `user`/`bot` 消息。平台/用户/发送者标识、checkpoint、来源消息数组、依赖列表、native target、附件与画像 revision 都会被丢弃。来源会话/persona 引用会变成确定性不透明哈希；重放同一导出时要复用稳定不透明命名空间。未知字段、凭据/登录/任务字段、消息类型、模态和会话类型会按原因计数并省略。生成的 JSONL 仍必须通过宿主 scope 解析、当前授权、审批、规范回读与回滚预检。转换器预演或 fixture 测试都不能证明真实历史已经导入。
+
 ## Bounds and recovery / 边界与恢复
 
 Default limits are 10 MB per artifact, 256 KB per JSONL row, 100,000 records, 100 records per page, 256 source references per record, and 100,000 characters per text field. Work Task events contain only cursors, counts, IDs, record digests, current authorization epochs, canonical readback digests, and operation IDs; source text is not copied into task progress. Deterministic idempotency keys allow a restart to reconcile a write that completed before its terminal task checkpoint. Each applied record has a Work Operation intent and a verified readback receipt. Rollback walks applied records in reverse order and uses version-checked canonical compensation. If a port cannot independently read back or compensate, the batch fails closed and remains available for host reconciliation.
