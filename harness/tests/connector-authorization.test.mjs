@@ -88,6 +88,28 @@ function privateGrantFor(input, principalSubject = privateActorId) {
   };
 }
 
+function providerGrantFor(input) {
+  const argumentsValue = input.arguments;
+  const request = {
+    requestId: input.requestId,
+    workspaceId: 'workspace-1',
+    principalIssuer: `https://login.microsoftonline.com/${route.tenantId}/v2.0`,
+    principalSubject: '11111111-1111-4111-8111-111111111111',
+    connectionRef: input.connectionRef,
+    providerId: input.providerId,
+    profileRef: input.profileRef,
+    operationId: input.operationId,
+    resourceRef: input.resourceRef,
+    argumentsDigestSha256: sha256(canonicalJson(argumentsValue)),
+    arguments: argumentsValue,
+  };
+  const now = Math.floor(Date.now() / 1000);
+  return {
+    connectorGrantBin: 'AQ==', grantRef: 'sha256:provider-fixture', audience: 'exchange',
+    organizationId: 'org-1', issuedAt: now, expiresAt: now + 15, request,
+  };
+}
+
 async function withHttpResponse(status, headers, responseBody, run) {
   const received = [];
   const server = createServer((request, response) => {
@@ -119,6 +141,137 @@ async function withHttpResponse(status, headers, responseBody, run) {
     await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
   }
 }
+
+test('GitHub provider operation timeout covers headers and body without extending grant or other provider calls', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'navigator-github-operation-budget-'));
+  const hmacKeyFile = join(directory, 'exchange-hmac.key');
+  await writeFile(hmacKeyFile, Buffer.alloc(32, 0x6d), { mode: 0o600 });
+  const received = [];
+  const responseTimers = new Set();
+  const delayed = (callback, response) => {
+    const timer = setTimeout(() => {
+      responseTimers.delete(timer);
+      callback();
+    }, 180);
+    responseTimers.add(timer);
+    response.once('close', () => {
+      clearTimeout(timer);
+      responseTimers.delete(timer);
+    });
+  };
+  const server = createServer((request, response) => {
+    const chunks = [];
+    request.on('data', chunk => chunks.push(chunk));
+    request.on('end', () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      received.push({ url: request.url, body });
+      const isGrant = request.url === '/internal/v1/connector-operation-grants';
+      let payload;
+      if (isGrant) {
+        const { arguments: _arguments, ...claimsWithoutArguments } = body;
+        const now = Math.floor(Date.now() / 1_000);
+        payload = JSON.stringify({
+          connectorGrantBin: 'AQ==', grantRef: 'slow-grant-fixture', audience: 'exchange',
+          issuedAt: now, expiresAt: now + 10,
+          claims: { ...claimsWithoutArguments, organizationId: 'org-1' },
+        });
+      } else {
+        payload = JSON.stringify({ requestId: body.requestId, outcome: 'verified', result: { complete: true } });
+      }
+      const writeHeaders = () => response.writeHead(200, { 'content-type': 'application/json' });
+      if (body.requestId === 'github-delayed-headers:1') {
+        delayed(() => {
+          writeHeaders();
+          response.end(payload);
+        }, response);
+        return;
+      }
+      writeHeaders();
+      response.write(payload.slice(0, -1));
+      delayed(() => response.end(payload.slice(-1)), response);
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const client = new ExchangeConnectorAuthorizationClient({
+      baseUrl: `http://127.0.0.1:${server.address().port}`,
+      hmacKeyFile,
+      hmacKeyId: 'test-key',
+      audience: 'exchange',
+      requestTimeoutMs: 100,
+      githubProviderOperationTimeoutMs: 400,
+    });
+    const githubInput = requestId => ({
+      requestId,
+      connectionRef,
+      providerId: 'github',
+      profileRef: 'github-profile',
+      operationId: 'github.vendor.cli.execute',
+      resourceRef: 'sha256:github-owner-repo',
+      arguments: { argv: ['api', 'repos/owner/repo/pulls?state=all', '--paginate'] },
+    });
+    const githubHeaders = githubInput('github-delayed-headers:1');
+    const githubBody = githubInput('github-delayed-body:1');
+    const githubHeaderResult = await client.callProviderOperation(
+      githubHeaders, providerGrantFor(githubHeaders), new AbortController().signal,
+    );
+    const githubBodyResult = await client.callProviderOperation(
+      githubBody, providerGrantFor(githubBody), new AbortController().signal,
+    );
+    assert.deepEqual(githubHeaderResult, {
+      requestId: githubHeaders.requestId, outcome: 'verified', result: { complete: true },
+    });
+    assert.deepEqual(githubBodyResult, {
+      requestId: githubBody.requestId, outcome: 'verified', result: { complete: true },
+    });
+
+    const otherProvider = {
+      ...githubInput('other-provider-default-timeout:1'),
+      providerId: 'huggingface',
+      profileRef: 'hf-profile',
+      operationId: 'hf.model.get',
+    };
+    await assert.rejects(
+      client.callProviderOperation(otherProvider, providerGrantFor(otherProvider), new AbortController().signal),
+      error => error instanceof ExchangeConnectorRequestError
+        && error.outcomeUnknown && error.safeCode === 'EXCHANGE_RESPONSE_BODY_TIMEOUT',
+    );
+
+    const grantRequest = {
+      requestId: 'github-grant-default-timeout:1',
+      workspaceId: 'workspace-1',
+      principalIssuer: `https://login.microsoftonline.com/${route.tenantId}/v2.0`,
+      principalSubject: '11111111-1111-4111-8111-111111111111',
+      connectionRef,
+      providerId: 'github',
+      profileRef: 'github-profile',
+      operationId: 'github.vendor.cli.execute',
+      resourceRef: 'sha256:github-owner-repo',
+      arguments: { argv: ['api', 'repos/owner/repo/pulls?state=all', '--paginate'] },
+    };
+    grantRequest.argumentsDigestSha256 = sha256(canonicalJson(grantRequest.arguments));
+    await assert.rejects(
+      client.mintGrant(grantRequest, new AbortController().signal),
+      error => error instanceof ExchangeConnectorRequestError
+        && error.outcomeUnknown && error.safeCode === 'EXCHANGE_RESPONSE_BODY_TIMEOUT',
+    );
+
+    assert.equal(received.length, 4);
+    assert.equal(received.filter(item => item.body.requestId === githubHeaders.requestId).length, 1,
+      'a slow GitHub header response is never replayed');
+    assert.equal(received.filter(item => item.body.requestId === githubBody.requestId).length, 1,
+      'a slow GitHub response body is never replayed');
+    assert.equal(received.filter(item => item.body.requestId === otherProvider.requestId).length, 1,
+      'a timed-out non-GitHub provider call is never replayed');
+    assert.equal(received.filter(item => item.body.requestId === grantRequest.requestId).length, 1,
+      'the grant request keeps the ordinary timeout and is never replayed');
+  } finally {
+    for (const timer of responseTimers) clearTimeout(timer);
+    server.closeAllConnections();
+    await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test('accepts Exchange UNKNOWN tombstones as terminal uncertain delivery', async () => {
   const input = { requestId: 'notification-1:attempt:1', conversation: route, text: 'The task completed.' };
