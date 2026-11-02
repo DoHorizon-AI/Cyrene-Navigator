@@ -15,6 +15,7 @@ import { Context } from '@deepseek-ai/cordis';
 import { DynamicPluginManager } from '../dist/plugin-manager.js';
 import { collectPluginContributions } from '../dist/conversation-plugin-hooks.js';
 import { hasConversationContextProofV1 } from '../dist/features/conversation-memory.js';
+import { WorkStateClient } from '../dist/work-state-client.js';
 
 const root = mkdtempSync(join(tmpdir(), 'navigator-plugin-test-'));
 after(() => rmSync(root, { recursive: true, force: true }));
@@ -73,8 +74,15 @@ async function mediaServer() {
   });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
-  process.env.PLUGIN_TEST_WORK_TOKEN = 'work-token-for-plugin-tests';
+  process.env.PLUGIN_TEST_ACTOR_A_TOKEN = 'actor-a-token-for-plugin-tests';
+  process.env.PLUGIN_TEST_ACTOR_B_TOKEN = 'actor-b-token-for-plugin-tests';
   return { server, requests, baseUrl: `http://127.0.0.1:${server.address().port}` };
+}
+
+/** The host's per-actor Work client: the credential is chosen here, never by a plugin. */
+function actorTransport(baseUrl, tokenEnv) {
+  const client = new WorkStateClient({ baseUrl, workspaceId: 'workspace-plugin', tokenEnv });
+  return request => client.requestWorkJson(request);
 }
 
 function newManager() {
@@ -88,29 +96,88 @@ test('the real media plugin loads, proposes context, and the host authorizes and
   try {
     const copied = join(root, 'conversation-media.mjs');
     copyFileSync(mediaPlugin, copied);
-    const info = await manager.loadPlugin('conversation-media', copied, {
-      bridgeModule,
-      connection: { baseUrl, workspaceId: 'workspace-plugin', tokenEnv: 'PLUGIN_TEST_WORK_TOKEN' },
-    });
+    const info = await manager.loadPlugin('conversation-media', copied, { bridgeModule });
     assert.equal(info.status, 'loaded', info.error);
 
     const context = trustedContext();
-    const outcome = await collectPluginContributions(ctx, api(), context, input());
+    const outcome = await collectPluginContributions(ctx, api(), context, input({ requestWork: actorTransport(baseUrl, 'PLUGIN_TEST_ACTOR_A_TOKEN') }));
     assert.equal(outcome.contributions.length, 1);
     assert.equal(outcome.contributions[0].featureId, 'plugin.conversation-media.v1');
     assert.match(outcome.contributions[0].content, /yellow smiling face/u);
     assert.deepEqual(outcome.held, []);
-    // Only opaque IDs reach the media route; identity comes from the Work token and task header.
+    // Only opaque IDs reach the media route; identity comes from the actor token the host chose.
     assert.deepEqual(requests[0].body, {
       messageId: 'work-message-1',
       artifactId: image.artifactId,
       operation: 'describe_image',
       prompt: 'What is in this image?',
     });
+    assert.equal(requests[0].url, '/api/v1/workspaces/workspace-plugin/work/conversation-media/analyze');
+    assert.equal(requests[0].headers.authorization, 'Bearer actor-a-token-for-plugin-tests');
     assert.equal(requests[0].headers['x-cyrene-work-task-id'], context.taskId);
     // The delivery proof exists only because the host recorded it.
     assert.equal(hasConversationContextProofV1(context, 'plugin.conversation-media.v1', [sourceRef]), true);
   } finally {
+    await manager.dispose();
+    server.close();
+  }
+});
+
+test('each turn is signed as its own actor and a plugin cannot choose another identity', async () => {
+  const { server, requests, baseUrl } = await mediaServer();
+  const { ctx, manager } = newManager();
+  try {
+    const copied = join(root, 'conversation-media-actors.mjs');
+    copyFileSync(mediaPlugin, copied);
+    await manager.loadPlugin('conversation-media', copied, { bridgeModule });
+    await collectPluginContributions(ctx, api(), trustedContext(), input({ requestWork: actorTransport(baseUrl, 'PLUGIN_TEST_ACTOR_A_TOKEN') }));
+    await collectPluginContributions(ctx, api(), trustedContext(), input({ requestWork: actorTransport(baseUrl, 'PLUGIN_TEST_ACTOR_B_TOKEN') }));
+    assert.deepEqual(requests.map(item => item.headers.authorization), [
+      'Bearer actor-a-token-for-plugin-tests',
+      'Bearer actor-b-token-for-plugin-tests',
+    ]);
+  } finally {
+    await manager.dispose();
+    server.close();
+  }
+});
+
+test('the work channel only reaches allowlisted routes with bounded bodies and no credentials', async () => {
+  const { server, requests, baseUrl } = await mediaServer();
+  const { ctx, manager } = newManager();
+  const attempts = [];
+  try {
+    const path = pluginFile('prober', `
+      export const name = 'prober';
+      export function apply(ctx) {
+        ctx.on('navigator/conversation-context', async payload => {
+          const probe = async (label, request) => {
+            try { await payload.work.request(request); globalThis.__probe.push([label, 'sent']); }
+            catch (error) { globalThis.__probe.push([label, error.message]); }
+          };
+          await probe('tasks', { method: 'GET', path: '/tasks' });
+          await probe('traversal', { method: 'POST', path: '/conversation-media/../tasks' });
+          await probe('delete', { method: 'DELETE', path: '/conversation-media/analyze' });
+          await probe('query', { method: 'POST', path: '/conversation-media/analyze?x=1' });
+          await probe('huge', { method: 'POST', path: '/conversation-media/analyze', body: { blob: 'x'.repeat(70000) } });
+          await probe('ok', { method: 'POST', path: '/conversation-media/analyze', body: { messageId: 'm' } });
+        });
+      }
+    `);
+    globalThis.__probe = attempts;
+    await manager.loadPlugin('prober', path);
+    await collectPluginContributions(ctx, api(), trustedContext(), input({ attachments: [], requestWork: actorTransport(baseUrl, 'PLUGIN_TEST_ACTOR_A_TOKEN') }));
+    assert.deepEqual(attempts.map(([label, result]) => [label, result === 'sent' ? 'sent' : 'rejected']), [
+      ['tasks', 'rejected'],
+      ['traversal', 'rejected'],
+      ['delete', 'rejected'],
+      ['query', 'rejected'],
+      ['huge', 'rejected'],
+      ['ok', 'sent'],
+    ]);
+    assert.equal(requests.length, 1, 'only the allowlisted call reached the server');
+  } finally {
+    delete globalThis.__probe;
     await manager.dispose();
     server.close();
   }
@@ -122,12 +189,9 @@ test('a revoked source is held and leaves no delivery proof', async () => {
   try {
     const copied = join(root, 'conversation-media-revoked.mjs');
     copyFileSync(mediaPlugin, copied);
-    await manager.loadPlugin('conversation-media', copied, {
-      bridgeModule,
-      connection: { baseUrl, workspaceId: 'workspace-plugin', tokenEnv: 'PLUGIN_TEST_WORK_TOKEN' },
-    });
+    await manager.loadPlugin('conversation-media', copied, { bridgeModule });
     const context = trustedContext();
-    const outcome = await collectPluginContributions(ctx, api(false), context, input());
+    const outcome = await collectPluginContributions(ctx, api(false), context, input({ requestWork: actorTransport(baseUrl, 'PLUGIN_TEST_ACTOR_A_TOKEN') }));
     assert.deepEqual(outcome.contributions, []);
     assert.deepEqual(outcome.held, [{ featureId: 'plugin.conversation-media.v1', code: 'SOURCE_NOT_AUTHORIZED' }]);
     assert.equal(hasConversationContextProofV1(context, 'plugin.conversation-media.v1', [sourceRef]), false);
@@ -223,9 +287,8 @@ test('hot reload swaps behaviour without a restart and unload removes the listen
   }
 });
 
-test('the media plugin stays idle without a Work connection', async () => {
+test('the media plugin stays idle when the host has no actor-scoped Work client', async () => {
   const { ctx, manager } = newManager();
-  delete process.env.CYRENE_PLUGIN_MEDIA_WORK_BASE_URL;
   try {
     const copied = join(root, 'conversation-media-idle.mjs');
     copyFileSync(mediaPlugin, copied);

@@ -402,6 +402,11 @@ export interface WorkStateStore {
   ): Promise<WorkConversationArtifactAuthorizationReceipt>;
   /** Build the actor-scoped conversation API over this already authenticated client. */
   conversationMemoryApiV1?(actorId: string): ConversationMemoryApiV1;
+  /**
+   * One host-mediated JSON call under the Work base, signed with this client's own actor
+   * token. Used for plugin requests so a plugin never holds or chooses a credential.
+   */
+  requestWorkJson?(input: WorkJsonRequest): Promise<unknown>;
   /** Read the current authorization epoch through this actor-scoped client. */
   getConversationMemoryOverview?(signal?: AbortSignal): Promise<{
     readonly authorizationEpoch: number;
@@ -414,6 +419,18 @@ export interface WorkStateStore {
     readonly personaId: string | null;
   }, signal?: AbortSignal): Promise<ConversationMessageFeatureRecord | undefined>;
 }
+
+/** A bounded Work request made on behalf of the Task's own actor. */
+export interface WorkJsonRequest {
+  readonly method: 'GET' | 'POST';
+  /** Path below `/work`, for example `/conversation-media/analyze`. */
+  readonly path: string;
+  readonly body?: unknown;
+  readonly taskId: string;
+  readonly signal: AbortSignal;
+}
+
+const WORK_JSON_PATH = /^\/[A-Za-z0-9][A-Za-z0-9._~-]*(?:\/[A-Za-z0-9][A-Za-z0-9._~-]*){0,7}$/u;
 
 export interface WorkStateConnection {
   readonly baseUrl: string;
@@ -829,6 +846,29 @@ export class WorkStateClient implements WorkStateStore {
     if (!connection.workspaceId.trim()) throw new Error('A configured workspace is required');
     this.workUrl = `${base.href.replace(/\/$/, '')}/api/v1/workspaces/${encodeURIComponent(connection.workspaceId)}/work`;
     this.tasksUrl = `${this.workUrl}/tasks`;
+  }
+
+  /** Make one JSON request as this client's actor; the caller supplies no credential or headers. */
+  async requestWorkJson(input: WorkJsonRequest): Promise<unknown> {
+    if ((input.method !== 'GET' && input.method !== 'POST')
+      || typeof input.path !== 'string' || !WORK_JSON_PATH.test(input.path)
+      || input.path.split('/').some(segment => segment === '.' || segment === '..')) {
+      throw new TypeError('Invalid Work request');
+    }
+    if (typeof input.taskId !== 'string' || input.taskId.length === 0 || input.taskId.length > 512
+      || /[\u0000-\u001f\u007f]/u.test(input.taskId)) {
+      throw new TypeError('Invalid Work task identity');
+    }
+    input.signal.throwIfAborted();
+    return this.requestAt(
+      `${this.workUrl}${input.path}`,
+      input.method,
+      input.body,
+      undefined,
+      { 'X-Cyrene-Work-Task-ID': input.taskId },
+      undefined,
+      input.signal,
+    );
   }
 
   /** Read image bytes after Work authorizes the exact attachment digest for this principal. */

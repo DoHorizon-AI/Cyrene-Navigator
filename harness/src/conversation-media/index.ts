@@ -10,6 +10,7 @@
 export {
   ConversationMediaBridgeError,
   NavigatorConversationMediaHttpBridge,
+  decodeAnalysisResponse,
 } from './bridge.ts';
 export type {
   ConversationMediaAttachment,

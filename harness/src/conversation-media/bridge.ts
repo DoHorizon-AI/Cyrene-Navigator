@@ -179,7 +179,8 @@ async function readBoundedJson(response: Response): Promise<unknown> {
   }
 }
 
-function decodeAnalysisResponse(value: unknown): MediaAnalysisResponse {
+/** Strictly decode a media analysis response; shared by the HTTP bridge and plugins. */
+export function decodeAnalysisResponse(value: unknown): MediaAnalysisResponse {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new ConversationMediaBridgeError('MEDIA_RESPONSE_INVALID', 502);
   }

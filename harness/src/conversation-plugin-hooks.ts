@@ -23,6 +23,11 @@ import type {
 const PLUGIN_FEATURE_ID = /^plugin\.[a-z0-9][a-z0-9-]{0,47}\.v[0-9]{1,3}$/u;
 const MAX_PROPOSALS_PER_TURN = 8;
 const MAX_CONTENT_BYTES = 32_000;
+/** Route families a plugin may call; everything else under Work stays host-only. */
+const PLUGIN_WORK_PATHS = /^\/(?:conversation-media|knowledge)\/[a-z][a-z-]{0,31}$/u;
+const MAX_WORK_REQUEST_BYTES = 64_000;
+const MAX_WORK_RESPONSE_BYTES = 1_000_000;
+const MAX_WORK_CALLS_PER_TURN = 32;
 
 /** One context contribution a plugin proposes; it has no effect until the host authorizes it. */
 export interface ConversationPluginProposal {
@@ -30,6 +35,18 @@ export interface ConversationPluginProposal {
   readonly content: string;
   readonly sourceRefs: readonly ConversationSourceRef[];
 }
+
+/** One JSON call to an allowlisted Work route, made as the turn's own actor. */
+export interface ConversationPluginWorkRequest {
+  readonly method: 'GET' | 'POST';
+  readonly path: string;
+  readonly body?: unknown;
+}
+
+/** Host-built transport for one turn; the plugin never sees a credential or a base URL. */
+export type ConversationPluginWorkTransport = (
+  request: ConversationPluginWorkRequest & { readonly taskId: string; readonly signal: AbortSignal },
+) => Promise<unknown>;
 
 /** Read-only turn facts handed to plugins. It carries neither tokens nor the Work API. */
 export interface ConversationContextHookPayload {
@@ -46,6 +63,13 @@ export interface ConversationContextHookPayload {
   readonly messageId: string;
   readonly query: string;
   readonly attachments: readonly ConversationMessageAttachment[];
+  /**
+   * Allowlisted Work calls as this turn's actor. Absent when the host has no actor-scoped
+   * Work client (for example in test mode); a plugin must then stay idle.
+   */
+  readonly work?: {
+    request(request: ConversationPluginWorkRequest): Promise<unknown>;
+  };
   /** Propose one contribution; invalid or unauthorized proposals are dropped by the host. */
   contribute(proposal: ConversationPluginProposal): void;
 }
@@ -83,12 +107,43 @@ export async function collectPluginContributions(
     readonly messageId: string;
     readonly query: string;
     readonly attachments: readonly ConversationMessageAttachment[];
+    readonly requestWork?: ConversationPluginWorkTransport;
   },
 ): Promise<PluginContextOutcome> {
   context.signal.throwIfAborted();
   const proposals: ConversationPluginProposal[] = [];
   const held: { featureId: string | null; code: string }[] = [];
   let closed = false;
+  let workCalls = 0;
+  const transport = input.requestWork;
+  const work = transport === undefined ? undefined : Object.freeze({
+    async request(request: ConversationPluginWorkRequest): Promise<unknown> {
+      if (closed) throw new TypeError('The conversation context hook is closed');
+      workCalls += 1;
+      if (workCalls > MAX_WORK_CALLS_PER_TURN) throw new TypeError('Plugin Work call limit reached');
+      if (request === null || typeof request !== 'object'
+        || (request.method !== 'GET' && request.method !== 'POST')
+        || typeof request.path !== 'string' || !PLUGIN_WORK_PATHS.test(request.path)) {
+        throw new TypeError('Plugin Work path is not allowed');
+      }
+      const body = request.body;
+      if (body !== undefined && new TextEncoder().encode(JSON.stringify(body) ?? '').byteLength > MAX_WORK_REQUEST_BYTES) {
+        throw new TypeError('Plugin Work request body is too large');
+      }
+      context.signal.throwIfAborted();
+      const result = await transport({
+        method: request.method,
+        path: request.path,
+        ...(body === undefined ? {} : { body }),
+        taskId: context.taskId,
+        signal: context.signal,
+      });
+      if (new TextEncoder().encode(JSON.stringify(result) ?? '').byteLength > MAX_WORK_RESPONSE_BYTES) {
+        throw new TypeError('Plugin Work response is too large');
+      }
+      return result;
+    },
+  });
   const payload: ConversationContextHookPayload = Object.freeze({
     scope: Object.freeze({
       workspaceId: context.workspaceId,
@@ -103,6 +158,7 @@ export async function collectPluginContributions(
     messageId: input.messageId,
     query: input.query,
     attachments: Object.freeze([...input.attachments]),
+    ...(work === undefined ? {} : { work }),
     contribute(proposal: ConversationPluginProposal): void {
       if (closed) {
         held.push({ featureId: null, code: 'PLUGIN_CONTRIBUTION_AFTER_CLOSE' });

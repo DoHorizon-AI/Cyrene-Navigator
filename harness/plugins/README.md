@@ -26,16 +26,20 @@ A plugin only proposes. The host:
 ## Trust model
 
 Dynamic plugins run in the executor process and can read its environment. Load only
-reviewed first-party files from a directory the executor owner controls. The hook
-hands plugins no token and no Work API object; a plugin that needs the Work API
-builds its own connection from configuration, as `conversation-media.mjs` does.
+reviewed first-party files from a directory the executor owner controls.
+
+The hook gives plugins no token, no base URL and no Work API object. When the host
+has an actor-scoped Work client it adds `payload.work.request({ method, path, body })`:
+
+- the request is signed with the **turn's own actor token**, so two users' turns never share an identity;
+- only `GET`/`POST` to `/conversation-media/<action>` and `/knowledge/<action>` are accepted, with no query string, no `..`, a 64 KB request cap, a 1 MB response cap and 32 calls per turn;
+- the host adds the task header itself, and a plugin cannot set headers or choose another credential;
+- `payload.work` is absent when there is no such client (for example test mode), and a plugin must then stay idle.
 
 ## Configuration
 
-`conversation-media.mjs` takes `connection` (`baseUrl`, `workspaceId`, `tokenEnv`)
-from the plugin config, or `CYRENE_PLUGIN_MEDIA_WORK_BASE_URL` and
-`CYRENE_PLUGIN_MEDIA_WORKSPACE_ID` from the environment when the directory loader
-(which passes no config) loads it. It finds the compiled bridge through
-`bridgeModule` or `CYRENE_NAVIGATOR_HARNESS_DIST`. Without a connection it stays idle.
+`conversation-media.mjs` needs no connection settings. It imports the compiled
+strict response decoder through `bridgeModule` (a file URL in the plugin config) or
+`CYRENE_NAVIGATOR_HARNESS_DIST` (the harness `dist` folder).
 
 中文：插件只能"提议"上下文；宿主负责来源授权、送达证明和最终发送前复核。插件与执行器同进程，只加载经审核的第一方文件。
