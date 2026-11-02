@@ -303,13 +303,44 @@ test('the media plugin stays idle when the host has no actor-scoped Work client'
 });
 
 
+test('an unload that overtakes an in-flight load leaves no plugin behind', async () => {
+  const { ctx, manager } = newManager();
+  try {
+    const path = pluginFile('overtaken', `
+      export const name = 'overtaken';
+      export function apply(ctx) {
+        ctx.on('navigator/conversation-context', payload => {
+          payload.contribute({ featureId: 'plugin.overtaken.v1', content: 'zombie', sourceRefs: [${JSON.stringify(sourceRef)}] });
+        });
+      }
+    `);
+    const loading = manager.loadPlugin('overtaken', path);
+    // The file was deleted while its load was still importing.
+    await manager.unloadPlugin('overtaken');
+    const info = await loading;
+    assert.notEqual(info.status, 'loaded');
+    const outcome = await collectPluginContributions(ctx, api(), trustedContext(), input({ attachments: [] }));
+    assert.deepEqual(outcome.contributions, []);
+    assert.deepEqual(manager.listPlugins(), []);
+  } finally {
+    await manager.dispose();
+  }
+});
+
 async function until(condition, label, timeoutMs = 8_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (await condition()) return;
+  // Monotonic clock: a wall-clock step (WSL2 time sync) must not end the wait early.
+  const started = performance.now();
+  const deadline = started + timeoutMs;
+  let last;
+  while (performance.now() < deadline) {
+    try {
+      if (await condition()) return;
+    } catch (error) {
+      last = error;
+    }
     await new Promise(resolve => setTimeout(resolve, 100));
   }
-  assert.fail(`timed out waiting for ${label}`);
+  assert.fail(`timed out waiting for ${label} after ${Math.round(performance.now() - started)}ms${last ? `; last error: ${last.message}` : ''}`);
 }
 
 test('the directory watcher loads, reloads and unloads plugins from files alone', async () => {

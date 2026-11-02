@@ -37,6 +37,9 @@ export interface DynamicPluginManagerOptions {
 
 export class DynamicPluginManager {
   private readonly managed = new Map<string, ManagedPluginEntry>();
+  /** Bumped by every load and unload of an id so a slower, older operation can tell it lost. */
+  private readonly generations = new Map<string, number>();
+  private loadSequence = 0;
   private watcher?: FSWatcher;
   private debounceTimers = new Map<string, NodeJS.Timeout>();
 
@@ -65,6 +68,7 @@ export class DynamicPluginManager {
     if (!existsSync(resolvedPath)) {
       throw new Error(`Plugin file does not exist: ${resolvedPath}`);
     }
+    const generation = this.nextGeneration(id);
 
     // If already loaded, safely dispose previous fiber first without impacting other plugins/sessions
     const existing = this.managed.get(id);
@@ -79,8 +83,8 @@ export class DynamicPluginManager {
 
     const timestamp = new Date().toISOString();
     try {
-      // Use query timestamp to bust Node ESM module resolution cache
-      const cacheBustUrl = `${pathToFileURL(resolvedPath).href}?t=${Date.now()}`;
+      // A per-process counter busts Node's ESM cache; a wall-clock step can repeat a timestamp.
+      const cacheBustUrl = `${pathToFileURL(resolvedPath).href}?t=${Date.now()}-${++this.loadSequence}`;
       const moduleNamespace = await import(cacheBustUrl);
       const pluginExport = moduleNamespace.default ?? moduleNamespace;
 
@@ -93,6 +97,16 @@ export class DynamicPluginManager {
       // Mount into Cordis context as an isolated fiber
       const fiber = this.ctx.plugin(pluginExport, config as never);
       await fiber;
+
+      // A newer load or an unload overtook this one while it was importing: do not resurrect it.
+      if (this.generations.get(id) !== generation) {
+        try {
+          await fiber.dispose();
+        } catch {
+          // The superseding operation owns the plugin's final state.
+        }
+        return { id, name: pluginName, modulePath: resolvedPath, loadedAt: timestamp, status: 'disposed' };
+      }
 
       const entry: ManagedPluginEntry = {
         id,
@@ -124,6 +138,12 @@ export class DynamicPluginManager {
     }
   }
 
+  private nextGeneration(id: string): number {
+    const generation = (this.generations.get(id) ?? 0) + 1;
+    this.generations.set(id, generation);
+    return generation;
+  }
+
   /**
    * Reload an existing loaded plugin.
    * 中文：重新加载已存在的动态插件。
@@ -141,6 +161,8 @@ export class DynamicPluginManager {
    * 中文：卸载并释放指定插件。
    */
   async unloadPlugin(id: string): Promise<boolean> {
+    // Supersede any load of this id that is still in flight, even before it has registered.
+    this.nextGeneration(id);
     const entry = this.managed.get(id);
     if (!entry) return false;
 
