@@ -46,6 +46,78 @@ def test_personas_are_versioned_and_scoped(store: ConversationDomainStore) -> No
     assert error.value.status == 422
 
 
+def test_persona_binding_is_actor_owned_eligible_and_versioned(
+    store: ConversationDomainStore,
+) -> None:
+    store.put_persona(
+        "org-a",
+        "workspace-a",
+        "actor-a",
+        {
+            "id": "persona-bound",
+            "name": "Bound",
+            "prompt": "Use a concise style.",
+            "enabled": True,
+            "conversationIds": ["conversation-1"],
+        },
+    )
+    store.put_persona(
+        "org-a",
+        "workspace-a",
+        "actor-a",
+        {
+            "id": "persona-disabled",
+            "name": "Disabled",
+            "prompt": "Do not use.",
+            "enabled": False,
+        },
+    )
+    body = {
+        "conversationId": "conversation-1",
+        "conversationKind": "direct",
+        "personaId": "persona-bound",
+        "expectedVersion": 0,
+    }
+    assert (
+        store.get_persona_binding("org-a", "workspace-a", "actor-a", "conversation-1", "direct")
+        is None
+    )
+    first = store.put_persona_binding("org-a", "workspace-a", "actor-a", body)
+    assert first["binding"]["version"] == 1
+    assert first["duplicate"] is False
+    replay = store.put_persona_binding("org-a", "workspace-a", "actor-a", body)
+    assert replay["binding"]["version"] == 1
+    assert replay["duplicate"] is True
+    changed = store.put_persona_binding(
+        "org-a", "workspace-a", "actor-a", {**body, "personaId": None, "expectedVersion": 1}
+    )
+    assert changed["binding"]["personaId"] is None
+    assert changed["binding"]["version"] == 2
+    with pytest.raises(PersistenceError) as stale:
+        store.put_persona_binding("org-a", "workspace-a", "actor-a", {**body, "expectedVersion": 1})
+    assert stale.value.status == 409
+    with pytest.raises(PersistenceError) as disabled:
+        store.put_persona_binding(
+            "org-a",
+            "workspace-a",
+            "actor-a",
+            {**body, "personaId": "persona-disabled", "expectedVersion": 2},
+        )
+    assert disabled.value.code == "CONVERSATION_PERSONA_UNAVAILABLE"
+    with pytest.raises(PersistenceError) as wrong_conversation:
+        store.put_persona_binding(
+            "org-a",
+            "workspace-a",
+            "actor-a",
+            {**body, "conversationId": "other", "expectedVersion": 0},
+        )
+    assert wrong_conversation.value.status == 409
+    assert (
+        store.get_persona_binding("org-a", "workspace-a", "actor-b", "conversation-1", "direct")
+        is None
+    )
+
+
 def test_v1_migration_preserves_unknown_source_context_as_null(tmp_path: Path) -> None:
     db_path = tmp_path / "legacy-domain.sqlite3"
     with sqlite3.connect(db_path) as connection:
@@ -84,7 +156,52 @@ def test_v1_migration_preserves_unknown_source_context_as_null(tmp_path: Path) -
     assert note["conversationKind"] is None
     assert note["personaId"] is None
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+
+
+def test_research_note_persists_external_evidence_and_receipt_idempotently(
+    store: ConversationDomainStore,
+) -> None:
+    body = {
+        "idempotencyKey": "research-evidence-note",
+        "conversationId": "conversation-1",
+        "conversationKind": "direct",
+        "title": "Release announcement",
+        "content": "The release date was announced.",
+        "sourceRefs": ["message:research-1"],
+        "researchOperationReceiptId": "research-operation-1",
+        "sourceEvidence": [
+            {
+                "sourceRef": "sha256:" + "a" * 64,
+                "kind": "web",
+                "title": "Release source",
+                "url": "https://example.com/releases",
+                "artifactId": None,
+                "sourceSha256": "b" * 64,
+                "retrievedAt": 1_800_000_000_000,
+            }
+        ],
+    }
+    created = store.create_research_note("org-a", "workspace-a", "actor-a", body)
+    replay = store.create_research_note("org-a", "workspace-a", "actor-a", body)
+    assert created["sourceEvidence"] == body["sourceEvidence"]
+    assert created["researchOperationReceiptId"] == "research-operation-1"
+    assert replay["id"] == created["id"]
+    with pytest.raises(PersistenceError):
+        store.create_research_note(
+            "org-a",
+            "workspace-a",
+            "actor-a",
+            {
+                **body,
+                "sourceEvidence": [
+                    {
+                        **body["sourceEvidence"][0],
+                        "sourceSha256": "c" * 64,
+                    }
+                ],
+            },
+        )
 
 
 def test_behavior_policy_is_scoped_and_uses_version_cas_without_default_rows(
@@ -304,9 +421,9 @@ def test_profile_candidates_activate_and_rollback_with_provenance(
 
     with sqlite3.connect(store.db_path) as connection:
         states = connection.execute(
-            "SELECT state FROM profiles WHERE actor='actor-a' ORDER BY created_at"
+            "SELECT state FROM profiles WHERE actor='actor-a' ORDER BY rowid"
         ).fetchall()
-    assert [row[0] for row in states] == ["active", "rolled_back"]
+        assert [row[0] for row in states] == ["active", "rolled_back"]
 
 
 def test_graph_changesets_require_provider_receipts_before_projection(
@@ -526,6 +643,8 @@ def test_research_skills_watches_focus_handoff_and_review_are_sourced_and_scoped
             "title": "Release date",
             "condition": "Notify when the release date changes.",
             "sourceRefs": ["message:3"],
+            "ownerTaskId": "parent-task-a",
+            "ownerSessionId": "parent-session-a",
         },
     )
     scheduled = store.schedule_watch(
@@ -547,6 +666,64 @@ def test_research_skills_watches_focus_handoff_and_review_are_sourced_and_scoped
     with pytest.raises(PersistenceError):
         store.schedule_watch("org-a", "workspace-a", "actor-a", str(watch["id"]), 3, None)
     assert store.list_watches("org-a", "workspace-a", "actor-b") == []
+
+    observation_watch = store.create_watch(
+        "org-a",
+        "workspace-a",
+        "actor-a",
+        {
+            "idempotencyKey": "watch-observation-1",
+            "conversationId": "conversation-1",
+            "conversationKind": "direct",
+            "title": "Build status",
+            "condition": "Notify when the build completes.",
+            "sourceRefs": ["message:5"],
+            "ownerTaskId": "parent-task-a",
+            "ownerSessionId": "parent-session-a",
+        },
+    )
+    result_sha = hashlib.sha256(b"build completed").hexdigest()
+    observed = store.record_watch_observation(
+        "org-a",
+        "workspace-a",
+        "actor-a",
+        str(observation_watch["id"]),
+        1,
+        "watch-task-a",
+        "watch-operation-a",
+        result_sha,
+        1_800_000_100_000,
+    )
+    assert observed["version"] == 2
+    assert observed["lastResultSha256"] == result_sha
+    assert observed["lastOperationReceiptId"] == "watch-operation-a"
+    assert (
+        store.record_watch_observation(
+            "org-a",
+            "workspace-a",
+            "actor-a",
+            str(observation_watch["id"]),
+            1,
+            "watch-task-a",
+            "watch-operation-a",
+            result_sha,
+            1_800_000_100_000,
+        )["version"]
+        == 2
+    )
+    with pytest.raises(PersistenceError) as stale_observation:
+        store.record_watch_observation(
+            "org-a",
+            "workspace-a",
+            "actor-b",
+            str(observation_watch["id"]),
+            1,
+            "watch-task-a",
+            "watch-operation-a",
+            result_sha,
+            1_800_000_100_000,
+        )
+    assert stale_observation.value.status == 404
 
     focus = store.create_focus_item(
         "org-a",

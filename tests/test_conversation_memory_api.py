@@ -657,6 +657,77 @@ def test_attachment_requires_current_message_source_authorization(tmp_path: Path
         assert granted.json()["allowed"] is True
 
 
+def test_document_attachment_reference_is_scoped_and_rejects_unknown_mime(tmp_path: Path) -> None:
+    """A bounded document artifact can enter only through its current source message."""
+
+    artifact_id = "b" * 64
+    with _client(tmp_path / "document-attachment.sqlite3") as client:
+        created = client.post(
+            BASE + "/messages",
+            json={
+                "eventId": "event-with-document",
+                "conversationId": "direct-alice",
+                "conversationKind": "direct",
+                "personaId": "persona-a",
+                "visibility": "private",
+                "role": "user",
+                "content": "Summarize this PDF.",
+                "attachments": [
+                    {
+                        "artifactId": artifact_id,
+                        "sha256": artifact_id,
+                        "mimeType": "application/pdf",
+                        "size": 512,
+                    }
+                ],
+            },
+            headers=_headers(),
+        )
+        assert created.status_code == 201, created.text
+        message_id = created.json()["message"]["id"]
+        epoch = client.get(BASE + "/overview", headers=_headers()).json()["authorizationEpoch"]
+        authorization = client.post(
+            BASE + "/artifacts/authorize",
+            json={
+                "artifactId": artifact_id,
+                "conversationId": "direct-alice",
+                "conversationKind": "direct",
+                "personaId": "persona-a",
+                "authorizationEpoch": epoch,
+                "sourceRefs": [
+                    {"memoryId": None, "memoryVersion": None, "sourceMessageIds": [message_id]}
+                ],
+            },
+            headers=_headers(),
+        )
+        assert authorization.status_code == 200
+        assert authorization.json()["allowed"] is True
+        assert authorization.json()["artifact"]["mimeType"] == "application/pdf"
+
+        unknown_mime = client.post(
+            BASE + "/messages",
+            json={
+                "eventId": "event-with-unknown-file",
+                "conversationId": "direct-alice",
+                "conversationKind": "direct",
+                "personaId": "persona-a",
+                "visibility": "private",
+                "role": "user",
+                "content": "Do not fetch this file.",
+                "attachments": [
+                    {
+                        "artifactId": "c" * 64,
+                        "sha256": "c" * 64,
+                        "mimeType": "application/octet-stream",
+                        "size": 512,
+                    }
+                ],
+            },
+            headers=_headers(),
+        )
+        assert unknown_mime.status_code == 422
+
+
 def test_memory_corrections_and_deletion_use_version_cas(tmp_path: Path) -> None:
     """Concurrent edits fail closed while an exact delete retry stays idempotent."""
 
