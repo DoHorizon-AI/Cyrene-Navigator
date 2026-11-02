@@ -53,10 +53,11 @@ function policy(overrides = {}) {
 }
 
 function dependencies(overrides = {}) {
-  const calls = { focusCreates: [], focusTransitions: [], handoffs: [], authorizations: [], schedules: [], cancels: [], dispatches: [], taskCancels: [], retractions: [], policies: [] };
+  const calls = { focusCreates: [], focusTransitions: [], followupDeliveryReceipts: [], handoffs: [], authorizations: [], schedules: [], cancels: [], dispatches: [], taskReads: [], taskCancels: [], retractions: [], policies: [] };
   let currentFocus = focus();
   let currentPolicy = policy();
   let messages = [userMessage()];
+  const taskOutcomes = new Map();
   const api = {
     apiVersion: 1,
     async createMessage() { throw new Error('not used'); },
@@ -110,6 +111,12 @@ function dependencies(overrides = {}) {
       currentFocus = { ...currentFocus, state: input.state, version: currentFocus.version + 1, updatedAt: fixedNow + 1 };
       return { item: currentFocus };
     },
+    async recordFollowupDelivery(_ctx, id, input) {
+      calls.followupDeliveryReceipts.push({ id, input });
+      if (currentFocus.version !== input.expectedVersion) throw new Error('follow-up delivery CAS mismatch');
+      currentFocus = { ...currentFocus, state: 'waiting', version: currentFocus.version + 1, updatedAt: fixedNow + 1 };
+      return { item: currentFocus };
+    },
     async createHandoff(_ctx, input) {
       calls.handoffs.push(input);
       return { handoff: { id: 'handoff-1', ...input, createdAt: fixedNow }, duplicate: false };
@@ -130,11 +137,17 @@ function dependencies(overrides = {}) {
     async cancel(marker) { calls.cancels.push(marker); return 1; },
   };
   const tasks = {
+    async read(_ctx, taskId) {
+      calls.taskReads.push(taskId);
+      return taskOutcomes.get(taskId);
+    },
     async dispatch(ctx, input) {
       calls.dispatches.push({ ctx, input });
-      return overrides.dispatchResult ?? {
-        taskId: input.taskId, status: 'completed', deliveryStatus: 'delivered', deliveryReceiptId: 'delivery-1',
-      };
+      const outcome = overrides.dispatchResult === undefined
+        ? { taskId: input.taskId, status: 'completed', deliveryStatus: 'delivered', deliveryReceiptId: 'delivery-1' }
+        : { ...overrides.dispatchResult, taskId: input.taskId };
+      taskOutcomes.set(input.taskId, outcome);
+      return outcome;
     },
     async cancel(_ctx, taskId) { calls.taskCancels.push(taskId); return overrides.cancelResult ?? true; },
     async retract(_ctx, taskId) {
@@ -148,6 +161,7 @@ function dependencies(overrides = {}) {
     setPolicy(value) { currentPolicy = value; },
     setFocus(value) { currentFocus = value; },
     setMessages(value) { messages = value; },
+    setTaskOutcome(taskId, value) { taskOutcomes.set(taskId, value); },
   };
 }
 
@@ -205,7 +219,38 @@ test('scheduled follow-up uses the existing DSH conversation task, marks origin 
   assert.equal(env.calls.dispatches[0].input.origin.kind, 'conversation-followup');
   assert.equal(env.calls.dispatches[0].input.executionClass, 'background');
   assert.deepEqual(env.calls.dispatches[0].input.sourceRefs, sourceRefs);
-  assert.deepEqual(env.calls.focusTransitions[0].input, { state: 'waiting', expectedVersion: 1 });
+  assert.deepEqual(env.calls.followupDeliveryReceipts[0].input, {
+    expectedVersion: 1, taskId: env.calls.dispatches[0].input.taskId, deliveryReceiptId: 'delivery-1',
+  });
+});
+
+test('queued and unknown follow-ups reconcile by durable Task read and never dispatch twice', async () => {
+  const env = dependencies({ dispatchResult: {
+    status: 'queued', deliveryStatus: 'unknown',
+  } });
+  const first = await env.feature.runScheduledFollowup(context(), 'focus-1');
+  assert.equal(first.status, 'pending');
+  assert.equal(env.calls.dispatches.length, 1);
+  assert.equal(env.calls.focusTransitions.length, 0);
+  assert.equal(env.calls.schedules.at(-1).dueAt, fixedNow + 30_000);
+  const taskId = env.calls.dispatches[0].input.taskId;
+  env.setTaskOutcome(taskId, { taskId, status: 'running', deliveryStatus: 'unknown' });
+
+  const second = await env.feature.runScheduledFollowup(context(), 'focus-1');
+  assert.equal(second.status, 'pending');
+  assert.equal(env.calls.dispatches.length, 1, 'running Task is observed instead of submitted again');
+  assert.equal(env.calls.taskReads.length, 2);
+  assert.equal(env.calls.focusTransitions.length, 0);
+
+  env.setTaskOutcome(taskId, {
+    taskId, status: 'completed', deliveryStatus: 'delivered', deliveryReceiptId: 'platform-delivery-2',
+  });
+  const recovered = await env.feature.runScheduledFollowup(context(), 'focus-1');
+  assert.equal(recovered.status, 'dispatched');
+  assert.equal(env.calls.dispatches.length, 1, 'completed send is reconciled without another executor invocation');
+  assert.equal(env.calls.followupDeliveryReceipts.at(-1).input.deliveryReceiptId, 'platform-delivery-2');
+  assert.equal(env.calls.focusTransitions.length, 0, 'automatic delivery uses the worker-only receipt CAS');
+  assert.equal(env.calls.cancels.at(-1).kind, 'followup');
 });
 
 test('a follow-up turn cannot create another focus trigger or send when policy is disabled at delivery', async () => {

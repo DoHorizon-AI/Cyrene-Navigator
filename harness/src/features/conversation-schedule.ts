@@ -16,7 +16,7 @@ import type {
 
 const MARKER_PREFIX = '[CYRENE_CONVERSATION_SCHEDULE_V1]\n';
 
-export type ConversationScheduleKind = 'maintenance' | 'watch' | 'followup';
+export type ConversationScheduleKind = 'maintenance' | 'watch' | 'followup' | 'bili-subscription';
 
 /** Durable DSH Schedule payload contains identifiers only, never message text or credentials. */
 export interface ConversationScheduleMarker {
@@ -191,7 +191,7 @@ export function parseConversationScheduleMarkerV1(prompt: string): ConversationS
     const record = value as Record<string, unknown>;
     if (Object.keys(record).length !== 3
       || record.version !== 1
-      || (record.kind !== 'maintenance' && record.kind !== 'watch' && record.kind !== 'followup')
+      || (record.kind !== 'maintenance' && record.kind !== 'watch' && record.kind !== 'followup' && record.kind !== 'bili-subscription')
       || !isIdentifier(record.resourceId)) return undefined;
     return { version: 1, kind: record.kind, resourceId: record.resourceId };
   } catch {
@@ -209,7 +209,7 @@ export function conversationScheduleMarker(
 
 function validateMarker(marker: ConversationScheduleMarker): ConversationScheduleMarker {
   if (marker?.version !== 1
-    || (marker.kind !== 'maintenance' && marker.kind !== 'watch' && marker.kind !== 'followup')
+    || (marker.kind !== 'maintenance' && marker.kind !== 'watch' && marker.kind !== 'followup' && marker.kind !== 'bili-subscription')
     || !isIdentifier(marker.resourceId)) {
     throw new TypeError('Conversation schedule marker is invalid');
   }

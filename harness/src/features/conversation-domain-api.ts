@@ -175,6 +175,17 @@ export interface MaintenanceCheckpoint {
   readonly details?: Readonly<Record<string, unknown>>;
 }
 
+/** External source evidence is separate from conversation-message lineage. */
+export interface ResearchSourceEvidence {
+  readonly sourceRef: string;
+  readonly kind: 'web' | 'document';
+  readonly title: string;
+  readonly url?: string;
+  readonly artifactId?: string;
+  readonly sourceSha256: string;
+  readonly retrievedAt: number;
+}
+
 /** A research note tied to exact source revisions. */
 export interface ResearchNote {
   readonly id: string;
@@ -185,8 +196,29 @@ export interface ResearchNote {
   readonly title: string;
   readonly content: string;
   readonly sourceRefs: readonly ConversationSourceRef[];
+  readonly sourceEvidence: readonly ResearchSourceEvidence[];
   readonly revision: number;
   readonly createdAt: number;
+}
+
+/** Server-verified evidence that a guide produced an external effect and readback. */
+export interface VerifiedSkillEvidence {
+  readonly actionId: string;
+  readonly targetDigestSha256: string;
+  readonly inputSha256: string;
+  readonly guideVersion: string;
+  readonly guideSha256: string;
+  readonly actionEffectOperationId: string;
+  readonly readbackEffectOperationId: string;
+  readonly effectOutcome: 'verified';
+  readonly effectResultSha256: string;
+  readonly effectReadbackOutcome: 'verified';
+  readonly effectReadbackSha256: string;
+  readonly readbackVerified: true;
+  readonly sourceRef: string;
+  readonly canonicalUrl: string;
+  readonly sourceSha256: string;
+  readonly workArtifactSha256: string;
 }
 
 /** A verified, sourced instruction card; verification identity is server-owned. */
@@ -201,6 +233,7 @@ export interface VerifiedSkill {
   readonly sourceRefs: readonly ConversationSourceRef[];
   readonly operationReceiptId: string;
   readonly independentReadReceiptId: string;
+  readonly evidence: VerifiedSkillEvidence;
   readonly verified: true;
   readonly verifiedBy: string;
   readonly verifiedAt: number;
@@ -212,12 +245,16 @@ export interface VerifiedSkill {
 export interface ConversationWatch {
   readonly id: string;
   readonly idempotencyKey: string;
+  readonly ownerTaskId: string;
+  readonly ownerSessionId: string;
   readonly conversationId: string;
   readonly conversationKind: ConversationKind | null;
   readonly personaId: string | null;
   readonly title: string;
   readonly condition: string;
   readonly sourceRefs: readonly ConversationSourceRef[];
+  readonly lastResultSha256: string | null;
+  readonly lastOperationReceiptId: string | null;
   readonly nextCheckAt: number | null;
   readonly state: 'active' | 'cancelled';
   readonly version: number;
@@ -359,12 +396,15 @@ export interface ConversationDomainApiV1 extends ConversationMemoryApiV1 {
   cancelMaintenanceJob(context: TrustedTurnContext, jobId: string, expectedVersion: number): Promise<{ readonly job: ConversationMaintenanceJob }>;
   createResearchNote(context: TrustedTurnContext, input: {
     readonly idempotencyKey: string;
+    /** Server verifies this exact trusted research operation before storing source evidence. */
+    readonly researchOperationReceiptId: string;
     readonly conversationId: string;
     readonly conversationKind: ConversationKind;
     readonly personaId: string | null;
     readonly title: string;
     readonly content: string;
     readonly sourceRefs: readonly ConversationSourceRef[];
+    readonly sourceEvidence: readonly ResearchSourceEvidence[];
   }): Promise<{ readonly note: ResearchNote; readonly duplicate?: boolean }>;
   listResearchNotes(context: TrustedTurnContext, input: { readonly conversationId?: string; readonly limit: number }): Promise<{ readonly items: readonly ResearchNote[] }>;
   createVerifiedSkill(context: TrustedTurnContext, input: {
@@ -374,6 +414,11 @@ export interface ConversationDomainApiV1 extends ConversationMemoryApiV1 {
     readonly personaId?: string | null;
     readonly operationReceiptId: string;
     readonly independentReadReceiptId: string;
+    readonly actionId: string;
+    readonly targetDigestSha256: string;
+    readonly inputSha256: string;
+    readonly guideVersion: string;
+    readonly guideSha256: string;
     readonly name: string;
     readonly content: string;
     readonly sourceRefs: readonly ConversationSourceRef[];
@@ -400,6 +445,14 @@ export interface ConversationDomainApiV1 extends ConversationMemoryApiV1 {
     readonly expectedVersion: number;
     readonly nextCheckAt: number | null;
   }): Promise<{ readonly watch: ConversationWatch }>;
+  /** Internal worker-only CAS; the server validates the completed DSH Task and Work receipt. */
+  recordWatchObservation(context: TrustedTurnContext, watchId: string, input: {
+    readonly expectedVersion: number;
+    readonly taskId: string;
+    readonly operationReceiptId: string;
+    readonly resultSha256: string;
+    readonly nextCheckAt: number;
+  }): Promise<{ readonly watch: ConversationWatch }>;
   createFocusItem(context: TrustedTurnContext, input: {
     readonly idempotencyKey: string;
     readonly conversationId: string;
@@ -419,6 +472,12 @@ export interface ConversationDomainApiV1 extends ConversationMemoryApiV1 {
   transitionFocusItem(context: TrustedTurnContext, focusItemId: string, input: {
     readonly state: FocusItem['state'];
     readonly expectedVersion: number;
+  }): Promise<{ readonly item: FocusItem }>;
+  /** Worker-only CAS accepted only after the server verifies the DSH Task and delivery receipt. */
+  recordFollowupDelivery(context: TrustedTurnContext, focusItemId: string, input: {
+    readonly expectedVersion: number;
+    readonly taskId: string;
+    readonly deliveryReceiptId: string;
   }): Promise<{ readonly item: FocusItem }>;
   createHandoff(context: TrustedTurnContext, input: {
     readonly idempotencyKey: string;
