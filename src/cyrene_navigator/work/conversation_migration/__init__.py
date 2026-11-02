@@ -8,6 +8,18 @@
 └─────────────────────────────────────────────────────────────────────┘
 """
 
+from .adapters import (
+    CanonicalGraphAdapter,
+    CanonicalMemoryAdapter,
+    CanonicalProfileAdapter,
+    CanonicalRollbackCapabilities,
+    ConversationMigrationHost,
+    DirectGraphCompensator,
+    GraphCompensationProvider,
+    WorkStoreOperationAdapter,
+    WorkStoreTaskProgressAdapter,
+    build_conversation_migration_host,
+)
 from .backup import ActorBackup, ActorBackupSource, build_actor_backup, parse_actor_backup
 from .jsonl import JsonLinesMigrationSource
 from .models import (
@@ -26,13 +38,23 @@ __all__ = [
     "ActorBackupSource",
     "ActorScope",
     "AuthorizedConversationContext",
+    "CanonicalGraphAdapter",
+    "CanonicalMemoryAdapter",
+    "CanonicalProfileAdapter",
+    "CanonicalRollbackCapabilities",
+    "ConversationMigrationHost",
     "ConversationMigrationService",
+    "DirectGraphCompensator",
+    "GraphCompensationProvider",
     "ImportPreview",
     "JsonLinesMigrationSource",
     "MigrationError",
     "MigrationReceipt",
     "MigrationRecord",
     "MigrationSettings",
+    "WorkStoreOperationAdapter",
+    "WorkStoreTaskProgressAdapter",
     "build_actor_backup",
+    "build_conversation_migration_host",
     "parse_actor_backup",
 ]

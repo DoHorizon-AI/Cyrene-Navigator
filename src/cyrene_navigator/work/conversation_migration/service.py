@@ -61,6 +61,7 @@ class _ProjectionRef:
     version: int
     context: AuthorizedConversationContext
     candidate_id: str | None = None
+    candidate_version: int | None = None
     readback_sha256: str = ""
     operation_id: str | None = None
     replayed: bool = False
@@ -78,6 +79,7 @@ class _LoadedProgress:
     projections: Mapping[str, _ProjectionRef]
     record_events: tuple[Mapping[str, object], ...]
     rollback_ordinals: frozenset[int]
+    rollback_events: Mapping[int, Mapping[str, object]]
     batch_rolled_back: bool
 
 
@@ -305,7 +307,8 @@ class ConversationMigrationService:
                 "IMPORT_ALREADY_ROLLED_BACK",
                 "This exact import batch was already rolled back; preview a new plan to reapply.",
             )
-        if progress.ordinal >= preview.record_count and progress.cursor is None:
+        if progress.ordinal >= preview.record_count:
+            self._verify_completed_applied(scope, task_id, source, preview, progress)
             return self._receipt_from_progress(batch_id, preview, progress, "applied")
         self._require_rollback_capabilities(scope, current_preview)
 
@@ -458,6 +461,7 @@ class ConversationMigrationService:
             )
         progress = self._load_progress(scope, task_id, batch_id)
         if progress.batch_rolled_back:
+            self._verify_completed_rollback(scope, task_id, progress)
             return MigrationReceipt(
                 batch_id=batch_id,
                 artifact_sha256=preview.artifact_sha256,
@@ -493,14 +497,23 @@ class ConversationMigrationService:
         for event in reversed(applied):
             ordinal = _required_int(event.get("ordinal"), "checkpoint ordinal")
             if ordinal in rolled_back:
+                rollback_event = progress.rollback_events.get(ordinal)
+                if rollback_event is None:
+                    raise MigrationError(
+                        "ROLLBACK_CHECKPOINT_MISSING", "Rollback checkpoint is missing."
+                    )
+                self._verify_rollback_checkpoint(scope, task_id, event, rollback_event)
                 continue
             self._rollback_one(scope, task_id, batch_id, preview, event)
             rolled_back_count += 1
         progress = self._load_progress(scope, task_id, batch_id)
-        if len(progress.rollback_ordinals) < len(applied):
+        if progress.rollback_ordinals != frozenset(
+            _required_int(item.get("ordinal"), "rollback ordinal") for item in applied
+        ):
             raise MigrationError(
                 "ROLLBACK_COUNT_MISMATCH", "Rollback checkpoints do not reconcile."
             )
+        self._verify_completed_rollback(scope, task_id, progress)
         self._progress.append_checkpoint(
             scope,
             task_id=task_id,
@@ -813,7 +826,7 @@ class ConversationMigrationService:
         known: set[str] = set()
         projections: dict[str, _ProjectionRef] = {}
         records: list[Mapping[str, object]] = []
-        rollback_ordinals: set[int] = set()
+        rollback_events: dict[int, Mapping[str, object]] = {}
         batch_rolled_back = False
         seen_events = 0
         while True:
@@ -877,6 +890,11 @@ class ConversationMigrationService:
                                 if isinstance(event.get("candidateId"), str)
                                 else None
                             ),
+                            candidate_version=(
+                                int(event["candidateVersion"])
+                                if type(event.get("candidateVersion")) is int
+                                else None
+                            ),
                             readback_sha256=str(event.get("readbackSha256", "")),
                             operation_id=(
                                 str(event["operationId"])
@@ -891,7 +909,14 @@ class ConversationMigrationService:
                             ),
                         )
                 elif event_type == "rollback" and type(event.get("ordinal")) is int:
-                    rollback_ordinals.add(int(event["ordinal"]))
+                    rollback_ordinal = int(event["ordinal"])
+                    prior_rollback = rollback_events.get(rollback_ordinal)
+                    if prior_rollback is not None and dict(prior_rollback) != dict(event):
+                        raise MigrationError(
+                            "ROLLBACK_CHECKPOINT_CONFLICT",
+                            "Stored rollback checkpoint conflicts for one record.",
+                        )
+                    rollback_events[rollback_ordinal] = event
                 elif event_type == "batch_rollback":
                     batch_rolled_back = event.get("state") == "rolled_back"
                 seen_events += 1
@@ -917,9 +942,166 @@ class ConversationMigrationService:
             known_records=frozenset(known),
             projections=projections,
             record_events=tuple(records),
-            rollback_ordinals=frozenset(rollback_ordinals),
+            rollback_ordinals=frozenset(rollback_events),
+            rollback_events=rollback_events,
             batch_rolled_back=batch_rolled_back,
         )
+
+    def _verify_completed_applied(
+        self,
+        scope: ActorScope,
+        task_id: str,
+        source: MigrationSource,
+        preview: ImportPreview,
+        progress: _LoadedProgress,
+    ) -> None:
+        """Reconcile every completed checkpoint against current auth and canonical state."""
+
+        events_by_ordinal: dict[int, Mapping[str, object]] = {}
+        for event in progress.record_events:
+            ordinal = event.get("ordinal")
+            if type(ordinal) is not int or ordinal < 1 or ordinal in events_by_ordinal:
+                raise MigrationError(
+                    "TASK_CHECKPOINT_INVALID", "Completed batch record ordinals are invalid."
+                )
+            events_by_ordinal[ordinal] = event
+        if set(events_by_ordinal) != set(range(1, preview.record_count + 1)):
+            raise MigrationError(
+                "TASK_CHECKPOINT_INCOMPLETE", "Completed batch checkpoints do not cover the source."
+            )
+
+        prior_ids: set[str] = set()
+        prior_projections: dict[str, _ProjectionRef] = {}
+        cursor: str | None = None
+        ordinal = 0
+        while True:
+            page = source.read_page(cursor, self._settings.max_page_records)
+            _validate_page(page, self._settings.max_page_records)
+            if not page.items and page.next_cursor is not None:
+                raise MigrationError(
+                    "SOURCE_CURSOR_STALLED", "Artifact page cursor did not advance."
+                )
+            for line in page.items:
+                ordinal += 1
+                row_event = events_by_ordinal.get(ordinal)
+                if row_event is None or row_event.get("sourceCursor") != line.cursor_after:
+                    raise MigrationError(
+                        "TASK_CHECKPOINT_SOURCE_MISMATCH",
+                        "Stored checkpoint does not identify the current source row.",
+                    )
+                record, _reason = self._normalize_line(line, ordinal, prior_ids)
+                state = row_event.get("state")
+                if state not in {"projected", "candidate", "quarantined"}:
+                    raise MigrationError(
+                        "TASK_CHECKPOINT_INVALID", "Completed record state is invalid."
+                    )
+                if record is None:
+                    if state != "quarantined":
+                        raise MigrationError(
+                            "TASK_CHECKPOINT_SOURCE_MISMATCH",
+                            "A projected source record no longer validates.",
+                        )
+                    continue
+                if (
+                    row_event.get("recordId") != record.record_id
+                    or row_event.get("recordKind") != record.kind
+                    or row_event.get("recordDigest") != record.digest
+                ):
+                    raise MigrationError(
+                        "TASK_CHECKPOINT_SOURCE_MISMATCH",
+                        "Stored checkpoint digest does not match the current source row.",
+                    )
+                if state == "quarantined":
+                    continue
+
+                context = self._authorization.resolve_conversation_context(
+                    scope,
+                    artifact_id=source.artifact_id,
+                    source_conversation_id=record.conversation_id,
+                    source_conversation_kind=record.conversation_kind,
+                    source_persona_id=record.persona_id,
+                )
+                if context is None or _context_to_mapping(context) != row_event.get(
+                    "targetContext"
+                ):
+                    raise MigrationError(
+                        "APPLIED_AUTHORIZATION_CHANGED",
+                        "Current target conversation authorization changed.",
+                    )
+                staged = self._authorization.authorize_staged_record(
+                    scope,
+                    artifact_id=source.artifact_id,
+                    artifact_sha256=source.expected_sha256,
+                    record=record,
+                )
+                if not staged.allowed:
+                    raise MigrationError(
+                        "APPLIED_AUTHORIZATION_REVOKED",
+                        "Current source authorization no longer permits this projection.",
+                    )
+                source_refs = _resolve_source_refs(record, prior_projections, context)
+                if source_refs is None:
+                    raise MigrationError(
+                        "APPLIED_LINEAGE_CHANGED", "Current source lineage cannot be rebuilt."
+                    )
+                if source_refs:
+                    source_decision = self._authorization.authorize_source_refs(
+                        scope,
+                        conversation_id=context.conversation_id,
+                        conversation_kind=context.conversation_kind,
+                        persona_id=context.persona_id,
+                        source_refs=source_refs,
+                    )
+                    if not source_decision.allowed:
+                        raise MigrationError(
+                            "APPLIED_AUTHORIZATION_REVOKED",
+                            "Current source authorization no longer permits this projection.",
+                        )
+
+                operation_id = row_event.get("operationId")
+                if not isinstance(operation_id, str):
+                    raise MigrationError(
+                        "TASK_CHECKPOINT_INVALID", "Projection operation receipt is missing."
+                    )
+                try:
+                    operation = self._operations.get(
+                        scope, task_id=task_id, operation_id=operation_id
+                    )
+                    if operation.status != "verified":
+                        raise MigrationError(
+                            "APPLIED_OPERATION_UNVERIFIED",
+                            "A completed projection has no verified Work Operation receipt.",
+                        )
+                    projection, readback_digest = self._read_verified_operation(
+                        scope, operation, record, context
+                    )
+                except Exception as error:
+                    raise MigrationError(
+                        "APPLIED_PROJECTION_CHANGED",
+                        "Current canonical state no longer matches the completed batch.",
+                    ) from error
+                if (
+                    projection.kind != row_event.get("projectionKind")
+                    or projection.entity_id != row_event.get("entityId")
+                    or projection.version != row_event.get("entityVersion")
+                    or projection.candidate_id != row_event.get("candidateId")
+                    or projection.candidate_version != row_event.get("candidateVersion")
+                    or readback_digest != row_event.get("readbackSha256")
+                    or (state == "candidate") != (projection.kind == "profile_candidate")
+                ):
+                    raise MigrationError(
+                        "APPLIED_PROJECTION_CHANGED",
+                        "Current canonical state differs from the completed checkpoint.",
+                    )
+                prior_projections[record.record_id] = projection
+                prior_ids.add(record.record_id)
+            cursor = page.next_cursor
+            if cursor is None:
+                break
+        if ordinal != preview.record_count:
+            raise MigrationError(
+                "IMPORT_COUNT_MISMATCH", "Current source count differs from the completed batch."
+            )
 
     def _apply_record(
         self,
@@ -995,6 +1177,7 @@ class ConversationMigrationService:
                     version=projection_ref.version,
                     context=context,
                     candidate_id=projection_ref.candidate_id,
+                    candidate_version=projection_ref.candidate_version,
                     readback_sha256=readback_digest,
                     operation_id=operation.operation_id,
                     replayed=True,
@@ -1033,6 +1216,7 @@ class ConversationMigrationService:
                 "entityId": projection_ref.entity_id,
                 "entityVersion": projection_ref.version,
                 "candidateId": projection_ref.candidate_id,
+                "candidateVersion": projection_ref.candidate_version,
                 "readbackSha256": readback_digest,
                 "authorizationEpoch": authorization_epoch,
             },
@@ -1048,6 +1232,7 @@ class ConversationMigrationService:
                 version=projection_ref.version,
                 context=context,
                 candidate_id=projection_ref.candidate_id,
+                candidate_version=projection_ref.candidate_version,
                 readback_sha256=readback_digest,
                 operation_id=operation.operation_id,
                 authorization_epoch=authorization_epoch,
@@ -1088,7 +1273,7 @@ class ConversationMigrationService:
             receipt = self._memory.create_message(scope, body)
             message = _nested_mapping(receipt, "message")
             entity_id = _required_id(message.get("id"), "message id")
-            readback = self._memory.get_message(scope, entity_id)
+            readback = self._memory.get_message(scope, entity_id, context=context)
             expected = _message_expected(body)
             actual = _message_actual(readback)
             if canonical_json(actual) != canonical_json(expected):
@@ -1149,38 +1334,93 @@ class ConversationMigrationService:
             readback = _required_mapping(
                 self._profiles.get_candidate(scope, candidate_id), "profile candidate readback"
             )
-            expected = _profile_expected(body, source_message_ids, state="candidate")
-            actual = _profile_candidate_actual(readback)
-            if canonical_json(actual) != canonical_json(expected):
-                raise MigrationError(
-                    "PROFILE_READBACK_MISMATCH", "Imported profile candidate differs."
-                )
+            candidate_state = readback.get("state")
             version = _positive_version(readback.get("version"))
-            profile_id: str | None = None
-            if self._authorization.approve_profile_activation(
-                scope, profile_approval_ref, record.digest
-            ):
-                activated = self._profiles.activate_candidate(scope, candidate_id, version)
-                profile = _unwrap_domain(activated, "profile")
-                profile_id = _required_id(profile.get("id"), "profile id")
-                active_readback = _required_mapping(
-                    self._profiles.get_profile(scope, profile_id), "profile readback"
-                )
-                active_expected = _profile_expected(body, source_message_ids, state="active")
-                active_actual = _profile_actual(active_readback)
-                if canonical_json(active_actual) != canonical_json(active_expected):
+            if candidate_state == "candidate":
+                actual = _profile_candidate_actual(readback)
+                expected = _profile_expected(body, source_message_ids, state="candidate")
+                if canonical_json(actual) != canonical_json(expected) or version != 1:
                     raise MigrationError(
-                        "PROFILE_READBACK_MISMATCH", "Activated profile readback differs."
+                        "PROFILE_READBACK_MISMATCH", "Imported profile candidate differs."
                     )
-                active_version = _positive_version(active_readback.get("version"))
-                projection = _ProjectionRef(
-                    "profile_active", profile_id, active_version, context, candidate_id=candidate_id
+                if not self._authorization.approve_profile_activation(
+                    scope, profile_approval_ref, record.digest
+                ):
+                    projection = _ProjectionRef(
+                        "profile_candidate",
+                        candidate_id,
+                        version,
+                        context,
+                        candidate_id=candidate_id,
+                        candidate_version=version,
+                    )
+                    return projection, hashlib.sha256(canonical_json(actual)).hexdigest()
+                activation_expected_version = version
+            elif candidate_state == "active":
+                actual = _profile_candidate_actual(readback)
+                expected = _profile_expected(body, source_message_ids, state="active")
+                if canonical_json(actual) != canonical_json(expected) or version != 2:
+                    raise MigrationError(
+                        "PROFILE_READBACK_MISMATCH",
+                        "In-flight activated candidate differs from the import plan.",
+                    )
+                # A deterministic candidate key plus version 2 proves that the prior
+                # activation CAS committed. This call is an idempotent current readback.
+                activation_expected_version = 1
+            elif candidate_state == "rolled_back":
+                raise MigrationError(
+                    "IMPORT_ALREADY_ROLLED_BACK",
+                    "This candidate was already rolled back and will not be reactivated.",
                 )
-                return projection, hashlib.sha256(canonical_json(active_actual)).hexdigest()
-            projection = _ProjectionRef(
-                "profile_candidate", candidate_id, version, context, candidate_id=candidate_id
+            else:
+                raise MigrationError(
+                    "PROFILE_READBACK_MISMATCH", "Profile candidate has an unknown state."
+                )
+
+            activated = self._profiles.activate_candidate(
+                scope, candidate_id, activation_expected_version
             )
-            return projection, hashlib.sha256(canonical_json(actual)).hexdigest()
+            profile = _unwrap_domain(activated, "profile")
+            profile_id = _required_id(profile.get("id"), "profile id")
+            active_readback = _required_mapping(
+                self._profiles.get_profile(scope, profile_id), "profile readback"
+            )
+            active_expected = _profile_expected(body, source_message_ids, state="active")
+            active_actual = _profile_actual(active_readback)
+            if canonical_json(active_actual) != canonical_json(active_expected):
+                raise MigrationError(
+                    "PROFILE_READBACK_MISMATCH", "Activated profile readback differs."
+                )
+            if active_readback.get("candidateId") != candidate_id:
+                raise MigrationError(
+                    "PROFILE_READBACK_MISMATCH", "Activated profile lost its candidate link."
+                )
+            active_version = _positive_version(active_readback.get("version"))
+            active_candidate = _required_mapping(
+                self._profiles.get_candidate(scope, candidate_id),
+                "activated profile candidate readback",
+            )
+            if canonical_json(_profile_candidate_actual(active_candidate)) != canonical_json(
+                _profile_expected(body, source_message_ids, state="active")
+            ):
+                raise MigrationError(
+                    "PROFILE_READBACK_MISMATCH",
+                    "Activated candidate evidence differs from its profile.",
+                )
+            candidate_version = _positive_version(active_candidate.get("version"))
+            if candidate_version != 2:
+                raise MigrationError(
+                    "PROFILE_READBACK_MISMATCH", "Activated candidate version is unexpected."
+                )
+            projection = _ProjectionRef(
+                "profile_active",
+                profile_id,
+                active_version,
+                context,
+                candidate_id=candidate_id,
+                candidate_version=candidate_version,
+            )
+            return projection, hashlib.sha256(canonical_json(active_actual)).hexdigest()
 
         if record.kind == "graph":
             body = self._graph_body(record, batch_id, context, prior_projections)
@@ -1297,7 +1537,65 @@ class ConversationMigrationService:
         version = _required_int(evidence.get("entityVersion"), "operation entity version")
         candidate_value = evidence.get("candidateId")
         candidate_id = candidate_value if isinstance(candidate_value, str) else None
-        readback = self._read_projection(scope, kind, entity_id)
+        candidate_version_value = evidence.get("candidateVersion")
+        candidate_version = (
+            _positive_version(candidate_version_value)
+            if type(candidate_version_value) is int
+            else None
+        )
+        if kind in {"profile_candidate", "profile_active"} and (
+            candidate_id is None or candidate_version is None
+        ):
+            raise MigrationError(
+                "OPERATION_EVIDENCE_INVALID", "Profile candidate recovery evidence is incomplete."
+            )
+        if kind in {"profile_candidate", "profile_active"}:
+            assert candidate_id is not None and candidate_version is not None
+        readback = self._read_projection(scope, kind, entity_id, context=context)
+        if kind != "message" and _positive_version(readback.get("version")) != version:
+            raise MigrationError(
+                "OPERATION_READBACK_CHANGED", "Canonical projection version changed."
+            )
+        expected_state = {
+            "message": "active",
+            "memory": "active",
+            "profile_candidate": "candidate",
+            "profile_active": "active",
+            "graph": "projected",
+        }[kind]
+        state_field = "status" if kind == "message" else "state"
+        if readback.get(state_field) != expected_state:
+            raise MigrationError(
+                "OPERATION_READBACK_CHANGED", "Canonical projection is no longer active."
+            )
+        if kind == "profile_candidate":
+            if candidate_id != entity_id or candidate_version != version:
+                raise MigrationError(
+                    "OPERATION_EVIDENCE_INVALID", "Profile candidate identity is inconsistent."
+                )
+        elif kind == "profile_active":
+            if readback.get("candidateId") != candidate_id:
+                raise MigrationError(
+                    "OPERATION_READBACK_CHANGED", "Active profile candidate link changed."
+                )
+            candidate = _required_mapping(
+                self._profiles.get_candidate(scope, str(candidate_id)),
+                "active profile candidate readback",
+            )
+            if (
+                candidate.get("state") != "active"
+                or _positive_version(candidate.get("version")) != candidate_version
+                or canonical_json(_profile_candidate_actual(candidate))
+                != canonical_json(
+                    {
+                        **_profile_actual(readback),
+                        "state": "active",
+                    }
+                )
+            ):
+                raise MigrationError(
+                    "OPERATION_READBACK_CHANGED", "Active profile candidate evidence changed."
+                )
         digest = _projection_readback_digest(kind, readback)
         if digest != evidence["readbackSha256"]:
             raise MigrationError(
@@ -1310,6 +1608,7 @@ class ConversationMigrationService:
                 version,
                 context,
                 candidate_id,
+                candidate_version,
                 authorization_epoch=_required_int(
                     evidence.get("authorizationEpoch"), "operation authorization epoch"
                 ),
@@ -1318,12 +1617,23 @@ class ConversationMigrationService:
         )
 
     def _read_projection(
-        self, scope: ActorScope, kind: str, entity_id: str
+        self,
+        scope: ActorScope,
+        kind: str,
+        entity_id: str,
+        *,
+        context: AuthorizedConversationContext | None = None,
     ) -> Mapping[str, object]:
         """Read one canonical projection through its public scope-bound API."""
 
         if kind == "message":
-            return _required_mapping(self._memory.get_message(scope, entity_id), "message readback")
+            if context is None:
+                raise MigrationError(
+                    "MESSAGE_SCOPE_MISSING", "Message readback requires target scope."
+                )
+            return _required_mapping(
+                self._memory.get_message(scope, entity_id, context=context), "message readback"
+            )
         if kind == "memory":
             return _required_mapping(self._memory.get_memory(scope, entity_id), "memory readback")
         if kind == "profile_candidate":
@@ -1339,7 +1649,12 @@ class ConversationMigrationService:
         raise MigrationError("PROJECTION_KIND_INVALID", "Stored projection kind is unsupported.")
 
     def _read_rollback_projection(
-        self, scope: ActorScope, kind: str, entity_id: str
+        self,
+        scope: ActorScope,
+        kind: str,
+        entity_id: str,
+        *,
+        context: AuthorizedConversationContext | None = None,
     ) -> Mapping[str, object]:
         """Read terminal compensation state, including a memory tombstone when required."""
 
@@ -1348,7 +1663,16 @@ class ConversationMigrationService:
                 self._memory.get_memory(scope, entity_id, include_deleted=True),
                 "deleted memory tombstone",
             )
-        return self._read_projection(scope, kind, entity_id)
+        if kind == "message":
+            if context is None:
+                raise MigrationError(
+                    "MESSAGE_SCOPE_MISSING", "Message rollback readback requires target scope."
+                )
+            return _required_mapping(
+                self._memory.get_message(scope, entity_id, context=context, include_revoked=True),
+                "revoked message",
+            )
+        return self._read_projection(scope, kind, entity_id, context=context)
 
     def _append_quarantine(
         self,
@@ -1409,7 +1733,10 @@ class ConversationMigrationService:
                 "OPERATION_NOT_VERIFIED", "Projection checkpoint has no verified operation."
             )
         evidence = operation.evidence
-        if evidence.get("readbackSha256") != projection.readback_sha256:
+        if (
+            evidence.get("readbackSha256") != projection.readback_sha256
+            or evidence.get("candidateVersion") != projection.candidate_version
+        ):
             raise MigrationError(
                 "OPERATION_EVIDENCE_MISMATCH", "Projection readback evidence changed."
             )
@@ -1427,6 +1754,7 @@ class ConversationMigrationService:
             "entityId": projection.entity_id,
             "entityVersion": projection.version,
             "candidateId": projection.candidate_id,
+            "candidateVersion": projection.candidate_version,
             "targetContext": _context_to_mapping(projection.context),
             "readbackSha256": evidence.get("readbackSha256"),
             "operationId": operation.operation_id,
@@ -1462,6 +1790,7 @@ class ConversationMigrationService:
             raise MigrationError(
                 "ROLLBACK_CHECKPOINT_INVALID", "Rollback checkpoint is incomplete."
             )
+        self._verify_original_projection_operation(scope, task_id, event)
         operation = self._operations.begin(
             scope,
             task_id=task_id,
@@ -1473,26 +1802,47 @@ class ConversationMigrationService:
                 "ordinal": ordinal,
                 "entityId": entity_id,
                 "entityVersion": version,
+                "recordDigest": event.get("recordDigest"),
+                "originalReadbackSha256": event.get("readbackSha256"),
             },
         )
         if operation.status == "verified":
-            readback = self._read_rollback_projection(scope, str(kind), entity_id)
-            if not _is_rolled_back(str(kind), readback):
+            _readback, candidate, rollback_digest = self._rollback_snapshot(
+                scope,
+                str(kind),
+                entity_id,
+                event,
+                expected_projection_sha256=_required_id(
+                    event.get("readbackSha256"), "original projection digest"
+                ),
+            )
+            if (
+                operation.evidence.get("rolledBack") is not True
+                or operation.evidence.get("batchId") != batch_id
+                or operation.evidence.get("recordDigest") != event.get("recordDigest")
+                or operation.evidence.get("ordinal") != ordinal
+                or operation.evidence.get("entityId") != entity_id
+                or operation.evidence.get("originalReadbackSha256") != event.get("readbackSha256")
+                or operation.evidence.get("readbackSha256") != rollback_digest
+                or operation.evidence.get("candidateId")
+                != (candidate.get("id") if candidate is not None else None)
+                or operation.evidence.get("candidateVersion")
+                != (_positive_version(candidate.get("version")) if candidate is not None else None)
+            ):
                 raise MigrationError(
-                    "ROLLBACK_READBACK_MISMATCH", "Verified rollback is no longer visible."
+                    "ROLLBACK_READBACK_MISMATCH", "Verified rollback no longer matches its receipt."
                 )
-            rollback_digest = hashlib.sha256(
-                canonical_json(_projection_view_for_rollback(str(kind), readback))
-            ).hexdigest()
         else:
-            readback = self._compensate(scope, str(kind), entity_id, version, event)
-            if not _is_rolled_back(str(kind), readback):
-                raise MigrationError(
-                    "ROLLBACK_READBACK_MISMATCH", "Canonical rollback did not read back."
-                )
-            rollback_digest = hashlib.sha256(
-                canonical_json(_projection_view_for_rollback(str(kind), readback))
-            ).hexdigest()
+            self._compensate(scope, str(kind), entity_id, version, event)
+            _readback, candidate, rollback_digest = self._rollback_snapshot(
+                scope,
+                str(kind),
+                entity_id,
+                event,
+                expected_projection_sha256=_required_id(
+                    event.get("readbackSha256"), "original projection digest"
+                ),
+            )
             completed = self._operations.complete(
                 scope,
                 task_id=task_id,
@@ -1503,6 +1853,14 @@ class ConversationMigrationService:
                     "entityId": entity_id,
                     "readbackSha256": rollback_digest,
                     "rolledBack": True,
+                    "candidateId": candidate.get("id") if candidate is not None else None,
+                    "candidateVersion": (
+                        _positive_version(candidate.get("version"))
+                        if candidate is not None
+                        else None
+                    ),
+                    "recordDigest": event.get("recordDigest"),
+                    "originalReadbackSha256": event.get("readbackSha256"),
                 },
             )
             if completed.status != "verified":
@@ -1522,8 +1880,194 @@ class ConversationMigrationService:
                 "readbackSha256": rollback_digest,
                 "state": "rolled_back",
                 "operationId": operation.operation_id,
+                "recordDigest": event.get("recordDigest"),
+                "originalReadbackSha256": event.get("readbackSha256"),
+                "candidateId": candidate.get("id") if candidate is not None else None,
+                "candidateVersion": (
+                    _positive_version(candidate.get("version")) if candidate is not None else None
+                ),
             },
         )
+
+    def _rollback_snapshot(
+        self,
+        scope: ActorScope,
+        kind: str,
+        entity_id: str,
+        event: Mapping[str, object],
+        *,
+        expected_projection_sha256: str,
+    ) -> tuple[Mapping[str, object], Mapping[str, object] | None, str]:
+        """Read current terminal state and include the active profile's linked candidate."""
+
+        context = _context_from_event(event) if kind == "message" else None
+        readback = self._read_rollback_projection(scope, kind, entity_id, context=context)
+        if not _is_rolled_back(kind, readback):
+            raise MigrationError(
+                "ROLLBACK_READBACK_MISMATCH", "Canonical rollback did not read back."
+            )
+        candidate: Mapping[str, object] | None = None
+        if kind == "profile_candidate":
+            candidate = readback
+        elif kind == "profile_active":
+            candidate_id = event.get("candidateId")
+            if not isinstance(candidate_id, str):
+                raise MigrationError(
+                    "ROLLBACK_CHECKPOINT_INVALID", "Active profile candidate link is missing."
+                )
+            candidate = _required_mapping(
+                self._profiles.get_candidate(scope, candidate_id),
+                "rolled-back profile candidate",
+            )
+            if candidate.get("state") != "rolled_back":
+                raise MigrationError(
+                    "ROLLBACK_READBACK_MISMATCH", "Profile candidate rollback did not read back."
+                )
+            candidate_active = dict(_profile_candidate_actual(candidate))
+            candidate_active["state"] = "active"
+            profile_active = dict(_profile_actual(readback))
+            profile_active["state"] = "active"
+            if canonical_json(candidate_active) != canonical_json(profile_active):
+                raise MigrationError(
+                    "ROLLBACK_READBACK_MISMATCH",
+                    "Rolled-back profile no longer matches its activated candidate.",
+                )
+        if (
+            kind != "graph"
+            and _prior_projection_digest(kind, readback) != expected_projection_sha256
+        ):
+            raise MigrationError(
+                "ROLLBACK_READBACK_MISMATCH",
+                "Canonical terminal state no longer matches its original projection receipt.",
+            )
+        digest_value: dict[str, object] = dict(_projection_view_for_rollback(kind, readback))
+        if kind == "profile_active" and candidate is not None:
+            digest_value["candidate"] = {
+                "id": candidate.get("id"),
+                "state": candidate.get("state"),
+                "version": candidate.get("version"),
+            }
+        digest = hashlib.sha256(canonical_json(digest_value)).hexdigest()
+        return readback, candidate, digest
+
+    def _verify_original_projection_operation(
+        self, scope: ActorScope, task_id: str, record_event: Mapping[str, object]
+    ) -> None:
+        """Bind rollback to the verified original Work Operation and its readback digest."""
+
+        operation_id = record_event.get("operationId")
+        if not isinstance(operation_id, str):
+            raise MigrationError(
+                "ROLLBACK_ORIGIN_RECEIPT_INVALID", "Original projection receipt is missing."
+            )
+        operation = self._operations.get(scope, task_id=task_id, operation_id=operation_id)
+        evidence = operation.evidence
+        if (
+            operation.status != "verified"
+            or evidence.get("recordId") != record_event.get("recordId")
+            or evidence.get("recordDigest") != record_event.get("recordDigest")
+            or evidence.get("projectionKind") != record_event.get("projectionKind")
+            or evidence.get("entityId") != record_event.get("entityId")
+            or evidence.get("entityVersion") != record_event.get("entityVersion")
+            or evidence.get("candidateId") != record_event.get("candidateId")
+            or evidence.get("candidateVersion") != record_event.get("candidateVersion")
+            or evidence.get("readbackSha256") != record_event.get("readbackSha256")
+        ):
+            raise MigrationError(
+                "ROLLBACK_ORIGIN_RECEIPT_INVALID",
+                "Original verified projection does not match its checkpoint.",
+            )
+
+    def _verify_rollback_checkpoint(
+        self,
+        scope: ActorScope,
+        task_id: str,
+        record_event: Mapping[str, object],
+        rollback_event: Mapping[str, object],
+    ) -> None:
+        """Reconcile an existing rollback receipt with current canonical/provider state."""
+
+        ordinal = _required_int(record_event.get("ordinal"), "rollback ordinal")
+        kind = record_event.get("projectionKind")
+        entity_id = record_event.get("entityId")
+        operation_id = rollback_event.get("operationId")
+        if (
+            kind not in {"message", "memory", "profile_candidate", "profile_active", "graph"}
+            or not isinstance(entity_id, str)
+            or not isinstance(operation_id, str)
+            or rollback_event.get("state") != "rolled_back"
+            or rollback_event.get("batchId") != record_event.get("batchId")
+            or rollback_event.get("artifactSha256") != record_event.get("artifactSha256")
+            or rollback_event.get("entityId") != entity_id
+            or rollback_event.get("recordDigest") != record_event.get("recordDigest")
+            or rollback_event.get("originalReadbackSha256") != record_event.get("readbackSha256")
+            or rollback_event.get("ordinal") != ordinal
+        ):
+            raise MigrationError(
+                "ROLLBACK_CHECKPOINT_INVALID", "Stored rollback receipt is incomplete."
+            )
+        operation = self._operations.get(scope, task_id=task_id, operation_id=operation_id)
+        if operation.status != "verified" or operation.evidence.get("rolledBack") is not True:
+            raise MigrationError(
+                "ROLLBACK_OPERATION_UNVERIFIED", "Rollback lacks a verified operation receipt."
+            )
+        self._verify_original_projection_operation(scope, task_id, record_event)
+        _readback, candidate, digest = self._rollback_snapshot(
+            scope,
+            str(kind),
+            entity_id,
+            record_event,
+            expected_projection_sha256=_required_id(
+                record_event.get("readbackSha256"), "original projection digest"
+            ),
+        )
+        candidate_id = candidate.get("id") if candidate is not None else None
+        candidate_version = (
+            _positive_version(candidate.get("version")) if candidate is not None else None
+        )
+        if (
+            rollback_event.get("readbackSha256") != digest
+            or operation.evidence.get("readbackSha256") != digest
+            or rollback_event.get("candidateId") != candidate_id
+            or operation.evidence.get("candidateId") != candidate_id
+            or rollback_event.get("candidateVersion") != candidate_version
+            or operation.evidence.get("candidateVersion") != candidate_version
+            or operation.evidence.get("batchId") != rollback_event.get("batchId")
+            or operation.evidence.get("recordDigest") != record_event.get("recordDigest")
+            or operation.evidence.get("originalReadbackSha256")
+            != record_event.get("readbackSha256")
+            or operation.evidence.get("entityId") != entity_id
+            or operation.evidence.get("ordinal") != ordinal
+        ):
+            raise MigrationError(
+                "ROLLBACK_READBACK_MISMATCH", "Canonical state changed after rollback receipt."
+            )
+
+    def _verify_completed_rollback(
+        self, scope: ActorScope, task_id: str, progress: _LoadedProgress
+    ) -> None:
+        """Require every projected row to retain its exact current rolled-back readback."""
+
+        applied = [
+            event
+            for event in progress.record_events
+            if event.get("state") in {"projected", "candidate"}
+        ]
+        applied_ordinals = {
+            _required_int(event.get("ordinal"), "rollback ordinal") for event in applied
+        }
+        if progress.rollback_ordinals != frozenset(applied_ordinals):
+            raise MigrationError(
+                "ROLLBACK_COUNT_MISMATCH", "Batch rollback receipts do not cover all projections."
+            )
+        for event in applied:
+            ordinal = _required_int(event.get("ordinal"), "rollback ordinal")
+            rollback_event = progress.rollback_events.get(ordinal)
+            if rollback_event is None:
+                raise MigrationError(
+                    "ROLLBACK_CHECKPOINT_MISSING", "Batch rollback receipt is missing."
+                )
+            self._verify_rollback_checkpoint(scope, task_id, event, rollback_event)
 
     def _compensate(
         self,
@@ -1537,7 +2081,15 @@ class ConversationMigrationService:
 
         if kind == "message":
             self._memory.revoke_message(scope, entity_id)
-            return _required_mapping(self._memory.get_message(scope, entity_id), "revoked message")
+            return _required_mapping(
+                self._memory.get_message(
+                    scope,
+                    entity_id,
+                    context=_context_from_event(event),
+                    include_revoked=True,
+                ),
+                "revoked message",
+            )
         if kind == "memory":
             self._memory.delete_memory(scope, entity_id, version)
             return _required_mapping(
@@ -1676,6 +2228,15 @@ def _context_from_mapping(value: Mapping[str, object]) -> AuthorizedConversation
         raise MigrationError(
             "TASK_CHECKPOINT_INVALID", "Stored target context is invalid."
         ) from error
+
+
+def _context_from_event(event: Mapping[str, object]) -> AuthorizedConversationContext:
+    """Rebuild target context from the actor-private projection checkpoint."""
+
+    value = event.get("targetContext")
+    if not isinstance(value, Mapping):
+        raise MigrationError("TASK_CHECKPOINT_INVALID", "Stored target context is missing.")
+    return _context_from_mapping(value)
 
 
 def _hash_plan_row(
@@ -2142,6 +2703,28 @@ def _projection_readback_digest(kind: str, readback: Mapping[str, object]) -> st
         actual = _graph_actual(readback)
     else:
         raise MigrationError("PROJECTION_KIND_INVALID", "Stored projection kind is unsupported.")
+    return hashlib.sha256(canonical_json(actual)).hexdigest()
+
+
+def _prior_projection_digest(kind: str, readback: Mapping[str, object]) -> str:
+    """Reconstruct the pre-compensation canonical digest from a terminal tombstone."""
+
+    if kind == "message":
+        actual = _message_actual(readback)
+        actual["status"] = "active"
+    elif kind == "memory":
+        actual = _memory_actual(readback)
+        actual["state"] = "active"
+    elif kind == "profile_candidate":
+        actual = _profile_candidate_actual(readback)
+        actual["state"] = "candidate"
+    elif kind == "profile_active":
+        actual = _profile_actual(readback)
+        actual["state"] = "active"
+    else:
+        raise MigrationError(
+            "ROLLBACK_PROJECTION_KIND_INVALID", "Terminal projection digest is unsupported."
+        )
     return hashlib.sha256(canonical_json(actual)).hexdigest()
 
 
