@@ -15,7 +15,11 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
 
 COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src ./src
-RUN uv sync --frozen --no-dev --no-editable
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends git \
+    && uv sync --frozen --no-dev --no-editable \
+    && apt-get purge --yes --auto-remove git \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install the immutable, release-verified runtime maintenance SDK wheel.
 COPY --from=runtime-maintenance-wheel /cyrene_runtime_maintenance-0.1.0-py3-none-any.whl /tmp/wheels/cyrene_runtime_maintenance-0.1.0-py3-none-any.whl
