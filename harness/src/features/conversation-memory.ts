@@ -45,6 +45,14 @@ export interface ConversationResourceScope {
 }
 
 /** A persisted message and the scope the Work API applied to it. */
+/** Opaque Work attachment metadata; bytes are only readable through the Work API. */
+export interface ConversationMessageAttachment {
+  readonly artifactId: string;
+  readonly sha256: string;
+  readonly mimeType: string;
+  readonly size: number;
+}
+
 export interface ConversationMessage {
   readonly id: string;
   readonly eventId: string;
@@ -53,6 +61,7 @@ export interface ConversationMessage {
   readonly occurredAt: number;
   readonly status: 'active' | 'revoked';
   readonly sourceRefs?: readonly ConversationSourceRef[];
+  readonly attachments?: readonly ConversationMessageAttachment[];
   readonly scope: ConversationResourceScope;
 }
 

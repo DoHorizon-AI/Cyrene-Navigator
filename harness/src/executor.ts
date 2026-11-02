@@ -51,6 +51,7 @@ import type { ConversationExecutionBackend } from './codebuddy-acp-execution.js'
 import type { WorkflowSourceTaskReceipt } from './workflows/store.js';
 import { getConnectorToolCatalog } from './tool-providers.js';
 import { VOLATILE_CONVERSATION_SESSION_PREFIX } from './persistence.js';
+import { collectPluginContributions } from './conversation-plugin-hooks.js';
 import { ConversationFeatureError, createConversationMemoryFeature } from './features/conversation-memory.js';
 import type {
   ConversationMemoryApiV1,
@@ -2237,6 +2238,12 @@ export class NavigatorExecutor {
     };
     const feature = createConversationMemoryFeature({ api, summaryProvider });
     const contextResult = await feature.beforeContext(context, { query: userText });
+    // Dynamic plugins may only propose context; the host authorizes and records each proposal.
+    const pluginContext = await collectPluginContributions(this.ctx, api, context, {
+      messageId: event.message.id,
+      query: userText,
+      attachments: event.message.attachments ?? [],
+    });
     const userSourceRef: ConversationSourceRef = {
       memoryId: null,
       memoryVersion: null,
@@ -2246,6 +2253,7 @@ export class NavigatorExecutor {
       userSourceRef,
       ...historySourceRefs,
       ...contextResult.contributions.flatMap(contribution => contribution.sourceRefs),
+      ...pluginContext.contributions.flatMap(contribution => contribution.sourceRefs),
     ];
     const totalSourceMessageIds = sourceRefs.reduce((count, ref) => count + ref.sourceMessageIds.length, 0);
     if (sourceRefs.length > 256 || totalSourceMessageIds > 32_768) {
@@ -2269,6 +2277,10 @@ export class NavigatorExecutor {
     }
     if (contextResult.contributions.length > 0) {
       promptParts.push(`Authorized conversation memory:\n${contextResult.contributions
+        .map(contribution => contribution.content).join('\n')}`);
+    }
+    if (pluginContext.contributions.length > 0) {
+      promptParts.push(`Authorized plugin context:\n${pluginContext.contributions
         .map(contribution => contribution.content).join('\n')}`);
     }
     promptParts.push(`Current user message:\n${userText}`);
