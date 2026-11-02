@@ -17,7 +17,7 @@ import time
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from threading import Barrier
+from threading import Barrier, Event
 from typing import Any
 
 import pytest
@@ -52,6 +52,15 @@ from cyrene_model_provider_contracts.embeddings import (
     EmbeddingVector,
     decode_embeddings_request,
     encode_embeddings_response,
+)
+from cyrene_model_provider_contracts.chat import (
+    CHAT_COMPLETION_V3_METHOD,
+    CHAT_COMPLETION_V3_REQUEST_TYPE_URL,
+    CHAT_COMPLETION_V3_RESPONSE_TYPE_URL,
+    ChatCompletionChunk,
+    ChatCompletionResponse,
+    decode_chat_completion_request_v3,
+    encode_chat_completion_response_v3,
 )
 from cyrene_model_provider_contracts.embeddings import (
     EmbeddingBatch as ModelEmbeddingBatch,
@@ -109,6 +118,10 @@ from cyrene_navigator.work.conversation_capabilities.peripheral import (
     HostTrustedCallerSigner,
     build_host_trusted_caller_signer,
 )
+from cyrene_navigator.work.conversation_capabilities.vision import (
+    DirectVisionProvider,
+    VisionProfile,
+)
 from cyrene_navigator.work.conversation_memory.providers import (
     MemoryProviderHit,
     MemoryProviderScope,
@@ -122,6 +135,7 @@ _CAPABILITIES = (
     "speech.provider.v1",
 )
 _INTERFACE_VERSIONS = {capability: "1" for capability in _CAPABILITIES}
+_INTERFACE_VERSIONS[MODEL_CAPABILITY_ID] = ("1", "3")
 _TOOL_KEY = bytes(range(32))
 
 
@@ -157,6 +171,8 @@ class _SimulatedCapabilityPlugin:
         self.speech_input: tuple[bytes, str, str | None] | None = None
         self.speech_fails = False
         self.embedding_zero = False
+        self.vision_request: Any | None = None
+        self.vision_text = "A red square on a plain white background."
 
     def on_invoke(
         self,
@@ -183,6 +199,22 @@ class _SimulatedCapabilityPlugin:
     def _model(
         self, action: str, payload: bytes, request_type_url: str | None
     ) -> tuple[bool, object]:
+        if action == CHAT_COMPLETION_V3_METHOD:
+            if request_type_url != CHAT_COMPLETION_V3_REQUEST_TYPE_URL:
+                return False, "INVALID_INPUT: model v3 type URL mismatch"
+            self.vision_request = decode_chat_completion_request_v3(payload)
+            response = ChatCompletionResponse(
+                chunks=(
+                    ChatCompletionChunk(delta=self.vision_text, role="assistant"),
+                    ChatCompletionChunk(
+                        finish_reason="stop", prompt_tokens=24, completion_tokens=11
+                    ),
+                )
+            )
+            return True, _TypedResult(
+                CHAT_COMPLETION_V3_RESPONSE_TYPE_URL,
+                encode_chat_completion_response_v3(response),
+            )
         if action != EMBEDDINGS_METHOD or request_type_url != EMBEDDINGS_REQUEST_TYPE_URL:
             return False, "INVALID_INPUT: model method or type URL mismatch"
         request = decode_embeddings_request(payload)
@@ -1144,6 +1176,62 @@ def test_speech_facade_forwards_real_bytes_and_reports_provider_errors() -> None
         assert error.value.code == "SPEECH_PROVIDER_ERROR_4"
 
 
+def test_v3_vision_sends_only_digest_verified_inline_image_and_honors_cancel() -> None:
+    import hashlib
+
+    image = b"\x89PNG\r\n\x1a\nfixture-image-bytes"
+    digest = hashlib.sha256(image).hexdigest()
+    with _direct_runtime() as (plugin, client):
+        provider = DirectVisionProvider(
+            client,
+            PluginBindingSettings("grpc://127.0.0.1:51011"),
+            VisionProfile(model_id="test-vision-model"),
+        )
+        result = provider.describe_image(
+            artifact_id=digest,
+            sha256=digest,
+            mime_type="image/png",
+            data=image,
+            prompt="What shape and color are visible?",
+            request_id="vision-request-1",
+        )
+        assert result.description == "A red square on a plain white background."
+        assert result.model == "test-vision-model"
+        assert result.image_sha256 == digest
+        assert (result.prompt_tokens, result.completion_tokens) == (24, 11)
+        request = plugin.vision_request
+        assert request is not None and request.model == "test-vision-model"
+        assert request.stream is False and request.tools == ()
+        image_part = request.messages[0].content[1]
+        assert image_part.mime_type == "image/png"
+        assert image_part.data == image
+        assert image_part.artifact_id is None
+
+        previous_calls = len(plugin.calls)
+        with pytest.raises(PersistenceError) as bad_digest:
+            provider.describe_image(
+                artifact_id="0" * 64,
+                sha256=digest,
+                mime_type="image/png",
+                data=image,
+            )
+        assert bad_digest.value.code == "WORK_ATTACHMENT_DIGEST_MISMATCH"
+        assert len(plugin.calls) == previous_calls
+
+        cancel_event = Event()
+        cancel_event.set()
+        with pytest.raises(PersistenceError) as cancelled:
+            provider.describe_image(
+                artifact_id=digest,
+                sha256=digest,
+                mime_type="image/png",
+                data=image,
+                cancel_event=cancel_event,
+            )
+        assert cancelled.value.code == "MEDIA_OPERATION_CANCELLED"
+        assert len(plugin.calls) == previous_calls
+
+
 def test_missing_endpoints_are_typed_unavailable_and_e5_profile_is_strict() -> None:
     bundle = build_conversation_capabilities(environment={})
     try:
@@ -1152,8 +1240,10 @@ def test_missing_endpoints_are_typed_unavailable_and_e5_profile_is_strict() -> N
         assert bundle.knowledge_graph_provider is None
         assert bundle.tool_provider_client is None
         assert bundle.speech_provider is None
+        assert bundle.vision_provider is None
         assert bundle.unavailable["memory.provider.v1"] == "NOT_CONFIGURED"
         assert bundle.unavailable["model.provider.v1 embeddings"] == "MODEL_BINDING_UNAVAILABLE"
+        assert bundle.unavailable["model.provider.v1 chat_completion_v3"] == "NOT_CONFIGURED"
     finally:
         bundle.close()
     with pytest.raises(CapabilityConfigurationError, match="distinct passage and query prefixes"):
@@ -1164,3 +1254,28 @@ def test_missing_endpoints_are_typed_unavailable_and_e5_profile_is_strict() -> N
             document_prefix="query: ",
             query_prefix="query: ",
         )
+
+
+def test_v3_vision_factory_uses_separate_fixed_endpoint_and_model_identity() -> None:
+    complete = build_conversation_capabilities(
+        environment={
+            "CYRENE_NAVIGATOR_VISION_PROVIDER_CONNECTION_REF": "grpc://127.0.0.1:51012",
+            "CYRENE_NAVIGATOR_VISION_MODEL_ID": "local-smolvlm-test",
+        }
+    )
+    try:
+        assert complete.vision_provider is not None
+        assert "model.provider.v1 chat_completion_v3" not in complete.unavailable
+    finally:
+        complete.close()
+
+    no_endpoint = build_conversation_capabilities(
+        environment={"CYRENE_NAVIGATOR_VISION_MODEL_ID": "local-smolvlm-test"}
+    )
+    try:
+        assert no_endpoint.vision_provider is None
+        assert no_endpoint.unavailable["model.provider.v1 chat_completion_v3"] == (
+            "VISION_BINDING_UNAVAILABLE"
+        )
+    finally:
+        no_endpoint.close()

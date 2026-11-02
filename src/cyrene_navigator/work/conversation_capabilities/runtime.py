@@ -90,6 +90,8 @@ def invoke_typed(
     request_bytes: bytes,
     response_type_url: str,
     deadline_seconds: float,
+    cancel_event: threading.Event | None = None,
+    request_id: str | None = None,
 ) -> TypedInvocation:
     """Invoke a fixed method and verify the server's response type URL."""
 
@@ -100,6 +102,8 @@ def invoke_typed(
             method=method,
             request=DirectPayload(type_url=request_type_url, value=request_bytes),
             deadline_seconds=deadline_seconds,
+            cancel_event=cancel_event,
+            request_id=request_id,
         )
     except DirectPluginInvocationCancelled as error:
         raise DirectCapabilityError("DIRECT_PLUGIN_CANCELLED", retryable=True) from error
