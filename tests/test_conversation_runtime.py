@@ -8,6 +8,7 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
+from uuid import uuid4
 
 import pytest
 from fastapi import FastAPI
@@ -39,6 +40,70 @@ PRINCIPAL = PersistencePrincipal(
     organization_id=ORG,
     actor_private_scope=True,
 )
+
+
+class SimulatedTrustedWorkStore(WorkStore):
+    """SIMULATED server-internal completed-task producer API for component tests."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self._trusted_operations: dict[str, dict[str, Any]] = {}
+        self._trusted_keys: dict[str, str] = {}
+
+    def create_completed_operation(
+        self,
+        organization_id: str | None,
+        workspace_id: str,
+        body: dict[str, Any],
+        *,
+        actor_id: str,
+        actor_private_scope: bool,
+        trusted_producer: str,
+    ) -> tuple[dict[str, Any], bool]:
+        assert trusted_producer == 'conversation-research-runtime'
+        assert actor_private_scope is True
+        task = super().get_task(
+            organization_id,
+            workspace_id,
+            str(body['taskId']),
+            actor_id=actor_id,
+            actor_private_scope=True,
+        )
+        assert task['status'] == 'completed'
+        evidence = dict(body['evidence'])
+        assert evidence['taskOutputSha256'] == hashlib.sha256(task['output'].encode()).hexdigest()
+        key = str(body['idempotencyKey'])
+        prior_id = self._trusted_keys.get(key)
+        if prior_id is not None:
+            return self._trusted_operations[prior_id], True
+        operation_id = uuid4().hex
+        operation = {
+            'id': operation_id,
+            'idempotencyKey': key,
+            'operationType': body['operationType'],
+            'taskId': body['taskId'],
+            'target': body['target'],
+            'request': dict(body['request']),
+            'status': 'verified',
+            'evidence': evidence,
+            'trustedProducer': trusted_producer,
+            'createdAt': 1,
+            'updatedAt': 2,
+        }
+        self._trusted_keys[key] = operation_id
+        self._trusted_operations[operation_id] = operation
+        return operation, False
+
+    def get_operation(
+        self,
+        organization_id: str | None,
+        workspace_id: str,
+        operation_id: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        if operation_id in self._trusted_operations:
+            return dict(self._trusted_operations[operation_id])
+        return super().get_operation(organization_id, workspace_id, operation_id, **kwargs)
 
 
 class FixtureSigner:
@@ -125,7 +190,7 @@ class FixturePublicWebBinding:
 
 @pytest.fixture
 def state(tmp_path: Path) -> tuple[WorkStore, ConversationMemoryStore, ConversationResearchScope]:
-    work = WorkStore(tmp_path / "work.sqlite3")
+    work = SimulatedTrustedWorkStore(tmp_path / "work.sqlite3")
     conversations = ConversationMemoryStore((tmp_path / "conversation.sqlite3").absolute())
     message = conversations.create_message(
         ORG,
@@ -224,7 +289,7 @@ def test_research_http_route_writes_and_reads_back_real_work_receipt(
 ) -> None:
     """SIMULATED local provider plus real Work/SQLite HTTP and receipt readback."""
 
-    work = WorkStore(tmp_path / "work.sqlite3")
+    work = SimulatedTrustedWorkStore(tmp_path / "work.sqlite3")
     conversations = ConversationMemoryStore((tmp_path / "conversation.sqlite3").absolute())
     # Use the fixture helper's independently-created SQLite data in the same store objects.
     # This explicit setup keeps the test route exercising one ASGI app and one authority.
@@ -326,7 +391,6 @@ def test_research_http_route_writes_and_reads_back_real_work_receipt(
         )
     assert response.status_code == 200, response.text
     result = response.json()
-    assert result["operationId"]
     assert result["resultSha256"] == result["artifactId"]
     assert result["sourceEvidence"][0]["sourceRef"] == "sha256:" + "2" * 64
     assert [tool for tool, _args in binding.calls] == ["web.search", "web.open"]
@@ -334,12 +398,15 @@ def test_research_http_route_writes_and_reads_back_real_work_receipt(
     output = json.dumps(
         {
             "version": 1,
-            "operationId": result["operationId"],
             "title": result["title"],
             "content": result["content"],
             "resultSha256": result["resultSha256"],
             "contentSha256": result["contentSha256"],
+            "sourceEvidence": result["sourceEvidence"],
+            "artifactId": result["artifactId"],
         },
+        ensure_ascii=False,
+        sort_keys=True,
         separators=(",", ":"),
     )
     work.patch_task(
@@ -351,13 +418,29 @@ def test_research_http_route_writes_and_reads_back_real_work_receipt(
         actor_private_scope=True,
     )
     request = _request(scope)
+    with TestClient(app) as client:
+        finalize = client.post(
+            f"/api/v1/workspaces/{WORKSPACE}/work/conversation-runtime/research/receipt",
+            json={
+                "taskId": CHILD_TASK,
+                "parentTaskId": PARENT_TASK,
+                "parentSessionId": SESSION,
+                "conversationId": CONVERSATION,
+                "conversationKind": "direct",
+                "personaId": None,
+                "authorizationEpoch": epoch,
+                "sourceRefs": source_refs,
+            },
+        )
+    assert finalize.status_code == 200, finalize.text
+    operation_id = finalize.json()["operationId"]
     receipt = asyncio.run(
         runtime.read_operation_receipt(
             PRINCIPAL,
             WORKSPACE,
             parent_task_id=request.parent_task_id,
             parent_session_id=request.parent_session_id,
-            operation_id=result["operationId"],
+            operation_id=operation_id,
             scope=scope,
         )
     )
@@ -367,7 +450,7 @@ def test_research_http_route_writes_and_reads_back_real_work_receipt(
             WORKSPACE,
             parent_task_id=request.parent_task_id,
             parent_session_id=request.parent_session_id,
-            operation_id=result["operationId"],
+            operation_id=operation_id,
             scope=ConversationResearchScope(
                 conversation_id=scope.conversation_id,
                 conversation_kind=scope.conversation_kind,
@@ -420,7 +503,7 @@ def test_research_rejects_another_actors_active_task(
         asyncio.run(_runtime(work, conversations).research(bob, WORKSPACE, _request(scope)))
 
 
-def test_cancellation_revokes_public_call_result_and_leaves_unknown_work_receipt(
+def test_cancellation_revokes_public_call_result_without_publishing_a_receipt(
     state: tuple[WorkStore, ConversationMemoryStore, ConversationResearchScope],
 ) -> None:
     work, conversations, scope = state
@@ -440,6 +523,14 @@ def test_cancellation_revokes_public_call_result_and_leaves_unknown_work_receipt
             await operation
 
     asyncio.run(run_and_cancel())
+    work.patch_task(
+        ORG,
+        WORKSPACE,
+        CHILD_TASK,
+        {"status": "aborted", "error": "cancelled"},
+        actor_id=ACTOR,
+        actor_private_scope=True,
+    )
     receipts = work.list_unresolved_operations(
         ORG,
         WORKSPACE,
@@ -447,6 +538,5 @@ def test_cancellation_revokes_public_call_result_and_leaves_unknown_work_receipt
         actor_id=ACTOR,
         actor_private_scope=True,
     )
-    assert len(receipts) == 1
-    assert receipts[0]["status"] == "uncertain"
+    assert receipts == []
     assert [tool for tool, _args in binding.calls] == ["web.search"]

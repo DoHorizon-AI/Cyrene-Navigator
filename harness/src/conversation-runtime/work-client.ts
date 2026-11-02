@@ -62,7 +62,6 @@ export interface ConversationMessageRecord {
 }
 
 export interface ConversationRuntimeReadResult {
-  readonly operationId: string;
   readonly title: string;
   readonly content: string;
   readonly resultSha256: string;
@@ -81,6 +80,7 @@ export interface ConversationResearchOperationReceipt {
   readonly taskOutputSha256: string;
   readonly status: 'verified';
   readonly operationType: 'conversation.research.read.v1';
+  readonly trustedProducer: 'conversation-research-runtime';
   readonly effect: 'read';
   readonly resultSha256: string;
   readonly contentSha256: string;
@@ -210,6 +210,7 @@ export class ConversationRuntimeWorkClient {
       readonly sourceRefs: readonly ConversationSourceRef[];
       readonly query: string;
       readonly attachmentIds: readonly string[];
+      readonly sourceUrls?: readonly string[];
     },
   ): Promise<ConversationRuntimeReadResult> {
     this.assertContext(context);
@@ -224,6 +225,7 @@ export class ConversationRuntimeWorkClient {
       sourceRefs: validateSourceRefs(input.sourceRefs),
       query: boundedText(input.query, 'research query', 2_000),
       attachmentIds: input.attachmentIds.map(digest => checkedDigest(digest, 'attachment id')),
+      sourceUrls: (input.sourceUrls ?? []).map(url => boundedText(url, 'research readback URL', 4_096)),
     }, context.signal);
     return decodeResearchResult(value);
   }
@@ -250,6 +252,67 @@ export class ConversationRuntimeWorkClient {
       context.signal,
     );
     return decodeResearchReceipt(value, context, id);
+  }
+
+  async finalizeResearchOperationReceipt(
+    context: RuntimeWorkContext,
+    childTask: { readonly taskId: string; readonly sessionId: string },
+    sourceRefs: readonly ConversationSourceRef[],
+  ): Promise<{ readonly operationId: string; readonly duplicate: boolean }> {
+    this.assertContext(context);
+    if (childTask.sessionId !== context.sessionId || childTask.taskId === context.taskId) {
+      throw new TypeError('Research receipt child Task does not match the trusted parent session');
+    }
+    const value = object(await this.request(context, '/conversation-runtime/research/receipt', 'POST', {
+      taskId: boundedText(childTask.taskId, 'research child Task ID', 512),
+      parentTaskId: boundedText(context.taskId, 'research parent Task ID', 512),
+      parentSessionId: boundedText(context.sessionId, 'research parent session ID', 512),
+      conversationId: boundedText(context.conversationId, 'conversation ID', 512),
+      conversationKind: context.conversationKind,
+      personaId: context.personaId,
+      authorizationEpoch: safeInteger(context.authorizationEpoch, 'authorization epoch'),
+      sourceRefs: validateSourceRefs(sourceRefs),
+    }, context.signal), 'Research Work operation finalization');
+    const operationId = boundedText(value.operationId, 'research Work operation ID', 512);
+    if (typeof value.duplicate !== 'boolean') throw new WorkRuntimeHttpError(502, 'RESEARCH_RECEIPT_FINALIZATION_INVALID');
+    return { operationId, duplicate: value.duplicate };
+  }
+
+  async finalizeSkillOperationReceipts(
+    context: RuntimeWorkContext,
+    input: {
+      readonly actionTaskId: string;
+      readonly readbackTaskId: string;
+      readonly actionEffectOperationId: string;
+      readonly readbackEffectOperationId: string;
+      readonly parentTaskId: string;
+      readonly parentSessionId: string;
+      readonly sourceRefs: readonly ConversationSourceRef[];
+    },
+  ): Promise<{ readonly writeOperationId: string; readonly readbackOperationId: string }> {
+    this.assertContext(context);
+    if (input.actionTaskId === input.readbackTaskId
+      || input.actionEffectOperationId === input.readbackEffectOperationId
+      || input.parentTaskId !== context.taskId || input.parentSessionId !== context.sessionId) {
+      throw new TypeError('Skill receipt Task identity does not match the trusted parent');
+    }
+    const value = object(await this.request(context, '/conversation-runtime/skills/receipts', 'POST', {
+      actionTaskId: boundedText(input.actionTaskId, 'skill action Task ID', 512),
+      readbackTaskId: boundedText(input.readbackTaskId, 'skill readback Task ID', 512),
+      actionEffectOperationId: boundedId(input.actionEffectOperationId, 'skill action effect operation ID'),
+      readbackEffectOperationId: boundedId(input.readbackEffectOperationId, 'skill readback effect operation ID'),
+      parentTaskId: boundedText(input.parentTaskId, 'skill parent Task ID', 512),
+      parentSessionId: boundedText(input.parentSessionId, 'skill parent session ID', 512),
+      conversationId: boundedText(context.conversationId, 'conversation ID', 512),
+      conversationKind: context.conversationKind,
+      personaId: context.personaId,
+      authorizationEpoch: safeInteger(context.authorizationEpoch, 'authorization epoch'),
+      sourceRefs: validateSourceRefs(input.sourceRefs),
+    }, context.signal), 'Skill Work operation pair finalization');
+    const writeOperationId = boundedText(value.writeOperationId, 'skill verify operation ID', 512);
+    const readbackOperationId = boundedText(value.readbackOperationId, 'skill readback operation ID', 512);
+    if (writeOperationId === readbackOperationId) throw new WorkRuntimeHttpError(502, 'SKILL_RECEIPT_PAIR_INVALID');
+    return { writeOperationId, readbackOperationId };
   }
 
   async listConversationMessages(
@@ -895,7 +958,6 @@ export function validateSourceRefs(values: readonly ConversationSourceRef[]): re
 
 function decodeResearchResult(value: unknown): ConversationRuntimeReadResult {
   const row = object(value, 'research result');
-  const operationId = boundedText(row.operationId, 'operation ID', 512);
   const title = boundedText(row.title, 'research title', 512);
   const content = boundedText(row.content, 'research content', 1_000_000);
   const resultSha256 = checkedDigest(row.resultSha256, 'result sha256');
@@ -908,7 +970,7 @@ function decodeResearchResult(value: unknown): ConversationRuntimeReadResult {
     throw new WorkRuntimeHttpError(502, 'RESEARCH_SOURCE_EVIDENCE_INVALID');
   }
   const sourceEvidence = row.sourceEvidence.map(decodeSourceEvidence);
-  return { operationId, title, content, resultSha256, contentSha256, sourceEvidence, artifactId };
+  return { title, content, resultSha256, contentSha256, sourceEvidence, artifactId };
 }
 
 function decodeResearchReceipt(
@@ -926,6 +988,7 @@ function decodeResearchReceipt(
     taskOutputSha256: checkedDigest(row.taskOutputSha256, 'Task output sha256'),
     status: 'verified',
     operationType: 'conversation.research.read.v1',
+    trustedProducer: 'conversation-research-runtime',
     effect: 'read',
     resultSha256: checkedDigest(row.resultSha256, 'result sha256'),
     contentSha256: checkedDigest(row.contentSha256, 'content sha256'),
@@ -936,6 +999,7 @@ function decodeResearchReceipt(
   };
   if (row.id !== expectedOperationId || row.workspaceId !== context.workspaceId
     || row.actorId !== context.actorId || row.status !== 'verified'
+    || row.trustedProducer !== 'conversation-research-runtime'
     || row.taskStatus !== 'completed' || row.operationType !== 'conversation.research.read.v1'
     || row.effect !== 'read' || receipt.sourceEvidence.length === 0) {
     throw new WorkRuntimeHttpError(409, 'WORK_OPERATION_RECEIPT_INVALID');

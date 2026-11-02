@@ -139,9 +139,8 @@ class _ActiveCallRegistry(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class ConversationRuntimeResult:
-    """Digest-backed result projected to the research feature after Work readback."""
+    """Digest-backed source result; its trusted Work receipt is finalized post-Task."""
 
-    operation_id: str
     title: str
     content: str
     result_sha256: str
@@ -218,31 +217,10 @@ class ConversationResearchRuntime:
             "querySha256": query_digest,
             "sourceRefsSha256": lineage_digest,
             "attachmentIds": list(request.attachment_ids),
+            "sourceUrlsSha256": _sha256(_canonical_json(list(request.source_urls))),
             "bindingId": binding.binding_id,
         }
         request_digest = _sha256(_canonical_json(request_shape))
-        operation_key = (
-            f"conversation-research:{_sha256((request.task_id + chr(0) + request_digest).encode())}"
-        )
-        operation_type = "conversation.research.read.v1"
-        target = f"conversation-research:{request_digest}"
-
-        operation, duplicate = await asyncio.to_thread(
-            self._work.create_operation,
-            principal.organization_id,
-            workspace_id,
-            {
-                "idempotencyKey": operation_key,
-                "operationType": operation_type,
-                "taskId": request.task_id,
-                "target": target,
-                "request": request_shape,
-            },
-            actor_id=principal.actor_id,
-            actor_private_scope=principal.actor_private_scope,
-        )
-        if duplicate:
-            return await self._read_duplicate(principal, workspace_id, request, operation)
 
         try:
             self._raise_if_cancelled(cancelled)
@@ -261,16 +239,28 @@ class ConversationResearchRuntime:
                         cancelled,
                     )
                 )
-            sources.extend(
-                await self._search_and_open(
-                    binding,
-                    principal,
-                    workspace_id,
-                    request.task_id,
-                    request.query.strip(),
-                    cancelled,
+            if request.source_urls:
+                sources.extend(
+                    await self._open_requested_urls(
+                        binding,
+                        principal,
+                        workspace_id,
+                        request.task_id,
+                        request.source_urls,
+                        cancelled,
+                    )
                 )
-            )
+            else:
+                sources.extend(
+                    await self._search_and_open(
+                        binding,
+                        principal,
+                        workspace_id,
+                        request.task_id,
+                        request.query.strip(),
+                        cancelled,
+                    )
+                )
             self._raise_if_cancelled(cancelled)
             if not sources:
                 raise ConversationRuntimeError("RESEARCH_SOURCE_REQUIRED", 422)
@@ -287,6 +277,9 @@ class ConversationResearchRuntime:
                 "content": content,
                 "contentSha256": content_sha256,
                 "sourceEvidence": list(source_evidence),
+                "requestDigestSha256": request_digest,
+                "bindingId": binding.binding_id,
+                "sourceRefsSha256": lineage_digest,
             }
             artifact_bytes = _canonical_json(artifact_payload)
             if len(artifact_bytes) > _MAX_ATTACHMENT_BYTES:
@@ -304,7 +297,7 @@ class ConversationResearchRuntime:
                 self._work.put_attachment,
                 principal.organization_id,
                 workspace_id,
-                f"research-{operation['id']}.json",
+                f"research-{request.task_id}.json",
                 "application/json",
                 artifact_bytes,
                 actor_id=principal.actor_id,
@@ -317,36 +310,7 @@ class ConversationResearchRuntime:
                 raise ConversationRuntimeError("RESEARCH_ARTIFACT_READBACK_MISMATCH", 409)
             self._raise_if_cancelled(cancelled)
             result_sha256 = _sha256(verified_bytes)
-            evidence = {
-                "outcome": "verified",
-                "effect": "read",
-                "taskSource": (
-                    task.get("metadata", {}).get("source")
-                    if isinstance(task.get("metadata"), Mapping)
-                    else None
-                ),
-                "resultSha256": result_sha256,
-                "contentSha256": content_sha256,
-                "targetDigestSha256": request_digest,
-                "sourceRefs": [dict(reference) for reference in request.scope.source_refs],
-                "sourceEvidence": list(source_evidence),
-                "artifactId": result_sha256,
-                "bindingId": binding.binding_id,
-                "readbackVerified": True,
-                "readbackSha256": _sha256(verified_bytes),
-            }
-            await asyncio.to_thread(
-                self._work.update_operation,
-                principal.organization_id,
-                workspace_id,
-                str(operation["id"]),
-                "verified",
-                evidence,
-                actor_id=principal.actor_id,
-                actor_private_scope=principal.actor_private_scope,
-            )
             return ConversationRuntimeResult(
-                operation_id=str(operation["id"]),
                 title=title,
                 content=content,
                 result_sha256=result_sha256,
@@ -355,23 +319,183 @@ class ConversationResearchRuntime:
                 artifact_id=result_sha256,
             )
         except asyncio.CancelledError:
-            await self._finish_uncertain(principal, workspace_id, operation, "CANCELLED")
             raise
-        except ConversationRuntimeError as error:
-            await self._finish_failed(principal, workspace_id, operation, error.code)
+        except ConversationRuntimeError:
             raise
-        except (PersistenceError, OSError, ValueError, TypeError, KeyError) as error:
-            await self._finish_uncertain(
-                principal, workspace_id, operation, _safe_error_code(error)
-            )
+        except (PersistenceError, OSError, ValueError, TypeError, KeyError):
             raise ConversationRuntimeError(
                 "RESEARCH_PROVIDER_FAILED", 502, retryable=True
             ) from None
         except Exception:
-            await self._finish_uncertain(principal, workspace_id, operation, "PROVIDER_FAILURE")
             raise ConversationRuntimeError(
                 "RESEARCH_PROVIDER_FAILED", 502, retryable=True
             ) from None
+
+    async def finalize_research_operation_receipt(
+        self,
+        principal: PersistencePrincipal,
+        workspace_id: str,
+        *,
+        task_id: str,
+        parent_task_id: str,
+        parent_session_id: str,
+        scope: ConversationResearchScope,
+    ) -> Mapping[str, Any]:
+        """Create the trusted receipt only after its actor-private DSH Task completed."""
+
+        self._require_principal(principal, workspace_id)
+        if not scope.source_refs:
+            raise ConversationRuntimeError("RESEARCH_SOURCE_REQUIRED", 422)
+        try:
+            task = await self._get_task(principal, workspace_id, task_id)
+            parent = await self._get_task(principal, workspace_id, parent_task_id)
+        except PersistenceError as error:
+            if error.status == 404:
+                raise ConversationRuntimeError("WORK_OPERATION_TASK_NOT_FOUND", 409) from None
+            raise
+        metadata = task.get("metadata")
+        output = task.get("output")
+        if (
+            task.get("status") != "completed"
+            or str(task.get("createdByActorId") or "").lower() != principal.actor_id.lower()
+            or task.get("workspaceId") != workspace_id
+            or task.get("sessionId") != parent_session_id
+            or not isinstance(output, str)
+            or not isinstance(metadata, Mapping)
+            or metadata.get("source") not in {"conversation-research-read", "conversation-watch"}
+            or metadata.get("workspaceId") != workspace_id
+            or str(metadata.get("actorId") or "").lower() != principal.actor_id.lower()
+            or metadata.get("parentTaskId") != parent_task_id
+            or metadata.get("parentSessionId") != parent_session_id
+            or _canonical_json(metadata.get("sourceRefs"))
+            != _canonical_json([dict(reference) for reference in scope.source_refs])
+            or task_id == parent_task_id
+            or str(parent.get("createdByActorId") or "").lower() != principal.actor_id.lower()
+            or parent.get("workspaceId") != workspace_id
+            or parent.get("sessionId") != parent_session_id
+        ):
+            raise ConversationRuntimeError("WORK_OPERATION_TASK_PROVENANCE_INVALID", 409)
+        await self._authorize_sources(principal, workspace_id, scope)
+        try:
+            task_output = json.loads(output)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ConversationRuntimeError("RESEARCH_TASK_OUTPUT_INVALID", 409) from None
+        if not isinstance(task_output, Mapping):
+            raise ConversationRuntimeError("RESEARCH_TASK_OUTPUT_INVALID", 409)
+        artifact_id = task_output.get("artifactId")
+        result_sha256 = task_output.get("resultSha256")
+        content_sha256 = task_output.get("contentSha256")
+        title = task_output.get("title")
+        content = task_output.get("content")
+        source_evidence = task_output.get("sourceEvidence")
+        if (
+            task_output.get("version") != 1
+            or not isinstance(artifact_id, str)
+            or not _SHA256.fullmatch(artifact_id)
+            or artifact_id != result_sha256
+            or not isinstance(content_sha256, str)
+            or not _SHA256.fullmatch(content_sha256)
+            or not isinstance(title, str)
+            or not title.strip()
+            or not isinstance(content, str)
+            or not isinstance(source_evidence, list)
+            or not 1 <= len(source_evidence) <= 20
+            or _sha256(content.encode("utf-8")) != content_sha256
+        ):
+            raise ConversationRuntimeError("RESEARCH_TASK_OUTPUT_INVALID", 409)
+        raw = await self._read_attachment(principal, workspace_id, artifact_id)
+        if _sha256(raw) != artifact_id:
+            raise ConversationRuntimeError("RESEARCH_ARTIFACT_READBACK_MISMATCH", 409)
+        try:
+            artifact = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ConversationRuntimeError("RESEARCH_ARTIFACT_INVALID", 409) from None
+        if (
+            not isinstance(artifact, Mapping)
+            or _canonical_json(artifact) != raw
+            or artifact.get("version") != 1
+            or artifact.get("title") != title
+            or artifact.get("content") != content
+            or artifact.get("contentSha256") != content_sha256
+            or artifact.get("sourceEvidence") != source_evidence
+            or artifact.get("bindingId") is None
+            or artifact.get("sourceRefsSha256")
+            != _sha256(
+                _canonical_json([dict(reference) for reference in scope.source_refs])
+            )
+            or not _SHA256.fullmatch(str(artifact.get("requestDigestSha256", "")))
+        ):
+            raise ConversationRuntimeError("RESEARCH_ARTIFACT_INVALID", 409)
+        binding = self._public_web
+        if binding is None or artifact.get("bindingId") != binding.binding_id:
+            raise PublicWebBindingUnavailable()
+        evidence = {
+            "outcome": "verified",
+            "effect": "read",
+            "taskSource": metadata["source"],
+            "resultSha256": artifact_id,
+            "contentSha256": content_sha256,
+            "targetDigestSha256": artifact["requestDigestSha256"],
+            "sourceRefs": [dict(reference) for reference in scope.source_refs],
+            "sourceEvidence": [dict(item) for item in source_evidence if isinstance(item, Mapping)],
+            "artifactId": artifact_id,
+            "bindingId": artifact["bindingId"],
+            "readbackVerified": True,
+            "readbackSha256": _sha256(raw),
+            "taskOutputSha256": _sha256(output.encode("utf-8")),
+        }
+        if len(evidence["sourceEvidence"]) != len(source_evidence):
+            raise ConversationRuntimeError("RESEARCH_SOURCE_EVIDENCE_INVALID", 409)
+        request = {
+            "source": "conversation-research-runtime",
+            "taskId": task_id,
+            "parentTaskId": parent_task_id,
+            "parentSessionId": parent_session_id,
+            "sourceRefsSha256": artifact["sourceRefsSha256"],
+            "resultArtifactId": artifact_id,
+            "resultSha256": artifact_id,
+            "contentSha256": content_sha256,
+            "targetDigestSha256": artifact["requestDigestSha256"],
+        }
+        request_digest = str(artifact["requestDigestSha256"])
+        key_digest = _sha256((task_id + chr(0) + request_digest).encode())
+        idempotency_key = f"conversation-research:{key_digest}"
+        create_completed = getattr(self._work, "create_completed_operation", None)
+        if not callable(create_completed):
+            raise ConversationRuntimeError(
+                "WORK_TRUSTED_OPERATION_UNAVAILABLE", 503, retryable=True
+            )
+        try:
+            operation, duplicate = await asyncio.to_thread(
+                create_completed,
+                principal.organization_id,
+                workspace_id,
+                {
+                    "idempotencyKey": idempotency_key,
+                    "operationType": "conversation.research.read.v1",
+                    "taskId": task_id,
+                    "target": f"conversation-research:{artifact['requestDigestSha256']}",
+                    "request": request,
+                    "evidence": evidence,
+                },
+                actor_id=principal.actor_id,
+                actor_private_scope=principal.actor_private_scope,
+                trusted_producer="conversation-research-runtime",
+            )
+        except TypeError:
+            raise ConversationRuntimeError(
+                "WORK_TRUSTED_OPERATION_UNAVAILABLE", 503, retryable=True
+            ) from None
+        if (
+            operation.get("trustedProducer") != "conversation-research-runtime"
+            or operation.get("taskId") != task_id
+            or operation.get("operationType") != "conversation.research.read.v1"
+            or operation.get("status") != "verified"
+            or operation.get("request") != request
+            or operation.get("evidence") != evidence
+        ):
+            raise ConversationRuntimeError("WORK_OPERATION_RECEIPT_INVALID", 409)
+        return {"operationId": str(operation["id"]), "duplicate": bool(duplicate)}
 
     async def read_operation_receipt(
         self,
@@ -406,11 +530,15 @@ class ConversationResearchRuntime:
             raise
         task_id = operation.get("taskId")
         evidence = operation.get("evidence")
+        trusted_producer = operation.get("trustedProducer")
+        operation_request = operation.get("request")
         stored_source_refs = evidence.get("sourceRefs") if isinstance(evidence, Mapping) else None
         if (
             operation.get("id") != operation_id
             or operation.get("operationType") != "conversation.research.read.v1"
             or operation.get("status") != "verified"
+            or trusted_producer != "conversation-research-runtime"
+            or not isinstance(operation_request, Mapping)
             or not isinstance(task_id, str)
             or not isinstance(evidence, Mapping)
             or evidence.get("outcome") != "verified"
@@ -455,7 +583,12 @@ class ConversationResearchRuntime:
             or task.get("workspaceId") != workspace_id
             or not isinstance(output, str)
             or not isinstance(metadata, Mapping)
-            or metadata.get("source") not in {"conversation-research-read", "conversation-watch"}
+            or metadata.get("source") not in {
+                "conversation-research-read",
+                "conversation-watch",
+                "conversation-skill-verify",
+                "conversation-skill-readback",
+            }
             or str(metadata.get("workspaceId") or "") != workspace_id
             or str(metadata.get("actorId") or "").lower() != principal.actor_id.lower()
             or metadata.get("conversationId") != authoritative_scope.conversation_id
@@ -508,6 +641,36 @@ class ConversationResearchRuntime:
             or _sha256(raw) != evidence.get("resultSha256")
         ):
             raise ConversationRuntimeError("WORK_OPERATION_ARTIFACT_INVALID", 409)
+        request_digest = stored.get("requestDigestSha256")
+        binding_id = stored.get("bindingId")
+        expected_request = {
+            "source": "conversation-research-runtime",
+            "taskId": task_id,
+            "parentTaskId": parent_task_id,
+            "parentSessionId": parent_session_id,
+            "sourceRefsSha256": _sha256(
+                _canonical_json(
+                    [dict(reference) for reference in authoritative_scope.source_refs]
+                )
+            ),
+            "resultArtifactId": artifact_id,
+            "resultSha256": evidence.get("resultSha256"),
+            "contentSha256": evidence.get("contentSha256"),
+            "targetDigestSha256": request_digest,
+        }
+        expected_key = (
+            f"conversation-research:{_sha256((task_id + chr(0) + str(request_digest)).encode())}"
+        )
+        if (
+            not isinstance(request_digest, str)
+            or not _SHA256.fullmatch(request_digest)
+            or operation.get("idempotencyKey") != expected_key
+            or operation.get("target") != f"conversation-research:{request_digest}"
+            or dict(operation_request) != expected_request
+            or evidence.get("bindingId") != binding_id
+            or evidence.get("targetDigestSha256") != request_digest
+        ):
+            raise ConversationRuntimeError("WORK_OPERATION_RECEIPT_INVALID", 409)
         return {
             "id": operation_id,
             "workspaceId": workspace_id,
@@ -517,6 +680,7 @@ class ConversationResearchRuntime:
             "taskOutputSha256": _sha256(output.encode("utf-8")),
             "status": "verified",
             "operationType": str(operation["operationType"]),
+            "trustedProducer": "conversation-research-runtime",
             "effect": "read",
             "resultSha256": str(evidence["resultSha256"]),
             "contentSha256": str(evidence["contentSha256"]),
@@ -593,6 +757,38 @@ class ConversationResearchRuntime:
                 sources.append(
                     await self._read_document_url(
                         binding, principal, workspace_id, task_id, url, title, cancelled
+                    )
+                )
+        return sources
+
+    async def _open_requested_urls(
+        self,
+        binding: _FixedPublicWebBinding,
+        principal: PersistencePrincipal,
+        workspace_id: str,
+        task_id: str,
+        source_urls: Sequence[str],
+        cancelled: Any,
+    ) -> list[_FetchedSource]:
+        """Independently reread exact host-selected public URLs without performing search."""
+
+        if not source_urls or len(source_urls) > _MAX_PAGE_READS:
+            raise ConversationRuntimeError("RESEARCH_READBACK_SCOPE_INVALID", 422)
+        sources: list[_FetchedSource] = []
+        for url in source_urls:
+            self._raise_if_cancelled(cancelled)
+            try:
+                sources.append(
+                    await self._open_web_page(
+                        binding, principal, workspace_id, task_id, url, url, cancelled
+                    )
+                )
+            except ConversationRuntimeError as error:
+                if error.code != "NOT_HTML":
+                    raise
+                sources.append(
+                    await self._read_document_url(
+                        binding, principal, workspace_id, task_id, url, url, cancelled
                     )
                 )
         return sources
@@ -1033,125 +1229,6 @@ class ConversationResearchRuntime:
         if len(data) != metadata.get("size") or _sha256(data) != digest:
             raise ConversationRuntimeError("RESEARCH_ARTIFACT_READBACK_MISMATCH", 409)
         return data
-
-    async def _read_duplicate(
-        self,
-        principal: PersistencePrincipal,
-        workspace_id: str,
-        request: ConversationResearchRequest,
-        operation: Mapping[str, Any],
-    ) -> ConversationRuntimeResult:
-        if (
-            operation.get("taskId") != request.task_id
-            or operation.get("operationType") != "conversation.research.read.v1"
-            or operation.get("status") != "verified"
-        ):
-            raise ConversationRuntimeError(
-                "RESEARCH_OPERATION_OUTCOME_UNKNOWN", 409, retryable=True
-            )
-        evidence = operation.get("evidence")
-        if not isinstance(evidence, Mapping):
-            raise ConversationRuntimeError("RESEARCH_OPERATION_RECEIPT_INVALID", 409)
-        if evidence.get("outcome") != "verified" or evidence.get("readbackVerified") is not True:
-            error_code = evidence.get("errorCode")
-            raise ConversationRuntimeError(
-                error_code if isinstance(error_code, str) else "RESEARCH_PREVIOUS_ATTEMPT_FAILED",
-                409,
-            )
-        artifact_id = evidence.get("artifactId")
-        expected_result_sha = evidence.get("resultSha256")
-        if (
-            not isinstance(artifact_id, str)
-            or not _SHA256.fullmatch(artifact_id)
-            or artifact_id != expected_result_sha
-            or evidence.get("sourceRefs") != [dict(ref) for ref in request.scope.source_refs]
-        ):
-            raise ConversationRuntimeError("RESEARCH_OPERATION_RECEIPT_INVALID", 409)
-        raw = await self._read_attachment(principal, workspace_id, artifact_id)
-        try:
-            stored = json.loads(raw)
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            raise ConversationRuntimeError("RESEARCH_ARTIFACT_READBACK_MISMATCH", 409) from None
-        if not isinstance(stored, Mapping):
-            raise ConversationRuntimeError("RESEARCH_ARTIFACT_READBACK_MISMATCH", 409)
-        title = stored.get("title")
-        content = stored.get("content")
-        sources = stored.get("sourceEvidence")
-        if (
-            not isinstance(title, str)
-            or not isinstance(content, str)
-            or not isinstance(sources, list)
-            or not sources
-            or sources != evidence.get("sourceEvidence")
-            or evidence.get("readbackSha256") != evidence.get("resultSha256")
-            or _sha256(content.encode("utf-8")) != evidence.get("contentSha256")
-        ):
-            raise ConversationRuntimeError("RESEARCH_ARTIFACT_READBACK_MISMATCH", 409)
-        return ConversationRuntimeResult(
-            operation_id=str(operation["id"]),
-            title=title,
-            content=content,
-            result_sha256=artifact_id,
-            content_sha256=str(evidence["contentSha256"]),
-            source_evidence=tuple(item for item in sources if isinstance(item, Mapping)),
-            artifact_id=artifact_id,
-        )
-
-    async def _finish_failed(
-        self,
-        principal: PersistencePrincipal,
-        workspace_id: str,
-        operation: Mapping[str, Any],
-        code: str,
-    ) -> None:
-        await self._finish_operation(
-            principal,
-            workspace_id,
-            operation,
-            "verified",
-            {"outcome": "failed", "effect": "read", "errorCode": code},
-        )
-
-    async def _finish_uncertain(
-        self,
-        principal: PersistencePrincipal,
-        workspace_id: str,
-        operation: Mapping[str, Any],
-        code: str,
-    ) -> None:
-        await self._finish_operation(
-            principal,
-            workspace_id,
-            operation,
-            "uncertain",
-            {"outcome": "uncertain", "effect": "read", "errorCode": code},
-        )
-
-    async def _finish_operation(
-        self,
-        principal: PersistencePrincipal,
-        workspace_id: str,
-        operation: Mapping[str, Any],
-        status: str,
-        evidence: Mapping[str, Any],
-    ) -> None:
-        try:
-            await asyncio.shield(
-                asyncio.to_thread(
-                    self._work.update_operation,
-                    principal.organization_id,
-                    workspace_id,
-                    str(operation["id"]),
-                    status,
-                    evidence,
-                    actor_id=principal.actor_id,
-                    actor_private_scope=principal.actor_private_scope,
-                )
-            )
-        except Exception:
-            # The original error remains authoritative; an untransitioned Work
-            # Operation is left for normal Work reconciliation instead of masking it.
-            return
 
     @staticmethod
     def _raise_if_cancelled(cancelled: Any) -> None:

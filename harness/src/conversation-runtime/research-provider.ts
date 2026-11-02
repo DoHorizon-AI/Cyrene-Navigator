@@ -11,11 +11,13 @@ import {
   type RuntimeWorkContext,
   type WorkAttachmentRef,
 } from './work-client.ts';
+import type { Agent } from '@deepseek-ai/dsh-agent';
 
 const MAX_AUTHORIZED_ATTACHMENTS = 8;
 
 /** Minimal current ResearchRead port; feature owns the canonical interface. */
 export interface ResearchReadInputV1 {
+  readonly agent?: Agent;
   readonly context: RuntimeWorkContext;
   readonly childTask: { readonly taskId: string; readonly sessionId: string };
   readonly scope: {
@@ -33,6 +35,11 @@ export interface ResearchReadInputV1 {
 export interface ResearchOperationReceiptReaderV1 {
   readonly apiVersion: 1;
   read(context: RuntimeWorkContext, operationId: string): ReturnType<ConversationRuntimeWorkClient['readResearchOperationReceipt']>;
+  finalize(
+    context: RuntimeWorkContext,
+    childTask: { readonly taskId: string; readonly sessionId: string },
+    input: { readonly sourceRefs: readonly ConversationSourceRef[]; readonly signal: AbortSignal },
+  ): ReturnType<ConversationRuntimeWorkClient['finalizeResearchOperationReceipt']>;
 }
 
 export interface ResearchWatchInputV1 {
@@ -112,6 +119,20 @@ export class ConversationResearchOperationReceiptReaderV1 implements ResearchOpe
   read(context: RuntimeWorkContext, operationId: string) {
     context.signal.throwIfAborted();
     return this.work.readResearchOperationReceipt(context, operationId);
+  }
+
+  finalize(
+    context: RuntimeWorkContext,
+    childTask: { readonly taskId: string; readonly sessionId: string },
+    input: { readonly sourceRefs: readonly ConversationSourceRef[]; readonly signal: AbortSignal },
+  ) {
+    context.signal.throwIfAborted();
+    input.signal.throwIfAborted();
+    return this.work.finalizeResearchOperationReceipt(
+      { ...context, signal: AbortSignal.any([context.signal, input.signal]) },
+      childTask,
+      input.sourceRefs,
+    );
   }
 }
 

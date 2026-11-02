@@ -10,6 +10,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 ConversationKind = Literal["direct", "group", "channel"]
@@ -71,6 +72,7 @@ class ConversationResearchRequest:
     scope: ConversationResearchScope
     query: str
     attachment_ids: tuple[str, ...] = ()
+    source_urls: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.task_id, str) or not self.task_id.strip() or len(self.task_id) > 512:
@@ -97,3 +99,18 @@ class ConversationResearchRequest:
             raise ValueError("attachment_ids must be lowercase SHA-256 ids")
         if len(set(self.attachment_ids)) != len(self.attachment_ids):
             raise ValueError("attachment_ids must be unique")
+        if len(self.source_urls) > 8 or len(set(self.source_urls)) != len(self.source_urls):
+            raise ValueError("source_urls are duplicated or exceed the readback bound")
+        for source_url in self.source_urls:
+            if not isinstance(source_url, str) or len(source_url) > 4_096:
+                raise ValueError("source_urls must contain bounded canonical public URLs")
+            parsed = urlsplit(source_url)
+            if (
+                parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.fragment
+                or parsed.geturl() != source_url
+            ):
+                raise ValueError("source_urls must contain bounded canonical public URLs")

@@ -81,6 +81,13 @@ before(async () => {
       });
       return;
     }
+    if (url.pathname.endsWith('/conversation-runtime/research/receipt')) {
+      assert.equal(body.taskId, 'child-task');
+      assert.equal(body.parentTaskId, 'parent-task');
+      assert.deepEqual(body.sourceRefs, sourceRefs);
+      send(response, 200, { operationId: 'operation-1', duplicate: false });
+      return;
+    }
     if (url.pathname.endsWith('/conversation-runtime/operations/operation-1/receipt')) {
       send(response, 200, {
         id: 'operation-1',
@@ -91,6 +98,7 @@ before(async () => {
         taskOutputSha256: 'e'.repeat(64),
         status: 'verified',
         operationType: 'conversation.research.read.v1',
+        trustedProducer: 'conversation-research-runtime',
         effect: 'read',
         resultSha256: 'b'.repeat(64),
         contentSha256: digest('A bounded fixture result.'),
@@ -152,21 +160,27 @@ test('ResearchRead pages source history, rechecks attachments, then calls the fi
     signal: context.signal,
   });
 
-  assert.equal(result.operationId, 'operation-1');
   assert.equal(result.contentSha256, digest(result.content));
   assert.equal(result.sourceEvidence[0].sourceSha256, 'd'.repeat(64));
   assert.deepEqual(requests.map(row => row.path.split('/').at(-1)), [
     'authorize', 'messages', 'messages', 'authorize', 'read',
   ]);
   assert.ok(requests.every(row => row.authorization === 'Bearer actor-private-work-token'));
-  const readBody = requests.at(-1).body;
-  assert.equal(readBody.taskId, 'child-task');
-  assert.equal(readBody.parentTaskId, 'parent-task');
-  assert.equal(readBody.parentSessionId, 'session-1');
-  assert.equal('actorId' in readBody, false);
-  assert.equal('providerUrl' in readBody, false);
+  const finalized = await work.finalizeResearchOperationReceipt(context, {
+    taskId: 'child-task', sessionId: 'session-1',
+  }, sourceRefs);
+  assert.equal(finalized.operationId, 'operation-1');
+  const finalizeCall = requests.at(-1);
+  assert.equal(finalizeCall.path.endsWith('/conversation-runtime/research/receipt'), true);
+  assert.equal(finalizeCall.body.taskId, 'child-task');
+  assert.equal(finalizeCall.body.parentTaskId, 'parent-task');
+  assert.equal(finalizeCall.body.parentSessionId, 'session-1');
+  assert.equal('actorId' in finalizeCall.body, false);
+  assert.equal('providerUrl' in finalizeCall.body, false);
 
-  const receipt = await work.readResearchOperationReceipt(context, result.operationId);
+  const receipt = await work.readResearchOperationReceipt(context, finalized.operationId);
+  const readBody = requests.at(-1).body;
+  assert.equal(readBody.taskId, undefined, 'receipt lookup binds the parent context, not a caller task selector');
   assert.equal(receipt.taskStatus, 'completed');
   assert.equal(receipt.taskOutputSha256, 'e'.repeat(64));
   assert.deepEqual(receipt.sourceRefs, sourceRefs);

@@ -27,6 +27,8 @@ export {
   ConversationResearchOperationReceiptReaderV1,
   ConversationResearchWatchProviderV1,
 } from './research-provider.ts';
+export { ConversationSkillEvidenceProducerV1 } from './skill-evidence-producer.ts';
+export type { SkillEvidenceInputV1, SkillEvidenceTaskPortV1 } from './skill-evidence-producer.ts';
 export type {
   ResearchOperationReceiptReaderV1,
   ResearchReadInputV1,

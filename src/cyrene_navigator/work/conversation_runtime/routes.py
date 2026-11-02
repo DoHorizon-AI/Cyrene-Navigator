@@ -37,6 +37,7 @@ class _ResearchReadBody(WorkModel):
         max_length=8,
         pattern=r"^[0-9a-f]{64}$",
     )
+    source_urls: list[str] = Field(default_factory=list, max_length=8)
 
 
 class _ReceiptReadBody(WorkModel):
@@ -49,6 +50,19 @@ class _ReceiptReadBody(WorkModel):
     persona_id: str | None = Field(default=None, max_length=512)
     authorization_epoch: int = Field(ge=0)
     source_refs: list[ConversationMemorySourceRef] = Field(default_factory=list, max_length=256)
+
+
+class _ReceiptFinalizeBody(WorkModel):
+    """Identity/scope for finalizing one completed child Task's real result."""
+
+    task_id: str = Field(min_length=1, max_length=512)
+    parent_task_id: str = Field(min_length=1, max_length=512)
+    parent_session_id: str = Field(min_length=1, max_length=512)
+    conversation_id: str = Field(min_length=1, max_length=512)
+    conversation_kind: Literal["direct", "group", "channel"]
+    persona_id: str | None = Field(default=None, max_length=512)
+    authorization_epoch: int = Field(ge=0)
+    source_refs: list[ConversationMemorySourceRef] = Field(min_length=1, max_length=256)
 
 
 PrincipalFor = Callable[..., PersistencePrincipal]
@@ -81,6 +95,7 @@ def mount_conversation_runtime_routes(
                     scope=scope,
                     query=body.query,
                     attachment_ids=tuple(body.attachment_ids),
+                    source_urls=tuple(body.source_urls),
                 ),
                 cancelled=cancelled,
             )
@@ -95,7 +110,6 @@ def mount_conversation_runtime_routes(
             disconnect_monitor.cancel()
             await asyncio.gather(disconnect_monitor, return_exceptions=True)
         return {
-            "operationId": result.operation_id,
             "title": result.title,
             "content": result.content,
             "resultSha256": result.result_sha256,
@@ -129,8 +143,32 @@ def mount_conversation_runtime_routes(
                 error.retryable,
             ) from None
 
+    @app.post(base + "/conversation-runtime/research/receipt")
+    async def finalize_research_receipt(
+        workspace_id: str, body: _ReceiptFinalizeBody, request: Request
+    ) -> Mapping[str, Any]:
+        principal = principal_for(request, workspace_id, write=True)
+        try:
+            return await runtime.finalize_research_operation_receipt(
+                principal,
+                workspace_id,
+                task_id=body.task_id,
+                parent_task_id=body.parent_task_id,
+                parent_session_id=body.parent_session_id,
+                scope=_scope(body),
+            )
+        except ConversationRuntimeError as error:
+            raise PersistenceError(
+                error.code,
+                error.status_code,
+                "The completed research Task could not be finalized as a trusted receipt.",
+                error.retryable,
+            ) from None
 
-def _scope(body: _ResearchReadBody | _ReceiptReadBody) -> ConversationResearchScope:
+
+def _scope(
+    body: _ResearchReadBody | _ReceiptReadBody | _ReceiptFinalizeBody,
+) -> ConversationResearchScope:
     kind = body.conversation_kind
     if kind not in {"direct", "group", "channel"}:
         raise PersistenceError(
