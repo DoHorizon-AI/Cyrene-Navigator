@@ -2243,6 +2243,10 @@ export class NavigatorExecutor {
       messageId: event.message.id,
       query: userText,
       attachments: event.message.attachments ?? [],
+      // The same actor-scoped client that built `api`; plugins never receive its credential.
+      ...(workState.requestWorkJson === undefined
+        ? {}
+        : { requestWork: request => workState.requestWorkJson!(request) }),
     });
     const userSourceRef: ConversationSourceRef = {
       memoryId: null,
