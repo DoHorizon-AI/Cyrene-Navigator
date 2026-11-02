@@ -15,6 +15,7 @@ import re
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from cyrene_plugin_runtime import (
     DirectPayload,
@@ -90,9 +91,16 @@ def invoke_typed(
     request_bytes: bytes,
     response_type_url: str,
     deadline_seconds: float,
+    cancel_event: threading.Event | None = None,
+    request_id: str | None = None,
 ) -> TypedInvocation:
     """Invoke a fixed method and verify the server's response type URL."""
 
+    optional: dict[str, Any] = {}
+    if cancel_event is not None:
+        optional["cancel_event"] = cancel_event
+    if request_id is not None:
+        optional["request_id"] = request_id
     try:
         response = client.invoke(
             capability=capability,
@@ -100,6 +108,7 @@ def invoke_typed(
             method=method,
             request=DirectPayload(type_url=request_type_url, value=request_bytes),
             deadline_seconds=deadline_seconds,
+            **optional,
         )
     except DirectPluginInvocationCancelled as error:
         raise DirectCapabilityError("DIRECT_PLUGIN_CANCELLED", retryable=True) from error

@@ -21,6 +21,16 @@ from cyrene_integration_contracts import TOOL_OPERATIONS
 _LOCAL_GRPC = re.compile(r"(?:grpc://)?(?:127\.0\.0\.1|localhost|\[::1\]):([0-9]{1,5})\Z")
 _ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,127}\Z")
 _TOOL_ID = re.compile(r"[a-z][a-z0-9_.-]{0,127}\Z")
+_MEDIA_TOOL_IDS = frozenset(
+    {
+        "media.asset.import",
+        "media.asset.search",
+        "media.asset.get",
+        "media.asset.delete",
+        "media.asset.restore",
+        "media.card.render",
+    }
+)
 _MAX_CONNECTION_REF_BYTES = 1_024
 _DEFAULT_AUDIO_TYPES = (
     "audio/mpeg",
@@ -172,6 +182,10 @@ class CapabilitySettings:
     graph: PluginBindingSettings | None = None
     tool: PluginBindingSettings | None = None
     speech: PluginBindingSettings | None = None
+    vision: PluginBindingSettings | None = None
+    vision_model_id: str | None = None
+    media_library: PluginBindingSettings | None = None
+    media_tool_caller: ToolCallerSettings | None = None
     embedding: EmbeddingProfile | None = None
     tool_caller: ToolCallerSettings | None = None
     speech_profile: SpeechProfile = field(default_factory=SpeechProfile)
@@ -199,6 +213,38 @@ class CapabilitySettings:
         graph = binding("CYRENE_NAVIGATOR_KNOWLEDGE_GRAPH_CONNECTION_REF", "knowledge.graph.v1")
         tool = binding("CYRENE_NAVIGATOR_TOOL_PROVIDER_CONNECTION_REF", "tool.provider.v1")
         speech = binding("CYRENE_NAVIGATOR_SPEECH_PROVIDER_CONNECTION_REF", "speech.provider.v1")
+        vision = binding(
+            "CYRENE_NAVIGATOR_VISION_PROVIDER_CONNECTION_REF",
+            "model.provider.v1 chat_completion_v3",
+        )
+        vision_model_id = environment.get("CYRENE_NAVIGATOR_VISION_MODEL_ID", "").strip() or None
+        if vision is None and vision_model_id is not None:
+            unavailable["model.provider.v1 chat_completion_v3"] = "VISION_BINDING_UNAVAILABLE"
+            vision_model_id = None
+        elif vision is not None and vision_model_id is None:
+            unavailable["model.provider.v1 chat_completion_v3"] = "VISION_MODEL_ID_UNAVAILABLE"
+            vision = None
+        elif vision_model_id is not None and len(vision_model_id.encode("utf-8")) > 256:
+            raise CapabilityConfigurationError("vision model id exceeds 256 bytes")
+        media_library = binding(
+            "CYRENE_NAVIGATOR_MEDIA_PROVIDER_CONNECTION_REF", "cyrene.tools.media"
+        )
+        media_tool_caller = (
+            _tool_caller_settings(environment, prefix="CYRENE_NAVIGATOR_MEDIA_TOOL_")
+            if media_library is not None
+            else None
+        )
+        if media_library is not None and media_tool_caller is None:
+            unavailable["cyrene.tools.media"] = "MEDIA_CALLER_PROFILE_UNAVAILABLE"
+            media_library = None
+        elif media_library is None and _media_tool_profile_present(environment):
+            unavailable["cyrene.tools.media"] = "MEDIA_BINDING_UNAVAILABLE"
+        elif media_tool_caller is not None and (
+            frozenset(media_tool_caller.tool_ids) != _MEDIA_TOOL_IDS
+        ):
+            raise CapabilityConfigurationError(
+                "media tool caller allowlist must contain the six fixed media tool IDs"
+            )
 
         embedding: EmbeddingProfile | None = None
         model_id = environment.get("CYRENE_NAVIGATOR_EMBEDDING_MODEL_ID", "").strip()
@@ -256,6 +302,10 @@ class CapabilitySettings:
             graph=graph,
             tool=tool,
             speech=speech,
+            vision=vision,
+            vision_model_id=vision_model_id,
+            media_library=media_library,
+            media_tool_caller=media_tool_caller,
             embedding=embedding,
             tool_caller=tool_caller,
             speech_profile=SpeechProfile(
@@ -267,15 +317,17 @@ class CapabilitySettings:
         )
 
 
-def _tool_caller_settings(environment: Mapping[str, str]) -> ToolCallerSettings | None:
+def _tool_caller_settings(
+    environment: Mapping[str, str], *, prefix: str = "CYRENE_NAVIGATOR_TOOL_"
+) -> ToolCallerSettings | None:
     """Build a tool signer profile only when every server-side pin is present."""
 
-    binding_id = environment.get("CYRENE_NAVIGATOR_TOOL_BINDING_ID", "").strip()
-    workload = environment.get("CYRENE_NAVIGATOR_TOOL_CALLER_WORKLOAD", "").strip()
-    audience = environment.get("CYRENE_NAVIGATOR_TOOL_AUDIENCE", "").strip()
-    issuer = environment.get("CYRENE_NAVIGATOR_TOOL_ISSUER", "").strip()
-    key_ref = environment.get("CYRENE_NAVIGATOR_TOOL_SIGNING_KEY_ENV", "").strip()
-    ids = environment.get("CYRENE_NAVIGATOR_TOOL_IDS", "").split(",")
+    binding_id = environment.get(f"{prefix}BINDING_ID", "").strip()
+    workload = environment.get(f"{prefix}CALLER_WORKLOAD", "").strip()
+    audience = environment.get(f"{prefix}AUDIENCE", "").strip()
+    issuer = environment.get(f"{prefix}ISSUER", "").strip()
+    key_ref = environment.get(f"{prefix}SIGNING_KEY_ENV", "").strip()
+    ids = environment.get(f"{prefix}IDS", "").split(",")
     tool_ids = tuple(dict.fromkeys(item.strip() for item in ids if item.strip()))
     if not all((binding_id, workload, audience, issuer, key_ref, tool_ids)):
         return None
@@ -288,6 +340,22 @@ def _tool_caller_settings(environment: Mapping[str, str]) -> ToolCallerSettings 
         issuer=issuer,
         key_environment_name=key_ref,
         tool_ids=tool_ids,
+    )
+
+
+def _media_tool_profile_present(environment: Mapping[str, str]) -> bool:
+    """Detect partial server media caller setup without reading any secret material."""
+
+    return any(
+        environment.get(f"CYRENE_NAVIGATOR_MEDIA_TOOL_{suffix}", "").strip()
+        for suffix in (
+            "BINDING_ID",
+            "CALLER_WORKLOAD",
+            "AUDIENCE",
+            "ISSUER",
+            "SIGNING_KEY_ENV",
+            "TOOL_IDS",
+        )
     )
 
 

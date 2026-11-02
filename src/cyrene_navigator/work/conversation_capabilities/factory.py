@@ -26,6 +26,7 @@ from cyrene_navigator.work.conversation_memory.providers import (
 from .config import CapabilitySettings
 from .embeddings import DirectEmbeddingClient
 from .knowledge_graph import DirectKnowledgeGraphProvider
+from .media_library import DirectMediaLibraryClient
 from .memory import DirectMemoryProvider
 from .peripheral import (
     DirectSpeechProvider,
@@ -35,6 +36,7 @@ from .peripheral import (
     build_host_trusted_caller_signer,
 )
 from .runtime import DirectPluginPool
+from .vision import DirectVisionProvider, VisionProfile
 
 
 @dataclass(slots=True)
@@ -48,6 +50,8 @@ class ConversationCapabilities:
     tool_provider_client: DirectToolProviderClient | None = None
     tool_signer: HostTrustedCallerSigner | None = None
     speech_provider: DirectSpeechProvider | None = None
+    vision_provider: DirectVisionProvider | None = None
+    media_library_client: DirectMediaLibraryClient | None = None
     unavailable: dict[str, str] = field(default_factory=dict)
 
     def close(self) -> None:
@@ -138,6 +142,37 @@ def build_conversation_capabilities(
             result.unavailable.pop("speech.provider.v1", None)
         except (ValueError, OSError):
             result.unavailable["speech.provider.v1"] = "ENDPOINT_UNAVAILABLE"
+
+    if settings.vision is not None and settings.vision_model_id is not None:
+        try:
+            result.vision_provider = DirectVisionProvider(
+                pool.client(settings.vision.connection_ref),
+                settings.vision,
+                VisionProfile(model_id=settings.vision_model_id),
+            )
+            result.unavailable.pop("model.provider.v1 chat_completion_v3", None)
+        except (ValueError, OSError):
+            result.unavailable["model.provider.v1 chat_completion_v3"] = "ENDPOINT_UNAVAILABLE"
+
+    if settings.media_library is not None and settings.media_tool_caller is not None:
+        try:
+            media_signer = build_host_trusted_caller_signer(
+                settings.media_tool_caller, selected_environment
+            )
+            media_tool_client = DirectToolProviderClient(
+                pool.client(settings.media_library.connection_ref),
+                settings.media_library,
+                settings.media_tool_caller,
+            )
+            result.media_library_client = DirectMediaLibraryClient(
+                media_tool_client,
+                media_signer,
+                settings.media_tool_caller,
+            )
+            # Availability remains NOT_VERIFIED until a real signed media call succeeds.
+            result.unavailable["cyrene.tools.media"] = "NOT_VERIFIED"
+        except (ValueError, OSError):
+            result.unavailable["cyrene.tools.media"] = "MEDIA_CALLER_PROFILE_UNAVAILABLE"
 
     return result
 

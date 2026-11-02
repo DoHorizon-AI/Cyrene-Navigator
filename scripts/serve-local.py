@@ -40,12 +40,19 @@ _MAX_TASK_CONCURRENCY = 32
 _MAX_CONNECTOR_TOOL_CATALOG_BYTES = 32 * 1024 * 1024
 _MAX_CONNECTOR_TOOL_CATALOG_ITEMS = 128
 _EXECUTOR_WORK_TOKEN_ENV = "CYRENE_EXECUTOR_WORK_TOKEN"
+_SIGNING_KEY_REFERENCE_ENV_NAMES = (
+    "CYRENE_NAVIGATOR_TOOL_SIGNING_KEY_ENV",
+    "CYRENE_NAVIGATOR_MEDIA_TOOL_SIGNING_KEY_ENV",
+)
 _PERSISTENCE_CAPABILITY_ENV_NAMES = (
     "CYRENE_NAVIGATOR_MODEL_PROVIDER_CONNECTION_REF",
     "CYRENE_NAVIGATOR_MEMORY_PROVIDER_CONNECTION_REF",
     "CYRENE_NAVIGATOR_KNOWLEDGE_GRAPH_CONNECTION_REF",
     "CYRENE_NAVIGATOR_TOOL_PROVIDER_CONNECTION_REF",
     "CYRENE_NAVIGATOR_SPEECH_PROVIDER_CONNECTION_REF",
+    "CYRENE_NAVIGATOR_VISION_PROVIDER_CONNECTION_REF",
+    "CYRENE_NAVIGATOR_VISION_MODEL_ID",
+    "CYRENE_NAVIGATOR_MEDIA_PROVIDER_CONNECTION_REF",
     "CYRENE_NAVIGATOR_EMBEDDING_MODEL_ID",
     "CYRENE_NAVIGATOR_EMBEDDING_PROFILE_ID",
     "CYRENE_NAVIGATOR_EMBEDDING_DIMENSIONS",
@@ -57,6 +64,12 @@ _PERSISTENCE_CAPABILITY_ENV_NAMES = (
     "CYRENE_NAVIGATOR_TOOL_ISSUER",
     "CYRENE_NAVIGATOR_TOOL_SIGNING_KEY_ENV",
     "CYRENE_NAVIGATOR_TOOL_IDS",
+    "CYRENE_NAVIGATOR_MEDIA_TOOL_BINDING_ID",
+    "CYRENE_NAVIGATOR_MEDIA_TOOL_CALLER_WORKLOAD",
+    "CYRENE_NAVIGATOR_MEDIA_TOOL_AUDIENCE",
+    "CYRENE_NAVIGATOR_MEDIA_TOOL_ISSUER",
+    "CYRENE_NAVIGATOR_MEDIA_TOOL_SIGNING_KEY_ENV",
+    "CYRENE_NAVIGATOR_MEDIA_TOOL_IDS",
     "CYRENE_NAVIGATOR_MEMORY_MAINTENANCE_TENANTS",
     "CYRENE_NAVIGATOR_SPEECH_ENABLED",
     "CYRENE_NAVIGATOR_SPEECH_DEFAULT_LANGUAGE",
@@ -696,10 +709,12 @@ def _persistence_child_environment(
     for name in _PERSISTENCE_CAPABILITY_ENV_NAMES:
         if name in os.environ:
             environment[name] = os.environ[name]
-    signing_key_env = environment.get("CYRENE_NAVIGATOR_TOOL_SIGNING_KEY_ENV")
-    if signing_key_env is not None:
+    for reference_name in _SIGNING_KEY_REFERENCE_ENV_NAMES:
+        signing_key_env = environment.get(reference_name)
+        if signing_key_env is None:
+            continue
         if not _ENV_NAME_RE.fullmatch(signing_key_env):
-            raise ValueError("CYRENE_NAVIGATOR_TOOL_SIGNING_KEY_ENV must be an environment name")
+            raise ValueError(f"{reference_name} must be an environment name")
         if signing_key_env in os.environ:
             environment[signing_key_env] = os.environ[signing_key_env]
     for name in env_references.difference(
@@ -723,9 +738,10 @@ def _persistence_startup_secrets(
     """Redact bearer and signing-key values if a child echoes its startup JSON."""
 
     names = set(credential_references)
-    signing_key_name = environment.get("CYRENE_NAVIGATOR_TOOL_SIGNING_KEY_ENV")
-    if signing_key_name is not None:
-        names.add(signing_key_name)
+    for reference_name in _SIGNING_KEY_REFERENCE_ENV_NAMES:
+        signing_key_name = environment.get(reference_name)
+        if signing_key_name is not None:
+            names.add(signing_key_name)
     values = (
         session_token,
         executor_token,

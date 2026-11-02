@@ -16,6 +16,7 @@ import binascii
 import importlib
 import json
 import re
+import threading
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, Protocol, cast
@@ -204,12 +205,15 @@ class DirectToolProviderClient:
         provider_tool_id: str,
         arguments: Mapping[str, Any],
         caller_context: Mapping[str, Any],
+        *,
+        cancel_event: threading.Event | None = None,
+        request_id: str | None = None,
     ) -> Mapping[str, Any]:
         """Check the current catalog and invoke one allowlisted signed tool exactly once."""
 
         if provider_tool_id not in self._allowed_tools or not isinstance(arguments, Mapping):
             raise _port_error("TOOL_OPERATION_UNAVAILABLE", unavailable=True)
-        catalog = self._catalog()
+        catalog = self._catalog(cancel_event=cancel_event, request_id=request_id)
         descriptors = {item.provider_tool_id: item for item in catalog.tools}
         descriptor = descriptors.get(provider_tool_id)
         if descriptor is None:
@@ -239,6 +243,8 @@ class DirectToolProviderClient:
                 request_bytes=encoded_request.value,
                 response_type_url=_tool_response_type_url(METHOD_CALL_TOOL),
                 deadline_seconds=self._binding.deadline_seconds,
+                cancel_event=cancel_event,
+                request_id=request_id,
             )
             response = decode_tool_response(
                 METHOD_CALL_TOOL, TypedPayload(type_url=result.type_url, value=result.value)
@@ -270,7 +276,12 @@ class DirectToolProviderClient:
             )
         return _tool_result_mapping(response.outcome)
 
-    def _catalog(self) -> Any:
+    def _catalog(
+        self,
+        *,
+        cancel_event: threading.Event | None = None,
+        request_id: str | None = None,
+    ) -> Any:
         """Read the current tool catalog before each call to bind its version."""
 
         try:
@@ -285,6 +296,8 @@ class DirectToolProviderClient:
                 request_bytes=encoded_request.value,
                 response_type_url=_tool_response_type_url(METHOD_LIST_TOOLS),
                 deadline_seconds=self._binding.deadline_seconds,
+                cancel_event=cancel_event,
+                request_id=request_id,
             )
             response = decode_tool_response(
                 METHOD_LIST_TOOLS, TypedPayload(type_url=result.type_url, value=result.value)
@@ -394,6 +407,7 @@ class DirectSpeechProvider:
         principal: PersistencePrincipal,
         workspace_id: str,
         request_id: str,
+        cancel_event: threading.Event | None = None,
     ) -> Mapping[str, Any]:
         """Return only the transcript and segments actually received from speech.provider.v1."""
 
@@ -429,6 +443,8 @@ class DirectSpeechProvider:
                 request_bytes=encoded_request,
                 response_type_url=_speech_response_type_url(METHOD_TRANSCRIBE),
                 deadline_seconds=self._binding.deadline_seconds,
+                cancel_event=cancel_event,
+                request_id=request_id,
             )
             response = decode_speech_response(METHOD_TRANSCRIBE, result.value)
         except DirectCapabilityError as error:
