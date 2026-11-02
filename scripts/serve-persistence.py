@@ -28,6 +28,10 @@ from cyrene_navigator import create_app as create_product_api_app
 from cyrene_navigator.persistence import PersistencePrincipal, create_persistence_app
 from cyrene_navigator.work.api import ConnectorBridge, TeamsPrivateConversationPolicy
 from cyrene_navigator.work.conversation_capabilities import build_conversation_capabilities
+from cyrene_navigator.work.conversation_knowledge.config import (
+    KNOWLEDGE_CONFIG_ENV,
+    load_conversation_knowledge,
+)
 
 PERSISTENCE_TLS_CERT_FILE_ENV = "CYRENE_PERSISTENCE_TLS_CERT_FILE"
 PERSISTENCE_TLS_KEY_FILE_ENV = "CYRENE_PERSISTENCE_TLS_KEY_FILE"
@@ -190,6 +194,16 @@ def main() -> None:
         config.teams_private_conversations, os.environ
     )
     capabilities = build_conversation_capabilities(environment=os.environ)
+    knowledge_config = os.environ.get(KNOWLEDGE_CONFIG_ENV, "").strip()
+    try:
+        conversation_knowledge = (
+            load_conversation_knowledge(Path(knowledge_config), pool=capabilities.pool)
+            if knowledge_config
+            else None
+        )
+    except BaseException:
+        capabilities.close()
+        raise
     summarizer_available = (
         os.environ.get("CYRENE_CONVERSATION_ASSISTANT_ENABLED") == "true"
         or os.environ.get("CYRENE_CONVERSATION_SUMMARIZER_AVAILABLE") == "true"
@@ -207,6 +221,7 @@ def main() -> None:
             conversation_memory_provider=capabilities.memory_provider,
             conversation_graph_provider=capabilities.knowledge_graph_provider,
             conversation_memory_summarizer_available=summarizer_available,
+            conversation_knowledge=conversation_knowledge,
         )
     except BaseException:
         capabilities.close()
