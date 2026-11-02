@@ -139,6 +139,13 @@ from cyrene_navigator.work.tool_routes import mount_work_tool_routes
 
 WorkAuthenticator = Callable[[Request, str], PersistencePrincipal]
 _LOGGER = logging.getLogger(__name__)
+_RESERVED_TRUSTED_OPERATION_TYPES = frozenset(
+    {
+        "conversation.research.read.v1",
+        "conversation.skill.verify",
+        "conversation.skill.readback",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,6 +356,63 @@ def mount_work_routes(
                 "A trusted Workspace writer principal is required for Work mutations.",
             )
         return principal
+
+    def resolve_trusted_turn_context(
+        request: Request, workspace_id: str, principal: PersistencePrincipal
+    ) -> dict[str, str]:
+        """Resolve a running chat Task from the private Harness principal only."""
+
+        if not principal.actor_private_scope:
+            raise PersistenceError(
+                "CONVERSATION_DOMAIN_TURN_CONTEXT_UNAVAILABLE",
+                503,
+                "Durable conversation tools require the actor-private Harness principal.",
+            )
+        task_id = request.headers.get("x-cyrene-work-task-id")
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise PersistenceError(
+                "CONVERSATION_DOMAIN_TURN_CONTEXT_REQUIRED",
+                409,
+                "A server-provided current Work Task ID is required.",
+            )
+        task = store.get_task(
+            principal.organization_id,
+            workspace_id,
+            task_id,
+            actor_id=principal.actor_id,
+            actor_private_scope=True,
+        )
+        if task.get("status") != "running":
+            raise PersistenceError(
+                "CONVERSATION_DOMAIN_TURN_TASK_NOT_RUNNING",
+                409,
+                "A durable conversation operation requires its running parent Task.",
+            )
+        metadata = task.get("metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        origin = metadata.get("navigatorConversationOrigin")
+        origin = origin if isinstance(origin, Mapping) else {}
+        task_origin = task.get("origin")
+        task_origin = task_origin if isinstance(task_origin, Mapping) else {}
+        if (
+            origin.get("kind") not in {"web", "teams_channel"}
+            and task_origin.get("kind") != "teams_private"
+        ):
+            raise PersistenceError(
+                "CONVERSATION_DOMAIN_TURN_CONTEXT_REQUIRED",
+                403,
+                "Only an authenticated Web or Teams chat Task can own a durable watch.",
+            )
+        session_id = task.get("sessionId")
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise PersistenceError(
+                "CONVERSATION_DOMAIN_TURN_CONTEXT_REQUIRED",
+                409,
+                "The current Work Task has no trusted session identity.",
+            )
+        return {"taskId": task_id, "sessionId": session_id}
+
+    app.state.trusted_turn_context = resolve_trusted_turn_context
 
     def validate_domain_sources(
         organization_id: str | None,
@@ -1227,6 +1291,12 @@ def mount_work_routes(
         workspace_id: str, body: OperationCreate, request: Request, response: Response
     ) -> dict[str, Any]:
         principal = principal_for(request, workspace_id, write=True)
+        if body.operation_type in _RESERVED_TRUSTED_OPERATION_TYPES:
+            raise PersistenceError(
+                "WORK_OPERATION_TRUSTED_PRODUCER_REQUIRED",
+                403,
+                "Reserved research and skill receipts require a server-side finalizer.",
+            )
         operation, duplicate = store.create_operation(
             principal.organization_id,
             workspace_id,
@@ -1254,6 +1324,26 @@ def mount_work_routes(
                 target=target,
                 operation_type=operation_type,
                 limit=limit,
+                actor_id=principal.actor_id,
+                actor_private_scope=principal.actor_private_scope,
+            )
+        }
+
+    @app.get(
+        base + "/operations/by-idempotency-key",
+        response_model=OperationReceipt,
+    )
+    def get_operation_by_idempotency_key(
+        workspace_id: str,
+        request: Request,
+        idempotency_key: str = Query(alias="idempotencyKey", min_length=1, max_length=512),
+    ) -> dict[str, Any]:
+        principal = principal_for(request, workspace_id)
+        return {
+            "operation": store.get_operation_by_idempotency_key(
+                principal.organization_id,
+                workspace_id,
+                idempotency_key,
                 actor_id=principal.actor_id,
                 actor_private_scope=principal.actor_private_scope,
             )
@@ -2000,6 +2090,40 @@ def mount_work_routes(
                 actor_private_scope=principal.actor_private_scope,
             )
         }
+
+    @app.get(
+        base + "/notifications/by-deduplication-key",
+        response_model=NotificationRecord,
+    )
+    def get_notification_by_deduplication_key(
+        workspace_id: str,
+        request: Request,
+        deduplication_key: str = Query(alias="deduplicationKey", min_length=1, max_length=512),
+    ) -> dict[str, Any]:
+        principal = principal_for(request, workspace_id)
+        return store.get_notification_by_deduplication_key(
+            principal.organization_id,
+            workspace_id,
+            deduplication_key,
+            actor_id=principal.actor_id,
+            actor_private_scope=principal.actor_private_scope,
+        )
+
+    @app.get(
+        base + "/notifications/{notification_id}",
+        response_model=NotificationRecord,
+    )
+    def get_notification(
+        workspace_id: str, notification_id: str, request: Request
+    ) -> dict[str, Any]:
+        principal = principal_for(request, workspace_id)
+        return store.get_notification(
+            principal.organization_id,
+            workspace_id,
+            notification_id,
+            actor_id=principal.actor_id,
+            actor_private_scope=principal.actor_private_scope,
+        )
 
     @app.post(base + "/notifications/claim", response_model=NotificationClaimResult)
     def claim_notifications(

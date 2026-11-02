@@ -18,6 +18,7 @@ from cyrene_navigator.persistence.store import PersistencePrincipal
 from cyrene_navigator.work.conversation_memory.domain_api import mount_domain_routes
 from cyrene_navigator.work.conversation_memory.domains import (
     ConversationDomainStore,
+    conversation_watch_task_id,
     maintenance_task_id,
 )
 
@@ -30,6 +31,7 @@ class _FakeWorkStore:
     def __init__(self) -> None:
         self.tasks: dict[tuple[str, str, str], dict[str, object]] = {}
         self.operations: dict[tuple[str, str, str], dict[str, object]] = {}
+        self.attachments: dict[tuple[str, str, str, str], tuple[Mapping[str, object], Path]] = {}
 
     def get_task(
         self,
@@ -66,6 +68,23 @@ class _FakeWorkStore:
         if task is None or task.get("createdByActorId") != actor_id:
             raise PersistenceError("WORK_OPERATION_NOT_FOUND", 404, "Operation was not found")
         return operation
+
+    def get_attachment(
+        self,
+        organization_id: str | None,
+        workspace_id: str,
+        digest: str,
+        *,
+        actor_id: str | None = None,
+        actor_private_scope: bool = False,
+        require_actor_private: bool = False,
+    ) -> tuple[Mapping[str, object], Path]:
+        if not actor_private_scope or organization_id is None or actor_id is None:
+            raise PersistenceError(WORKSPACE_FORBIDDEN, 403, "Private attachment scope required")
+        value = self.attachments.get((organization_id, workspace_id, actor_id, digest))
+        if value is None:
+            raise PersistenceError("WORK_ATTACHMENT_NOT_FOUND", 404, "Attachment was not found")
+        return value
 
 
 class _FakeGraphProvider:
@@ -227,6 +246,15 @@ def domain_api(
             source_ids,
         )
 
+    def trusted_turn_context(
+        _request: Request, workspace_id: str, principal: PersistencePrincipal
+    ) -> Mapping[str, str]:
+        assert workspace_id == "workspace-a"
+        return {
+            "taskId": f"parent-task-{principal.actor_id}",
+            "sessionId": f"parent-session-{principal.actor_id}",
+        }
+
     mount_domain_routes(
         app,
         BASE,
@@ -234,6 +262,7 @@ def domain_api(
         store,
         validate_source_ids,
         validate_source_refs=validate_source_refs,
+        trusted_turn_context=trusted_turn_context,
     )
     return TestClient(app), store, source_checks
 
@@ -276,45 +305,130 @@ def _seed_maintenance_task(
 
 
 def _seed_skill_receipts(
-    client: TestClient, *, content: str, valid_readback: bool = True
+    client: TestClient, *, body: Mapping[str, object], valid_readback: bool = True
 ) -> tuple[str, str]:
     work_store = client.app.state.work_store
+    verify_id = "skill-verify-receipt"
+    read_id = "skill-readback-receipt"
+    action_task_id = "skill-verify-task"
+    read_task_id = "skill-readback-task"
+    source_refs = body["sourceRefs"]
+    source_refs_digest = hashlib.sha256(
+        json.dumps(source_refs, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
+    ).hexdigest()
+    action_id = "public-web.lookup"
+    target_digest = "a" * 64
+    input_digest = "b" * 64
+    guide_version = "1"
+    guide_digest = "c" * 64
+    effect_operation_id = "public-web-effect-operation"
+    source_ref = "sha256:" + "d" * 64
+    source_sha = "e" * 64
+    artifact_sha = "f" * 64
+    effect_result = source_sha
+    parent_task = "parent-task-actor-a"
+    parent_session = "parent-session-actor-a"
     task_specs = (
-        ("skill-verify-task", "verified skill operation output"),
-        ("skill-readback-task", "independent skill readback output"),
+        (action_task_id, "verified skill operation output"),
+        (read_task_id, "independent skill readback output"),
     )
-    for task_id, output in task_specs:
+    for index, (task_id, output) in enumerate(task_specs):
+        source = "conversation-skill-verify" if index == 0 else "conversation-skill-readback"
+        task_parent = parent_task if index == 0 else action_task_id
+        metadata = {
+            "source": source,
+            "workspaceId": "workspace-a",
+            "actorId": "actor-a",
+            "conversationId": body.get("conversationId"),
+            "conversationKind": body.get("conversationKind"),
+            "personaId": body.get("personaId"),
+            "parentTaskId": task_parent,
+            "parentSessionId": parent_session,
+            "sourceRefs": source_refs,
+            "actionId": action_id,
+            "targetDigestSha256": target_digest,
+            "inputSha256": input_digest,
+            "guideVersion": guide_version,
+            "guideSha256": guide_digest,
+            "effectOperationId": effect_operation_id,
+            "effectResultSha256": effect_result,
+        }
         work_store.tasks[("org-a", "workspace-a", task_id)] = {
             "id": task_id,
             "workspaceId": "workspace-a",
             "createdByActorId": "actor-a",
             "status": "completed",
             "output": output,
-            "metadata": {},
+            "sessionId": parent_session,
+            "metadata": metadata,
         }
-    verify_id = "skill-verify-receipt"
-    read_id = "skill-readback-receipt"
+    write_request = {
+        "source": "conversation-skill-probe",
+        "actionId": action_id,
+        "targetDigestSha256": target_digest,
+        "inputSha256": input_digest,
+        "guideVersion": guide_version,
+        "guideSha256": guide_digest,
+        "taskId": action_task_id,
+        "parentTaskId": parent_task,
+        "parentSessionId": parent_session,
+        "sourceRefsSha256": source_refs_digest,
+        "effectOperationId": effect_operation_id,
+        "effectResultSha256": effect_result,
+    }
+    read_request = {
+        **write_request,
+        "taskId": read_task_id,
+        "parentTaskId": action_task_id,
+        "writeOperationId": verify_id,
+    }
+    evidence_base = {
+        "actionId": action_id,
+        "targetDigestSha256": target_digest,
+        "inputSha256": input_digest,
+        "guideVersion": guide_version,
+        "guideSha256": guide_digest,
+        "sourceRef": source_ref,
+        "canonicalUrl": "https://example.com/guide",
+        "sourceSha256": source_sha,
+        "workArtifactSha256": artifact_sha,
+        "readbackVerified": True,
+    }
+    write_output = task_specs[0][1]
     work_store.operations[("org-a", "workspace-a", verify_id)] = {
         "id": verify_id,
         "operationType": "conversation.skill.verify",
-        "taskId": "skill-verify-task",
+        "taskId": action_task_id,
         "status": "verified",
+        "trustedProducer": "conversation-research-runtime",
+        "taskOutputSha256": hashlib.sha256(write_output.encode()).hexdigest(),
+        "request": write_request,
         "evidence": {
-            "taskOutputSha256": hashlib.sha256(task_specs[0][1].encode()).hexdigest(),
+            **evidence_base,
+            "outcome": "verified",
+            "effect": "read",
+            "effectOutcome": "verified",
+            "effectOperationId": effect_operation_id,
+            "effectResultSha256": effect_result,
             "readbackReceiptId": read_id,
         },
     }
-    content_digest = hashlib.sha256(content.encode()).hexdigest()
+    readback_output = task_specs[1][1]
+    effect_readback = source_sha
     if not valid_readback:
-        content_digest = "0" * 64
+        effect_readback = "0" * 64
     work_store.operations[("org-a", "workspace-a", read_id)] = {
         "id": read_id,
         "operationType": "conversation.skill.readback",
-        "taskId": "skill-readback-task",
+        "taskId": read_task_id,
         "status": "verified",
+        "trustedProducer": "conversation-research-runtime",
+        "taskOutputSha256": hashlib.sha256(readback_output.encode()).hexdigest(),
+        "request": read_request,
         "evidence": {
-            "taskOutputSha256": hashlib.sha256(task_specs[1][1].encode()).hexdigest(),
-            "contentSha256": content_digest,
+            **evidence_base,
+            "effectReadbackOutcome": "verified",
+            "effectReadbackSha256": effect_readback,
         },
     }
     return verify_id, read_id
@@ -530,6 +644,73 @@ def test_routes_require_writer_and_reject_body_identity_fields(
     assert store.list_personas("org-a", "workspace-a", "actor-a") == []
 
 
+def test_persona_binding_route_scopes_conversation_and_enforces_cas(
+    domain_api: tuple[TestClient, ConversationDomainStore, list[tuple[object, ...]]],
+) -> None:
+    client, store, _ = domain_api
+    base = "/api/v1/workspaces/workspace-a/work"
+    persona = {
+        "id": "persona-bound",
+        "name": "Bound",
+        "prompt": "Use the scoped persona.",
+        "enabled": True,
+        "conversationIds": ["conversation-1"],
+    }
+    assert client.put(base + "/personas", json=persona, headers=_write_headers()).status_code == 200
+    read_url = base + "/personas/binding?conversationId=conversation-1&conversationKind=direct"
+    assert client.get(read_url).json() == {"binding": None, "availablePersonaIds": ["persona-bound"]}
+
+    put_url = base + "/personas/binding"
+    body = {
+        "conversationId": "conversation-1",
+        "conversationKind": "direct",
+        "personaId": "persona-bound",
+        "expectedVersion": 0,
+    }
+    created = client.put(put_url, json=body, headers=_write_headers())
+    assert created.status_code == 200
+    assert created.json()["binding"]["version"] == 1
+    assert created.json()["duplicate"] is False
+    read = client.get(read_url).json()
+    assert read["binding"]["personaId"] == "persona-bound"
+    assert read["availablePersonaIds"] == ["persona-bound"]
+    assert client.get(read_url, headers={"X-Actor": "actor-b"}).json() == {
+        "binding": None,
+        "availablePersonaIds": [],
+    }
+
+    denied_scope = client.put(
+        put_url,
+        json={**body, "conversationId": "conversation-2", "expectedVersion": 0},
+        headers=_write_headers(),
+    )
+    assert denied_scope.status_code == 409
+    stale = client.put(
+        put_url,
+        json={**body, "personaId": None, "expectedVersion": 0},
+        headers=_write_headers(),
+    )
+    assert stale.status_code == 409
+    cleared = client.put(
+        put_url,
+        json={**body, "personaId": None, "expectedVersion": 1},
+        headers=_write_headers(),
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()["binding"]["personaId"] is None
+    assert cleared.json()["binding"]["version"] == 2
+    assert cleared.json()["duplicate"] is False
+    body_actor = client.put(
+        put_url,
+        json={**body, "expectedVersion": 2, "actorId": "actor-b"},
+        headers=_write_headers(),
+    )
+    assert body_actor.status_code == 422
+    assert store.get_persona_binding(
+        "org-a", "workspace-a", "actor-a", "conversation-1", "direct"
+    )["version"] == 2
+
+
 def test_source_context_is_checked_before_profile_write(
     domain_api: tuple[TestClient, ConversationDomainStore, list[tuple[object, ...]]],
 ) -> None:
@@ -739,6 +920,126 @@ def test_watch_schedule_revalidates_source_and_uses_owner_cas(
     assert after_cancel.status_code == 409
 
 
+def test_watch_observation_requires_trusted_completed_operation_and_worker_cas(
+    domain_api: tuple[TestClient, ConversationDomainStore, list[tuple[object, ...]]],
+) -> None:
+    client, store, _source_checks = domain_api
+    base = "/api/v1/workspaces/workspace-a/work"
+    condition = "Notify when the build completes."
+    source_refs = [
+        {"memoryId": None, "memoryVersion": None, "sourceMessageIds": ["watch-read-source"]}
+    ]
+    created = client.post(
+        base + "/watches",
+        json={
+            "idempotencyKey": "observe-watch",
+            "conversationId": "conversation-1",
+            "conversationKind": "direct",
+            "title": "Build status",
+            "condition": condition,
+            "sourceRefs": source_refs,
+        },
+        headers=_write_headers(),
+    )
+    assert created.status_code == 201
+    watch = created.json()["watch"]
+    watch_id = watch["id"]
+    task_id = conversation_watch_task_id(watch_id, 1)
+    receipt_id = "watch-read-operation-a"
+    result_sha = hashlib.sha256(b"build completed").hexdigest()
+    source_refs_digest = hashlib.sha256(
+        json.dumps(source_refs, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
+    ).hexdigest()
+    condition_sha = hashlib.sha256(condition.encode()).hexdigest()
+    operation_request = {
+        "source": "conversation-watch",
+        "taskId": task_id,
+        "workspaceId": "workspace-a",
+        "actorId": "actor-a",
+        "conversationId": "conversation-1",
+        "conversationKind": "direct",
+        "personaId": None,
+        "idempotencyKey": "observe-watch",
+        "parentTaskId": "parent-task-actor-a",
+        "parentSessionId": "parent-session-actor-a",
+        "watchId": watch_id,
+        "watchVersion": 1,
+        "sourceRefsDigest": source_refs_digest,
+        "conditionSha256": condition_sha,
+    }
+    task_output = "research read completed"
+    task_metadata = {
+        "source": "conversation-watch",
+        "workspaceId": "workspace-a",
+        "actorId": "actor-a",
+        "watchId": watch_id,
+        "watchVersion": 1,
+        "idempotencyKey": "observe-watch",
+        "parentTaskId": "parent-task-actor-a",
+        "parentSessionId": "parent-session-actor-a",
+        "conversationId": "conversation-1",
+        "conversationKind": "direct",
+        "personaId": None,
+        "sourceRefsDigest": source_refs_digest,
+        "conditionSha256": condition_sha,
+        "sourceRefs": source_refs,
+    }
+    work_store = client.app.state.work_store
+    work_store.tasks[("org-a", "workspace-a", task_id)] = {
+        "id": task_id,
+        "workspaceId": "workspace-a",
+        "createdByActorId": "actor-a",
+        "sessionId": "parent-session-actor-a",
+        "status": "completed",
+        "metadata": task_metadata,
+        "output": task_output,
+    }
+    work_store.operations[("org-a", "workspace-a", receipt_id)] = {
+        "id": receipt_id,
+        "operationType": "conversation.research.read.v1",
+        "taskId": task_id,
+        "status": "verified",
+        "trustedProducer": "conversation-research-runtime",
+        "taskOutputSha256": hashlib.sha256(task_output.encode()).hexdigest(),
+        "request": operation_request,
+        "evidence": {
+            "outcome": "verified",
+            "effect": "read",
+            "resultSha256": result_sha,
+            "sourceRefs": source_refs,
+        },
+    }
+    observe_url = f"{base}/watches/{watch_id}/observe"
+    observation_body = {
+        "expectedVersion": 1,
+        "taskId": task_id,
+        "operationReceiptId": receipt_id,
+        "resultSha256": result_sha,
+        "nextCheckAt": 1_800_000_100_000,
+    }
+    normal_owner = client.post(observe_url, json=observation_body, headers=_write_headers())
+    assert normal_owner.status_code == 403
+    observed = client.post(observe_url, json=observation_body, headers=_worker_headers())
+    assert observed.status_code == 200, observed.text
+    assert observed.json()["watch"]["version"] == 2
+    assert observed.json()["watch"]["lastResultSha256"] == result_sha
+    replay = client.post(observe_url, json=observation_body, headers=_worker_headers())
+    assert replay.status_code == 200
+    assert replay.json()["watch"]["version"] == 2
+    with pytest.raises(PersistenceError):
+        store.record_watch_observation(
+            "org-a",
+            "workspace-a",
+            "actor-b",
+            watch_id,
+            1,
+            task_id,
+            receipt_id,
+            result_sha,
+            1_800_000_100_000,
+        )
+
+
 def test_skill_verification_requires_independent_work_operation_receipts(
     domain_api: tuple[TestClient, ConversationDomainStore, list[tuple[object, ...]]],
 ) -> None:
@@ -757,34 +1058,137 @@ def test_skill_verification_requires_independent_work_operation_receipts(
                 "sourceMessageIds": ["source-skill"],
             }
         ],
+        "actionId": "public-web.lookup",
+        "targetDigestSha256": "a" * 64,
+        "inputSha256": "b" * 64,
+        "guideVersion": "1",
+        "guideSha256": "c" * 64,
     }
     missing = client.post(base, json=body, headers=_write_headers())
     assert missing.status_code == 422
 
-    verify_id, read_id = _seed_skill_receipts(client, content=body["content"], valid_readback=False)
+    verify_id, read_id = _seed_skill_receipts(client, body=body, valid_readback=False)
     submitted = {
         **body,
         "operationReceiptId": verify_id,
         "independentReadReceiptId": read_id,
     }
-    denied = client.post(base, json=submitted, headers=_write_headers())
+    denied = client.post(base, json=submitted, headers=_worker_headers())
     assert denied.status_code == 409
     assert denied.json()["code"] == "WORK_OPERATION_VERIFICATION_REQUIRED"
 
-    _seed_skill_receipts(client, content=body["content"])
+    _seed_skill_receipts(client, body=body)
     created = client.post(
         base,
         json={**submitted, "verifiedBy": "actor-spoof"},
-        headers=_write_headers(),
+        headers=_worker_headers(),
     )
     assert created.status_code == 422
-    created = client.post(base, json=submitted, headers=_write_headers())
+    created = client.post(base, json=submitted, headers=_worker_headers())
     assert created.status_code == 201
     skill = created.json()["skill"]
     assert skill["verified"] is True
     assert skill["verifiedBy"] == "actor-a"
     assert skill["operationReceiptId"] == verify_id
     assert skill["independentReadReceiptId"] == read_id
+    assert skill["evidence"]["sourceSha256"] == "e" * 64
+    listed = client.get(base)
+    assert listed.status_code == 200
+    assert listed.json()["items"][0]["evidence"] == skill["evidence"]
+
+
+def test_research_note_source_evidence_requires_trusted_operation_and_is_projected_exactly(
+    domain_api: tuple[TestClient, ConversationDomainStore, list[tuple[object, ...]]],
+) -> None:
+    client, store, _source_checks = domain_api
+    base = "/api/v1/workspaces/workspace-a/work/research/notes"
+    source_refs = [
+        {"memoryId": "memory-research", "memoryVersion": 2, "sourceMessageIds": ["source-research"]}
+    ]
+    source_evidence = [
+        {
+            "sourceRef": "sha256:" + "a" * 64,
+            "kind": "web",
+            "title": "Research source",
+            "url": "https://example.com/research",
+            "artifactId": None,
+            "sourceSha256": "b" * 64,
+            "retrievedAt": 1_800_000_000_000,
+        }
+    ]
+    body = {
+        "idempotencyKey": "research-note-with-evidence",
+        "conversationId": "conversation-1",
+        "conversationKind": "direct",
+        "title": "A source-backed note",
+        "content": "The source supports this summary.",
+        "sourceRefs": source_refs,
+        "sourceEvidence": source_evidence,
+        "researchOperationReceiptId": "research-read-receipt",
+    }
+    no_marker = client.app.state.work_store
+    no_marker.tasks[("org-a", "workspace-a", "research-read-task")] = {
+        "id": "research-read-task",
+        "workspaceId": "workspace-a",
+        "createdByActorId": "actor-a",
+        "sessionId": "research-parent-session",
+        "status": "completed",
+        "metadata": {
+            "source": "conversation-research-read",
+            "workspaceId": "workspace-a",
+            "actorId": "actor-a",
+            "conversationId": "conversation-1",
+            "conversationKind": "direct",
+            "personaId": None,
+            "idempotencyKey": "research-read-key",
+            "parentTaskId": "research-parent-task",
+            "parentSessionId": "research-parent-session",
+            "sourceRefs": source_refs,
+        },
+        "output": "trusted web read result",
+    }
+    request_payload = {
+        "source": "conversation-research-read",
+        "workspaceId": "workspace-a",
+        "actorId": "actor-a",
+        "conversationId": "conversation-1",
+        "conversationKind": "direct",
+        "personaId": None,
+        "idempotencyKey": "research-read-key",
+        "parentTaskId": "research-parent-task",
+        "parentSessionId": "research-parent-session",
+        "sourceRefs": source_refs,
+    }
+    output = "trusted web read result"
+    no_marker.operations[("org-a", "workspace-a", "research-read-receipt")] = {
+        "id": "research-read-receipt",
+        "operationType": "conversation.research.read.v1",
+        "taskId": "research-read-task",
+        "status": "verified",
+        "taskOutputSha256": hashlib.sha256(output.encode()).hexdigest(),
+        "request": request_payload,
+        "evidence": {
+            "resultSha256": "c" * 64,
+            "sourceRefs": source_refs,
+            "sourceEvidence": source_evidence,
+        },
+    }
+    unavailable = client.post(base, json=body, headers=_write_headers())
+    assert unavailable.status_code == 503
+    assert unavailable.json()["code"] == "WORK_OPERATION_PROVENANCE_UNAVAILABLE"
+    assert store.list_research_notes("org-a", "workspace-a", "actor-a") == []
+
+    no_marker.operations[("org-a", "workspace-a", "research-read-receipt")][
+        "trustedProducer"
+    ] = "conversation-research-runtime"
+    created = client.post(base, json=body, headers=_write_headers())
+    assert created.status_code == 201, created.text
+    note = created.json()["note"]
+    assert note["researchOperationReceiptId"] == "research-read-receipt"
+    assert note["sourceEvidence"] == source_evidence
+    assert store.list_research_notes("org-a", "workspace-a", "actor-a")[0][
+        "sourceEvidence"
+    ] == source_evidence
 
 
 def test_graph_query_is_unavailable_and_never_returns_fixture_hits(
@@ -863,16 +1267,75 @@ def test_graph_provider_readback_is_persisted_and_query_results_reauthorize_sour
 
 def test_daily_review_event_allows_empty_lineage_only_with_exact_report_scope(
     domain_api: tuple[TestClient, ConversationDomainStore, list[tuple[object, ...]]],
+    tmp_path: Path,
 ) -> None:
-    """A no-message review stores only its verified report pointer and exact chat scope."""
+    """A no-message review needs its running private Task and an exact attachment readback."""
 
     client, _, _ = domain_api
     base = "/api/v1/workspaces/workspace-a/work/review-events"
+    job_response = client.post(
+        "/api/v1/workspaces/workspace-a/work/maintenance/jobs",
+        json={
+            "idempotencyKey": "daily-review-job-empty-window",
+            "kind": "daily_review",
+            "conversationId": "conversation-1",
+            "conversationKind": "direct",
+            "personaId": "conversation-assistant",
+        },
+        headers=_write_headers(),
+    )
+    assert job_response.status_code == 201, job_response.text
+    job = job_response.json()["job"]
+    task_id = _seed_maintenance_task(client, job, status="running")
+    running = client.patch(
+        f"/api/v1/workspaces/workspace-a/work/maintenance/jobs/{job['id']}/checkpoint",
+        json={
+            "expectedVersion": 1,
+            "checkpoint": {
+                "cursor": None,
+                "processedCount": 0,
+                "checkpointDigest": "b" * 64,
+                "details": {"state": "running"},
+            },
+        },
+        headers=_worker_headers(),
+    )
+    assert running.status_code == 200, running.text
+
+    manifest = {
+        "schema": "cyrene.conversation-daily-review.v1",
+        "scope": {
+            "conversationId": "conversation-1",
+            "conversationKind": "direct",
+            "personaId": "conversation-assistant",
+        },
+        "sourceRefs": [],
+    }
+    report_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    report_digest = hashlib.sha256(report_bytes).hexdigest()
+    report_path = tmp_path / "daily-review-report.json"
+    report_path.write_bytes(report_bytes)
+    client.app.state.work_store.attachments[("org-a", "workspace-a", "actor-a", report_digest)] = (
+        {
+            "id": report_digest,
+            "sha256": report_digest,
+            "size": len(report_bytes),
+            "mediaType": "application/json",
+        },
+        report_path,
+    )
     body = {
         "idempotencyKey": "daily-review-empty-window",
+        "taskId": task_id,
         "eventType": "daily_review",
         "summary": json.dumps(
-            {"report": {"artifactId": "review-artifact-1", "sha256": "a" * 64, "sizeBytes": 128}},
+            {
+                "report": {
+                    "artifactId": report_digest,
+                    "sha256": report_digest,
+                    "sizeBytes": len(report_bytes),
+                }
+            },
             separators=(",", ":"),
         ),
         "sourceRefs": [],
@@ -880,7 +1343,10 @@ def test_daily_review_event_allows_empty_lineage_only_with_exact_report_scope(
         "conversationKind": "direct",
         "personaId": "conversation-assistant",
     }
-    created = client.post(base, json=body, headers=_write_headers())
+    forbidden = client.post(base, json=body, headers=_write_headers())
+    assert forbidden.status_code == 403
+
+    created = client.post(base, json=body, headers=_worker_headers())
     assert created.status_code == 201, created.text
     event = created.json()["event"]
     assert event["eventType"] == "daily_review"
@@ -888,21 +1354,21 @@ def test_daily_review_event_allows_empty_lineage_only_with_exact_report_scope(
     assert event["conversationId"] == "conversation-1"
     assert event["personaId"] == "conversation-assistant"
 
-    duplicate = client.post(base, json=body, headers=_write_headers())
+    duplicate = client.post(base, json=body, headers=_worker_headers())
     assert duplicate.status_code == 200, duplicate.text
     assert duplicate.json()["event"]["id"] == event["id"]
 
     no_report = client.post(
         base,
         json={**body, "idempotencyKey": "daily-review-missing-report", "summary": "No report."},
-        headers=_write_headers(),
+        headers=_worker_headers(),
     )
     assert no_report.status_code == 422
 
     ordinary_empty = client.post(
         base,
         json={**body, "idempotencyKey": "reviewed-empty", "eventType": "reviewed"},
-        headers=_write_headers(),
+        headers=_worker_headers(),
     )
     assert ordinary_empty.status_code == 422
 

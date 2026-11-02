@@ -2209,7 +2209,7 @@ def _normalize_source_refs(value: object) -> list[JsonObject]:
 
 
 def _normalize_attachments(value: object) -> list[JsonObject]:
-    """Validate bounded opaque image references without accepting paths or URLs."""
+    """Validate bounded opaque image/document references without paths or URLs."""
 
     if not isinstance(value, list) or len(value) > 32:
         raise _invalid(
@@ -2217,7 +2217,20 @@ def _normalize_attachments(value: object) -> list[JsonObject]:
         )
     normalized: list[JsonObject] = []
     seen: set[str] = set()
-    allowed_mime = {"image/gif", "image/jpeg", "image/png", "image/webp"}
+    allowed_mime = {
+        "image/gif",
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+        "application/pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "text/csv",
+        "text/html",
+        "text/markdown",
+        "text/plain",
+    }
     for item in value:
         if not isinstance(item, Mapping) or set(item) != {
             "artifactId",

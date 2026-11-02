@@ -18,7 +18,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 from cyrene_navigator.persistence.errors import PersistenceError
@@ -47,6 +47,13 @@ _CREDENTIAL_HEALTH_CONNECTOR_ID = _TEAMS_CONNECTOR_ID
 _CREDENTIAL_HEALTH_RECIPIENT = "teams:credential-health"
 _CREDENTIAL_HEALTH_REMINDER_COOLDOWN_MS = 24 * 60 * 60 * 1_000
 _PRIVATE_INSTALL_EVENT_RETENTION_MS = 90 * 24 * 60 * 60 * 1_000
+_TRUSTED_OPERATION_PRODUCERS = frozenset(
+    {
+        "exchange-connector-dispatch",
+        "conversation-research-runtime",
+        "notification-outbox",
+    }
+)
 _PRIVATE_INSTALL_EVENT_MAX_PER_WORKSPACE = 10_000
 _CREDENTIAL_CAPABILITY_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 _TERMINAL_TASK_STATES = frozenset({"completed", "failed", "aborted"})
@@ -1610,8 +1617,13 @@ class WorkStore:
         *,
         actor_id: str | None = None,
         actor_private_scope: bool = False,
+        trusted_producer: str | None = None,
     ) -> tuple[JsonObject, bool]:
-        """Record intent before an external effect and never replay it here. | 只记录操作意图。"""
+        """Record an operation intent or a fixed internal producer receipt.
+
+        Generic Work requests cannot set trustedProducer. Internal effect and
+        readback routes bind it to an actor-private Work Task. 操作意图或可信回执。
+        """
 
         org, workspace = _scope(organization_id, workspace_id)
         key = _identifier(body.get("idempotencyKey"), "idempotencyKey")
@@ -1620,6 +1632,25 @@ class WorkStore:
         target = _optional_text(body.get("target"), "target", 2_000)
         scope_lock = _optional_text(body.get("scopeLock"), "scopeLock", 100)
         actor = _identifier(actor_id, "actorId").lower() if actor_id is not None else None
+        producer = _trusted_operation_producer(trusted_producer)
+        if producer is not None and (not actor_private_scope or task_id is None):
+            raise PersistenceError(
+                "WORK_OPERATION_TRUSTED_PRODUCER_REQUIRED",
+                403,
+                "Trusted operation receipts require an actor-private Work Task context.",
+            )
+        if producer in {"conversation-research-runtime", "notification-outbox"}:
+            raise PersistenceError(
+                "WORK_OPERATION_TRUSTED_FINALIZER_REQUIRED",
+                403,
+                "Completed research and notification receipts require their fixed finalizer.",
+            )
+        if producer is not None and not _trusted_operation_type_allowed(producer, operation_type):
+            raise PersistenceError(
+                "WORK_OPERATION_TRUSTED_PRODUCER_MISMATCH",
+                403,
+                "The trusted producer cannot create this operation type.",
+            )
         request = _json_object(body.get("request", {}), "request")
         digest_value = {
             "operationType": operation_type,
@@ -1647,11 +1678,13 @@ class WorkStore:
                     "scopeLock is reserved for a host-bound GitHub branch operation.",
                 )
             digest_value["scopeLock"] = scope_lock
+        if producer is not None:
+            digest_value["trustedProducer"] = producer
         digest = _digest(digest_value)
         now = _unix_ms()
         with self._mutation() as conn:
             if task_id is not None:
-                self._require_running_task(conn, org, workspace, task_id)
+                task_row = self._require_task(conn, org, workspace, task_id)
                 self._require_teams_task_actor(
                     conn,
                     org,
@@ -1660,6 +1693,18 @@ class WorkStore:
                     actor,
                     actor_private_scope=actor_private_scope,
                 )
+                task_status = str(task_row["status"])
+                if producer in {"conversation-research-runtime", "notification-outbox"}:
+                    if task_status != "completed":
+                        raise _conflict(
+                            "WORK_OPERATION_TRUSTED_TASK_NOT_COMPLETED",
+                            "Research and notification readback receipts require a completed Task.",
+                        )
+                elif task_status != "running":
+                    raise _conflict(
+                        "WORK_OPERATION_TASK_NOT_RUNNING",
+                        "External effect intents must be recorded before the Work Task completes.",
+                    )
             prior = conn.execute(
                 """SELECT * FROM work_operations WHERE organization_id=? AND workspace_id=?
                    AND idempotency_key=?""",
@@ -1671,7 +1716,7 @@ class WorkStore:
                         "WORK_OPERATION_KEY_CONFLICT",
                         "idempotencyKey names another operation.",
                     )
-                return self._operation_view(prior), True
+                return self._operation_view_with_task_output(conn, prior), True
             if (
                 operation_type.startswith("tool.provider.v1:")
                 and target is not None
@@ -1702,8 +1747,9 @@ class WorkStore:
             conn.execute(
                 """INSERT INTO work_operations(
                    organization_id,workspace_id,operation_id,idempotency_key,operation_type,
-                   task_id,target,scope_lock,request_json,status,evidence_json,request_digest,created_at,updated_at
-                   ) VALUES(?,?,?,?,?,?,?,?,?,'started','{}',?,?,?)""",
+                   task_id,target,scope_lock,trusted_producer,request_json,status,evidence_json,
+                   request_digest,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,'started','{}',?,?,?)""",
                 (
                     org,
                     workspace,
@@ -1713,6 +1759,7 @@ class WorkStore:
                     task_id,
                     target,
                     scope_lock,
+                    producer,
                     _json_text(request),
                     digest,
                     now,
@@ -1729,6 +1776,921 @@ class WorkStore:
                 ).fetchone()
             ), False
 
+    def create_completed_operation(
+        self,
+        organization_id: str | None,
+        workspace_id: str,
+        body: Mapping[str, Any],
+        *,
+        actor_id: str | None = None,
+        actor_private_scope: bool = False,
+        trusted_producer: str,
+    ) -> tuple[JsonObject, bool]:
+        """Atomically record one verified research read from a completed child Task.
+
+        The producer route must already have performed the provider action,
+        source reauthorization, and independent artifact readback. This method
+        binds that result to the exact actor-private Task and derives its output
+        digest from the canonical Work row rather than trusting request JSON.
+        """
+
+        org, workspace = _scope(organization_id, workspace_id)
+        key = _identifier(body.get("idempotencyKey"), "idempotencyKey")
+        operation_type = _bounded_text(body.get("operationType"), "operationType", 128)
+        task_id = _identifier(body.get("taskId"), "taskId")
+        target = _bounded_text(body.get("target"), "target", 2_000)
+        if body.get("scopeLock") is not None:
+            raise _invalid(
+                "WORK_OPERATION_SCOPE_LOCK_INVALID",
+                "Completed research receipts cannot claim a connector scope lock.",
+            )
+        actor = _identifier(actor_id, "actorId").lower() if actor_id is not None else None
+        producer = _trusted_operation_producer(trusted_producer)
+        if (
+            producer != "conversation-research-runtime"
+            or operation_type
+            not in {
+                "conversation.research.read.v1",
+                "conversation.skill.verify",
+                "conversation.skill.readback",
+            }
+            or not actor_private_scope
+        ):
+            raise PersistenceError(
+                "WORK_OPERATION_TRUSTED_PRODUCER_REQUIRED",
+                403,
+                "Only the fixed research runtime finalizer can create these receipts.",
+            )
+        request = _json_object(body.get("request", {}), "request")
+        evidence = _json_object(body.get("evidence", {}), "evidence")
+        if operation_type == "conversation.research.read.v1":
+            expected_request_fields = {
+                "source",
+                "taskId",
+                "parentTaskId",
+                "parentSessionId",
+                "sourceRefsSha256",
+                "resultArtifactId",
+                "resultSha256",
+                "contentSha256",
+                "targetDigestSha256",
+            }
+            expected_evidence_fields = {
+                "outcome",
+                "effect",
+                "taskSource",
+                "resultSha256",
+                "contentSha256",
+                "targetDigestSha256",
+                "sourceRefs",
+                "sourceEvidence",
+                "artifactId",
+                "bindingId",
+                "readbackVerified",
+                "readbackSha256",
+            }
+            invalid_request_code = "WORK_OPERATION_RESEARCH_REQUEST_INVALID"
+            invalid_evidence_code = "WORK_OPERATION_RESEARCH_EVIDENCE_INVALID"
+        else:
+            expected_request_fields = {
+                "source",
+                "actionId",
+                "targetDigestSha256",
+                "inputSha256",
+                "guideVersion",
+                "guideSha256",
+                "taskId",
+                "parentTaskId",
+                "parentSessionId",
+                "sourceRefsSha256",
+                "actionEffectOperationId",
+            }
+            expected_evidence_fields = {
+                "outcome",
+                "effect",
+                "actionId",
+                "targetDigestSha256",
+                "inputSha256",
+                "guideVersion",
+                "guideSha256",
+                "actionEffectOperationId",
+                "sourceRef",
+                "canonicalUrl",
+                "sourceSha256",
+                "workArtifactSha256",
+            }
+            if operation_type == "conversation.skill.verify":
+                expected_request_fields.update({"effectResultSha256", "readbackOperationId"})
+                expected_evidence_fields.update(
+                    {"effectOutcome", "effectResultSha256", "readbackReceiptId"}
+                )
+            else:
+                expected_request_fields.update(
+                    {"readbackEffectOperationId", "effectReadbackSha256"}
+                )
+                expected_evidence_fields.update(
+                    {
+                        "readbackEffectOperationId",
+                        "effectReadbackOutcome",
+                        "effectReadbackSha256",
+                        "readbackVerified",
+                    }
+                )
+            invalid_request_code = "WORK_OPERATION_SKILL_REQUEST_INVALID"
+            invalid_evidence_code = "WORK_OPERATION_SKILL_EVIDENCE_INVALID"
+        if set(request) != expected_request_fields:
+            raise _invalid(
+                invalid_request_code, "Trusted operation request has an unsupported shape."
+            )
+        if frozenset(evidence) not in {
+            frozenset(expected_evidence_fields),
+            frozenset(expected_evidence_fields | {"taskOutputSha256"}),
+        }:
+            raise _invalid(
+                invalid_evidence_code,
+                "Trusted operation evidence has an unsupported shape.",
+            )
+        with self._mutation() as conn:
+            task = self._require_task(conn, org, workspace, task_id)
+            self._require_teams_task_actor(
+                conn,
+                org,
+                workspace,
+                task_id,
+                actor,
+                actor_private_scope=actor_private_scope,
+            )
+            if str(task["status"]) != "completed":
+                raise _conflict(
+                    "WORK_OPERATION_TRUSTED_TASK_NOT_COMPLETED",
+                    "A research receipt requires its exact completed Work Task.",
+                )
+            output = str(task["output"] or "")
+            task_output_sha256 = hashlib.sha256(output.encode("utf-8")).hexdigest()
+            metadata = _stored_object(task["metadata_json"], "Task metadata")
+            if operation_type == "conversation.research.read.v1":
+                self._validate_completed_research_operation(
+                    conn,
+                    org,
+                    workspace,
+                    task,
+                    metadata,
+                    task_id=task_id,
+                    actor_id=actor,
+                    request=request,
+                    evidence=evidence,
+                    target=target,
+                    idempotency_key=key,
+                    output=output,
+                    task_output_sha256=task_output_sha256,
+                )
+            else:
+                self._validate_completed_skill_operation(
+                    conn,
+                    org,
+                    workspace,
+                    task,
+                    metadata,
+                    task_id=task_id,
+                    actor_id=actor,
+                    operation_type=operation_type,
+                    request=request,
+                    evidence=evidence,
+                    target=target,
+                    output=output,
+                )
+            evidence_obj = dict(evidence)
+            supplied_task_digest = evidence_obj.pop("taskOutputSha256", None)
+            if supplied_task_digest is not None and supplied_task_digest != task_output_sha256:
+                raise _conflict(
+                    "WORK_OPERATION_TASK_OUTPUT_MISMATCH",
+                    "The supplied Task output digest does not match the stored completed Task.",
+                )
+            evidence_obj["taskOutputSha256"] = task_output_sha256
+            digest_value = {
+                "operationType": operation_type,
+                "taskId": task_id,
+                "target": target,
+                "request": request,
+                "trustedProducer": producer,
+            }
+            request_digest = _digest(digest_value)
+            prior = conn.execute(
+                """SELECT * FROM work_operations WHERE organization_id=? AND workspace_id=?
+                   AND idempotency_key=?""",
+                (org, workspace, key),
+            ).fetchone()
+            if prior is not None:
+                if (
+                    str(prior["request_digest"]) != request_digest
+                    or prior["trusted_producer"] != producer
+                    or prior["status"] != "verified"
+                    or _stored_object(prior["evidence_json"], "operation evidence") != evidence_obj
+                ):
+                    raise _conflict(
+                        "WORK_OPERATION_KEY_CONFLICT",
+                        "idempotencyKey names another completed operation receipt.",
+                    )
+                return self._operation_view_with_task_output(conn, prior), True
+            task_prior = conn.execute(
+                """SELECT * FROM work_operations WHERE organization_id=? AND workspace_id=?
+                   AND task_id=? AND operation_type=? AND trusted_producer=? LIMIT 1""",
+                (org, workspace, task_id, operation_type, producer),
+            ).fetchone()
+            if task_prior is not None:
+                raise _conflict(
+                    "WORK_OPERATION_TASK_RECEIPT_EXISTS",
+                    "A completed Task can have only one receipt of this fixed operation type.",
+                )
+            now = _unix_ms()
+            operation_id = uuid4().hex
+            conn.execute(
+                """INSERT INTO work_operations(
+                   organization_id,workspace_id,operation_id,idempotency_key,operation_type,
+                   task_id,target,scope_lock,trusted_producer,request_json,status,evidence_json,
+                   request_digest,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,NULL,?,?,'verified',?,?,?,?)""",
+                (
+                    org,
+                    workspace,
+                    operation_id,
+                    key,
+                    operation_type,
+                    task_id,
+                    target,
+                    producer,
+                    _json_text(request),
+                    _json_text(evidence_obj),
+                    request_digest,
+                    now,
+                    now,
+                ),
+            )
+            created = conn.execute(
+                """SELECT * FROM work_operations WHERE organization_id=? AND workspace_id=?
+                   AND operation_id=?""",
+                (org, workspace, operation_id),
+            ).fetchone()
+            return self._operation_view_with_task_output(conn, created), False
+
+    def _validate_completed_research_operation(
+        self,
+        conn: sqlite3.Connection,
+        org: str,
+        workspace: str,
+        task: sqlite3.Row,
+        metadata: Mapping[str, Any],
+        *,
+        task_id: str,
+        actor_id: str | None,
+        request: Mapping[str, Any],
+        evidence: Mapping[str, Any],
+        target: str,
+        idempotency_key: str,
+        output: str,
+        task_output_sha256: str,
+    ) -> None:
+        """Bind a research readback to its child Task, parent, and source lineage."""
+
+        source = metadata.get("source")
+        parent_task_id = metadata.get("parentTaskId")
+        parent_session_id = metadata.get("parentSessionId")
+        source_refs = metadata.get("sourceRefs")
+        expected_metadata_fields = (
+            {
+                "source",
+                "workspaceId",
+                "actorId",
+                "conversationId",
+                "conversationKind",
+                "personaId",
+                "idempotencyKey",
+                "parentTaskId",
+                "parentSessionId",
+                "sourceRefs",
+            }
+            if source == "conversation-research-read"
+            else {
+                "source",
+                "workspaceId",
+                "actorId",
+                "conversationId",
+                "conversationKind",
+                "personaId",
+                "watchId",
+                "watchVersion",
+                "idempotencyKey",
+                "parentTaskId",
+                "parentSessionId",
+                "sourceRefs",
+                "sourceRefsDigest",
+                "conditionSha256",
+            }
+            if source == "conversation-watch"
+            else {
+                "source",
+                "workspaceId",
+                "actorId",
+                "conversationId",
+                "conversationKind",
+                "personaId",
+                "parentTaskId",
+                "parentSessionId",
+                "sourceRefs",
+                "actionId",
+                "targetDigestSha256",
+                "target",
+                "actionInput",
+                "inputSha256",
+                "guideVersion",
+                "guideSha256",
+            }
+            if source == "conversation-skill-verify"
+            else {
+                "source",
+                "workspaceId",
+                "actorId",
+                "conversationId",
+                "conversationKind",
+                "personaId",
+                "parentTaskId",
+                "parentSessionId",
+                "sourceRefs",
+                "actionTaskId",
+                "actionId",
+                "targetDigestSha256",
+                "target",
+                "actionInput",
+                "inputSha256",
+                "guideVersion",
+                "guideSha256",
+                "sourceRef",
+                "canonicalUrl",
+                "sourceSha256",
+                "workArtifactSha256",
+            }
+        )
+        source_refs_digest = _digest(source_refs) if isinstance(source_refs, list) else ""
+        if (
+            set(metadata) != expected_metadata_fields
+            or source
+            not in {
+                "conversation-research-read",
+                "conversation-watch",
+                "conversation-skill-verify",
+                "conversation-skill-readback",
+            }
+            or metadata.get("conversationKind") not in {"direct", "group", "channel"}
+            or (
+                metadata.get("personaId") is not None
+                and not isinstance(metadata.get("personaId"), str)
+            )
+            or metadata.get("workspaceId") != workspace
+            or str(metadata.get("actorId") or "").lower() != actor_id
+            or metadata.get("parentTaskId") != request.get("parentTaskId")
+            or metadata.get("parentSessionId") != request.get("parentSessionId")
+            or metadata.get("parentSessionId") != task["session_id"]
+            or request.get("source") != "conversation-research-runtime"
+            or request.get("taskId") != task_id
+            or request.get("parentTaskId") != parent_task_id
+            or request.get("parentSessionId") != parent_session_id
+            or not isinstance(source_refs, list)
+            or not source_refs
+            or request.get("sourceRefsSha256") != source_refs_digest
+            or request.get("sourceRefsSha256")
+            != metadata.get("sourceRefsDigest", source_refs_digest)
+            or (
+                source == "conversation-watch"
+                and (
+                    not isinstance(metadata.get("watchId"), str)
+                    or type(metadata.get("watchVersion")) is not int
+                    or metadata.get("watchVersion", 0) < 1
+                    or metadata.get("sourceRefsDigest") != source_refs_digest
+                    or re.fullmatch(r"[0-9a-f]{64}", str(metadata.get("conditionSha256", "")))
+                    is None
+                )
+            )
+            or evidence.get("taskSource") != source
+            or evidence.get("sourceRefs") != source_refs
+            or evidence.get("outcome") != "verified"
+            or evidence.get("effect") != "read"
+            or evidence.get("readbackVerified") is not True
+        ):
+            raise PersistenceError(
+                "WORK_OPERATION_TASK_PROVENANCE_INVALID",
+                409,
+                "Research Task metadata, source lineage, or completed result does not match.",
+            )
+        parent_id = _identifier(parent_task_id, "metadata.parentTaskId")
+        parent = self._require_task(conn, org, workspace, parent_id)
+        self._require_teams_task_actor(
+            conn,
+            org,
+            workspace,
+            parent_id,
+            actor_id,
+            actor_private_scope=True,
+        )
+        if (
+            str(parent["created_by_actor_id"] or "").lower() != actor_id
+            or str(parent["session_id"]) != parent_session_id
+        ):
+            raise PersistenceError(
+                "WORK_OPERATION_PARENT_TASK_PROVENANCE_INVALID",
+                409,
+                "Research receipt parent Task is outside the exact actor-private session.",
+            )
+        try:
+            task_output = json.loads(output)
+        except (TypeError, ValueError) as exc:
+            raise PersistenceError(
+                "WORK_OPERATION_RESEARCH_OUTPUT_INVALID",
+                409,
+                "Completed research Task output is not a JSON result envelope.",
+            ) from exc
+        if not isinstance(task_output, Mapping):
+            raise _invalid(
+                "WORK_OPERATION_RESEARCH_OUTPUT_INVALID",
+                "Completed research Task output is not a result object.",
+            )
+        artifact_id = _validate_digest(str(evidence.get("artifactId", "")))
+        content_digest = _validate_digest(str(evidence.get("contentSha256", "")))
+        target_digest = _validate_digest(str(evidence.get("targetDigestSha256", "")))
+        expected_idempotency_key = (
+            "conversation-research:"
+            + hashlib.sha256(f"{task_id}\0{target_digest}".encode()).hexdigest()
+        )
+        source_evidence = evidence.get("sourceEvidence")
+        if source in {"conversation-research-read", "conversation-watch"}:
+            expected_output_fields = {
+                "version",
+                "artifactId",
+                "title",
+                "content",
+                "resultSha256",
+                "contentSha256",
+                "sourceEvidence",
+            }
+            output_matches = (
+                set(task_output) == expected_output_fields
+                and task_output.get("version") == 1
+                and task_output.get("artifactId") == artifact_id
+                and task_output.get("resultSha256") == artifact_id
+                and task_output.get("contentSha256") == content_digest
+                and isinstance(task_output.get("content"), str)
+                and hashlib.sha256(str(task_output["content"]).encode("utf-8")).hexdigest()
+                == content_digest
+                and task_output.get("sourceEvidence") == source_evidence
+            )
+        else:
+            phase = "verify" if source == "conversation-skill-verify" else "readback"
+            common_fields = {
+                "version",
+                "phase",
+                "actionId",
+                "targetDigestSha256",
+                "inputSha256",
+                "guideVersion",
+                "guideSha256",
+                "sourceRef",
+                "canonicalUrl",
+                "sourceSha256",
+                "workArtifactSha256",
+                "artifactId",
+                "contentSha256",
+            }
+            output_fields = common_fields | (
+                {"sourceEvidence", "title"} if phase == "verify" else set()
+            )
+            output_matches = (
+                set(task_output) == output_fields
+                and task_output.get("version") == 1
+                and task_output.get("phase") == phase
+                and task_output.get("actionId") == metadata.get("actionId") == "public-web.lookup"
+                and task_output.get("targetDigestSha256") == metadata.get("targetDigestSha256")
+                and task_output.get("inputSha256") == metadata.get("inputSha256")
+                and task_output.get("guideVersion") == metadata.get("guideVersion")
+                and task_output.get("guideSha256") == metadata.get("guideSha256")
+                and task_output.get("artifactId") == artifact_id
+                and task_output.get("workArtifactSha256") == artifact_id
+                and task_output.get("contentSha256") == content_digest
+                and task_output.get("sourceRef")
+                == metadata.get("sourceRef", task_output.get("sourceRef"))
+                and task_output.get("canonicalUrl")
+                == metadata.get("canonicalUrl", task_output.get("canonicalUrl"))
+                and task_output.get("sourceSha256")
+                == metadata.get("sourceSha256", task_output.get("sourceSha256"))
+                and task_output.get("sourceEvidence", source_evidence) == source_evidence
+            )
+            if not output_matches:
+                raise PersistenceError(
+                    "WORK_OPERATION_RESEARCH_READBACK_INVALID",
+                    409,
+                    "Skill evidence Task output does not match its closed operation receipt.",
+                )
+        if (
+            not output_matches
+            or request.get("resultArtifactId") != artifact_id
+            or request.get("resultSha256") != artifact_id
+            or evidence.get("resultSha256") != artifact_id
+            or evidence.get("readbackSha256") != artifact_id
+            or request.get("contentSha256") != content_digest
+            or request.get("targetDigestSha256") != target_digest
+            or request.get("resultSha256") != evidence.get("resultSha256")
+            or request.get("targetDigestSha256") != evidence.get("targetDigestSha256")
+            or target != f"conversation-research:{target_digest}"
+            or request.get("taskId") != task_id
+            or request.get("parentTaskId") != metadata.get("parentTaskId")
+            or request.get("parentSessionId") != metadata.get("parentSessionId")
+            or request.get("sourceRefsSha256") != source_refs_digest
+            or expected_idempotency_key != idempotency_key
+            or not isinstance(source_evidence, list)
+            or not source_evidence
+            or not all(isinstance(item, Mapping) for item in source_evidence)
+            or not isinstance(evidence.get("bindingId"), str)
+            or not evidence.get("bindingId")
+        ):
+            raise PersistenceError(
+                "WORK_OPERATION_RESEARCH_READBACK_INVALID",
+                409,
+                "Research artifact evidence does not match the stored completed Task output.",
+            )
+        _validate_digest(task_output_sha256)
+
+    def _validate_completed_skill_operation(
+        self,
+        conn: sqlite3.Connection,
+        org: str,
+        workspace: str,
+        task: sqlite3.Row,
+        metadata: Mapping[str, Any],
+        *,
+        task_id: str,
+        actor_id: str | None,
+        operation_type: str,
+        request: Mapping[str, Any],
+        evidence: Mapping[str, Any],
+        target: str,
+        output: str,
+    ) -> None:
+        """Verify one completed public-web skill action or independent readback."""
+
+        phase = "verify" if operation_type == "conversation.skill.verify" else "readback"
+        expected_source = (
+            "conversation-skill-verify" if phase == "verify" else "conversation-skill-readback"
+        )
+        expected_metadata_fields = {
+            "source",
+            "workspaceId",
+            "actorId",
+            "conversationId",
+            "conversationKind",
+            "personaId",
+            "parentTaskId",
+            "parentSessionId",
+            "sourceRefs",
+            "actionId",
+            "targetDigestSha256",
+            "target",
+            "actionInput",
+            "inputSha256",
+            "guideVersion",
+            "guideSha256",
+        }
+        if phase == "readback":
+            expected_metadata_fields.update(
+                {
+                    "actionTaskId",
+                    "sourceRef",
+                    "canonicalUrl",
+                    "sourceSha256",
+                    "workArtifactSha256",
+                }
+            )
+        source_refs = metadata.get("sourceRefs")
+        target_value = metadata.get("target")
+        action_input = metadata.get("actionInput")
+        guide_version = metadata.get("guideVersion")
+        target_digest = _validate_digest(str(metadata.get("targetDigestSha256", "")))
+        input_digest = _validate_digest(str(metadata.get("inputSha256", "")))
+        guide_digest = _validate_digest(str(metadata.get("guideSha256", "")))
+        if (
+            set(metadata) != expected_metadata_fields
+            or metadata.get("source") != expected_source
+            or metadata.get("workspaceId") != workspace
+            or str(metadata.get("actorId") or "").lower() != actor_id
+            or metadata.get("conversationKind") not in {"direct", "group", "channel"}
+            or not isinstance(metadata.get("conversationId"), str)
+            or metadata.get("actionId") != "public-web.lookup"
+            or not isinstance(target_value, Mapping)
+            or _digest(target_value) != target_digest
+            or not isinstance(action_input, Mapping)
+            or _digest(action_input) != input_digest
+            or type(guide_version) is not int
+            or guide_version < 1
+            or metadata.get("parentTaskId") != request.get("parentTaskId")
+            or metadata.get("parentSessionId") != request.get("parentSessionId")
+            or metadata.get("parentSessionId") != task["session_id"]
+            or not isinstance(source_refs, list)
+            or not source_refs
+            or request.get("source") != "conversation-skill-probe"
+            or request.get("actionId") != "public-web.lookup"
+            or request.get("taskId") != task_id
+            or request.get("parentTaskId") != metadata.get("parentTaskId")
+            or request.get("parentSessionId") != metadata.get("parentSessionId")
+            or request.get("sourceRefsSha256") != _digest(source_refs)
+            or request.get("targetDigestSha256") != target_digest
+            or request.get("inputSha256") != input_digest
+            or request.get("guideVersion") != str(guide_version)
+            or request.get("guideSha256") != guide_digest
+            or evidence.get("actionId") != "public-web.lookup"
+            or evidence.get("targetDigestSha256") != target_digest
+            or evidence.get("inputSha256") != input_digest
+            or evidence.get("guideVersion") != str(guide_version)
+            or evidence.get("guideSha256") != guide_digest
+            or evidence.get("actionEffectOperationId") != request.get("actionEffectOperationId")
+            or evidence.get("outcome") != "verified"
+            or evidence.get("effect") != "read"
+            or evidence.get("sourceRef")
+            != (metadata.get("sourceRef") if phase == "readback" else evidence.get("sourceRef"))
+            or evidence.get("canonicalUrl")
+            != (
+                metadata.get("canonicalUrl")
+                if phase == "readback"
+                else evidence.get("canonicalUrl")
+            )
+            or evidence.get("sourceSha256")
+            != (
+                metadata.get("sourceSha256")
+                if phase == "readback"
+                else evidence.get("sourceSha256")
+            )
+            or evidence.get("workArtifactSha256")
+            != (
+                metadata.get("workArtifactSha256")
+                if phase == "readback"
+                else evidence.get("workArtifactSha256")
+            )
+        ):
+            raise PersistenceError(
+                "WORK_OPERATION_SKILL_TASK_PROVENANCE_INVALID",
+                409,
+                "Skill receipt does not match its exact completed action Task metadata.",
+            )
+        parent_task_id = _identifier(metadata.get("parentTaskId"), "metadata.parentTaskId")
+        parent = self._require_task(conn, org, workspace, parent_task_id)
+        self._require_teams_task_actor(
+            conn,
+            org,
+            workspace,
+            parent_task_id,
+            actor_id,
+            actor_private_scope=True,
+        )
+        if str(parent["created_by_actor_id"] or "").lower() != actor_id or str(
+            parent["session_id"]
+        ) != metadata.get("parentSessionId"):
+            raise PersistenceError(
+                "WORK_OPERATION_PARENT_TASK_PROVENANCE_INVALID",
+                409,
+                "Skill receipt parent Task is outside its actor-private session.",
+            )
+        if phase == "readback":
+            if metadata.get("actionTaskId") != parent_task_id:
+                raise _conflict(
+                    "WORK_OPERATION_SKILL_TASK_PROVENANCE_INVALID",
+                    "Independent readback must be parented by the completed action Task.",
+                )
+            action_metadata = _stored_object(parent["metadata_json"], "action Task metadata")
+            if (
+                parent["status"] != "completed"
+                or action_metadata.get("source") != "conversation-skill-verify"
+                or action_metadata.get("targetDigestSha256") != target_digest
+                or action_metadata.get("inputSha256") != input_digest
+                or action_metadata.get("guideVersion") != guide_version
+                or action_metadata.get("guideSha256") != guide_digest
+                or action_metadata.get("sourceRefs") != source_refs
+                or action_metadata.get("conversationId") != metadata.get("conversationId")
+                or action_metadata.get("conversationKind") != metadata.get("conversationKind")
+                or action_metadata.get("personaId") != metadata.get("personaId")
+            ):
+                raise _conflict(
+                    "WORK_OPERATION_SKILL_TASK_PROVENANCE_INVALID",
+                    "Independent readback Task does not match its completed action Task.",
+                )
+        try:
+            task_output = json.loads(output)
+        except (TypeError, ValueError) as exc:
+            raise PersistenceError(
+                "WORK_OPERATION_SKILL_OUTPUT_INVALID",
+                409,
+                "Completed skill Task output is not a JSON result envelope.",
+            ) from exc
+        if not isinstance(task_output, Mapping):
+            raise _invalid(
+                "WORK_OPERATION_SKILL_OUTPUT_INVALID",
+                "Completed skill Task output is not a result object.",
+            )
+        expected_output_fields = {
+            "version",
+            "phase",
+            "actionId",
+            "targetDigestSha256",
+            "inputSha256",
+            "guideVersion",
+            "guideSha256",
+            "sourceRef",
+            "canonicalUrl",
+            "sourceSha256",
+            "workArtifactSha256",
+            "artifactId",
+            "contentSha256",
+        }
+        if phase == "verify":
+            expected_output_fields.update({"sourceEvidence", "title"})
+        source_ref = _bounded_text(evidence.get("sourceRef"), "sourceRef", 128)
+        source_sha256 = _validate_digest(str(evidence.get("sourceSha256", "")))
+        canonical_url = _bounded_text(evidence.get("canonicalUrl"), "canonicalUrl", 4_096)
+        artifact_sha256 = _validate_digest(str(evidence.get("workArtifactSha256", "")))
+        try:
+            from urllib.parse import urlsplit
+
+            parsed_url = urlsplit(canonical_url)
+        except ValueError:
+            parsed_url = None
+        if (
+            set(task_output) != expected_output_fields
+            or task_output.get("version") != 1
+            or task_output.get("phase") != phase
+            or task_output.get("actionId") != "public-web.lookup"
+            or task_output.get("targetDigestSha256") != target_digest
+            or task_output.get("inputSha256") != input_digest
+            or task_output.get("guideVersion") != guide_version
+            or task_output.get("guideSha256") != guide_digest
+            or task_output.get("sourceRef") != source_ref
+            or task_output.get("canonicalUrl") != canonical_url
+            or task_output.get("sourceSha256") != source_sha256
+            or task_output.get("workArtifactSha256") != artifact_sha256
+            or task_output.get("artifactId") != artifact_sha256
+            or evidence.get("sourceRef") != metadata.get("sourceRef", evidence.get("sourceRef"))
+            or evidence.get("canonicalUrl")
+            != metadata.get("canonicalUrl", evidence.get("canonicalUrl"))
+            or evidence.get("sourceSha256")
+            != metadata.get("sourceSha256", evidence.get("sourceSha256"))
+            or evidence.get("workArtifactSha256")
+            != metadata.get("workArtifactSha256", evidence.get("workArtifactSha256"))
+            or parsed_url is None
+            or parsed_url.scheme != "https"
+            or not parsed_url.hostname
+            or parsed_url.username is not None
+            or parsed_url.password is not None
+            or (
+                evidence.get("actionEffectOperationId") == evidence.get("readbackEffectOperationId")
+                and evidence.get("readbackEffectOperationId") is not None
+            )
+        ):
+            raise PersistenceError(
+                "WORK_OPERATION_SKILL_OUTPUT_INVALID",
+                409,
+                "Skill result evidence does not match the exact action and readback Task outputs.",
+            )
+        if phase == "verify":
+            action_operation = self._require_skill_effect_operation(
+                conn,
+                org,
+                workspace,
+                str(request.get("actionEffectOperationId", "")),
+                task_id=task_id,
+                canonical_url=canonical_url,
+            )
+            action_evidence = _stored_object(action_operation["evidence_json"], "effect evidence")
+            result_digest = _validate_digest(str(action_evidence.get("resultSha256", "")))
+            readback_operation_id = _identifier(
+                request.get("readbackOperationId"), "readbackOperationId"
+            )
+            readback_operation = conn.execute(
+                """SELECT * FROM work_operations WHERE organization_id=? AND workspace_id=?
+                   AND operation_id=?""",
+                (org, workspace, readback_operation_id),
+            ).fetchone()
+            if (
+                readback_operation is None
+                or readback_operation["trusted_producer"] != "conversation-research-runtime"
+                or readback_operation["operation_type"] != "conversation.skill.readback"
+                or readback_operation["status"] != "verified"
+                or readback_operation["task_id"] == task_id
+                or readback_operation["target"] != target
+            ):
+                raise PersistenceError(
+                    "WORK_OPERATION_SKILL_READBACK_REQUIRED",
+                    409,
+                    "A distinct verified independent skill readback receipt is required.",
+                )
+            readback_request = _stored_object(
+                readback_operation["request_json"], "skill readback request"
+            )
+            readback_evidence = _stored_object(
+                readback_operation["evidence_json"], "skill readback evidence"
+            )
+            if (
+                request.get("readbackOperationId") != readback_operation["operation_id"]
+                or evidence.get("readbackReceiptId") != readback_operation["operation_id"]
+                or evidence.get("effectResultSha256") != result_digest
+                or readback_request.get("source") != "conversation-skill-probe"
+                or readback_request.get("actionId") != request.get("actionId")
+                or readback_request.get("targetDigestSha256") != target_digest
+                or readback_request.get("inputSha256") != input_digest
+                or readback_request.get("guideVersion") != str(guide_version)
+                or readback_request.get("guideSha256") != guide_digest
+                or readback_request.get("parentTaskId") != task_id
+                or readback_request.get("parentSessionId") != metadata.get("parentSessionId")
+                or readback_request.get("sourceRefsSha256") != _digest(source_refs)
+                or readback_request.get("actionEffectOperationId")
+                != request.get("actionEffectOperationId")
+                or readback_evidence.get("sourceRef") != source_ref
+                or readback_evidence.get("canonicalUrl") != canonical_url
+                or readback_evidence.get("sourceSha256") != source_sha256
+                or readback_evidence.get("actionEffectOperationId")
+                != request.get("actionEffectOperationId")
+            ):
+                raise PersistenceError(
+                    "WORK_OPERATION_SKILL_READBACK_MISMATCH",
+                    409,
+                    "The independent skill readback is not bound to this exact action result.",
+                )
+        else:
+            readback_operation = self._require_skill_effect_operation(
+                conn,
+                org,
+                workspace,
+                str(request.get("readbackEffectOperationId", "")),
+                task_id=task_id,
+                canonical_url=canonical_url,
+            )
+            readback_evidence = _stored_object(
+                readback_operation["evidence_json"], "readback effect evidence"
+            )
+            action_operation_id = _identifier(
+                request.get("actionEffectOperationId"), "actionEffectOperationId"
+            )
+            if (
+                request.get("readbackEffectOperationId") == action_operation_id
+                or request.get("actionEffectOperationId") != evidence.get("actionEffectOperationId")
+                or request.get("readbackEffectOperationId")
+                != evidence.get("readbackEffectOperationId")
+                or evidence.get("effectReadbackSha256") != readback_evidence.get("resultSha256")
+                or evidence.get("effectReadbackOutcome") != "verified"
+                or evidence.get("readbackVerified") is not True
+            ):
+                raise PersistenceError(
+                    "WORK_OPERATION_SKILL_READBACK_MISMATCH",
+                    409,
+                    "The independent skill effect readback is not verified.",
+                )
+
+    @staticmethod
+    def _require_skill_effect_operation(
+        conn: sqlite3.Connection,
+        org: str,
+        workspace: str,
+        operation_id: str,
+        *,
+        task_id: str,
+        canonical_url: str,
+    ) -> sqlite3.Row:
+        """Read one exact verified web.open Work receipt under its actor Task."""
+
+        identifier = _identifier(operation_id, "provider operation id")
+        row = conn.execute(
+            """SELECT * FROM work_operations WHERE organization_id=? AND workspace_id=?
+               AND operation_id=?""",
+            (org, workspace, identifier),
+        ).fetchone()
+        if row is None or row["task_id"] != task_id or row["trusted_producer"] is not None:
+            raise PersistenceError(
+                "WORK_OPERATION_SKILL_PROVIDER_RECEIPT_REQUIRED",
+                409,
+                "A verified web.open operation receipt for the exact Task is required.",
+            )
+        request = _stored_object(row["request_json"], "provider operation request")
+        evidence = _stored_object(row["evidence_json"], "provider operation evidence")
+        arguments = request.get("arguments")
+        if (
+            row["status"] != "verified"
+            or row["operation_type"] != "tool.provider.v1:web.open"
+            or request.get("operationId") != "web.open"
+            or not isinstance(arguments, Mapping)
+            or arguments.get("url") != canonical_url
+            or evidence.get("outcome") != "verified"
+            or evidence.get("effect") != "read"
+        ):
+            raise PersistenceError(
+                "WORK_OPERATION_SKILL_PROVIDER_RECEIPT_INVALID",
+                409,
+                "The provider operation is not the verified exact public URL read.",
+            )
+        return cast(sqlite3.Row, row)
+
     def update_operation(
         self,
         organization_id: str | None,
@@ -1739,12 +2701,17 @@ class WorkStore:
         *,
         actor_id: str | None = None,
         actor_private_scope: bool = False,
+        trusted_producer: str | None = None,
     ) -> tuple[JsonObject, bool]:
-        """Move started or uncertain receipts forward without a replay path. | 单向更新回执。"""
+        """Move one receipt forward; trusted outcomes require their fixed producer.
+
+        This method never performs or retries the external effect. 单向更新操作回执。
+        """
 
         org, workspace = _scope(organization_id, workspace_id)
         operation_id = _identifier(operation_id, "operation id")
         actor = _identifier(actor_id, "actorId").lower() if actor_id is not None else None
+        producer = _trusted_operation_producer(trusted_producer)
         evidence_obj = _json_object(evidence, "evidence")
         with self._mutation() as conn:
             row = conn.execute(
@@ -1765,6 +2732,44 @@ class WorkStore:
                     str(row["task_id"]),
                     actor,
                     actor_private_scope=actor_private_scope,
+                )
+            stored_producer = row["trusted_producer"]
+            if stored_producer is not None:
+                if producer != stored_producer or not actor_private_scope:
+                    raise PersistenceError(
+                        "WORK_OPERATION_TRUSTED_PRODUCER_REQUIRED",
+                        403,
+                        "Only its trusted actor-private producer can finalize this operation.",
+                    )
+                if producer in {"conversation-research-runtime", "notification-outbox"}:
+                    raise PersistenceError(
+                        "WORK_OPERATION_TRUSTED_FINALIZER_REQUIRED",
+                        403,
+                        "Completed research and notification receipts are immutable.",
+                    )
+                if row["task_id"] is None:
+                    raise _conflict(
+                        "WORK_OPERATION_TRUSTED_TASK_REQUIRED",
+                        "Trusted operation outcomes require their exact active Work Task.",
+                    )
+                task_row = self._require_task(conn, org, workspace, str(row["task_id"]))
+                task_status = str(task_row["status"])
+                if producer == "exchange-connector-dispatch" and task_status != "running":
+                    raise _conflict(
+                        "WORK_OPERATION_TASK_NOT_RUNNING",
+                        "Exchange dispatch receipts must be finalized before the Work Task ends.",
+                    )
+                if producer in {"conversation-research-runtime", "notification-outbox"} and (
+                    task_status != "completed"
+                ):
+                    raise _conflict(
+                        "WORK_OPERATION_TRUSTED_TASK_NOT_COMPLETED",
+                        "Readback receipts require their exact completed Work Task.",
+                    )
+            elif producer is not None:
+                raise _conflict(
+                    "WORK_OPERATION_TRUSTED_PRODUCER_IMMUTABLE",
+                    "A normal operation cannot be upgraded to a trusted receipt.",
                 )
             current = str(row["status"])
             if current == status:
@@ -1832,13 +2837,21 @@ class WorkStore:
                     _identifier(actor_id, "actorId").lower() if actor_id is not None else None,
                     actor_private_scope=actor_private_scope,
                 )
-            return self._operation_view(row)
+            if row["trusted_producer"] is not None and not actor_private_scope:
+                raise _not_found(
+                    "WORK_OPERATION_NOT_FOUND",
+                    "The operation does not exist in this actor scope.",
+                )
+            return self._operation_view_with_task_output(conn, row)
 
     def get_operation_by_idempotency_key(
         self,
         organization_id: str | None,
         workspace_id: str,
         idempotency_key: str,
+        *,
+        actor_id: str | None = None,
+        actor_private_scope: bool = False,
     ) -> JsonObject:
         """Read an immutable operation by tenant-scoped effective idempotency key.
 
@@ -1848,6 +2861,7 @@ class WorkStore:
 
         org, workspace = _scope(organization_id, workspace_id)
         key = _identifier(idempotency_key, "idempotencyKey")
+        actor = _identifier(actor_id, "actorId").lower() if actor_id is not None else None
         with self._read() as conn:
             row = conn.execute(
                 """SELECT * FROM work_operations WHERE organization_id=? AND workspace_id=?
@@ -1859,7 +2873,41 @@ class WorkStore:
                     "WORK_OPERATION_NOT_FOUND",
                     "The operation does not exist in this Workspace.",
                 )
-            return self._operation_view(row)
+            if row["trusted_producer"] is not None and not actor_private_scope:
+                raise _not_found(
+                    "WORK_OPERATION_NOT_FOUND",
+                    "The operation does not exist in this actor scope.",
+                )
+            if row["task_id"] is not None:
+                self._require_teams_task_actor(
+                    conn,
+                    org,
+                    workspace,
+                    str(row["task_id"]),
+                    actor,
+                    actor_private_scope=actor_private_scope,
+                )
+            return self._operation_view_with_task_output(conn, row)
+
+    def _operation_view_with_task_output(
+        self, conn: sqlite3.Connection, row: sqlite3.Row
+    ) -> JsonObject:
+        """Add a canonical terminal Task digest to one trusted operation view."""
+
+        view = self._operation_view(row)
+        if row["trusted_producer"] is None or row["task_id"] is None:
+            return view
+        task = self._require_task(
+            conn,
+            str(row["organization_id"]),
+            str(row["workspace_id"]),
+            str(row["task_id"]),
+        )
+        if str(task["status"]) == "completed":
+            view["taskOutputSha256"] = hashlib.sha256(
+                str(task["output"] or "").encode("utf-8")
+            ).hexdigest()
+        return view
 
     def list_unresolved_operations(
         self,
@@ -1887,8 +2935,9 @@ class WorkStore:
             "organization_id=?",
             "workspace_id=?",
             "status IN ('started','uncertain')",
+            "(trusted_producer IS NULL OR ?=1)",
         ]
-        params: list[Any] = [org, workspace]
+        params: list[Any] = [org, workspace, int(actor_private_scope)]
         filters.append(
             "((task_id IS NULL AND ?=0) OR EXISTS (SELECT 1 FROM work_tasks task "
             "WHERE task.organization_id=work_operations.organization_id "
@@ -1941,6 +2990,7 @@ class WorkStore:
                     "taskId": row["task_id"],
                     "target": row["target"],
                     "status": str(row["status"]),
+                    "trustedProducer": row["trusted_producer"],
                     "evidence": _stored_object(row["evidence_json"], "operation evidence"),
                     "createdAt": int(row["created_at"]),
                     "updatedAt": int(row["updated_at"]),
@@ -3151,6 +4201,118 @@ class WorkStore:
         with self._read() as conn:
             rows = conn.execute(query, params).fetchall()
             return [self._notification_view(row) for row in rows]
+
+    def get_notification(
+        self,
+        organization_id: str | None,
+        workspace_id: str,
+        notification_id: str,
+        *,
+        actor_id: str | None = None,
+        actor_private_scope: bool = False,
+    ) -> JsonObject:
+        """Read one exact notification inside its task or owner actor scope."""
+
+        org, workspace = _scope(organization_id, workspace_id)
+        identifier = _identifier(notification_id, "notification id")
+        actor = _identifier(actor_id, "actorId").lower() if actor_id is not None else None
+        with self._read() as conn:
+            row = conn.execute(
+                """SELECT * FROM work_notifications WHERE organization_id=?
+                   AND workspace_id=? AND notification_id=?""",
+                (org, workspace, identifier),
+            ).fetchone()
+            if row is None:
+                raise _not_found(
+                    "WORK_NOTIFICATION_NOT_FOUND",
+                    "The notification does not exist in this Workspace.",
+                )
+            if row["task_id"] is not None:
+                self._require_teams_task_actor(
+                    conn,
+                    org,
+                    workspace,
+                    str(row["task_id"]),
+                    actor,
+                    actor_private_scope=actor_private_scope,
+                )
+            self._require_notification_actor(
+                conn, org, workspace, row, actor, actor_private_scope=actor_private_scope
+            )
+            return self._notification_view(row)
+
+    def get_notification_by_deduplication_key(
+        self,
+        organization_id: str | None,
+        workspace_id: str,
+        deduplication_key: str,
+        *,
+        actor_id: str | None = None,
+        actor_private_scope: bool = False,
+    ) -> JsonObject:
+        """Resolve one exact outbox idempotency key without scanning a list page."""
+
+        org, workspace = _scope(organization_id, workspace_id)
+        key = _identifier(deduplication_key, "deduplication key")
+        actor = _identifier(actor_id, "actorId").lower() if actor_id is not None else None
+        with self._read() as conn:
+            row = conn.execute(
+                """SELECT * FROM work_notifications WHERE organization_id=?
+                   AND workspace_id=? AND deduplication_key=?""",
+                (org, workspace, key),
+            ).fetchone()
+            if row is None:
+                raise _not_found(
+                    "WORK_NOTIFICATION_NOT_FOUND",
+                    "The notification does not exist in this Workspace.",
+                )
+            if row["task_id"] is not None:
+                self._require_teams_task_actor(
+                    conn,
+                    org,
+                    workspace,
+                    str(row["task_id"]),
+                    actor,
+                    actor_private_scope=actor_private_scope,
+                )
+            self._require_notification_actor(
+                conn, org, workspace, row, actor, actor_private_scope=actor_private_scope
+            )
+            return self._notification_view(row)
+
+    def _require_notification_actor(
+        self,
+        conn: sqlite3.Connection,
+        org: str,
+        workspace: str,
+        row: sqlite3.Row,
+        actor_id: str | None,
+        *,
+        actor_private_scope: bool,
+    ) -> None:
+        owner = row["owner_actor_id"]
+        if owner is not None:
+            if actor_id is None or str(owner).lower() != actor_id:
+                raise _not_found(
+                    "WORK_NOTIFICATION_NOT_FOUND",
+                    "The notification does not exist in this actor scope.",
+                )
+            return
+        if row["task_id"] is None:
+            if actor_private_scope:
+                raise _not_found(
+                    "WORK_NOTIFICATION_NOT_FOUND",
+                    "The notification does not exist in this actor scope.",
+                )
+            return
+        self._require_teams_task_actor(
+            conn,
+            org,
+            workspace,
+            str(row["task_id"]),
+            actor_id,
+            actor_private_scope=actor_private_scope,
+        )
 
     def claim_notifications(
         self,
@@ -6485,7 +7647,11 @@ class WorkStore:
                 },
                 "work_private_installations": {"last_activity_occurred_at": "INTEGER"},
                 "work_private_installation_events": {"activity_occurred_at": "INTEGER"},
-                "work_operations": {"task_id": "TEXT", "scope_lock": "TEXT"},
+                "work_operations": {
+                    "task_id": "TEXT",
+                    "scope_lock": "TEXT",
+                    "trusted_producer": "TEXT",
+                },
                 "work_connector_states": {"configured": "INTEGER NOT NULL DEFAULT 0"},
                 "work_connector_threads": {
                     "service_url": "TEXT NOT NULL DEFAULT ''",
@@ -7198,6 +8364,7 @@ class WorkStore:
             "taskId": row["task_id"],
             "target": row["target"],
             "scopeLock": row["scope_lock"],
+            "trustedProducer": row["trusted_producer"],
             "request": _stored_object(row["request_json"], "operation request"),
             "status": str(row["status"]),
             "evidence": _stored_object(row["evidence_json"], "operation evidence"),
@@ -7680,6 +8847,7 @@ CREATE TABLE IF NOT EXISTS work_operations (
  organization_id TEXT NOT NULL, workspace_id TEXT NOT NULL, operation_id TEXT NOT NULL,
  idempotency_key TEXT NOT NULL, operation_type TEXT NOT NULL, task_id TEXT, target TEXT,
  scope_lock TEXT,
+ trusted_producer TEXT,
  request_json TEXT NOT NULL, status TEXT NOT NULL, evidence_json TEXT NOT NULL,
  request_digest TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
  PRIMARY KEY(organization_id,workspace_id,operation_id),
@@ -7899,6 +9067,27 @@ def _identifier(value: object, field: str) -> str:
     if any(ord(character) < 32 or ord(character) == 127 for character in value):
         raise _invalid("WORK_INVALID_IDENTIFIER", f"{field} contains control characters")
     return value
+
+
+def _trusted_operation_producer(value: str | None) -> str | None:
+    """Validate an internal producer marker without accepting a Work body field."""
+
+    if value is None:
+        return None
+    producer = _bounded_text(value, "trustedProducer", 64)
+    if producer not in _TRUSTED_OPERATION_PRODUCERS:
+        raise _invalid("WORK_OPERATION_TRUSTED_PRODUCER_INVALID", "trustedProducer is invalid")
+    return producer
+
+
+def _trusted_operation_type_allowed(producer: str, operation_type: str) -> bool:
+    if producer == "exchange-connector-dispatch":
+        return operation_type.startswith("tool.provider.v1:")
+    if producer == "conversation-research-runtime":
+        return operation_type.startswith("conversation.")
+    if producer == "notification-outbox":
+        return operation_type.startswith("conversation.bilibili.subscription.notification.")
+    return False
 
 
 def _teams_thread_message(value: object) -> JsonObject | None:

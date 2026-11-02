@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic.alias_generators import to_camel
@@ -27,6 +28,9 @@ class DomainModel(BaseModel):
         extra="forbid",
         strict=True,
     )
+
+
+ConversationKind = Literal["direct", "group", "channel"]
 
 
 class EmptyRequest(DomainModel):
@@ -70,9 +74,42 @@ class PersonaReceipt(DomainModel):
     persona: PersonaView
 
 
+class PersonaBindingPut(DomainModel):
+    """Bind or clear an actor-owned persona for one conversation kind."""
+
+    conversation_id: str = Field(min_length=1, max_length=200)
+    conversation_kind: ConversationKind
+    persona_id: str | None = Field(..., max_length=200)
+    expected_version: int = Field(ge=0)
+
+
+class PersonaBindingView(DomainModel):
+    """Versioned actor-owned persona selection for one exact conversation."""
+
+    conversation_id: str
+    conversation_kind: ConversationKind
+    persona_id: str | None = None
+    version: int = Field(ge=1)
+    created_at: int = Field(ge=0)
+    updated_at: int = Field(ge=0)
+
+
+class PersonaBindingReceipt(DomainModel):
+    """Persona binding write response."""
+
+    binding: PersonaBindingView
+    duplicate: bool
+
+
+class PersonaBindingReadReceipt(DomainModel):
+    """Persona binding read response, including an unbound conversation."""
+
+    binding: PersonaBindingView | None = None
+    available_persona_ids: list[str]
+
+
 ProfileSubjectKind = Literal["user", "group"]
 ProfileCategory = Literal["preference", "style", "constraint", "temporary_state"]
-ConversationKind = Literal["direct", "group", "channel"]
 
 
 class DomainSourceRef(DomainModel):
@@ -410,6 +447,44 @@ class MaintenanceJobsView(DomainModel):
     items: list[MaintenanceJobView]
 
 
+class ResearchSourceEvidence(DomainModel):
+    """External source metadata returned by the configured research provider."""
+
+    source_ref: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    kind: Literal["web", "document"]
+    title: str = Field(min_length=1, max_length=1_000)
+    url: str | None = Field(default=None, max_length=4_096)
+    artifact_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    retrieved_at: int = Field(ge=0, le=253_402_300_799_999)
+
+    @model_validator(mode="after")
+    def validate_evidence_source(self) -> ResearchSourceEvidence:
+        if self.kind == "web" and self.url is None:
+            raise ValueError("web sourceEvidence requires a canonical HTTPS URL")
+        if self.kind == "document" and self.artifact_id is None:
+            raise ValueError("document sourceEvidence requires an authorized artifactId")
+        if self.url is not None:
+            if self.url != self.url.strip() or any(ord(ch) < 33 for ch in self.url):
+                raise ValueError("sourceEvidence URL is not canonical text")
+            try:
+                parsed = urlsplit(self.url)
+                hostname = parsed.hostname
+                _ = parsed.port
+            except ValueError as exc:
+                raise ValueError("sourceEvidence URL is invalid") from exc
+            if (
+                parsed.scheme != "https"
+                or not parsed.netloc
+                or hostname is None
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.netloc != parsed.netloc.lower()
+            ):
+                raise ValueError("sourceEvidence URL must be canonical HTTPS without userinfo")
+        return self
+
+
 class ResearchNoteCreate(DomainModel):
     """Create a source-backed research note revision."""
 
@@ -420,6 +495,19 @@ class ResearchNoteCreate(DomainModel):
     title: str = Field(min_length=1, max_length=240)
     content: str = Field(min_length=1, max_length=16_000)
     source_refs: list[DomainSourceRefInput] = Field(min_length=1, max_length=256)
+    source_evidence: list[ResearchSourceEvidence] = Field(default_factory=list, max_length=64)
+    research_operation_receipt_id: str | None = Field(default=None, max_length=512)
+
+    @model_validator(mode="after")
+    def validate_source_evidence_receipt(self) -> ResearchNoteCreate:
+        source_refs = [item.source_ref for item in self.source_evidence]
+        if len(source_refs) != len(set(source_refs)):
+            raise ValueError("sourceEvidence sourceRef values must be unique")
+        if self.source_evidence and self.research_operation_receipt_id is None:
+            raise ValueError("sourceEvidence requires its trusted research operation receipt")
+        if not self.source_evidence and self.research_operation_receipt_id is not None:
+            raise ValueError("researchOperationReceiptId requires sourceEvidence")
+        return self
 
 
 class ResearchNoteView(DomainModel):
@@ -433,6 +521,8 @@ class ResearchNoteView(DomainModel):
     title: str
     content: str
     source_refs: list[DomainSourceRef]
+    source_evidence: list[ResearchSourceEvidence] = Field(default_factory=list)
+    research_operation_receipt_id: str | None = None
     revision: int = Field(ge=1)
     created_at: int = Field(ge=0)
 
@@ -460,6 +550,11 @@ class VerifiedSkillCreate(DomainModel):
     source_refs: list[DomainSourceRefInput] = Field(min_length=1, max_length=256)
     operation_receipt_id: str = Field(min_length=1, max_length=512)
     independent_read_receipt_id: str = Field(min_length=1, max_length=512)
+    action_id: str = Field(min_length=1, max_length=256)
+    target_digest_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    input_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    guide_version: str = Field(min_length=1, max_length=128)
+    guide_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     conversation_kind: ConversationKind | None = None
     persona_id: str | None = Field(default=None, max_length=200)
 
@@ -475,6 +570,27 @@ class VerifiedSkillCreate(DomainModel):
         return self
 
 
+class VerifiedSkillEvidenceView(DomainModel):
+    """Server-verified action and independent effect-readback evidence."""
+
+    action_id: Literal["public-web.lookup"]
+    target_digest_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    input_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    guide_version: str = Field(min_length=1, max_length=128)
+    guide_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    action_effect_operation_id: str = Field(min_length=1, max_length=512)
+    readback_effect_operation_id: str = Field(min_length=1, max_length=512)
+    effect_outcome: Literal["verified"]
+    effect_result_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    effect_readback_outcome: Literal["verified"]
+    effect_readback_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    readback_verified: Literal[True]
+    source_ref: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    canonical_url: str = Field(min_length=1, max_length=4_096)
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    work_artifact_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
 class VerifiedSkillView(DomainModel):
     """Skill revision with server-derived verifier identity and time."""
 
@@ -486,6 +602,7 @@ class VerifiedSkillView(DomainModel):
     name: str
     content: str
     source_refs: list[DomainSourceRef]
+    evidence: VerifiedSkillEvidenceView
     operation_receipt_id: str
     independent_read_receipt_id: str
     verified: Literal[True]
@@ -528,6 +645,16 @@ class WatchSchedule(DomainModel):
     next_check_at: int | None = Field(..., ge=0)
 
 
+class WatchObservation(DomainModel):
+    """Trusted worker checkpoint for one independently verified watch read."""
+
+    expected_version: int = Field(ge=1)
+    task_id: str = Field(min_length=1, max_length=512)
+    operation_receipt_id: str = Field(min_length=1, max_length=512)
+    result_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    next_check_at: int | None = Field(default=None, ge=0)
+
+
 class WatchView(DomainModel):
     """Watch state with its CAS version."""
 
@@ -539,7 +666,12 @@ class WatchView(DomainModel):
     title: str
     condition: str
     source_refs: list[DomainSourceRef]
+    owner_task_id: str = ""
+    owner_session_id: str = ""
     next_check_at: int | None = None
+    last_result_sha256: str | None = None
+    last_operation_receipt_id: str | None = None
+    last_observed_at: int | None = None
     state: Literal["active", "cancelled"]
     version: int = Field(ge=1)
     created_at: int = Field(ge=0)
@@ -682,6 +814,7 @@ class ReviewEventCreate(DomainModel):
     """Append one idempotent sourced review event."""
 
     idempotency_key: str = Field(min_length=1, max_length=200)
+    task_id: str | None = Field(default=None, min_length=1, max_length=512)
     event_type: Literal[
         "approved", "rejected", "edited", "imported", "rolled_back", "reviewed", "daily_review"
     ]
@@ -699,14 +832,20 @@ class ReviewEventCreate(DomainModel):
                 self.conversation_id is None
                 or self.conversation_kind is None
                 or self.persona_id is None
+                or self.task_id is None
             ):
-                raise ValueError("daily_review requires exact conversation and persona scope")
+                raise ValueError(
+                    "daily_review requires exact conversation, persona, and Task scope"
+                )
             if not self._has_verified_report_reference():
                 raise ValueError(
                     "daily_review summary requires a verified report artifact reference"
                 )
-        elif not self.source_refs:
-            raise ValueError("sourceRefs must not be empty for sourced review events")
+        else:
+            if not self.source_refs:
+                raise ValueError("sourceRefs must not be empty for sourced review events")
+            if self.task_id is not None:
+                raise ValueError("taskId is reserved for daily_review events")
         if self.conversation_id is not None and self.conversation_kind is None:
             raise ValueError("conversationKind is required with conversationId")
         if self.conversation_id is None:

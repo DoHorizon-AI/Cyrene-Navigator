@@ -1701,7 +1701,15 @@
               "image/png",
               "image/jpeg",
               "image/webp",
-              "image/gif"
+              "image/gif",
+              "application/pdf",
+              "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+              "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+              "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+              "text/csv",
+              "text/html",
+              "text/markdown",
+              "text/plain"
             ],
             "title": "Mimetype",
             "type": "string"
@@ -5909,6 +5917,22 @@
             ],
             "title": "Taskid"
           },
+          "trustedProducer": {
+            "anyOf": [
+              {
+                "enum": [
+                  "exchange-connector-dispatch",
+                  "conversation-research-runtime",
+                  "notification-outbox"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trustedproducer"
+          },
           "updatedAt": {
             "title": "Updatedat",
             "type": "integer"
@@ -5977,6 +6001,22 @@
               }
             ],
             "title": "Taskid"
+          },
+          "trustedProducer": {
+            "anyOf": [
+              {
+                "enum": [
+                  "exchange-connector-dispatch",
+                  "conversation-research-runtime",
+                  "notification-outbox"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trustedproducer"
           },
           "updatedAt": {
             "title": "Updatedat",
@@ -7096,6 +7136,26 @@
             ],
             "title": "Personaid"
           },
+          "researchOperationReceiptId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Researchoperationreceiptid"
+          },
+          "sourceEvidence": {
+            "items": {
+              "$ref": "#/components/schemas/ResearchSourceEvidence"
+            },
+            "maxItems": 64,
+            "title": "Sourceevidence",
+            "type": "array"
+          },
           "sourceRefs": {
             "items": {
               "anyOf": [
@@ -7201,10 +7261,28 @@
             ],
             "title": "Personaid"
           },
+          "researchOperationReceiptId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Researchoperationreceiptid"
+          },
           "revision": {
             "minimum": 1.0,
             "title": "Revision",
             "type": "integer"
+          },
+          "sourceEvidence": {
+            "items": {
+              "$ref": "#/components/schemas/ResearchSourceEvidence"
+            },
+            "title": "Sourceevidence",
+            "type": "array"
           },
           "sourceRefs": {
             "items": {
@@ -7248,6 +7326,75 @@
           "items"
         ],
         "title": "ResearchNotesView",
+        "type": "object"
+      },
+      "ResearchSourceEvidence": {
+        "additionalProperties": false,
+        "description": "External source metadata returned by the configured research provider.",
+        "properties": {
+          "artifactId": {
+            "anyOf": [
+              {
+                "pattern": "^[a-f0-9]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Artifactid"
+          },
+          "kind": {
+            "enum": [
+              "web",
+              "document"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "retrievedAt": {
+            "maximum": 253402300799999.0,
+            "minimum": 0.0,
+            "title": "Retrievedat",
+            "type": "integer"
+          },
+          "sourceRef": {
+            "pattern": "^sha256:[a-f0-9]{64}$",
+            "title": "Sourceref",
+            "type": "string"
+          },
+          "sourceSha256": {
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Sourcesha256",
+            "type": "string"
+          },
+          "title": {
+            "maxLength": 1000,
+            "minLength": 1,
+            "title": "Title",
+            "type": "string"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          }
+        },
+        "required": [
+          "sourceRef",
+          "kind",
+          "title",
+          "sourceSha256",
+          "retrievedAt"
+        ],
+        "title": "ResearchSourceEvidence",
         "type": "object"
       },
       "ReviewEventCreate": {
@@ -7346,6 +7493,19 @@
             "minLength": 1,
             "title": "Summary",
             "type": "string"
+          },
+          "taskId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Taskid"
           }
         },
         "required": [
@@ -8651,6 +8811,12 @@
         "additionalProperties": false,
         "description": "Submit sourced skill content for authenticated actor verification.",
         "properties": {
+          "actionId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Actionid",
+            "type": "string"
+          },
           "content": {
             "maxLength": 16000,
             "minLength": 1,
@@ -8685,6 +8851,17 @@
             ],
             "title": "Conversationkind"
           },
+          "guideSha256": {
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Guidesha256",
+            "type": "string"
+          },
+          "guideVersion": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Guideversion",
+            "type": "string"
+          },
           "idempotencyKey": {
             "maxLength": 200,
             "minLength": 1,
@@ -8695,6 +8872,11 @@
             "maxLength": 512,
             "minLength": 1,
             "title": "Independentreadreceiptid",
+            "type": "string"
+          },
+          "inputSha256": {
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Inputsha256",
             "type": "string"
           },
           "name": {
@@ -8736,6 +8918,11 @@
             "minItems": 1,
             "title": "Sourcerefs",
             "type": "array"
+          },
+          "targetDigestSha256": {
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Targetdigestsha256",
+            "type": "string"
           }
         },
         "required": [
@@ -8744,9 +8931,110 @@
           "content",
           "sourceRefs",
           "operationReceiptId",
-          "independentReadReceiptId"
+          "independentReadReceiptId",
+          "actionId",
+          "targetDigestSha256",
+          "inputSha256",
+          "guideVersion",
+          "guideSha256"
         ],
         "title": "VerifiedSkillCreate",
+        "type": "object"
+      },
+      "VerifiedSkillEvidenceView": {
+        "additionalProperties": false,
+        "description": "Server-verified action and independent effect-readback evidence.",
+        "properties": {
+          "actionId": {
+            "const": "public-web.lookup",
+            "title": "Actionid",
+            "type": "string"
+          },
+          "canonicalUrl": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Canonicalurl",
+            "type": "string"
+          },
+          "effectOutcome": {
+            "const": "verified",
+            "title": "Effectoutcome",
+            "type": "string"
+          },
+          "effectReadbackOutcome": {
+            "const": "verified",
+            "title": "Effectreadbackoutcome",
+            "type": "string"
+          },
+          "effectReadbackSha256": {
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Effectreadbacksha256",
+            "type": "string"
+          },
+          "effectResultSha256": {
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Effectresultsha256",
+            "type": "string"
+          },
+          "guideSha256": {
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Guidesha256",
+            "type": "string"
+          },
+          "guideVersion": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Guideversion",
+            "type": "string"
+          },
+          "inputSha256": {
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Inputsha256",
+            "type": "string"
+          },
+          "readbackVerified": {
+            "const": true,
+            "title": "Readbackverified",
+            "type": "boolean"
+          },
+          "sourceRef": {
+            "pattern": "^sha256:[a-f0-9]{64}$",
+            "title": "Sourceref",
+            "type": "string"
+          },
+          "sourceSha256": {
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Sourcesha256",
+            "type": "string"
+          },
+          "targetDigestSha256": {
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Targetdigestsha256",
+            "type": "string"
+          },
+          "workArtifactSha256": {
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Workartifactsha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "actionId",
+          "targetDigestSha256",
+          "inputSha256",
+          "guideVersion",
+          "guideSha256",
+          "effectOutcome",
+          "effectResultSha256",
+          "effectReadbackOutcome",
+          "effectReadbackSha256",
+          "readbackVerified",
+          "sourceRef",
+          "canonicalUrl",
+          "sourceSha256",
+          "workArtifactSha256"
+        ],
+        "title": "VerifiedSkillEvidenceView",
         "type": "object"
       },
       "VerifiedSkillReceipt": {
@@ -8807,6 +9095,9 @@
             "minimum": 0.0,
             "title": "Createdat",
             "type": "integer"
+          },
+          "evidence": {
+            "$ref": "#/components/schemas/VerifiedSkillEvidenceView"
           },
           "id": {
             "title": "Id",
@@ -8873,6 +9164,7 @@
           "name",
           "content",
           "sourceRefs",
+          "evidence",
           "operationReceiptId",
           "independentReadReceiptId",
           "verified",
@@ -8991,6 +9283,54 @@
         "title": "WatchCreate",
         "type": "object"
       },
+      "WatchObservation": {
+        "additionalProperties": false,
+        "description": "Trusted worker checkpoint for one independently verified watch read.",
+        "properties": {
+          "expectedVersion": {
+            "minimum": 1.0,
+            "title": "Expectedversion",
+            "type": "integer"
+          },
+          "nextCheckAt": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nextcheckat"
+          },
+          "operationReceiptId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Operationreceiptid",
+            "type": "string"
+          },
+          "resultSha256": {
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Resultsha256",
+            "type": "string"
+          },
+          "taskId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Taskid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expectedVersion",
+          "taskId",
+          "operationReceiptId",
+          "resultSha256"
+        ],
+        "title": "WatchObservation",
+        "type": "object"
+      },
       "WatchReceipt": {
         "additionalProperties": false,
         "description": "Watch create/cancel response.",
@@ -9094,6 +9434,39 @@
             "title": "Idempotencykey",
             "type": "string"
           },
+          "lastObservedAt": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lastobservedat"
+          },
+          "lastOperationReceiptId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lastoperationreceiptid"
+          },
+          "lastResultSha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lastresultsha256"
+          },
           "nextCheckAt": {
             "anyOf": [
               {
@@ -9104,6 +9477,16 @@
               }
             ],
             "title": "Nextcheckat"
+          },
+          "ownerSessionId": {
+            "default": "",
+            "title": "Ownersessionid",
+            "type": "string"
+          },
+          "ownerTaskId": {
+            "default": "",
+            "title": "Ownertaskid",
+            "type": "string"
           },
           "personaId": {
             "anyOf": [
@@ -14897,6 +15280,64 @@
         "summary": "Cancel Watch"
       }
     },
+    "/api/v1/workspaces/{workspace_id}/work/conversation-memory/watches/{watch_id}/observe": {
+      "post": {
+        "operationId": "record_watch_observation_api_v1_workspaces__workspace_id__work_conversation_memory_watches__watch_id__observe_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "watch_id",
+            "required": true,
+            "schema": {
+              "title": "Watch Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WatchObservation"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WatchUpdateReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Record Watch Observation"
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/work/conversation-memory/watches/{watch_id}/schedule": {
       "put": {
         "operationId": "schedule_watch_api_v1_workspaces__workspace_id__work_conversation_memory_watches__watch_id__schedule_put",
@@ -15555,6 +15996,56 @@
         "summary": "Queue Notification"
       }
     },
+    "/api/v1/workspaces/{workspace_id}/work/notifications/by-deduplication-key": {
+      "get": {
+        "operationId": "get_notification_by_deduplication_key_api_v1_workspaces__workspace_id__work_notifications_by_deduplication_key_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "deduplicationKey",
+            "required": true,
+            "schema": {
+              "maxLength": 512,
+              "minLength": 1,
+              "title": "Deduplicationkey",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationRecord"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Notification By Deduplication Key"
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/work/notifications/claim": {
       "post": {
         "operationId": "claim_notifications_api_v1_workspaces__workspace_id__work_notifications_claim_post",
@@ -15602,6 +16093,54 @@
           }
         },
         "summary": "Claim Notifications"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/notifications/{notification_id}": {
+      "get": {
+        "operationId": "get_notification_api_v1_workspaces__workspace_id__work_notifications__notification_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "notification_id",
+            "required": true,
+            "schema": {
+              "title": "Notification Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationRecord"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Notification"
       }
     },
     "/api/v1/workspaces/{workspace_id}/work/notifications/{notification_id}/finish": {
@@ -15767,6 +16306,56 @@
           }
         },
         "summary": "Create Operation"
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/work/operations/by-idempotency-key": {
+      "get": {
+        "operationId": "get_operation_by_idempotency_key_api_v1_workspaces__workspace_id__work_operations_by_idempotency_key_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "title": "Workspace Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "idempotencyKey",
+            "required": true,
+            "schema": {
+              "maxLength": 512,
+              "minLength": 1,
+              "title": "Idempotencykey",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Operation By Idempotency Key"
       }
     },
     "/api/v1/workspaces/{workspace_id}/work/operations/unresolved": {

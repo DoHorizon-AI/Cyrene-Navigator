@@ -550,9 +550,18 @@ class OperationRecord(WorkModel):
     task_id: str | None = None
     target: str | None = None
     scope_lock: str | None = None
+    trusted_producer: (
+        Literal[
+            "exchange-connector-dispatch",
+            "conversation-research-runtime",
+            "notification-outbox",
+        ]
+        | None
+    ) = None
     request: dict[str, Any]
     status: Literal["started", "uncertain", "verified"]
     evidence: dict[str, Any]
+    task_output_sha256: str | None = None
     created_at: int
     updated_at: int
 
@@ -564,6 +573,14 @@ class OperationSummary(WorkModel):
     operation_type: str
     task_id: str | None = None
     target: str | None = None
+    trusted_producer: (
+        Literal[
+            "exchange-connector-dispatch",
+            "conversation-research-runtime",
+            "notification-outbox",
+        ]
+        | None
+    ) = None
     status: Literal["started", "uncertain"]
     evidence: dict[str, Any]
     created_at: int
@@ -659,7 +676,20 @@ class ConversationMemoryAttachmentRef(WorkModel):
 
     artifact_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    mime_type: Literal["image/png", "image/jpeg", "image/webp", "image/gif"]
+    mime_type: Literal[
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/gif",
+        "application/pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "text/csv",
+        "text/html",
+        "text/markdown",
+        "text/plain",
+    ]
     size: int = Field(ge=1, le=10_000_000)
 
     @model_validator(mode="after")
