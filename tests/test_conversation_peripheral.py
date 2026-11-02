@@ -1064,7 +1064,7 @@ def test_bilibili_write_receipts_are_idempotent_and_never_store_message_text(
     assert success.status_code == 200
     assert success.json()["operation"]["status"] == "verified"
     assert success.json()["operation"]["taskId"] is None
-    assert "trustedProducer" not in success.json()["operation"]
+    assert success.json()["operation"].get("trustedProducer") is None
     assert success.json()["operation"]["evidence"]["readbackSha256"] == "b" * 64
     assert duplicate.status_code == 200 and duplicate.json()["duplicate"] is True
     assert unknown.status_code == 202

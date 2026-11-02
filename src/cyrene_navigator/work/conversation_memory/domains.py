@@ -23,6 +23,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
+from urllib.parse import urlsplit
 
 from cyrene_navigator.persistence.errors import PersistenceError
 
@@ -150,7 +151,7 @@ class ConversationDomainStore:
             connection.execute("PRAGMA synchronous=NORMAL")
             connection.execute("BEGIN IMMEDIATE")
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version > 4:
+            if version > 6:
                 raise PersistenceError(
                     "CONVERSATION_DOMAIN_SCHEMA_UNSUPPORTED",
                     500,
@@ -164,6 +165,13 @@ class ConversationDomainStore:
                     conversation_ids_json TEXT NOT NULL, version INTEGER NOT NULL,
                     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
                     PRIMARY KEY (org, workspace, actor, persona_id)
+                )""",
+                """CREATE TABLE IF NOT EXISTS persona_bindings (
+                    org TEXT NOT NULL, workspace TEXT NOT NULL, actor TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL, conversation_kind TEXT NOT NULL,
+                    persona_id TEXT, version INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (org, workspace, actor, conversation_id, conversation_kind)
                 )""",
                 """CREATE TABLE IF NOT EXISTS active_behavior_policies (
                     org TEXT NOT NULL, workspace TEXT NOT NULL, actor TEXT NOT NULL,
@@ -236,7 +244,9 @@ class ConversationDomainStore:
                     note_id TEXT NOT NULL, idempotency_key TEXT NOT NULL,
                     conversation_id TEXT NOT NULL, conversation_kind TEXT, persona_id TEXT,
                     title TEXT NOT NULL, content TEXT NOT NULL,
-                    source_refs_json TEXT NOT NULL, revision INTEGER NOT NULL,
+                    source_refs_json TEXT NOT NULL,
+                    source_evidence_json TEXT NOT NULL DEFAULT '[]',
+                    research_operation_receipt_id TEXT, revision INTEGER NOT NULL,
                     created_at INTEGER NOT NULL,
                     PRIMARY KEY (org, workspace, actor, note_id),
                     UNIQUE (org, workspace, actor, idempotency_key)
@@ -262,7 +272,11 @@ class ConversationDomainStore:
                     conversation_id TEXT NOT NULL, conversation_kind TEXT, persona_id TEXT,
                     title TEXT NOT NULL,
                     condition TEXT NOT NULL, source_refs_json TEXT NOT NULL,
-                    next_check_at INTEGER, state TEXT NOT NULL, version INTEGER NOT NULL,
+                    owner_task_id TEXT NOT NULL DEFAULT '',
+                    owner_session_id TEXT NOT NULL DEFAULT '',
+                    next_check_at INTEGER, last_result_sha256 TEXT,
+                    last_operation_receipt_id TEXT, last_observed_at INTEGER,
+                    state TEXT NOT NULL, version INTEGER NOT NULL,
                     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
                     PRIMARY KEY (org, workspace, actor, watch_id),
                     UNIQUE (org, workspace, actor, idempotency_key)
@@ -382,7 +396,31 @@ class ConversationDomainStore:
                     connection.execute(
                         "ALTER TABLE verified_skills ADD COLUMN independent_read_receipt_id TEXT"
                     )
-            connection.execute("PRAGMA user_version=4")
+            if version < 5:
+                schema_migrations: dict[str, tuple[tuple[str, str], ...]] = {
+                    "research_notes": (
+                        ("source_evidence_json", "TEXT NOT NULL DEFAULT '[]'"),
+                        ("research_operation_receipt_id", "TEXT"),
+                    ),
+                    "watches": (
+                        ("owner_task_id", "TEXT NOT NULL DEFAULT ''"),
+                        ("owner_session_id", "TEXT NOT NULL DEFAULT ''"),
+                        ("last_result_sha256", "TEXT"),
+                        ("last_operation_receipt_id", "TEXT"),
+                        ("last_observed_at", "INTEGER"),
+                    ),
+                }
+                for table, column_definitions in schema_migrations.items():
+                    existing = {
+                        str(row["name"])
+                        for row in connection.execute(f"PRAGMA table_info({table})")
+                    }
+                    for column, definition in column_definitions:
+                        if column not in existing:
+                            connection.execute(
+                                f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                            )
+            connection.execute("PRAGMA user_version=6")
             connection.commit()
         except PersistenceError:
             connection.rollback()
@@ -526,6 +564,115 @@ class ConversationDomainStore:
             ).fetchone()
         assert row is not None
         return _persona_view(row, self._row_json(row, "conversation_ids_json"))
+
+    def get_persona_binding(
+        self,
+        org: str,
+        workspace: str,
+        actor: str,
+        conversation_id: str,
+        conversation_kind: str,
+    ) -> WireView | None:
+        """Read the actor-owned binding for one conversation ID and kind."""
+
+        scope = self._scope(org, workspace, actor)
+        conversation = _identifier(conversation_id, "conversationId")
+        kind = _choice(conversation_kind, "conversationKind", {"direct", "group", "channel"})
+        with self._read() as connection:
+            row = connection.execute(
+                """SELECT * FROM persona_bindings
+                   WHERE org=? AND workspace=? AND actor=?
+                     AND conversation_id=? AND conversation_kind=?""",
+                (*scope, conversation, kind),
+            ).fetchone()
+        return None if row is None else _persona_binding_view(row)
+
+    def put_persona_binding(
+        self, org: str, workspace: str, actor: str, body: Mapping[str, object]
+    ) -> WireView:
+        """CAS an actor-owned persona binding after checking current persona eligibility."""
+
+        scope = self._scope(org, workspace, actor)
+        payload = _body(
+            body,
+            required={"conversationId", "conversationKind", "personaId", "expectedVersion"},
+            optional=set(),
+        )
+        conversation = _identifier(payload["conversationId"], "conversationId")
+        kind = _choice(
+            payload["conversationKind"], "conversationKind", {"direct", "group", "channel"}
+        )
+        persona_id = _optional_identifier(payload["personaId"], "personaId")
+        expected = _nonnegative_integer(payload["expectedVersion"], "expectedVersion")
+        now = _now_ms()
+        duplicate = False
+        with self._write() as connection:
+            if persona_id is not None:
+                persona = connection.execute(
+                    """SELECT enabled,conversation_ids_json FROM personas
+                       WHERE org=? AND workspace=? AND actor=? AND persona_id=?""",
+                    (*scope, persona_id),
+                ).fetchone()
+                if persona is None or not bool(persona["enabled"]):
+                    raise PersistenceError(
+                        "CONVERSATION_PERSONA_UNAVAILABLE",
+                        409,
+                        "Only an enabled persona owned by this actor can be bound.",
+                    )
+                allowed_conversations = self._row_json(persona, "conversation_ids_json")
+                if not isinstance(allowed_conversations, list) or any(
+                    not isinstance(item, str) for item in allowed_conversations
+                ):
+                    raise PersistenceError(
+                        "CONVERSATION_DOMAIN_STORAGE_CORRUPT",
+                        500,
+                        "Stored persona conversation scope is invalid.",
+                    )
+                if allowed_conversations and conversation not in allowed_conversations:
+                    raise PersistenceError(
+                        "CONVERSATION_PERSONA_UNAVAILABLE",
+                        409,
+                        "Persona is not available for this conversation.",
+                    )
+            current = connection.execute(
+                """SELECT * FROM persona_bindings
+                   WHERE org=? AND workspace=? AND actor=?
+                     AND conversation_id=? AND conversation_kind=?""",
+                (*scope, conversation, kind),
+            ).fetchone()
+            if current is None:
+                if expected != 0:
+                    raise _conflict("Persona binding version changed")
+                connection.execute(
+                    """INSERT INTO persona_bindings (
+                           org,workspace,actor,conversation_id,conversation_kind,persona_id,
+                           version,created_at,updated_at
+                       ) VALUES (?,?,?,?,?,?,1,?,?)""",
+                    (*scope, conversation, kind, persona_id, now, now),
+                )
+            else:
+                current_version = int(current["version"])
+                if current["persona_id"] == persona_id:
+                    if expected not in {current_version, current_version - 1}:
+                        raise _conflict("Persona binding version changed")
+                    duplicate = True
+                elif expected != current_version:
+                    raise _conflict("Persona binding version changed")
+                else:
+                    connection.execute(
+                        """UPDATE persona_bindings SET persona_id=?,version=version+1,updated_at=?
+                           WHERE org=? AND workspace=? AND actor=?
+                             AND conversation_id=? AND conversation_kind=? AND version=?""",
+                        (persona_id, now, *scope, conversation, kind, current_version),
+                    )
+            row = connection.execute(
+                """SELECT * FROM persona_bindings
+                   WHERE org=? AND workspace=? AND actor=?
+                     AND conversation_id=? AND conversation_kind=?""",
+                (*scope, conversation, kind),
+            ).fetchone()
+        assert row is not None
+        return {"binding": _persona_binding_view(row), "duplicate": duplicate}
 
     def get_active_behavior_policy(
         self, org: str, workspace: str, actor: str, conversation_id: str
@@ -1464,13 +1611,19 @@ class ConversationDomainStore:
                 "content",
                 "sourceRefs",
             },
-            optional={"personaId"},
+            optional={"personaId", "sourceEvidence", "researchOperationReceiptId"},
         )
         key = _idempotency_key(payload["idempotencyKey"])
         conversation_id, conversation_kind, persona_id = _source_context(payload)
         title = _text(payload["title"], "title", maximum=240)
         content = _text(payload["content"], "content", maximum=_MAX_TEXT)
         sources = _source_refs(payload["sourceRefs"])
+        source_evidence = _source_evidence(payload.get("sourceEvidence", []))
+        research_receipt_id = _optional_identifier(
+            payload.get("researchOperationReceiptId"), "researchOperationReceiptId"
+        )
+        if source_evidence and research_receipt_id is None:
+            raise _invalid("sourceEvidence requires researchOperationReceiptId")
         digest = _digest(
             {
                 "conversationId": conversation_id,
@@ -1479,6 +1632,8 @@ class ConversationDomainStore:
                 "title": title,
                 "content": content,
                 "sourceRefs": sources,
+                "sourceEvidence": source_evidence,
+                "researchOperationReceiptId": research_receipt_id,
             }
         )
         now = _now_ms()
@@ -1491,7 +1646,11 @@ class ConversationDomainStore:
             if existing is not None:
                 if _research_note_digest(existing) != digest:
                     raise _conflict("Research note idempotency key was reused with different data")
-                return _research_note_view(existing, self._row_json(existing, "source_refs_json"))
+                return _research_note_view(
+                    existing,
+                    self._row_json(existing, "source_refs_json"),
+                    self._row_json(existing, "source_evidence_json"),
+                )
             revision_row = connection.execute(
                 """SELECT MAX(revision) AS revision FROM research_notes
                    WHERE org=? AND workspace=? AND actor=? AND conversation_id=? AND title=?""",
@@ -1503,8 +1662,9 @@ class ConversationDomainStore:
                 """INSERT INTO research_notes (
                    org, workspace, actor, note_id, idempotency_key, conversation_id,
                        conversation_kind, persona_id, title, content, source_refs_json,
+                       source_evidence_json, research_operation_receipt_id,
                        revision, created_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     *scope,
                     note_id,
@@ -1515,6 +1675,8 @@ class ConversationDomainStore:
                     title,
                     content,
                     _json_dumps(sources, "sourceRefs"),
+                    _json_dumps(source_evidence, "sourceEvidence"),
+                    research_receipt_id,
                     revision,
                     now,
                 ),
@@ -1525,7 +1687,11 @@ class ConversationDomainStore:
                 (*scope, note_id),
             ).fetchone()
         assert row is not None
-        return _research_note_view(row, self._row_json(row, "source_refs_json"))
+        return _research_note_view(
+            row,
+            self._row_json(row, "source_refs_json"),
+            self._row_json(row, "source_evidence_json"),
+        )
 
     def list_research_notes(
         self,
@@ -1549,7 +1715,14 @@ class ConversationDomainStore:
         params += (page_limit,)
         with self._read() as connection:
             rows = connection.execute(sql, params).fetchall()
-        return [_research_note_view(row, self._row_json(row, "source_refs_json")) for row in rows]
+        return [
+            _research_note_view(
+                row,
+                self._row_json(row, "source_refs_json"),
+                self._row_json(row, "source_evidence_json"),
+            )
+            for row in rows
+        ]
 
     def create_verified_skill(
         self, org: str, workspace: str, actor: str, body: Mapping[str, object]
@@ -1674,6 +1847,8 @@ class ConversationDomainStore:
                 "title",
                 "condition",
                 "sourceRefs",
+                "ownerTaskId",
+                "ownerSessionId",
             },
             optional={"nextCheckAt", "personaId"},
         )
@@ -1682,6 +1857,8 @@ class ConversationDomainStore:
         title = _text(payload["title"], "title", maximum=240)
         condition = _text(payload["condition"], "condition", maximum=2_000)
         sources = _source_refs(payload["sourceRefs"])
+        owner_task_id = _identifier(payload["ownerTaskId"], "ownerTaskId")
+        owner_session_id = _identifier(payload["ownerSessionId"], "ownerSessionId")
         next_check = _optional_timestamp(payload.get("nextCheckAt"), "nextCheckAt")
         digest = _digest(
             {
@@ -1710,9 +1887,9 @@ class ConversationDomainStore:
                 """INSERT INTO watches (
                        org, workspace, actor, watch_id, idempotency_key, conversation_id,
                        conversation_kind, persona_id, title, condition, source_refs_json,
-                       next_check_at, state, version,
+                       owner_task_id, owner_session_id, next_check_at, state, version,
                        created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)""",
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)""",
                 (
                     *scope,
                     watch_id,
@@ -1723,6 +1900,8 @@ class ConversationDomainStore:
                     title,
                     condition,
                     _json_dumps(sources, "sourceRefs"),
+                    owner_task_id,
+                    owner_session_id,
                     next_check,
                     now,
                     now,
@@ -1810,6 +1989,61 @@ class ConversationDomainStore:
                 """UPDATE watches SET state='cancelled', version=version+1, updated_at=?
                    WHERE org=? AND workspace=? AND actor=? AND watch_id=? AND version=?""",
                 (now, *scope, identifier, expected),
+            )
+            updated = connection.execute(
+                """SELECT * FROM watches
+                   WHERE org=? AND workspace=? AND actor=? AND watch_id=?""",
+                (*scope, identifier),
+            ).fetchone()
+        assert updated is not None
+        return _watch_view(updated, self._row_json(updated, "source_refs_json"))
+
+    def record_watch_observation(
+        self,
+        org: str,
+        workspace: str,
+        actor: str,
+        watch_id: str,
+        expected_version: int,
+        task_id: str,
+        operation_receipt_id: str,
+        result_sha256: str,
+        next_check_at: int | None,
+    ) -> WireView:
+        """CAS one worker-verified observation without changing watch ownership."""
+
+        scope = self._scope(org, workspace, actor)
+        identifier = _identifier(watch_id, "watchId")
+        expected = _version(expected_version, "expectedVersion")
+        _identifier(task_id, "taskId")
+        receipt = _identifier(operation_receipt_id, "operationReceiptId")
+        digest = _digest_text(result_sha256, "resultSha256")
+        next_check = _optional_timestamp(next_check_at, "nextCheckAt")
+        now = _now_ms()
+        with self._write() as connection:
+            row = connection.execute(
+                """SELECT * FROM watches
+                   WHERE org=? AND workspace=? AND actor=? AND watch_id=?""",
+                (*scope, identifier),
+            ).fetchone()
+            if row is None:
+                raise _not_found("Watch was not found")
+            if (
+                int(row["version"]) == expected + 1
+                and row["last_operation_receipt_id"] == receipt
+                and row["last_result_sha256"] == digest
+                and row["next_check_at"] == next_check
+            ):
+                return _watch_view(row, self._row_json(row, "source_refs_json"))
+            if int(row["version"]) != expected or row["state"] != "active":
+                raise _conflict("Watch state or version changed")
+            if row["owner_task_id"] == "" or row["owner_session_id"] == "":
+                raise _conflict("Legacy watch lacks trusted owner task context")
+            connection.execute(
+                """UPDATE watches SET last_result_sha256=?,last_operation_receipt_id=?,
+                       last_observed_at=?,next_check_at=?,version=version+1,updated_at=?
+                   WHERE org=? AND workspace=? AND actor=? AND watch_id=? AND version=?""",
+                (digest, receipt, now, next_check, now, *scope, identifier, expected),
             )
             updated = connection.execute(
                 """SELECT * FROM watches
@@ -2437,7 +2671,11 @@ class ConversationDomainStore:
                 "researchNotes",
                 """SELECT * FROM research_notes WHERE org=? AND workspace=? AND actor=?
                    ORDER BY note_id""",
-                lambda row: _research_note_view(row, _decode_json(row, "source_refs_json")),
+                lambda row: _research_note_view(
+                    row,
+                    _decode_json(row, "source_refs_json"),
+                    _decode_json(row, "source_evidence_json"),
+                ),
             ),
             (
                 "verifiedSkills",
@@ -2884,6 +3122,74 @@ def _source_refs(value: object, *, allow_empty: bool = False) -> list[dict[str, 
     return result
 
 
+def _source_evidence(value: object) -> list[dict[str, object]]:
+    """Validate external research evidence without treating URLs as authorization."""
+
+    if not isinstance(value, list) or len(value) > 64:
+        raise _invalid("sourceEvidence must be a bounded array")
+    result: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for item in value:
+        payload = _body(
+            item,
+            required={"sourceRef", "kind", "title", "sourceSha256", "retrievedAt"},
+            optional={"url", "artifactId"},
+        )
+        source_ref = _text(payload["sourceRef"], "sourceEvidence.sourceRef", maximum=71)
+        if re.fullmatch(r"sha256:[a-f0-9]{64}", source_ref) is None:
+            raise _invalid("sourceEvidence.sourceRef must be a SHA-256 reference")
+        if source_ref in seen:
+            raise _invalid("sourceEvidence sourceRef values must be unique")
+        seen.add(source_ref)
+        kind = _choice(payload["kind"], "sourceEvidence.kind", {"web", "document"})
+        title = _text(payload["title"], "sourceEvidence.title", maximum=1_000)
+        source_sha = _digest_text(payload["sourceSha256"], "sourceEvidence.sourceSha256")
+        retrieved_at = _timestamp(payload["retrievedAt"], "sourceEvidence.retrievedAt")
+        raw_url = payload.get("url")
+        url: str | None = None
+        if raw_url is not None:
+            url = _text(raw_url, "sourceEvidence.url", maximum=4_096)
+            if url != raw_url or any(ord(character) < 33 for character in url):
+                raise _invalid("sourceEvidence URL is not canonical text")
+            try:
+                parsed = urlsplit(url)
+                hostname = parsed.hostname
+                _ = parsed.port
+            except ValueError as exc:
+                raise _invalid("sourceEvidence URL is invalid") from exc
+            if (
+                parsed.scheme != "https"
+                or not parsed.netloc
+                or hostname is None
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.netloc != parsed.netloc.lower()
+            ):
+                raise _invalid("sourceEvidence URL must be canonical HTTPS without userinfo")
+        artifact_id_raw = payload.get("artifactId")
+        artifact_id = (
+            None
+            if artifact_id_raw is None
+            else _digest_text(artifact_id_raw, "sourceEvidence.artifactId")
+        )
+        if kind == "web" and url is None:
+            raise _invalid("web sourceEvidence requires a canonical HTTPS URL")
+        if kind == "document" and artifact_id is None:
+            raise _invalid("document sourceEvidence requires an authorized artifactId")
+        result.append(
+            {
+                "sourceRef": source_ref,
+                "kind": kind,
+                "title": title,
+                "url": url,
+                "artifactId": artifact_id,
+                "sourceSha256": source_sha,
+                "retrievedAt": retrieved_at,
+            }
+        )
+    return result
+
+
 def _source_message_ids(value: object, *, allow_empty: bool = False) -> list[str]:
     if not isinstance(value, list) or len(value) > 128 or (not value and not allow_empty):
         raise _invalid("sourceMessageIds must be a bounded array")
@@ -3017,6 +3323,16 @@ def maintenance_task_id(workspace_id: str, actor_id: str, job_id: str) -> str:
         f"cyrene-maintenance-v1\0{workspace}\0{actor}\0{job}".encode()
     ).hexdigest()[:32]
     return f"maintenance-{digest}"
+
+
+def conversation_watch_task_id(watch_id: str, expected_version: int) -> str:
+    """Derive the stable child Task id for one versioned watch observation."""
+
+    watch = _identifier(watch_id, "watchId")
+    version = _version(expected_version, "expectedVersion")
+    resource = f"{watch}:v{version}"
+    digest = hashlib.sha256(f"watch\0{resource}".encode()).hexdigest()[:40]
+    return f"conversation-watch-{digest}"
 
 
 def _now_ms() -> int:
@@ -3219,6 +3535,19 @@ def _json_object(value: object, field: str) -> dict[str, object]:
     return value
 
 
+def _persona_binding_view(row: sqlite3.Row) -> WireView:
+    """Project one exact conversation binding with its durable CAS version."""
+
+    return {
+        "conversationId": str(row["conversation_id"]),
+        "conversationKind": str(row["conversation_kind"]),
+        "personaId": row["persona_id"],
+        "version": int(row["version"]),
+        "createdAt": int(row["created_at"]),
+        "updatedAt": int(row["updated_at"]),
+    }
+
+
 def _persona_view(row: sqlite3.Row, conversation_ids: object) -> WireView:
     conversations = _json_array(conversation_ids, "conversationIds")
     if any(not isinstance(item, str) for item in conversations):
@@ -3344,7 +3673,7 @@ def _maintenance_view(row: sqlite3.Row, details: object) -> WireView:
     }
 
 
-def _research_note_view(row: sqlite3.Row, sources: object) -> WireView:
+def _research_note_view(row: sqlite3.Row, sources: object, source_evidence: object) -> WireView:
     return {
         "id": str(row["note_id"]),
         "idempotencyKey": str(row["idempotency_key"]),
@@ -3354,6 +3683,8 @@ def _research_note_view(row: sqlite3.Row, sources: object) -> WireView:
         "title": str(row["title"]),
         "content": str(row["content"]),
         "sourceRefs": _json_array(sources, "sourceRefs"),
+        "sourceEvidence": _json_array(source_evidence, "sourceEvidence"),
+        "researchOperationReceiptId": row["research_operation_receipt_id"],
         "revision": int(row["revision"]),
         "createdAt": int(row["created_at"]),
     }
@@ -3389,7 +3720,12 @@ def _watch_view(row: sqlite3.Row, sources: object) -> WireView:
         "title": str(row["title"]),
         "condition": str(row["condition"]),
         "sourceRefs": _json_array(sources, "sourceRefs"),
+        "ownerTaskId": str(row["owner_task_id"]),
+        "ownerSessionId": str(row["owner_session_id"]),
         "nextCheckAt": row["next_check_at"],
+        "lastResultSha256": row["last_result_sha256"],
+        "lastOperationReceiptId": row["last_operation_receipt_id"],
+        "lastObservedAt": row["last_observed_at"],
         "state": str(row["state"]),
         "version": int(row["version"]),
         "createdAt": int(row["created_at"]),
@@ -3534,8 +3870,8 @@ def _research_note_digest(row: sqlite3.Row) -> str:
             "title": str(row["title"]),
             "content": str(row["content"]),
             "sourceRefs": _decode_json(row, "source_refs_json"),
-            "operationReceiptId": row["operation_receipt_id"],
-            "independentReadReceiptId": row["independent_read_receipt_id"],
+            "sourceEvidence": _decode_json(row, "source_evidence_json"),
+            "researchOperationReceiptId": row["research_operation_receipt_id"],
         }
     )
 

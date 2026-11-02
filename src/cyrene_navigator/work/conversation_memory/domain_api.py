@@ -10,14 +10,19 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
 import sqlite3
+import stat
 import time
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Literal, Protocol, cast
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Query, Request, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from cyrene_navigator.persistence.errors import WORKSPACE_FORBIDDEN, PersistenceError
 from cyrene_navigator.persistence.store import PersistencePrincipal
@@ -51,6 +56,9 @@ from cyrene_navigator.work.conversation_memory.domain_models import (
     MaintenanceJobUpdateReceipt,
     MaintenanceJobView,
     MaintenanceState,
+    PersonaBindingPut,
+    PersonaBindingReadReceipt,
+    PersonaBindingReceipt,
     PersonaPut,
     PersonaReceipt,
     PersonasView,
@@ -62,6 +70,7 @@ from cyrene_navigator.work.conversation_memory.domain_models import (
     ResearchNoteCreate,
     ResearchNoteReceipt,
     ResearchNotesView,
+    ResearchSourceEvidence,
     ReviewEventCreate,
     ReviewEventReceipt,
     ReviewEventsView,
@@ -70,6 +79,7 @@ from cyrene_navigator.work.conversation_memory.domain_models import (
     VerifiedSkillsView,
     WatchCreate,
     WatchesView,
+    WatchObservation,
     WatchReceipt,
     WatchSchedule,
     WatchUpdateReceipt,
@@ -77,6 +87,7 @@ from cyrene_navigator.work.conversation_memory.domain_models import (
 from cyrene_navigator.work.conversation_memory.domains import (
     ConversationDomainStore,
     WireView,
+    conversation_watch_task_id,
     maintenance_task_id,
 )
 
@@ -141,6 +152,28 @@ class WorkTaskLookup(Protocol):
         actor_id: str | None = None,
         actor_private_scope: bool = False,
     ) -> Mapping[str, object]: ...
+
+    def get_attachment(
+        self,
+        organization_id: str | None,
+        workspace_id: str,
+        digest: str,
+        *,
+        actor_id: str | None = None,
+        actor_private_scope: bool = False,
+        require_actor_private: bool = False,
+    ) -> tuple[Mapping[str, object], Path]: ...
+
+
+class TrustedTurnContextResolver(Protocol):
+    """Host resolver for the real parent Task/session of an authenticated turn."""
+
+    def __call__(
+        self,
+        request: Request,
+        workspace_id: str,
+        principal: PersistencePrincipal,
+    ) -> Mapping[str, str]: ...
 
 
 class GraphProvider(Protocol):
@@ -268,18 +301,36 @@ def _deduplicate_source_refs(
             result.append(ref)
     return result
 
-    def query(
-        self,
-        *,
-        organization_id: str,
-        workspace_id: str,
-        actor_id: str,
-        conversation_id: str,
-        conversation_kind: str,
-        persona_id: str | None,
-        query: str,
-        limit: int,
-    ) -> Mapping[str, object]: ...
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _canonical_sha256(value: object) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _source_evidence_payloads(value: object) -> list[Mapping[str, object]]:
+    if not isinstance(value, list) or len(value) > 64:
+        raise PersistenceError(
+            "CONVERSATION_DOMAIN_INVALID", 422, "sourceEvidence exceeds its supported limit."
+        )
+    result: list[Mapping[str, object]] = []
+    seen: set[str] = set()
+    for item in value:
+        try:
+            evidence = ResearchSourceEvidence.model_validate(item)
+        except ValidationError as exc:
+            raise PersistenceError(
+                "CONVERSATION_DOMAIN_INVALID", 422, "sourceEvidence entry is invalid."
+            ) from exc
+        if evidence.source_ref in seen:
+            raise PersistenceError(
+                "CONVERSATION_DOMAIN_INVALID", 422, "sourceEvidence sourceRefs must be unique."
+            )
+        seen.add(evidence.source_ref)
+        result.append(evidence.model_dump(by_alias=True, exclude_none=False))
+    return result
 
 
 def mount_domain_routes(
@@ -290,6 +341,7 @@ def mount_domain_routes(
     validate_source_ids: SourceIdValidator | None = None,
     *,
     validate_source_refs: SourceRefValidator | None = None,
+    trusted_turn_context: TrustedTurnContextResolver | None = None,
 ) -> None:
     """Mount authenticated P3–P10 routes on the host Work API.
 
@@ -362,6 +414,390 @@ def mount_domain_routes(
                 persona_id,
                 message_ids,
             )
+
+    def resolve_trusted_turn(
+        request: Request, workspace_id: str, principal: PersistencePrincipal
+    ) -> tuple[str, str]:
+        resolver = trusted_turn_context or cast(
+            TrustedTurnContextResolver | None,
+            getattr(app.state, "trusted_turn_context", None),
+        )
+        if resolver is None:
+            raise PersistenceError(
+                "CONVERSATION_DOMAIN_TURN_CONTEXT_UNAVAILABLE",
+                503,
+                "A trusted Work Task/session resolver is required for durable watches.",
+            )
+        context = resolver(request, workspace_id, principal)
+        task_id = context.get("taskId")
+        session_id = context.get("sessionId")
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise PersistenceError(
+                "CONVERSATION_DOMAIN_TURN_CONTEXT_REQUIRED",
+                409,
+                "A real parent Work Task is required.",
+            )
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise PersistenceError(
+                "CONVERSATION_DOMAIN_TURN_CONTEXT_REQUIRED",
+                409,
+                "A real Work session is required.",
+            )
+        return task_id, session_id
+
+    def validate_source_evidence_artifacts(
+        principal: PersistencePrincipal,
+        workspace_id: str,
+        conversation_id: str | None,
+        conversation_kind: str | None,
+        persona_id: str | None,
+        source_refs: Sequence[Mapping[str, object]],
+        source_evidence: Sequence[Mapping[str, object]],
+        *,
+        read_contents: bool,
+    ) -> None:
+        artifacts = [
+            item.get("artifactId")
+            for item in source_evidence
+            if isinstance(item.get("artifactId"), str)
+        ]
+        if not artifacts:
+            return
+        if conversation_id is None or conversation_kind not in {"direct", "group", "channel"}:
+            raise PersistenceError(
+                "CONVERSATION_DOMAIN_SOURCE_UNAVAILABLE",
+                409,
+                "Document evidence requires an exact conversation scope.",
+            )
+        organization_id = principal.organization_id
+        memory_store = getattr(app.state, "work_conversation_memory", None)
+        work_store = cast(WorkTaskLookup | None, getattr(app.state, "work_store", None))
+        if organization_id is None or memory_store is None or work_store is None:
+            raise PersistenceError(
+                "CONVERSATION_RESEARCH_ARTIFACT_AUTHORIZATION_UNAVAILABLE",
+                503,
+                "P2 memory authorization and actor-private Work attachments are required.",
+            )
+        overview = memory_store.overview(organization_id, workspace_id, principal.actor_id)
+        epoch = overview.get("authorizationEpoch")
+        if not isinstance(epoch, int) or isinstance(epoch, bool):
+            raise PersistenceError(
+                "CONVERSATION_RESEARCH_ARTIFACT_AUTHORIZATION_UNAVAILABLE",
+                503,
+                "Current P2 authorization epoch is unavailable.",
+            )
+        for evidence in source_evidence:
+            artifact_id = evidence.get("artifactId")
+            if artifact_id is None:
+                continue
+            if not isinstance(artifact_id, str):
+                raise PersistenceError(
+                    "CONVERSATION_DOMAIN_INVALID", 422, "sourceEvidence artifactId is invalid."
+                )
+            authorization = memory_store.authorize_artifact(
+                organization_id,
+                workspace_id,
+                principal.actor_id,
+                artifact_id,
+                conversation_id,
+                conversation_kind,
+                persona_id,
+                epoch,
+                source_refs,
+            )
+            artifact_metadata = authorization.get("artifact")
+            if authorization.get("allowed") is not True or not isinstance(
+                artifact_metadata, Mapping
+            ):
+                raise PersistenceError(
+                    "CONVERSATION_DOMAIN_SOURCE_UNAVAILABLE",
+                    409,
+                    "A document artifact is no longer authorized by its source messages.",
+                )
+            attachment, path = work_store.get_attachment(
+                organization_id,
+                workspace_id,
+                artifact_id,
+                actor_id=principal.actor_id,
+                actor_private_scope=True,
+                require_actor_private=True,
+            )
+            if (
+                attachment.get("id") != artifact_id
+                or attachment.get("sha256") != evidence.get("sourceSha256")
+                or attachment.get("size") != artifact_metadata.get("size")
+                or attachment.get("mediaType") != artifact_metadata.get("mimeType")
+                or artifact_metadata.get("artifactId") != artifact_id
+            ):
+                raise PersistenceError(
+                    "CONVERSATION_DOMAIN_SOURCE_UNAVAILABLE",
+                    409,
+                    "Document metadata does not match the currently authorized Work attachment.",
+                )
+            if read_contents:
+                try:
+                    descriptor = os.open(
+                        path,
+                        os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    )
+                    with os.fdopen(descriptor, "rb") as stream:
+                        info = os.fstat(stream.fileno())
+                        if not stat.S_ISREG(info.st_mode) or info.st_size > 10_000_000:
+                            raise ValueError("document attachment is not bounded regular content")
+                        content = stream.read(10_000_001)
+                except (OSError, ValueError) as exc:
+                    raise PersistenceError(
+                        "CONVERSATION_RESEARCH_ARTIFACT_READBACK_FAILED",
+                        409,
+                        "Authorized document bytes could not be independently read.",
+                    ) from exc
+                if len(content) != info.st_size or hashlib.sha256(
+                    content
+                ).hexdigest() != evidence.get("sourceSha256"):
+                    raise PersistenceError(
+                        "CONVERSATION_RESEARCH_ARTIFACT_READBACK_FAILED",
+                        409,
+                        "Document bytes do not match sourceEvidence sourceSha256.",
+                    )
+
+    def verify_research_evidence_receipt(
+        principal: PersistencePrincipal,
+        organization_id: str,
+        workspace_id: str,
+        body: ResearchNoteCreate,
+    ) -> tuple[list[Mapping[str, object]], list[Mapping[str, object]]]:
+        refs = _source_ref_payloads(body.source_refs)
+        evidence = _source_evidence_payloads(
+            [item.model_dump(by_alias=True, exclude_none=False) for item in body.source_evidence]
+        )
+        if not evidence:
+            if body.research_operation_receipt_id is not None:
+                raise PersistenceError(
+                    "CONVERSATION_DOMAIN_INVALID",
+                    422,
+                    "researchOperationReceiptId requires sourceEvidence.",
+                )
+            return refs, evidence
+        receipt_id = body.research_operation_receipt_id
+        if receipt_id is None:
+            raise PersistenceError(
+                "CONVERSATION_DOMAIN_INVALID", 422, "Trusted research evidence receipt is required."
+            )
+        work_store = cast(WorkTaskLookup | None, getattr(app.state, "work_store", None))
+        if work_store is None:
+            raise PersistenceError(
+                "WORK_OPERATION_VERIFICATION_UNAVAILABLE",
+                503,
+                "A WorkStore is required to verify research sourceEvidence.",
+            )
+        try:
+            operation = work_store.get_operation(
+                organization_id,
+                workspace_id,
+                receipt_id,
+                actor_id=principal.actor_id,
+                actor_private_scope=True,
+            )
+        except PersistenceError as exc:
+            if exc.status == 404:
+                raise PersistenceError(
+                    "WORK_OPERATION_VERIFICATION_REQUIRED",
+                    409,
+                    "Research operation receipt is unavailable in this actor scope.",
+                ) from exc
+            raise
+        trusted_producer = operation.get("trustedProducer")
+        if trusted_producer is None:
+            raise PersistenceError(
+                "WORK_OPERATION_PROVENANCE_UNAVAILABLE",
+                503,
+                "WorkStore has no immutable research runtime producer marker yet.",
+            )
+        if trusted_producer != "conversation-research-runtime":
+            raise PersistenceError(
+                "WORK_OPERATION_VERIFICATION_REQUIRED",
+                409,
+                "Receipt was not produced by the trusted research runtime.",
+            )
+        operation_type = operation.get("operationType")
+        task_id = operation.get("taskId")
+        request_payload = operation.get("request")
+        operation_evidence = operation.get("evidence")
+        if (
+            operation.get("id") != receipt_id
+            or operation_type != "conversation.research.read.v1"
+            or operation.get("status") != "verified"
+            or not isinstance(task_id, str)
+            or not isinstance(request_payload, Mapping)
+            or not isinstance(operation_evidence, Mapping)
+        ):
+            raise PersistenceError(
+                "WORK_OPERATION_VERIFICATION_REQUIRED",
+                409,
+                "Research operation receipt has an invalid scope or status.",
+            )
+        request = cast(Mapping[str, object], request_payload)
+        operation_source = request.get("source")
+        parent_task_id = request.get("parentTaskId")
+        parent_session_id = request.get("parentSessionId")
+        request_key = request.get("idempotencyKey")
+        request_source_refs = request.get("sourceRefs")
+        is_watch_read = operation_source == "conversation-watch"
+        expected_request: dict[str, object] = {
+            "source": operation_source,
+            "workspaceId": workspace_id,
+            "actorId": principal.actor_id,
+            "conversationId": body.conversation_id,
+            "conversationKind": body.conversation_kind,
+            "personaId": body.persona_id,
+            "idempotencyKey": request_key,
+            "parentTaskId": parent_task_id,
+            "parentSessionId": parent_session_id,
+            "sourceRefs": refs,
+        }
+        expected_metadata: dict[str, object] = {
+            "source": str(operation_source),
+            "workspaceId": workspace_id,
+            "actorId": principal.actor_id,
+            "conversationId": body.conversation_id,
+            "conversationKind": body.conversation_kind,
+            "personaId": body.persona_id,
+            "idempotencyKey": request_key,
+            "parentTaskId": parent_task_id,
+            "parentSessionId": parent_session_id,
+            "sourceRefs": refs,
+        }
+        watch: Mapping[str, object] | None = None
+        if is_watch_read:
+            watch_id_value = request.get("watchId")
+            watch_version = request.get("watchVersion")
+            source_refs_digest = _canonical_sha256(refs)
+            condition_sha256 = request.get("conditionSha256")
+            if (
+                not isinstance(watch_id_value, str)
+                or type(watch_version) is not int
+                or not isinstance(condition_sha256, str)
+                or re.fullmatch(r"[a-f0-9]{64}", condition_sha256) is None
+                or request.get("sourceRefsDigest") != source_refs_digest
+            ):
+                raise PersistenceError(
+                    "WORK_OPERATION_VERIFICATION_REQUIRED",
+                    409,
+                    "Watch research receipt is missing its exact watch source snapshot.",
+                )
+            watch = domain_store.get_watch(
+                organization_id, workspace_id, principal.actor_id, watch_id_value
+            )
+            if task_id != conversation_watch_task_id(watch_id_value, watch_version):
+                raise PersistenceError(
+                    "WORK_TASK_BACKGROUND_PROVENANCE_REQUIRED",
+                    409,
+                    "Watch research Task identity does not match its persisted version.",
+                )
+            if (
+                watch.get("conversationId") != body.conversation_id
+                or watch.get("conversationKind") != body.conversation_kind
+                or watch.get("personaId") != body.persona_id
+                or _canonical_json(watch.get("sourceRefs")) != _canonical_json(refs)
+                or hashlib.sha256(str(watch.get("condition", "")).encode()).hexdigest()
+                != condition_sha256
+                or not (
+                    watch.get("state") == "active"
+                    and (
+                        watch.get("version") == watch_version
+                        or (
+                            watch.get("lastOperationReceiptId") == receipt_id
+                            and watch.get("lastResultSha256")
+                            == operation_evidence.get("resultSha256")
+                        )
+                    )
+                )
+            ):
+                raise PersistenceError(
+                    "CONVERSATION_DOMAIN_SOURCE_UNAVAILABLE",
+                    409,
+                    "Research result no longer matches the exact active watch version.",
+                )
+            expected_request.update(
+                {
+                    "watchId": watch_id_value,
+                    "watchVersion": watch_version,
+                    "sourceRefsDigest": source_refs_digest,
+                    "conditionSha256": condition_sha256,
+                    "taskId": task_id,
+                }
+            )
+            expected_metadata.update(
+                {
+                    "watchId": watch_id_value,
+                    "watchVersion": watch_version,
+                    "sourceRefsDigest": source_refs_digest,
+                    "conditionSha256": condition_sha256,
+                }
+            )
+        if (
+            operation_source not in {"conversation-research-read", "conversation-watch"}
+            or request.get("workspaceId") != workspace_id
+            or request.get("actorId") != principal.actor_id
+            or request.get("conversationId") != body.conversation_id
+            or request.get("conversationKind") != body.conversation_kind
+            or request.get("personaId") != body.persona_id
+            or request_key is None
+            or not isinstance(parent_task_id, str)
+            or not isinstance(parent_session_id, str)
+            or not isinstance(request_source_refs, list)
+            or _canonical_json(_source_ref_payloads(request_source_refs)) != _canonical_json(refs)
+            or dict(request) != expected_request
+        ):
+            raise PersistenceError(
+                "WORK_OPERATION_VERIFICATION_REQUIRED",
+                409,
+                "Research receipt request does not match the note source scope.",
+            )
+        try:
+            task = work_store.get_task(
+                organization_id,
+                workspace_id,
+                task_id,
+                actor_id=principal.actor_id,
+                actor_private_scope=True,
+            )
+        except PersistenceError as exc:
+            if exc.status == 404:
+                raise PersistenceError(
+                    "WORK_OPERATION_VERIFICATION_REQUIRED",
+                    409,
+                    "Research receipt requires its actor-private completed Task.",
+                ) from exc
+            raise
+        task_metadata_raw = task.get("metadata")
+        output = task.get("output")
+        output_digest = (
+            hashlib.sha256(output.encode()).hexdigest() if isinstance(output, str) else None
+        )
+        projected_output_digest = operation.get("taskOutputSha256")
+        source_evidence = _source_evidence_payloads(operation_evidence.get("sourceEvidence"))
+        operation_refs = _source_ref_payloads(operation_evidence.get("sourceRefs", []))
+        if (
+            task.get("id") != task_id
+            or task.get("workspaceId") != workspace_id
+            or task.get("createdByActorId") != principal.actor_id
+            or task.get("sessionId") != parent_session_id
+            or task.get("status") != "completed"
+            or not isinstance(task_metadata_raw, Mapping)
+            or dict(task_metadata_raw) != expected_metadata
+            or not isinstance(output, str)
+            or projected_output_digest != output_digest
+            or _canonical_json(operation_refs) != _canonical_json(refs)
+            or _canonical_json(source_evidence) != _canonical_json(evidence)
+            or not re.fullmatch(r"[a-f0-9]{64}", str(operation_evidence.get("resultSha256")))
+        ):
+            raise PersistenceError(
+                "WORK_OPERATION_VERIFICATION_REQUIRED",
+                409,
+                "Research sourceEvidence does not match its trusted completed read receipt.",
+            )
+        return refs, evidence
 
     def view_sources_authorized(
         principal: PersistencePrincipal,
@@ -436,6 +872,23 @@ def mount_domain_routes(
                 conversation_kind,
                 persona_id,
                 deduplicated_refs,
+            )
+        except PersistenceError as exc:
+            if exc.status in {401, 403, 404, 409, 422}:
+                return False
+            raise
+        raw_evidence = view.get("sourceEvidence", [])
+        try:
+            normalized_evidence = _source_evidence_payloads(raw_evidence)
+            validate_source_evidence_artifacts(
+                principal,
+                workspace_id,
+                conversation_id,
+                conversation_kind,
+                persona_id,
+                deduplicated_refs,
+                normalized_evidence,
+                read_contents=False,
             )
         except PersistenceError as exc:
             if exc.status in {401, 403, 404, 409, 422}:
@@ -588,11 +1041,24 @@ def mount_domain_routes(
         principal: PersistencePrincipal,
         organization_id: str,
         workspace_id: str,
-        operation_receipt_id: str,
-        read_receipt_id: str,
-        content: str,
-    ) -> None:
-        """Require two immutable verified operation receipts and completed task outputs."""
+        body: VerifiedSkillCreate,
+        parent_task_id: str | None,
+        parent_session_id: str | None,
+        *,
+        require_worker: bool = True,
+    ) -> Mapping[str, object]:
+        """Require one real action and a distinct independent effect readback."""
+
+        if require_worker and (
+            not principal.can_write_harness
+            or not principal.actor_private_scope
+            or principal.organization_id is None
+        ):
+            raise PersistenceError(
+                WORKSPACE_FORBIDDEN,
+                403,
+                "Verified skills require a trusted actor-private Harness worker.",
+            )
 
         work_store = cast(WorkTaskLookup | None, getattr(app.state, "work_store", None))
         if work_store is None:
@@ -601,11 +1067,15 @@ def mount_domain_routes(
                 503,
                 "A WorkStore is required to verify skill receipts.",
             )
-        receipts: list[Mapping[str, object]] = []
-        for receipt_id, expected_type in (
-            (operation_receipt_id, "conversation.skill.verify"),
-            (read_receipt_id, "conversation.skill.readback"),
-        ):
+        conversation_kind = body.conversation_kind or "direct"
+        source_refs = _source_ref_payloads(body.source_refs)
+        source_refs_digest = _canonical_sha256(source_refs)
+        operation_specs = (
+            (body.operation_receipt_id, "conversation.skill.verify"),
+            (body.independent_read_receipt_id, "conversation.skill.readback"),
+        )
+        operations: list[Mapping[str, object]] = []
+        for receipt_id, expected_type in operation_specs:
             try:
                 operation = work_store.get_operation(
                     organization_id,
@@ -623,19 +1093,229 @@ def mount_domain_routes(
                     ) from exc
                 raise
             task_id = operation.get("taskId")
-            evidence = operation.get("evidence")
+            trusted_producer = operation.get("trustedProducer")
             if (
                 operation.get("id") != receipt_id
                 or operation.get("operationType") != expected_type
                 or operation.get("status") != "verified"
                 or not isinstance(task_id, str)
-                or not isinstance(evidence, Mapping)
+                or not isinstance(operation.get("evidence"), Mapping)
+                or not isinstance(operation.get("request"), Mapping)
             ):
                 raise PersistenceError(
                     "WORK_OPERATION_VERIFICATION_REQUIRED",
                     409,
                     "Skill verification operation receipt has invalid provenance.",
                 )
+            if trusted_producer is None:
+                raise PersistenceError(
+                    "WORK_OPERATION_PROVENANCE_UNAVAILABLE",
+                    503,
+                    "WorkStore has no immutable research runtime producer marker yet.",
+                )
+            if trusted_producer != "conversation-research-runtime":
+                raise PersistenceError(
+                    "WORK_OPERATION_VERIFICATION_REQUIRED",
+                    409,
+                    "Skill receipt was not produced by the trusted research runtime.",
+                )
+            operations.append(operation)
+        verify_operation, read_operation = operations
+        verify_evidence = cast(Mapping[str, object], verify_operation.get("evidence"))
+        read_evidence = cast(Mapping[str, object], read_operation.get("evidence"))
+        verify_request = cast(Mapping[str, object], verify_operation.get("request"))
+        read_request = cast(Mapping[str, object], read_operation.get("request"))
+        action_task_id = verify_operation.get("taskId")
+        readback_task_id = read_operation.get("taskId")
+        if (
+            not isinstance(action_task_id, str)
+            or not isinstance(readback_task_id, str)
+            or action_task_id == readback_task_id
+        ):
+            raise PersistenceError(
+                "WORK_OPERATION_VERIFICATION_REQUIRED",
+                409,
+                "Action and readback must use distinct actor-private Tasks.",
+            )
+        action_effect_id = verify_evidence.get("actionEffectOperationId")
+        read_action_effect_id = read_evidence.get("actionEffectOperationId")
+        readback_effect_id = read_evidence.get("readbackEffectOperationId")
+        action_result_sha = verify_evidence.get("effectResultSha256")
+        readback_result_sha = read_evidence.get("effectReadbackSha256")
+        if (
+            not isinstance(action_effect_id, str)
+            or not action_effect_id
+            or read_action_effect_id != action_effect_id
+            or not isinstance(readback_effect_id, str)
+            or not readback_effect_id
+            or readback_effect_id == action_effect_id
+            or not isinstance(action_result_sha, str)
+            or re.fullmatch(r"[a-f0-9]{64}", action_result_sha) is None
+            or not isinstance(readback_result_sha, str)
+            or re.fullmatch(r"[a-f0-9]{64}", readback_result_sha) is None
+        ):
+            raise PersistenceError(
+                "WORK_OPERATION_VERIFICATION_REQUIRED",
+                409,
+                "Skill receipts do not bind distinct action and readback effect operations.",
+            )
+        write_parent_id = parent_task_id or verify_request.get("parentTaskId")
+        parent_session = parent_session_id or verify_request.get("parentSessionId")
+        if not isinstance(write_parent_id, str) or not isinstance(parent_session, str):
+            raise PersistenceError(
+                "WORK_OPERATION_VERIFICATION_REQUIRED",
+                409,
+                "Skill action Task is missing its authenticated parent context.",
+            )
+        common_request = {
+            "source": "conversation-skill-probe",
+            "actionId": body.action_id,
+            "targetDigestSha256": body.target_digest_sha256,
+            "inputSha256": body.input_sha256,
+            "guideVersion": body.guide_version,
+            "guideSha256": body.guide_sha256,
+            "sourceRefsSha256": source_refs_digest,
+        }
+        expected_verify_request = {
+            **common_request,
+            "taskId": action_task_id,
+            "parentTaskId": write_parent_id,
+            "parentSessionId": parent_session,
+            "actionEffectOperationId": action_effect_id,
+            "effectResultSha256": action_result_sha,
+            "readbackOperationId": body.independent_read_receipt_id,
+        }
+        expected_read_request = {
+            **common_request,
+            "taskId": readback_task_id,
+            "parentTaskId": action_task_id,
+            "parentSessionId": parent_session,
+            "actionEffectOperationId": action_effect_id,
+            "readbackEffectOperationId": readback_effect_id,
+            "effectReadbackSha256": readback_result_sha,
+        }
+        if (
+            dict(verify_request) != expected_verify_request
+            or dict(read_request) != expected_read_request
+            or verify_evidence.get("readbackReceiptId") != body.independent_read_receipt_id
+        ):
+            raise PersistenceError(
+                "WORK_OPERATION_VERIFICATION_REQUIRED",
+                409,
+                "Skill operation requests do not bind the exact action/readback pair.",
+            )
+        verify_source_evidence = _source_evidence_payloads(verify_evidence.get("sourceEvidence"))
+        read_source_evidence = _source_evidence_payloads(read_evidence.get("sourceEvidence"))
+        if (
+            len(verify_source_evidence) != 1
+            or verify_source_evidence[0].get("kind") != "web"
+            or _canonical_json(verify_source_evidence) != _canonical_json(read_source_evidence)
+        ):
+            raise PersistenceError(
+                "WORK_OPERATION_VERIFICATION_REQUIRED",
+                409,
+                "Action and readback must carry the same single public web source.",
+            )
+        source_evidence = verify_source_evidence[0]
+        expected_source_values = {
+            "sourceRef": source_evidence.get("sourceRef"),
+            "canonicalUrl": source_evidence.get("url"),
+            "sourceSha256": source_evidence.get("sourceSha256"),
+        }
+        for evidence in (verify_evidence, read_evidence):
+            if any(evidence.get(key) != value for key, value in expected_source_values.items()):
+                raise PersistenceError(
+                    "WORK_OPERATION_VERIFICATION_REQUIRED",
+                    409,
+                    "Skill sourceEvidence does not match its receipt digests.",
+                )
+        artifact_sha = verify_evidence.get("workArtifactSha256")
+        raw_source_ref = verify_evidence.get("sourceRef")
+        canonical_url = verify_evidence.get("canonicalUrl")
+        source_sha = verify_evidence.get("sourceSha256")
+        if (
+            body.action_id != "public-web.lookup"
+            or verify_evidence.get("actionId") != body.action_id
+            or read_evidence.get("actionId") != body.action_id
+            or verify_evidence.get("targetDigestSha256") != body.target_digest_sha256
+            or read_evidence.get("targetDigestSha256") != body.target_digest_sha256
+            or verify_evidence.get("inputSha256") != body.input_sha256
+            or read_evidence.get("inputSha256") != body.input_sha256
+            or verify_evidence.get("guideVersion") != body.guide_version
+            or read_evidence.get("guideVersion") != body.guide_version
+            or verify_evidence.get("guideSha256") != body.guide_sha256
+            or read_evidence.get("guideSha256") != body.guide_sha256
+            or verify_evidence.get("effectOutcome") != "verified"
+            or verify_evidence.get("effectResultSha256") != action_result_sha
+            or read_evidence.get("effectReadbackOutcome") != "verified"
+            or read_evidence.get("effectReadbackSha256") != readback_result_sha
+            or read_evidence.get("readbackVerified") is not True
+            or action_result_sha != readback_result_sha
+            or action_result_sha != source_sha
+            or not isinstance(raw_source_ref, str)
+            or re.fullmatch(r"sha256:[a-f0-9]{64}", raw_source_ref) is None
+            or not isinstance(canonical_url, str)
+            or not isinstance(source_sha, str)
+            or re.fullmatch(r"[a-f0-9]{64}", source_sha) is None
+            or not isinstance(artifact_sha, str)
+            or re.fullmatch(r"[a-f0-9]{64}", artifact_sha) is None
+            or read_evidence.get("workArtifactSha256") != artifact_sha
+        ):
+            raise PersistenceError(
+                "WORK_OPERATION_VERIFICATION_REQUIRED",
+                409,
+                "Skill action and independent effect readback receipts do not match.",
+            )
+        try:
+            parsed_url = urlsplit(canonical_url)
+        except ValueError as exc:
+            raise PersistenceError(
+                "WORK_OPERATION_VERIFICATION_REQUIRED",
+                409,
+                "Skill source URL is invalid.",
+            ) from exc
+        if (
+            parsed_url.scheme != "https"
+            or not parsed_url.hostname
+            or parsed_url.username is not None
+            or parsed_url.password is not None
+            or parsed_url.netloc != parsed_url.netloc.lower()
+        ):
+            raise PersistenceError(
+                "WORK_OPERATION_VERIFICATION_REQUIRED",
+                409,
+                "Skill source URL must be canonical HTTPS without userinfo.",
+            )
+
+        expected_verify_metadata = {
+            "source": "conversation-skill-verify",
+            "workspaceId": workspace_id,
+            "actorId": principal.actor_id,
+            "conversationId": body.conversation_id,
+            "conversationKind": conversation_kind,
+            "personaId": body.persona_id,
+            "parentTaskId": write_parent_id,
+            "parentSessionId": parent_session,
+            "sourceRefs": source_refs,
+            "actionId": body.action_id,
+            "targetDigestSha256": body.target_digest_sha256,
+            "inputSha256": body.input_sha256,
+            "guideVersion": body.guide_version,
+            "guideSha256": body.guide_sha256,
+        }
+        expected_read_metadata = {
+            **expected_verify_metadata,
+            "source": "conversation-skill-readback",
+            "parentTaskId": action_task_id,
+            "sourceRef": raw_source_ref,
+            "canonicalUrl": canonical_url,
+            "sourceSha256": source_sha,
+            "workArtifactSha256": artifact_sha,
+        }
+        for operation, task_id, expected_metadata in (
+            (verify_operation, action_task_id, expected_verify_metadata),
+            (read_operation, readback_task_id, expected_read_metadata),
+        ):
             try:
                 task = work_store.get_task(
                     organization_id,
@@ -653,29 +1333,493 @@ def mount_domain_routes(
                     ) from exc
                 raise
             output = task.get("output")
-            task_digest = evidence.get("taskOutputSha256")
             if (
-                task.get("createdByActorId") != principal.actor_id
+                task.get("id") != task_id
+                or task.get("createdByActorId") != principal.actor_id
+                or task.get("workspaceId") != workspace_id
+                or task.get("sessionId") != parent_session
                 or task.get("status") != "completed"
+                or task.get("metadata") != expected_metadata
                 or not isinstance(output, str)
-                or task_digest != hashlib.sha256(output.encode()).hexdigest()
+                or operation.get("taskOutputSha256") != hashlib.sha256(output.encode()).hexdigest()
             ):
                 raise PersistenceError(
                     "WORK_OPERATION_VERIFICATION_REQUIRED",
                     409,
-                    "Skill verification receipt does not match a completed Task output.",
+                    "Skill receipt does not match its exact completed Task.",
                 )
-            receipts.append(evidence)
-        verify_evidence, read_evidence = receipts
-        content_digest = hashlib.sha256(content.encode()).hexdigest()
+        try:
+            artifact, _ = work_store.get_attachment(
+                organization_id,
+                workspace_id,
+                artifact_sha,
+                actor_id=principal.actor_id,
+                actor_private_scope=True,
+                require_actor_private=True,
+            )
+        except PersistenceError as exc:
+            if exc.status == 404:
+                raise PersistenceError(
+                    "WORK_OPERATION_VERIFICATION_REQUIRED",
+                    409,
+                    "Skill work artifact is unavailable to this actor.",
+                ) from exc
+            raise
+        if artifact.get("sha256") != artifact_sha:
+            raise PersistenceError(
+                "WORK_OPERATION_VERIFICATION_REQUIRED",
+                409,
+                "Skill work artifact digest does not match its receipt.",
+            )
+        return {
+            "actionId": body.action_id,
+            "targetDigestSha256": body.target_digest_sha256,
+            "inputSha256": body.input_sha256,
+            "guideVersion": body.guide_version,
+            "guideSha256": body.guide_sha256,
+            "actionEffectOperationId": action_effect_id,
+            "readbackEffectOperationId": readback_effect_id,
+            "effectOutcome": "verified",
+            "effectResultSha256": action_result_sha,
+            "effectReadbackOutcome": "verified",
+            "effectReadbackSha256": readback_result_sha,
+            "readbackVerified": True,
+            "sourceRef": raw_source_ref,
+            "canonicalUrl": canonical_url,
+            "sourceSha256": source_sha,
+            "workArtifactSha256": artifact_sha,
+        }
+
+    def skill_receipt_body_from_view(
+        principal: PersistencePrincipal,
+        organization_id: str,
+        workspace_id: str,
+        skill: Mapping[str, object],
+    ) -> VerifiedSkillCreate:
+        work_store = cast(WorkTaskLookup | None, getattr(app.state, "work_store", None))
+        operation_id = skill.get("operationReceiptId")
+        if work_store is None or not isinstance(operation_id, str):
+            raise PersistenceError(
+                "WORK_OPERATION_VERIFICATION_UNAVAILABLE",
+                503,
+                "A WorkStore is required to reconstruct verified skill evidence.",
+            )
+        operation = work_store.get_operation(
+            organization_id,
+            workspace_id,
+            operation_id,
+            actor_id=principal.actor_id,
+            actor_private_scope=True,
+        )
+        request_payload = operation.get("request")
+        if not isinstance(request_payload, Mapping):
+            raise PersistenceError(
+                "WORK_OPERATION_VERIFICATION_REQUIRED",
+                409,
+                "Stored skill receipt request is invalid.",
+            )
+        try:
+            return VerifiedSkillCreate.model_validate(
+                {
+                    "idempotencyKey": skill.get("idempotencyKey"),
+                    "conversationId": skill.get("conversationId"),
+                    "conversationKind": skill.get("conversationKind"),
+                    "personaId": skill.get("personaId"),
+                    "name": skill.get("name"),
+                    "content": skill.get("content"),
+                    "sourceRefs": skill.get("sourceRefs"),
+                    "operationReceiptId": skill.get("operationReceiptId"),
+                    "independentReadReceiptId": skill.get("independentReadReceiptId"),
+                    "actionId": request_payload.get("actionId"),
+                    "targetDigestSha256": request_payload.get("targetDigestSha256"),
+                    "inputSha256": request_payload.get("inputSha256"),
+                    "guideVersion": request_payload.get("guideVersion"),
+                    "guideSha256": request_payload.get("guideSha256"),
+                }
+            )
+        except ValidationError as exc:
+            raise PersistenceError(
+                "WORK_OPERATION_VERIFICATION_REQUIRED",
+                409,
+                "Stored skill receipt does not contain its typed action scope.",
+            ) from exc
+
+    def verify_watch_observation(
+        principal: PersistencePrincipal,
+        organization_id: str,
+        workspace_id: str,
+        watch: Mapping[str, object],
+        body: WatchObservation,
+    ) -> None:
+        """Verify a completed actor-private research read before watch CAS."""
+
         if (
-            verify_evidence.get("readbackReceiptId") != read_receipt_id
-            or read_evidence.get("contentSha256") != content_digest
+            not principal.can_write_harness
+            or not principal.actor_private_scope
+            or principal.organization_id is None
+        ):
+            raise PersistenceError(
+                WORKSPACE_FORBIDDEN,
+                403,
+                "Watch observations require a trusted actor-private Harness worker.",
+            )
+        version_matches = watch.get("version") == body.expected_version
+        replay_matches = (
+            watch.get("version") == body.expected_version + 1
+            and watch.get("lastOperationReceiptId") == body.operation_receipt_id
+            and watch.get("lastResultSha256") == body.result_sha256
+            and watch.get("nextCheckAt") == body.next_check_at
+        )
+        if watch.get("state") != "active" or not (version_matches or replay_matches):
+            raise PersistenceError(
+                "CONVERSATION_DOMAIN_CONFLICT", 409, "Watch state or version changed."
+            )
+        task_id = conversation_watch_task_id(str(watch["id"]), body.expected_version)
+        if body.task_id != task_id:
+            raise PersistenceError(
+                "WORK_TASK_BACKGROUND_PROVENANCE_REQUIRED",
+                409,
+                "Watch Task identity does not match the persisted watch version.",
+            )
+        work_store = cast(WorkTaskLookup | None, getattr(app.state, "work_store", None))
+        if work_store is None:
+            raise PersistenceError(
+                "WORK_OPERATION_VERIFICATION_UNAVAILABLE",
+                503,
+                "A WorkStore is required to verify watch observations.",
+            )
+        try:
+            operation = work_store.get_operation(
+                organization_id,
+                workspace_id,
+                body.operation_receipt_id,
+                actor_id=principal.actor_id,
+                actor_private_scope=True,
+            )
+        except PersistenceError as exc:
+            if exc.status == 404:
+                raise PersistenceError(
+                    "WORK_OPERATION_VERIFICATION_REQUIRED",
+                    409,
+                    "Watch observation operation receipt is unavailable.",
+                ) from exc
+            raise
+        trusted_producer = operation.get("trustedProducer")
+        if trusted_producer is None:
+            raise PersistenceError(
+                "WORK_OPERATION_PROVENANCE_UNAVAILABLE",
+                503,
+                "WorkStore has no immutable research runtime producer marker yet.",
+            )
+        if trusted_producer != "conversation-research-runtime":
+            raise PersistenceError(
+                "WORK_OPERATION_VERIFICATION_REQUIRED",
+                409,
+                "Watch receipt was not produced by the trusted research runtime.",
+            )
+        refs = _source_ref_payloads(cast(Sequence[object], watch.get("sourceRefs", [])))
+        refs_digest = _canonical_sha256(refs)
+        condition_digest = hashlib.sha256(str(watch.get("condition", "")).encode()).hexdigest()
+        expected_request = {
+            "source": "conversation-watch",
+            "taskId": task_id,
+            "workspaceId": workspace_id,
+            "actorId": principal.actor_id,
+            "conversationId": watch.get("conversationId"),
+            "conversationKind": watch.get("conversationKind"),
+            "personaId": watch.get("personaId"),
+            "idempotencyKey": watch.get("idempotencyKey"),
+            "parentTaskId": watch.get("ownerTaskId"),
+            "parentSessionId": watch.get("ownerSessionId"),
+            "watchId": watch.get("id"),
+            "watchVersion": body.expected_version,
+            "sourceRefsDigest": refs_digest,
+            "conditionSha256": condition_digest,
+        }
+        request_payload = operation.get("request")
+        evidence = operation.get("evidence")
+        if (
+            operation.get("id") != body.operation_receipt_id
+            or operation.get("operationType") != "conversation.research.read.v1"
+            or operation.get("status") != "verified"
+            or operation.get("taskId") != task_id
+            or not isinstance(request_payload, Mapping)
+            or dict(request_payload) != expected_request
+            or not isinstance(evidence, Mapping)
+            or evidence.get("outcome") != "verified"
+            or evidence.get("effect") != "read"
+            or evidence.get("resultSha256") != body.result_sha256
+            or evidence.get("sourceRefs") is None
+            or _canonical_json(_source_ref_payloads(cast(Sequence[object], evidence["sourceRefs"])))
+            != _canonical_json(refs)
         ):
             raise PersistenceError(
                 "WORK_OPERATION_VERIFICATION_REQUIRED",
                 409,
-                "Skill verification and independent readback receipts do not match.",
+                "Watch receipt does not match its exact versioned source scope.",
+            )
+        try:
+            task = work_store.get_task(
+                organization_id,
+                workspace_id,
+                task_id,
+                actor_id=principal.actor_id,
+                actor_private_scope=True,
+            )
+        except PersistenceError as exc:
+            if exc.status == 404:
+                raise PersistenceError(
+                    "WORK_TASK_BACKGROUND_PROVENANCE_REQUIRED",
+                    409,
+                    "Watch observation requires its completed actor-private Task.",
+                ) from exc
+            raise
+        metadata = {
+            "source": "conversation-watch",
+            "workspaceId": workspace_id,
+            "actorId": principal.actor_id,
+            "watchId": watch["id"],
+            "watchVersion": body.expected_version,
+            "idempotencyKey": watch["idempotencyKey"],
+            "parentTaskId": watch["ownerTaskId"],
+            "parentSessionId": watch["ownerSessionId"],
+            "conversationId": watch["conversationId"],
+            "conversationKind": watch["conversationKind"],
+            "personaId": watch["personaId"],
+            "sourceRefsDigest": refs_digest,
+            "conditionSha256": condition_digest,
+            "sourceRefs": refs,
+        }
+        output = task.get("output")
+        task_digest = operation.get("taskOutputSha256")
+        if (
+            task.get("id") != task_id
+            or task.get("workspaceId") != workspace_id
+            or task.get("createdByActorId") != principal.actor_id
+            or task.get("sessionId") != watch.get("ownerSessionId")
+            or task.get("status") != "completed"
+            or task.get("metadata") != metadata
+            or not isinstance(output, str)
+            or task_digest != hashlib.sha256(output.encode()).hexdigest()
+        ):
+            raise PersistenceError(
+                "WORK_TASK_BACKGROUND_PROVENANCE_REQUIRED",
+                409,
+                "Watch Task metadata or output does not match the verified operation.",
+            )
+
+    def verify_daily_review_report(
+        principal: PersistencePrincipal,
+        organization_id: str,
+        workspace_id: str,
+        body: ReviewEventCreate,
+    ) -> None:
+        """Bind a source-free daily-review ledger row to a live private Task and report."""
+
+        if not principal.can_write_harness or not principal.actor_private_scope:
+            raise PersistenceError(
+                WORKSPACE_FORBIDDEN,
+                403,
+                "Daily review requires the actor-private Harness worker principal.",
+            )
+        work_store = cast(WorkTaskLookup | None, getattr(app.state, "work_store", None))
+        if work_store is None:
+            raise PersistenceError(
+                "DAILY_REVIEW_REPORT_UNAVAILABLE",
+                503,
+                "A WorkStore is required to verify daily review reports.",
+                retryable=True,
+            )
+        task_id = body.task_id
+        if task_id is None:
+            raise PersistenceError(
+                "DAILY_REVIEW_TASK_REQUIRED", 422, "daily_review requires its exact Work Task id."
+            )
+        try:
+            task = work_store.get_task(
+                organization_id,
+                workspace_id,
+                task_id,
+                actor_id=principal.actor_id,
+                actor_private_scope=True,
+            )
+        except PersistenceError as exc:
+            if exc.status == 404:
+                raise PersistenceError(
+                    "DAILY_REVIEW_TASK_REQUIRED",
+                    409,
+                    "Daily review Task is unavailable in the current actor scope.",
+                ) from exc
+            raise
+        raw_metadata = task.get("metadata")
+        if not isinstance(raw_metadata, Mapping):
+            raise PersistenceError(
+                "DAILY_REVIEW_TASK_REQUIRED",
+                409,
+                "Daily review Task metadata is unavailable.",
+            )
+        metadata = cast(Mapping[str, object], raw_metadata)
+        job_id_value = metadata.get("maintenanceJobId")
+        if not isinstance(job_id_value, str):
+            raise PersistenceError(
+                "DAILY_REVIEW_TASK_REQUIRED",
+                409,
+                "The Work Task is not bound to an actor-owned maintenance job.",
+            )
+        job_id = job_id_value
+        job = domain_store.get_maintenance_job(
+            organization_id, workspace_id, principal.actor_id, job_id
+        )
+        if (
+            job.get("kind") != "daily_review"
+            or job.get("state") != "running"
+            or job.get("taskId") != task_id
+            or job.get("conversationId") != body.conversation_id
+            or job.get("conversationKind") != body.conversation_kind
+            or job.get("personaId") != body.persona_id
+        ):
+            raise PersistenceError(
+                "DAILY_REVIEW_TASK_SCOPE_MISMATCH",
+                409,
+                "The report Task does not match the current daily-review job scope.",
+            )
+        verified_task = maintenance_task_for_job(principal, organization_id, workspace_id, job)
+        if (
+            verified_task is None
+            or verified_task.get("id") != task_id
+            or verified_task.get("status") != "running"
+            or not isinstance(verified_task.get("metadata"), Mapping)
+        ):
+            raise PersistenceError(
+                "DAILY_REVIEW_TASK_REQUIRED",
+                409,
+                "The report must be written by its running actor-private Work Task.",
+            )
+        metadata = cast(Mapping[str, object], verified_task["metadata"])
+        if (
+            metadata.get("source") != "conversation-maintenance"
+            or metadata.get("kind") != "daily_review"
+            or metadata.get("maintenanceJobId") != job_id
+        ):
+            raise PersistenceError(
+                "DAILY_REVIEW_TASK_SCOPE_MISMATCH",
+                409,
+                "The report Task metadata does not identify this daily-review job.",
+            )
+
+        try:
+            summary = json.loads(body.summary)
+        except json.JSONDecodeError as exc:
+            raise PersistenceError(
+                "DAILY_REVIEW_REPORT_INVALID", 422, "Daily review summary is invalid JSON."
+            ) from exc
+        report = summary.get("report") if isinstance(summary, Mapping) else None
+        if not isinstance(report, Mapping):
+            raise PersistenceError(
+                "DAILY_REVIEW_REPORT_INVALID", 422, "Daily review summary has no report receipt."
+            )
+        artifact_id = report.get("artifactId")
+        digest = report.get("sha256")
+        report_size = report.get("sizeBytes")
+        if (
+            not isinstance(artifact_id, str)
+            or artifact_id != digest
+            or not re.fullmatch(r"[a-f0-9]{64}", artifact_id)
+            or type(report_size) is not int
+            or not 1 <= report_size <= 10_000_000
+        ):
+            raise PersistenceError(
+                "DAILY_REVIEW_REPORT_INVALID", 422, "Daily review report receipt is malformed."
+            )
+        try:
+            attachment, path = work_store.get_attachment(
+                organization_id,
+                workspace_id,
+                artifact_id,
+                actor_id=principal.actor_id,
+                actor_private_scope=True,
+                require_actor_private=True,
+            )
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+            with os.fdopen(descriptor, "rb") as stream:
+                file_info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(file_info.st_mode) or file_info.st_size != report_size:
+                    raise ValueError("report attachment size or type differs from its receipt")
+                content = stream.read(10_000_001)
+        except (OSError, ValueError) as exc:
+            raise PersistenceError(
+                "DAILY_REVIEW_REPORT_READBACK_FAILED",
+                409,
+                "Daily review report attachment could not be independently read back.",
+            ) from exc
+        if (
+            len(content) != report_size
+            or hashlib.sha256(content).hexdigest() != digest
+            or attachment.get("id") != artifact_id
+            or attachment.get("sha256") != digest
+            or attachment.get("size") != report_size
+            or not isinstance(attachment.get("mediaType"), str)
+            or not str(attachment["mediaType"]).startswith("application/")
+            or not (
+                attachment["mediaType"] == "application/json"
+                or str(attachment["mediaType"]).endswith("+json")
+            )
+        ):
+            raise PersistenceError(
+                "DAILY_REVIEW_REPORT_READBACK_FAILED",
+                409,
+                "Daily review report attachment metadata or digest differs from its receipt.",
+            )
+        try:
+            manifest = json.loads(content)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PersistenceError(
+                "DAILY_REVIEW_REPORT_READBACK_FAILED",
+                409,
+                "Daily review report attachment is not valid JSON.",
+            ) from exc
+        if (
+            not isinstance(manifest, Mapping)
+            or manifest.get("schema") != "cyrene.conversation-daily-review.v1"
+        ):
+            raise PersistenceError(
+                "DAILY_REVIEW_REPORT_READBACK_FAILED",
+                409,
+                "Daily review report attachment has an unexpected schema.",
+            )
+        report_scope = manifest.get("scope")
+        if not isinstance(report_scope, Mapping) or any(
+            report_scope.get(key) != value
+            for key, value in (
+                ("conversationId", body.conversation_id),
+                ("conversationKind", body.conversation_kind),
+                ("personaId", body.persona_id),
+            )
+        ):
+            raise PersistenceError(
+                "DAILY_REVIEW_REPORT_READBACK_FAILED",
+                409,
+                "Daily review report scope does not match the authenticated ledger scope.",
+            )
+        manifest_refs = manifest.get("sourceRefs")
+        if not isinstance(manifest_refs, list):
+            raise PersistenceError(
+                "DAILY_REVIEW_REPORT_READBACK_FAILED",
+                409,
+                "Daily review report sourceRefs are missing.",
+            )
+        expected_refs = _source_ref_payloads(body.source_refs)
+        actual_refs = _source_ref_payloads(manifest_refs)
+        if json.dumps(actual_refs, sort_keys=True, separators=(",", ":")) != json.dumps(
+            expected_refs, sort_keys=True, separators=(",", ":")
+        ):
+            raise PersistenceError(
+                "DAILY_REVIEW_REPORT_READBACK_FAILED",
+                409,
+                "Daily review report source lineage differs from its ledger event.",
             )
 
     def require_graph_provider() -> GraphProvider:
@@ -757,6 +1901,47 @@ def mount_domain_routes(
             domain_body(body),
         )
         return {"persona": persona}
+
+    @app.get(base + "/personas/binding", response_model=PersonaBindingReadReceipt)
+    def get_persona_binding(
+        workspace_id: str,
+        request: Request,
+        conversation_id: str = Query(alias="conversationId", min_length=1, max_length=200),
+        conversation_kind: Literal["direct", "group", "channel"] = Query(alias="conversationKind"),
+    ) -> WireView:
+        principal, organization_id = actor_scope(request, workspace_id, write=False)
+        binding = domain_store.get_persona_binding(
+            organization_id,
+            workspace_id,
+            principal.actor_id,
+            conversation_id,
+            conversation_kind,
+        )
+        personas = domain_store.list_personas(
+            organization_id,
+            workspace_id,
+            principal.actor_id,
+            conversation_id,
+        )
+        available_ids = [
+            str(persona["id"]) for persona in personas if persona.get("enabled") is True
+        ]
+        return {"binding": binding, "availablePersonaIds": available_ids}
+
+    @app.put(base + "/personas/binding", response_model=PersonaBindingReceipt)
+    def put_persona_binding(
+        workspace_id: str,
+        body: PersonaBindingPut,
+        request: Request,
+    ) -> WireView:
+        principal, organization_id = actor_scope(request, workspace_id, write=True)
+        binding = domain_store.put_persona_binding(
+            organization_id,
+            workspace_id,
+            principal.actor_id,
+            body.model_dump(by_alias=True, exclude_none=False),
+        )
+        return binding
 
     @app.post(
         base + "/profile-candidates",
@@ -1291,6 +2476,19 @@ def mount_domain_routes(
             body.persona_id,
             body.source_refs,
         )
+        normalized_refs, normalized_evidence = verify_research_evidence_receipt(
+            principal, organization_id, workspace_id, body
+        )
+        validate_source_evidence_artifacts(
+            principal,
+            workspace_id,
+            body.conversation_id,
+            body.conversation_kind,
+            body.persona_id,
+            normalized_refs,
+            normalized_evidence,
+            read_contents=True,
+        )
         duplicate = has_idempotency_record(
             organization_id,
             workspace_id,
@@ -1346,13 +2544,14 @@ def mount_domain_routes(
             body.persona_id,
             body.source_refs,
         )
-        verify_skill_receipts(
+        parent_task_id, parent_session_id = resolve_trusted_turn(request, workspace_id, principal)
+        evidence = verify_skill_receipts(
             principal,
             organization_id,
             workspace_id,
-            body.operation_receipt_id,
-            body.independent_read_receipt_id,
-            body.content,
+            body,
+            parent_task_id,
+            parent_session_id,
         )
         duplicate = has_idempotency_record(
             organization_id,
@@ -1366,8 +2565,16 @@ def mount_domain_routes(
             organization_id,
             workspace_id,
             principal.actor_id,
-            domain_body(body),
+            domain_body(
+                body,
+                "action_id",
+                "target_digest_sha256",
+                "input_sha256",
+                "guide_version",
+                "guide_sha256",
+            ),
         )
+        skill["evidence"] = evidence
         if duplicate:
             response.status_code = 200
         return {"skill": skill, "duplicate": duplicate}
@@ -1382,7 +2589,22 @@ def mount_domain_routes(
         items = domain_store.list_verified_skills(
             organization_id, workspace_id, principal.actor_id, limit
         )
-        return {"items": filter_authorized_views(principal, workspace_id, items)}
+        verified_items: list[WireView] = []
+        for item in filter_authorized_views(principal, workspace_id, items):
+            evidence_body = skill_receipt_body_from_view(
+                principal, organization_id, workspace_id, item
+            )
+            evidence = verify_skill_receipts(
+                principal,
+                organization_id,
+                workspace_id,
+                evidence_body,
+                None,
+                None,
+                require_worker=False,
+            )
+            verified_items.append({**item, "evidence": evidence})
+        return {"items": verified_items}
 
     @app.post(base + "/watches", response_model=WatchReceipt, status_code=201)
     def create_watch(
@@ -1400,6 +2622,7 @@ def mount_domain_routes(
             body.persona_id,
             body.source_refs,
         )
+        owner_task_id, owner_session_id = resolve_trusted_turn(request, workspace_id, principal)
         duplicate = has_idempotency_record(
             organization_id,
             workspace_id,
@@ -1408,11 +2631,14 @@ def mount_domain_routes(
             "idempotency_key",
             body.idempotency_key,
         )
+        watch_body = domain_body(body)
+        watch_body["ownerTaskId"] = owner_task_id
+        watch_body["ownerSessionId"] = owner_session_id
         watch = domain_store.create_watch(
             organization_id,
             workspace_id,
             principal.actor_id,
-            domain_body(body),
+            watch_body,
         )
         if duplicate:
             response.status_code = 200
@@ -1475,6 +2701,32 @@ def mount_domain_routes(
             principal.actor_id,
             watch_id,
             body.expected_version,
+            body.next_check_at,
+        )
+        return {"watch": watch}
+
+    @app.post(base + "/watches/{watch_id}/observe", response_model=WatchUpdateReceipt)
+    def record_watch_observation(
+        workspace_id: str,
+        watch_id: str,
+        body: WatchObservation,
+        request: Request,
+    ) -> WireView:
+        principal, organization_id = actor_scope(request, workspace_id, write=True)
+        current = domain_store.get_watch(
+            organization_id, workspace_id, principal.actor_id, watch_id
+        )
+        require_view_sources(principal, workspace_id, current)
+        verify_watch_observation(principal, organization_id, workspace_id, current, body)
+        watch = domain_store.record_watch_observation(
+            organization_id,
+            workspace_id,
+            principal.actor_id,
+            watch_id,
+            body.expected_version,
+            body.task_id,
+            body.operation_receipt_id,
+            body.result_sha256,
             body.next_check_at,
         )
         return {"watch": watch}
@@ -1654,6 +2906,16 @@ def mount_domain_routes(
         response: Response,
     ) -> WireView:
         principal, organization_id = actor_scope(request, workspace_id, write=True)
+        if body.event_type == "daily_review" and not (
+            principal.can_write_harness and principal.actor_private_scope
+        ):
+            raise PersistenceError(
+                WORKSPACE_FORBIDDEN,
+                403,
+                "Daily review ledger events require the actor-private Harness worker principal.",
+            )
+        if body.event_type == "daily_review":
+            verify_daily_review_report(principal, organization_id, workspace_id, body)
         conversation_kind = body.conversation_kind or "direct"
         validate_sources(
             principal,
@@ -1675,7 +2937,7 @@ def mount_domain_routes(
             organization_id,
             workspace_id,
             principal.actor_id,
-            domain_body(body),
+            domain_body(body, "task_id"),
         )
         if duplicate:
             response.status_code = 200

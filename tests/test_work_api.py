@@ -2936,6 +2936,330 @@ def test_actor_private_principals_get_private_task_memory_and_attachment_rows(
         assert shared_not_private.value.code == "WORK_ATTACHMENT_NOT_FOUND"
 
 
+def test_trusted_operation_provenance_is_server_owned_and_task_bound(tmp_path: Path) -> None:
+    """Completed research receipts bind to DB output, never a generic body assertion."""
+
+    base = BASE.format(workspace="w1")
+    headers = _headers("actor-private-harness-owner")
+    with _client(tmp_path / "trusted-operation.sqlite3") as client:
+
+        def complete_task(task_id: str, metadata: dict[str, Any], output: str) -> None:
+            created = client.post(
+                base + "/tasks",
+                json={
+                    "id": task_id,
+                    "sessionId": "research-session",
+                    "prompt": "run the fixed read operation",
+                    "metadata": metadata,
+                },
+                headers=headers,
+            )
+            assert created.status_code == 201, created.text
+            claimed = client.post(base + f"/tasks/{task_id}/claim", headers=headers)
+            assert claimed.status_code == 200 and claimed.json()["claimed"]
+            finished = client.patch(
+                base + f"/tasks/{task_id}",
+                json={"status": "completed", "output": output},
+                headers=headers,
+            )
+            assert finished.status_code == 200, finished.text
+
+        actor_id = "22222222-2222-4222-8222-222222222222"
+        complete_task("research-parent", {}, "parent task result")
+        source_refs = [
+            {"memoryId": None, "memoryVersion": None, "sourceMessageIds": ["source-message-1"]}
+        ]
+        source_evidence = [
+            {
+                "sourceRef": "sha256:" + "1" * 64,
+                "kind": "web",
+                "title": "Verified article",
+                "url": "https://example.test/article",
+                "sourceSha256": "1" * 64,
+                "retrievedAt": "2026-10-31T12:00:00Z",
+            }
+        ]
+        content = "The verified page says this."
+        content_sha256 = hashlib.sha256(content.encode()).hexdigest()
+        artifact_id = "a" * 64
+        target_digest = "d" * 64
+        task_id = "research-child"
+        metadata = {
+            "source": "conversation-research-read",
+            "workspaceId": "w1",
+            "actorId": actor_id,
+            "conversationId": "conversation-1",
+            "conversationKind": "direct",
+            "personaId": None,
+            "idempotencyKey": "research-request-1",
+            "parentTaskId": "research-parent",
+            "parentSessionId": "research-session",
+            "sourceRefs": source_refs,
+        }
+        output = json.dumps(
+            {
+                "version": 1,
+                "artifactId": artifact_id,
+                "title": "Verified article",
+                "content": content,
+                "resultSha256": artifact_id,
+                "contentSha256": content_sha256,
+                "sourceEvidence": source_evidence,
+            },
+            separators=(",", ":"),
+        )
+        complete_task(task_id, metadata, output)
+        operation_body = {
+            "idempotencyKey": "conversation-research:"
+            + hashlib.sha256(f"{task_id}\0{target_digest}".encode()).hexdigest(),
+            "operationType": "conversation.research.read.v1",
+            "taskId": task_id,
+            "target": f"conversation-research:{target_digest}",
+            "request": {
+                "source": "conversation-research-runtime",
+                "taskId": task_id,
+                "parentTaskId": "research-parent",
+                "parentSessionId": "research-session",
+                "sourceRefsSha256": _digest(source_refs),
+                "resultArtifactId": artifact_id,
+                "resultSha256": artifact_id,
+                "contentSha256": content_sha256,
+                "targetDigestSha256": target_digest,
+            },
+            "evidence": {
+                "outcome": "verified",
+                "effect": "read",
+                "taskSource": "conversation-research-read",
+                "resultSha256": artifact_id,
+                "contentSha256": content_sha256,
+                "targetDigestSha256": target_digest,
+                "sourceRefs": source_refs,
+                "sourceEvidence": source_evidence,
+                "artifactId": artifact_id,
+                "bindingId": "fixed-public-web-binding",
+                "readbackVerified": True,
+                "readbackSha256": artifact_id,
+            },
+        }
+        generic = client.post(
+            base + "/operations",
+            json={key: value for key, value in operation_body.items() if key != "evidence"},
+            headers=headers,
+        )
+        assert generic.status_code == 403
+        assert (
+            client.post(
+                base + "/operations/trusted/conversation-research-runtime",
+                json=operation_body,
+                headers=headers,
+            ).status_code
+            == 404
+        )
+        work_store = client.app.state.work_store
+        with pytest.raises(PersistenceError) as generic_producer:
+            work_store.create_operation(
+                "org-a",
+                "w1",
+                operation_body,
+                actor_id=actor_id,
+                actor_private_scope=True,
+                trusted_producer="conversation-research-runtime",
+            )
+        assert generic_producer.value.code == "WORK_OPERATION_TRUSTED_FINALIZER_REQUIRED"
+        tampered_digest = json.loads(json.dumps(operation_body))
+        tampered_digest["evidence"]["taskOutputSha256"] = "0" * 64
+        with pytest.raises(PersistenceError) as digest_mismatch:
+            work_store.create_completed_operation(
+                "org-a",
+                "w1",
+                tampered_digest,
+                actor_id=actor_id,
+                actor_private_scope=True,
+                trusted_producer="conversation-research-runtime",
+            )
+        assert digest_mismatch.value.code == "WORK_OPERATION_TASK_OUTPUT_MISMATCH"
+        operation, duplicate = work_store.create_completed_operation(
+            "org-a",
+            "w1",
+            operation_body,
+            actor_id=actor_id,
+            actor_private_scope=True,
+            trusted_producer="conversation-research-runtime",
+        )
+        assert duplicate is False
+        record = operation
+        assert record["trustedProducer"] == "conversation-research-runtime"
+        assert record["status"] == "verified"
+        expected_output_sha256 = hashlib.sha256(output.encode()).hexdigest()
+        assert record["evidence"]["taskOutputSha256"] == expected_output_sha256
+        assert record["taskOutputSha256"] == expected_output_sha256
+
+        replay, duplicate = work_store.create_completed_operation(
+            "org-a",
+            "w1",
+            operation_body,
+            actor_id=actor_id,
+            actor_private_scope=True,
+            trusted_producer="conversation-research-runtime",
+        )
+        assert duplicate is True
+        assert replay["id"] == record["id"]
+
+        generic_update = client.patch(
+            base + f"/operations/{record['id']}",
+            json={"status": "verified", "evidence": record["evidence"]},
+            headers=headers,
+        )
+        assert generic_update.status_code == 403
+        with pytest.raises(PersistenceError) as update_producer:
+            work_store.update_operation(
+                "org-a",
+                "w1",
+                record["id"],
+                "verified",
+                record["evidence"],
+                actor_id=actor_id,
+                actor_private_scope=True,
+                trusted_producer="conversation-research-runtime",
+            )
+        assert update_producer.value.code == "WORK_OPERATION_TRUSTED_FINALIZER_REQUIRED"
+        readback = client.get(base + f"/operations/{record['id']}", headers=headers)
+        assert readback.status_code == 200
+        assert readback.json()["operation"]["trustedProducer"] == "conversation-research-runtime"
+        assert readback.json()["operation"]["taskOutputSha256"] == expected_output_sha256
+        by_key = client.get(
+            base + "/operations/by-idempotency-key",
+            params={"idempotencyKey": operation_body["idempotencyKey"]},
+            headers=headers,
+        )
+        assert by_key.status_code == 200
+        assert by_key.json()["operation"]["id"] == record["id"]
+        assert by_key.json()["operation"]["trustedProducer"] == "conversation-research-runtime"
+        assert by_key.json()["operation"]["taskOutputSha256"] == expected_output_sha256
+        assert (
+            client.get(
+                base + "/operations/by-idempotency-key",
+                params={"idempotencyKey": operation_body["idempotencyKey"]},
+                headers=_headers("teams-v2-owner"),
+            ).status_code
+            == 404
+        )
+
+
+def test_notification_exact_lookup_is_actor_scoped_and_avoids_list_paging(
+    tmp_path: Path,
+) -> None:
+    """Exact ID and deduplication lookups read one authorized outbox row."""
+
+    base = BASE.format(workspace="w1")
+    owner = _headers("actor-private-harness-owner")
+    other = _headers("actor-private-member")
+    with _client(tmp_path / "notification-exact-read.sqlite3") as client:
+        task = client.post(
+            base + "/tasks", json=_task_body("notification-owner-task"), headers=owner
+        )
+        assert task.status_code == 201, task.text
+        assert client.post(base + "/tasks/notification-owner-task/claim", headers=owner).json()[
+            "claimed"
+        ]
+        created = client.post(
+            base + "/notifications",
+            json={
+                "deduplicationKey": "notification-readback-key",
+                "type": "test.notice",
+                "payload": {"resultSha256": "a" * 64},
+                "taskId": "notification-owner-task",
+            },
+            headers=owner,
+        )
+        assert created.status_code == 201, created.text
+        notification = created.json()["notification"]
+        by_id = client.get(base + f"/notifications/{notification['id']}", headers=owner)
+        assert by_id.status_code == 200, by_id.text
+        assert by_id.json()["id"] == notification["id"]
+        by_key = client.get(
+            base + "/notifications/by-deduplication-key",
+            params={"deduplicationKey": "notification-readback-key"},
+            headers=owner,
+        )
+        assert by_key.status_code == 200, by_key.text
+        assert by_key.json()["id"] == notification["id"]
+        assert (
+            client.get(base + f"/notifications/{notification['id']}", headers=other).status_code
+            == 404
+        )
+
+
+def test_watch_creation_binds_to_running_actor_private_chat_task(tmp_path: Path) -> None:
+    """A watch cannot be created from a caller-selected or ordinary Work Task."""
+
+    base = BASE.format(workspace="w1")
+    headers = _headers("actor-private-harness-owner")
+    with _client(tmp_path / "watch-task-owner.sqlite3") as client:
+        task_id = "watch-parent-task"
+        task = client.post(
+            base + "/tasks",
+            json={
+                "id": task_id,
+                "sessionId": "watch-session",
+                "prompt": "watch the requested source",
+                "metadata": {
+                    "navigatorConversationOrigin": {
+                        "kind": "web",
+                        "conversationKind": "direct",
+                        "conversationId": "conversation-1",
+                        "eventId": "event-1",
+                    }
+                },
+            },
+            headers=headers,
+        )
+        assert task.status_code == 201, task.text
+        assert client.post(base + f"/tasks/{task_id}/claim", headers=headers).json()["claimed"]
+        message = client.app.state.work_conversation_memory.create_message(
+            "org-a",
+            "w1",
+            "22222222-2222-4222-8222-222222222222",
+            {
+                "eventId": "source-event-1",
+                "conversationId": "conversation-1",
+                "conversationKind": "direct",
+                "role": "user",
+                "visibility": "private",
+                "content": "Watch this authorized article.",
+            },
+        )
+        body = {
+            "idempotencyKey": "watch-idempotency-1",
+            "conversationId": "conversation-1",
+            "conversationKind": "direct",
+            "personaId": None,
+            "title": "Article updates",
+            "condition": "Notify me when the article changes.",
+            "sourceRefs": [
+                {
+                    "memoryId": None,
+                    "memoryVersion": None,
+                    "sourceMessageIds": [message["message"]["id"]],
+                }
+            ],
+            "nextCheckAt": 1_800_000_000_000,
+        }
+        route = base + "/conversation-memory/watches"
+        missing_context = client.post(route, json=body, headers=headers)
+        assert missing_context.status_code == 409, missing_context.text
+        created = client.post(
+            route,
+            json=body,
+            headers={**headers, "X-Cyrene-Work-Task-ID": task_id},
+        )
+        assert created.status_code == 201, created.text
+        watch = created.json()["watch"]
+        assert watch["ownerTaskId"] == task_id
+        assert watch["ownerSessionId"] == "watch-session"
+        assert watch["sourceRefs"] == body["sourceRefs"]
+
+
 def test_v3_github_actions_workflow_target_roundtrips_and_stays_actor_private(
     tmp_path: Path,
 ) -> None:
@@ -4174,6 +4498,7 @@ def test_operation_scope_lock_migrates_without_rewriting_existing_receipts(tmp_p
     with _client(db_path), sqlite3.connect(db_path) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(work_operations)")}
         assert "scope_lock" in columns
+        assert "trusted_producer" in columns
         assert conn.execute(
             "SELECT operation_id,status,scope_lock FROM work_operations"
         ).fetchone() == ("legacy-operation", "uncertain", None)
