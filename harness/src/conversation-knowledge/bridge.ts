@@ -61,6 +61,31 @@ export interface KnowledgeAuthorizationReceipt {
   readonly reasonCode?: string;
 }
 
+/** The exact body of `POST .../knowledge/authorize` for one earlier search page. */
+export interface KnowledgeAuthorizationBody {
+  readonly datasetId: string;
+  readonly datasetVersionId: string;
+  readonly librarySelector: string;
+  readonly query: string;
+  readonly limit: number;
+  readonly cursor?: string;
+  readonly resultDigest: string;
+  readonly citations: readonly KnowledgeCitation[];
+}
+
+export function authorizationBodyFromPage(page: KnowledgeSearchPage): KnowledgeAuthorizationBody {
+  return {
+    datasetId: page.datasetId,
+    datasetVersionId: page.datasetVersionId,
+    librarySelector: page.librarySelector,
+    query: page.query,
+    limit: page.limit,
+    ...(page.cursor === undefined ? {} : { cursor: page.cursor }),
+    resultDigest: page.resultDigest,
+    citations: page.hits.map(hit => hit.citation),
+  };
+}
+
 /** Bounded error without response text or any knowledge content. */
 export class ConversationKnowledgeBridgeError extends Error {
   readonly code: string;
@@ -123,16 +148,7 @@ export class NavigatorConversationKnowledgeHttpBridge implements ConversationKno
     page: KnowledgeSearchPage,
     context: TrustedTurnContext,
   ): Promise<KnowledgeAuthorizationReceipt> {
-    const payload = await this.post('authorize', {
-      datasetId: page.datasetId,
-      datasetVersionId: page.datasetVersionId,
-      librarySelector: page.librarySelector,
-      query: page.query,
-      limit: page.limit,
-      ...(page.cursor === undefined ? {} : { cursor: page.cursor }),
-      resultDigest: page.resultDigest,
-      citations: page.hits.map(hit => hit.citation),
-    }, context);
+    const payload = await this.post('authorize', authorizationBodyFromPage(page), context);
     const receipt = decodeReceipt(payload);
     if (receipt.resultDigest !== page.resultDigest || receipt.datasetVersionId !== page.datasetVersionId) {
       throw new ConversationKnowledgeBridgeError('KNOWLEDGE_RECEIPT_MISMATCH', 502);
@@ -237,7 +253,7 @@ function text(value: unknown, max = 4_096): string {
   return value;
 }
 
-function decodeCitation(value: unknown): KnowledgeCitation {
+export function decodeCitation(value: unknown): KnowledgeCitation {
   const row = object(value);
   if (!Number.isSafeInteger(row.blockOrdinal) || Number(row.blockOrdinal) < 0
     || !Array.isArray(row.hierarchyPath) || !Array.isArray(row.assetRefs)) {
@@ -259,7 +275,7 @@ function decodeCitation(value: unknown): KnowledgeCitation {
   };
 }
 
-function decodeSearch(value: unknown, query: string, limit: number, cursor: string | undefined): KnowledgeSearchPage {
+export function decodeSearch(value: unknown, query: string, limit: number, cursor: string | undefined): KnowledgeSearchPage {
   const row = object(value);
   const pkg = object(row.package);
   if (row.query !== query || !Array.isArray(row.hits) || row.hits.length > limit
@@ -289,7 +305,7 @@ function decodeSearch(value: unknown, query: string, limit: number, cursor: stri
   };
 }
 
-function decodeReceipt(value: unknown): KnowledgeAuthorizationReceipt {
+export function decodeReceipt(value: unknown): KnowledgeAuthorizationReceipt {
   const row = object(value);
   if (typeof row.allowed !== 'boolean' || !Number.isSafeInteger(row.checkedAt)) {
     throw new ConversationKnowledgeBridgeError('KNOWLEDGE_RESPONSE_INVALID', 502);

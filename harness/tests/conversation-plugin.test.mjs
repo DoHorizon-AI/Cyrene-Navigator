@@ -13,7 +13,8 @@ import { join } from 'node:path';
 import { after, test } from 'node:test';
 import { Context } from '@deepseek-ai/cordis';
 import { DynamicPluginManager } from '../dist/plugin-manager.js';
-import { collectPluginContributions } from '../dist/conversation-plugin-hooks.js';
+import { collectPluginContributions, recheckExternalProofs } from '../dist/conversation-plugin-hooks.js';
+import { KNOWLEDGE_PROOF_KIND, createKnowledgeProofVerifier } from '../dist/conversation-knowledge/index.js';
 import { hasConversationContextProofV1 } from '../dist/features/conversation-memory.js';
 import { WorkStateClient } from '../dist/work-state-client.js';
 
@@ -335,6 +336,208 @@ test('the directory watcher loads, reloads and unloads plugins from files alone'
     rmSync(path);
     await until(async () => (await contentNow()).length === 0, 'unload after delete');
     assert.deepEqual(manager.listPlugins(), []);
+  } finally {
+    await manager.dispose();
+  }
+});
+
+
+// ---------------------------------------------------------------------------------------------
+// Catalyst knowledge plugin: the plugin retrieves, the host verifies and rechecks.
+// ---------------------------------------------------------------------------------------------
+
+const knowledgePlugin = new URL('../plugins/conversation-knowledge.mjs', import.meta.url);
+const knowledgeBridgeModule = new URL('../dist/conversation-knowledge/bridge.js', import.meta.url).href;
+const DATASET = '11111111-1111-4111-8111-111111111111';
+const VERSION = '22222222-2222-4222-8222-222222222222';
+const REVISION = '33333333-3333-4333-8333-333333333333';
+const knowledgeCitation = {
+  librarySelector: 'handbook',
+  datasetId: DATASET,
+  datasetVersionId: VERSION,
+  contentRevisionId: REVISION,
+  sourceRevisionId: '44444444-4444-4444-8444-444444444444',
+  sourceId: '55555555-5555-4555-8555-555555555555',
+  blockId: 'block-1',
+  blockOrdinal: 0,
+  chunkId: `sha256:${'c'.repeat(64)}`,
+  locator: { page: 2 },
+  hierarchyPath: ['Operations'],
+  assetRefs: [],
+};
+const knowledgeSearch = query => ({
+  package: { librarySelector: 'handbook', datasetId: DATASET, datasetName: 'Handbook', datasetVersionId: VERSION, version: 3 },
+  query,
+  usePurpose: 'knowledge_retrieval',
+  packageDigest: `sha256:${'a'.repeat(64)}`,
+  resultDigest: 'd'.repeat(64),
+  hits: [{ text: 'Reset the gateway before restarting.', score: 1.5, citation: knowledgeCitation }],
+});
+
+async function knowledgeServer() {
+  const state = { searchStatus: 200, allowed: true, reasonCode: undefined, requests: [] };
+  const server = createServer((request, response) => {
+    let raw = '';
+    request.on('data', chunk => { raw += chunk; });
+    request.on('end', () => {
+      const body = JSON.parse(raw);
+      state.requests.push({ url: request.url, headers: request.headers, body });
+      response.writeHead(request.url.endsWith('/search') ? state.searchStatus : 200, { 'content-type': 'application/json' });
+      if (request.url.endsWith('/search')) {
+        response.end(JSON.stringify(state.searchStatus === 200 ? knowledgeSearch(body.query) : { code: 'KNOWLEDGE_PACKAGE_STALE' }));
+      } else {
+        response.end(JSON.stringify({
+          allowed: state.allowed,
+          datasetVersionId: VERSION,
+          contentRevisionId: REVISION,
+          packageDigest: `sha256:${'a'.repeat(64)}`,
+          resultDigest: body.resultDigest,
+          checkedAt: 1_800_000_000_000,
+          ...(state.reasonCode === undefined ? {} : { reasonCode: state.reasonCode }),
+        }));
+      }
+    });
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  process.env.PLUGIN_TEST_ACTOR_A_TOKEN = 'actor-a-token-for-plugin-tests';
+  return { server, state, baseUrl: `http://127.0.0.1:${server.address().port}` };
+}
+
+const knowledgeVerifiers = () => new Map([[KNOWLEDGE_PROOF_KIND, createKnowledgeProofVerifier()]]);
+
+async function loadKnowledgePlugin(manager, name) {
+  const copied = join(root, `${name}.mjs`);
+  copyFileSync(knowledgePlugin, copied);
+  const info = await manager.loadPlugin('conversation-knowledge', copied, { bridgeModule: knowledgeBridgeModule });
+  assert.equal(info.status, 'loaded', info.error);
+}
+
+test('the knowledge plugin retrieves as the turn actor and the host verifies the sources', async () => {
+  const { server, state, baseUrl } = await knowledgeServer();
+  const { ctx, manager } = newManager();
+  try {
+    await loadKnowledgePlugin(manager, 'knowledge-accept');
+    const outcome = await collectPluginContributions(
+      ctx, api(), trustedContext(),
+      input({ attachments: [], query: 'restart gateway', requestWork: actorTransport(baseUrl, 'PLUGIN_TEST_ACTOR_A_TOKEN') }),
+      { verifiers: knowledgeVerifiers() },
+    );
+    assert.deepEqual(outcome.held, []);
+    assert.equal(outcome.contributions.length, 1);
+    const contribution = outcome.contributions[0];
+    assert.equal(contribution.featureId, 'plugin.conversation-knowledge.v1');
+    assert.match(contribution.content, /Handbook/u);
+    assert.match(contribution.content, /Reset the gateway/u);
+    assert.deepEqual(contribution.sourceRefs, []);
+    assert.equal(contribution.externalProofs[0].kind, 'catalyst-knowledge.v1');
+    // The model-visible query is all the plugin sends; package, principal and purpose stay server-side.
+    assert.deepEqual(state.requests[0].body, { query: 'restart gateway', limit: 5 });
+    // The host, not the plugin, asked the server to recheck the cited sources as the same actor.
+    assert.equal(state.requests[1].url.endsWith('/knowledge/authorize'), true);
+    assert.equal(state.requests[1].headers.authorization, 'Bearer actor-a-token-for-plugin-tests');
+    assert.equal(state.requests[1].body.citations[0].blockId, 'block-1');
+  } finally {
+    await manager.dispose();
+    server.close();
+  }
+});
+
+test('a revoked knowledge source is held at acceptance and a stale package yields no proposal', async () => {
+  const { server, state, baseUrl } = await knowledgeServer();
+  const { ctx, manager } = newManager();
+  try {
+    await loadKnowledgePlugin(manager, 'knowledge-revoked');
+    const run = () => collectPluginContributions(
+      ctx, api(), trustedContext(),
+      input({ attachments: [], query: 'restart gateway', requestWork: actorTransport(baseUrl, 'PLUGIN_TEST_ACTOR_A_TOKEN') }),
+      { verifiers: knowledgeVerifiers() },
+    );
+    state.allowed = false;
+    state.reasonCode = 'KNOWLEDGE_SOURCE_NOT_AUTHORIZED';
+    const revoked = await run();
+    assert.deepEqual(revoked.contributions, []);
+    assert.deepEqual(revoked.held, [{ featureId: 'plugin.conversation-knowledge.v1', code: 'KNOWLEDGE_SOURCE_NOT_AUTHORIZED' }]);
+
+    state.allowed = true;
+    state.searchStatus = 409;
+    const stale = await run();
+    assert.deepEqual(stale.contributions, []);
+    assert.deepEqual(stale.held, []);
+  } finally {
+    await manager.dispose();
+    server.close();
+  }
+});
+
+test('knowledge needs a registered verifier, rejects forged evidence, and is rechecked before delivery', async () => {
+  const { server, state, baseUrl } = await knowledgeServer();
+  const { ctx, manager } = newManager();
+  try {
+    await loadKnowledgePlugin(manager, 'knowledge-verifier');
+    const transport = actorTransport(baseUrl, 'PLUGIN_TEST_ACTOR_A_TOKEN');
+    const withoutVerifier = await collectPluginContributions(
+      ctx, api(), trustedContext(), input({ attachments: [], query: 'restart gateway', requestWork: transport }),
+    );
+    assert.deepEqual(withoutVerifier.held.map(item => item.code), ['PLUGIN_EXTERNAL_VERIFIER_UNAVAILABLE']);
+
+    const forgedPath = pluginFile('forger', `
+      export const name = 'forger';
+      export function apply(ctx) {
+        ctx.on('navigator/conversation-context', payload => {
+          payload.contribute({
+            featureId: 'plugin.forger.v1', content: 'invented fact', sourceRefs: [],
+            externalProof: { kind: 'catalyst-knowledge.v1', evidence: { resultDigest: 'not-a-digest', citations: [] } },
+          });
+        });
+      }
+    `);
+    await manager.loadPlugin('forger', forgedPath);
+    const forged = await collectPluginContributions(
+      ctx, api(), trustedContext(), input({ attachments: [], query: 'restart gateway', requestWork: transport }),
+      { verifiers: knowledgeVerifiers() },
+    );
+    assert.ok(forged.held.some(item => item.featureId === 'plugin.forger.v1' && item.code === 'KNOWLEDGE_EVIDENCE_INVALID'));
+    assert.ok(forged.contributions.every(item => item.featureId !== 'plugin.forger.v1'));
+
+    // Delivery gate: the same proof is rechecked and a revocation in between holds the reply.
+    await manager.unloadPlugin('forger');
+    const accepted = await collectPluginContributions(
+      ctx, api(), trustedContext(), input({ attachments: [], query: 'restart gateway', requestWork: transport }),
+      { verifiers: knowledgeVerifiers() },
+    );
+    const proofs = accepted.contributions[0].externalProofs;
+    const context = trustedContext();
+    assert.equal(await recheckExternalProofs(knowledgeVerifiers(), context, proofs, request => transport(request)), 'allow');
+    state.allowed = false;
+    state.reasonCode = 'KNOWLEDGE_PACKAGE_STALE';
+    assert.equal(await recheckExternalProofs(knowledgeVerifiers(), context, proofs, request => transport(request)), 'KNOWLEDGE_PACKAGE_STALE');
+    assert.equal(await recheckExternalProofs(knowledgeVerifiers(), context, proofs, undefined), 'KNOWLEDGE_VERIFIER_UNAVAILABLE');
+    assert.equal(await recheckExternalProofs(new Map(), context, proofs, transport), 'PLUGIN_EXTERNAL_VERIFIER_UNAVAILABLE');
+  } finally {
+    await manager.dispose();
+    server.close();
+  }
+});
+
+test('a verifier that throws holds the proposal instead of allowing it', async () => {
+  const { ctx, manager } = newManager();
+  try {
+    const path = pluginFile('needs-proof', `
+      export const name = 'needs-proof';
+      export function apply(ctx) {
+        ctx.on('navigator/conversation-context', payload => {
+          payload.contribute({ featureId: 'plugin.needs-proof.v1', content: 'x', sourceRefs: [], externalProof: { kind: 'test.v1', evidence: {} } });
+        });
+      }
+    `);
+    await manager.loadPlugin('needs-proof', path);
+    const outcome = await collectPluginContributions(
+      ctx, api(), trustedContext(), input({ attachments: [] }),
+      { verifiers: new Map([['test.v1', { verify: async () => { throw new Error('verifier down'); } }]]) },
+    );
+    assert.deepEqual(outcome.contributions, []);
+    assert.deepEqual(outcome.held, [{ featureId: 'plugin.needs-proof.v1', code: 'EXTERNAL_PROOF_UNAVAILABLE' }]);
   } finally {
     await manager.dispose();
   }

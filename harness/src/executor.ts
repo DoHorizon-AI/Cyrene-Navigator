@@ -51,7 +51,12 @@ import type { ConversationExecutionBackend } from './codebuddy-acp-execution.js'
 import type { WorkflowSourceTaskReceipt } from './workflows/store.js';
 import { getConnectorToolCatalog } from './tool-providers.js';
 import { VOLATILE_CONVERSATION_SESSION_PREFIX } from './persistence.js';
-import { collectPluginContributions } from './conversation-plugin-hooks.js';
+import { collectPluginContributions, recheckExternalProofs } from './conversation-plugin-hooks.js';
+import type {
+  ConversationExternalProof,
+  ConversationExternalProofVerifiers,
+  ConversationPluginWorkTransport,
+} from './conversation-plugin-hooks.js';
 import { ConversationFeatureError, createConversationMemoryFeature } from './features/conversation-memory.js';
 import type {
   ConversationMemoryApiV1,
@@ -193,6 +198,7 @@ interface InternalTaskState {
     readonly userEventId: string;
     readonly userMessageId: string;
     readonly sourceRefs: readonly ConversationSourceRef[];
+    readonly externalProofs: readonly ConversationExternalProof[];
     assistantMessageId?: string;
     assistantEventId?: string;
   };
@@ -235,6 +241,8 @@ export interface ExecutorConfig {
   /** Optional top-level conversation engine; omission preserves the DSH AgentLoop backend. */
   readonly conversationBackend?: ConversationExecutionBackend;
   readonly workspaceId: string;
+  /** Host-owned checks for plugin contributions whose provenance is not a Work message. */
+  readonly conversationExternalVerifiers?: ConversationExternalProofVerifiers;
   readonly authTokenEnv?: string;
   readonly allowedOrigins?: readonly string[];
   readonly teams?: TeamsExecutorConfig;
@@ -2247,7 +2255,9 @@ export class NavigatorExecutor {
       ...(workState.requestWorkJson === undefined
         ? {}
         : { requestWork: request => workState.requestWorkJson!(request) }),
-    });
+    }, { ...(this.config.conversationExternalVerifiers === undefined
+      ? {}
+      : { verifiers: this.config.conversationExternalVerifiers }) });
     const userSourceRef: ConversationSourceRef = {
       memoryId: null,
       memoryVersion: null,
@@ -2273,6 +2283,7 @@ export class NavigatorExecutor {
       userEventId,
       userMessageId: event.message.id,
       sourceRefs,
+      externalProofs: pluginContext.contributions.flatMap(contribution => contribution.externalProofs),
     };
     const promptParts: string[] = [];
     if (authorizedHistory.length > 0) {
@@ -2295,6 +2306,16 @@ export class NavigatorExecutor {
   private async finishConversationAssistantTurn(task: InternalTaskState, assistantText: string): Promise<'allow' | string> {
     const turn = task.conversationTurn;
     if (turn === undefined) return 'allow';
+    const deliveryWork = task.workState ?? this.config.workState;
+    const external = await recheckExternalProofs(
+      this.config.conversationExternalVerifiers,
+      turn.context,
+      turn.externalProofs,
+      deliveryWork.requestWorkJson === undefined
+        ? undefined
+        : (request: Parameters<ConversationPluginWorkTransport>[0]) => deliveryWork.requestWorkJson!(request),
+    );
+    if (external !== 'allow') return external;
     const decision = await turn.feature.beforeDelivery(turn.context, {
       text: assistantText,
       sourceRefs: turn.sourceRefs,
