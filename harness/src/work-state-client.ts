@@ -13,6 +13,7 @@ import type {
   ConversationMemoryApiV1,
   ConversationMemory as ConversationMemoryFeatureRecord,
   ConversationMessage as ConversationMessageFeatureRecord,
+  ConversationMessageAttachment,
   ConversationSourceRef as ConversationSourceRefFeatureRecord,
   TrustedTurnContext,
 } from './features/conversation-memory.js';
@@ -621,8 +622,28 @@ function decodeConversationMessage(value: unknown): ConversationMessageFeatureRe
     ...(row.sourceRefs === undefined
       ? {}
       : { sourceRefs: decodeConversationSourceRefs(row.sourceRefs, 'message sourceRefs') }),
+    ...(row.attachments === undefined
+      ? {}
+      : { attachments: decodeConversationAttachments(row.attachments) }),
     scope: decodeConversationResourceScope(row.scope),
   };
+}
+
+function decodeConversationAttachments(value: unknown): ConversationMessageAttachment[] {
+  if (!Array.isArray(value) || value.length > 32) {
+    throw new TypeError('Invalid conversation message attachments');
+  }
+  return value.map(item => {
+    const row = object(item, 'Conversation attachment');
+    const artifactId = stringField(row.artifactId, 'attachment artifactId');
+    const sha256 = stringField(row.sha256, 'attachment sha256');
+    const size = row.size;
+    if (!/^[0-9a-f]{64}$/u.test(artifactId) || sha256 !== artifactId
+      || typeof size !== 'number' || !Number.isSafeInteger(size) || size < 1 || size > 10_000_000) {
+      throw new TypeError('Invalid conversation attachment metadata');
+    }
+    return { artifactId, sha256, mimeType: stringField(row.mimeType, 'attachment mimeType'), size };
+  });
 }
 
 function decodeConversationMemory(

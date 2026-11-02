@@ -6,6 +6,9 @@
 
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import { Context } from '@deepseek-ai/cordis';
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session';
@@ -576,6 +579,88 @@ test('projectConversationAssistantTaskRead projects safe error codes and falls b
     assert.equal(readUnsafe.output, '');
     assert.equal(readUnsafe.reasoning, '');
   } finally {
+    await app.executor.dispose();
+    await app.pluginManager?.dispose();
+    await app.ctx.fiber.dispose();
+  }
+});
+
+const PLUGIN_SOURCE_ID = 'plugin-source-1';
+
+function contextPlugin(text) {
+  return `
+    export const name = 'executor-context-plugin';
+    export function apply(ctx) {
+      ctx.on('navigator/conversation-context', payload => {
+        payload.contribute({
+          featureId: 'plugin.executor-test.v1',
+          content: ${JSON.stringify(text)},
+          sourceRefs: [{ memoryId: null, memoryVersion: null, sourceMessageIds: [${JSON.stringify(PLUGIN_SOURCE_ID)}] }],
+        });
+      });
+    }
+  `;
+}
+
+function recordAuthorizedSources(store) {
+  const seen = [];
+  const original = store.conversationMemoryApiV1;
+  store.conversationMemoryApiV1 = actorId => {
+    const api = original(actorId);
+    const authorize = api.authorizeSources;
+    api.authorizeSources = async (context, input) => {
+      seen.push(input.sourceRefs.flatMap(ref => ref.sourceMessageIds));
+      return authorize(context, input);
+    };
+    return api;
+  };
+  return seen;
+}
+
+test('a dynamic plugin contribution reaches a real executor turn and is rechecked at delivery', async () => {
+  const { app, store, adapter } = await makeApp(false);
+  const seen = recordAuthorizedSources(store);
+  const directory = mkdtempSync(join(tmpdir(), 'navigator-executor-plugin-'));
+  try {
+    assert.ok(app.pluginManager, 'the executor app exposes the dynamic plugin manager');
+    const path = join(directory, 'executor-context.mjs');
+    writeFileSync(path, contextPlugin('PLUGIN-CONTEXT-MARKER-4471'));
+    assert.equal((await app.pluginManager.loadPlugin('executor-context', path)).status, 'loaded');
+
+    const outcome = await app.executor.executeTask(
+      webTurn('conversation-plugin', 'web-conversation-plugin', 'Use the plugin context.'),
+      () => {},
+    );
+    assert.equal(outcome.status, 'completed');
+    const prompt = adapter.prompts.find(text => text.includes('Current user message:'));
+    assert.ok(prompt.includes('Authorized plugin context:\nPLUGIN-CONTEXT-MARKER-4471'));
+    // The plugin's source is part of the host's own delivery-time authorization, not the plugin's.
+    assert.ok(seen.at(-1).includes(PLUGIN_SOURCE_ID), 'delivery gate checked the plugin source');
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+    await app.executor.dispose();
+    await app.pluginManager?.dispose();
+    await app.ctx.fiber.dispose();
+  }
+});
+
+test('a plugin contribution whose source is revoked never reaches the model prompt', async () => {
+  const { app, adapter, revokeSource } = await makeApp(false);
+  const directory = mkdtempSync(join(tmpdir(), 'navigator-executor-plugin-'));
+  try {
+    const path = join(directory, 'executor-context.mjs');
+    writeFileSync(path, contextPlugin('PLUGIN-CONTEXT-MARKER-REVOKED'));
+    assert.equal((await app.pluginManager.loadPlugin('executor-context', path)).status, 'loaded');
+    revokeSource(PLUGIN_SOURCE_ID);
+
+    const outcome = await app.executor.executeTask(
+      webTurn('conversation-plugin-revoked', 'web-conversation-plugin-revoked', 'Use the plugin context.'),
+      () => {},
+    );
+    assert.equal(outcome.status, 'completed');
+    assert.ok(adapter.prompts.every(text => !text.includes('PLUGIN-CONTEXT-MARKER-REVOKED')));
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
     await app.executor.dispose();
     await app.pluginManager?.dispose();
     await app.ctx.fiber.dispose();
