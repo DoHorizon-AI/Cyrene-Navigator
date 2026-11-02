@@ -22,6 +22,8 @@ import AgentRegistry from '@deepseek-ai/dsh-agent';
 import AgentLoop from '@deepseek-ai/dsh-agent-loop';
 import CyreneSessionPersistence from './persistence.js';
 import { DynamicPluginManager, apply as applyPluginManager } from './plugin-manager.js';
+import type { ConversationExternalProofVerifiers } from './conversation-plugin-hooks.js';
+import { KNOWLEDGE_PROOF_KIND, createKnowledgeProofVerifier } from './conversation-knowledge/verifier.js';
 import {
   NavigatorExecutor,
   apply as applyExecutor,
@@ -169,6 +171,8 @@ export interface CreateExecutorAppOptions {
   readonly teams?: TeamsExecutorConfig;
   /** Opt in to the static, actor-private P2 conversation assistant profile. */
   readonly enableConversationAssistant?: boolean;
+  /** Override the host-owned external-source verifiers (tests); the default registers knowledge. */
+  readonly conversationExternalVerifiers?: ConversationExternalProofVerifiers;
   /** Restrict a Teams deployment to authenticated text conversations with no model tools. | 仅允许通过身份校验的纯文字对话，不向模型开放工具。 */
   readonly teamsChatOnly?: boolean;
   readonly connectorBindingsPath?: string;
@@ -628,6 +632,8 @@ export async function createExecutorApp(options: CreateExecutorAppOptions = {}) 
     ...(readExchangeOperationState === undefined ? {} : { readExchangeOperationState }),
     ...(conversationAssistantEnabled
       ? {
+        conversationExternalVerifiers: options.conversationExternalVerifiers
+          ?? new Map([[KNOWLEDGE_PROOF_KIND, createKnowledgeProofVerifier()]]),
         conversationAssistant: {
           enabled: true,
           personaId: 'conversation-assistant',

@@ -666,3 +666,65 @@ test('a plugin contribution whose source is revoked never reaches the model prom
     await app.ctx.fiber.dispose();
   }
 });
+
+test('an external-source proof is rechecked at delivery and a revocation holds the reply', async () => {
+  const verifierCalls = [];
+  const verifiers = new Map([['test-proof.v1', {
+    async verify() {
+      verifierCalls.push('verify');
+      return verifierCalls.length === 1
+        ? { allowed: true }
+        : { allowed: false, code: 'TEST_PROOF_REVOKED' };
+    },
+  }]]);
+  const store = new InMemoryWorkStateStore(ACTOR_ID);
+  const { messages } = installConversationApi(store, { denyDelivery: false });
+  const adapter = new ConversationAdapter();
+  const app = await createExecutorApp({
+    testMode: true,
+    workStateStore: store,
+    authTokenEnv: 'CYRENE_CONVERSATION_TEST_TOKEN',
+    enableConversationAssistant: true,
+    workspaceOwnerActorId: ACTOR_ID,
+    customLlmAdapter: { provider: 'conversation-test', adapter },
+    model: 'conversation-test-v1',
+    conversationExternalVerifiers: verifiers,
+  });
+  const directory = mkdtempSync(join(tmpdir(), 'navigator-executor-plugin-'));
+  const emitted = [];
+  try {
+    const path = join(directory, 'external-proof.mjs');
+    writeFileSync(path, `
+      export const name = 'external-proof';
+      export function apply(ctx) {
+        ctx.on('navigator/conversation-context', payload => {
+          payload.contribute({
+            featureId: 'plugin.external-proof.v1',
+            content: 'EXTERNAL-PROOF-MARKER-9921',
+            sourceRefs: [],
+            externalProof: { kind: 'test-proof.v1', evidence: { any: 'thing' } },
+          });
+        });
+      }
+    `);
+    assert.equal((await app.pluginManager.loadPlugin('external-proof', path)).status, 'loaded');
+
+    const outcome = await app.executor.executeTask(
+      webTurn('conversation-external-proof', 'web-conversation-external-proof', 'Use the external knowledge.'),
+      event => emitted.push(event),
+    );
+    // Accepted once (the plugin context reached the model) and rechecked once before delivery.
+    assert.equal(verifierCalls.length, 2);
+    assert.ok(adapter.prompts.some(text => text.includes('Authorized plugin context:\nEXTERNAL-PROOF-MARKER-9921')));
+    assert.equal(outcome.status, 'failed');
+    assert.equal(outcome.output, '');
+    assert.equal(outcome.error, 'TEST_PROOF_REVOKED');
+    assert.equal(emitted.some(event => event.type === 'text-delta'), false);
+    assert.equal(messages.filter(message => message.role === 'assistant').length, 0);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+    await app.executor.dispose();
+    await app.pluginManager?.dispose();
+    await app.ctx.fiber.dispose();
+  }
+});

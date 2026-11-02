@@ -29,11 +29,34 @@ const MAX_WORK_REQUEST_BYTES = 64_000;
 const MAX_WORK_RESPONSE_BYTES = 1_000_000;
 const MAX_WORK_CALLS_PER_TURN = 32;
 
+/** Provenance that is not a Work message (for example a Catalyst knowledge page). */
+export interface ConversationExternalProof {
+  readonly kind: string;
+  readonly evidence: unknown;
+}
+
+/**
+ * Host-owned check for one external provenance kind. It runs when a proposal is accepted
+ * and again immediately before delivery, so a stale or revoked source holds the reply.
+ * It receives the turn's actor-scoped Work transport; it never trusts the plugin's word.
+ */
+export interface ConversationExternalProofVerifier {
+  verify(
+    context: TrustedTurnContext,
+    evidence: unknown,
+    work: ConversationPluginWorkTransport | undefined,
+  ): Promise<{ readonly allowed: boolean; readonly code?: string }>;
+}
+
+export type ConversationExternalProofVerifiers = ReadonlyMap<string, ConversationExternalProofVerifier>;
+
 /** One context contribution a plugin proposes; it has no effect until the host authorizes it. */
 export interface ConversationPluginProposal {
   readonly featureId: string;
   readonly content: string;
+  /** Work-message provenance; may be empty only when an `externalProof` is supplied. */
   readonly sourceRefs: readonly ConversationSourceRef[];
+  readonly externalProof?: ConversationExternalProof;
 }
 
 /** One JSON call to an allowlisted Work route, made as the turn's own actor. */
@@ -79,6 +102,7 @@ export interface AuthorizedPluginContribution {
   readonly featureId: string;
   readonly content: string;
   readonly sourceRefs: readonly ConversationSourceRef[];
+  readonly externalProofs: readonly ConversationExternalProof[];
 }
 
 export interface PluginContextOutcome {
@@ -109,6 +133,7 @@ export async function collectPluginContributions(
     readonly attachments: readonly ConversationMessageAttachment[];
     readonly requestWork?: ConversationPluginWorkTransport;
   },
+  options: { readonly verifiers?: ConversationExternalProofVerifiers } = {},
 ): Promise<PluginContextOutcome> {
   context.signal.throwIfAborted();
   const proposals: ConversationPluginProposal[] = [];
@@ -191,22 +216,36 @@ export async function collectPluginContributions(
       held.push({ featureId, code });
       continue;
     }
-    const proof = await authorizeConversationSourcesV1(api, context, proposal.sourceRefs);
-    if (proof.currentAuthorizationEpoch !== context.authorizationEpoch) {
-      held.push({ featureId, code: 'AUTHORIZATION_EPOCH_CHANGED' });
-      continue;
+    if (proposal.sourceRefs.length > 0) {
+      const proof = await authorizeConversationSourcesV1(api, context, proposal.sourceRefs);
+      if (proof.currentAuthorizationEpoch !== context.authorizationEpoch) {
+        held.push({ featureId, code: 'AUTHORIZATION_EPOCH_CHANGED' });
+        continue;
+      }
+      if (!proof.allowed) {
+        held.push({ featureId, code: 'SOURCE_NOT_AUTHORIZED' });
+        continue;
+      }
     }
-    if (!proof.allowed) {
-      held.push({ featureId, code: 'SOURCE_NOT_AUTHORIZED' });
-      continue;
+    const externalProofs: ConversationExternalProof[] = [];
+    if (proposal.externalProof !== undefined) {
+      const verdict = await checkExternalProof(options.verifiers, context, proposal.externalProof, transport);
+      if (verdict !== 'allow') {
+        held.push({ featureId, code: verdict });
+        continue;
+      }
+      externalProofs.push(proposal.externalProof);
     }
     // The delivery proof is written by the host, never by the plugin.
-    recordConversationContextSourcesV1(context, proposal.featureId, proposal.sourceRefs);
+    if (proposal.sourceRefs.length > 0) {
+      recordConversationContextSourcesV1(context, proposal.featureId, proposal.sourceRefs);
+    }
     claimed.add(proposal.featureId);
     contributions.push({
       featureId: proposal.featureId,
       content: proposal.content,
       sourceRefs: proposal.sourceRefs,
+      externalProofs,
     });
   }
   return { contributions, held };
@@ -223,8 +262,50 @@ function validateProposal(proposal: ConversationPluginProposal, claimed: Readonl
     return 'PLUGIN_CONTENT_INVALID';
   }
   // A contribution without exact provenance can never be revalidated at delivery.
-  if (!Array.isArray(proposal.sourceRefs) || proposal.sourceRefs.length === 0) {
+  if (!Array.isArray(proposal.sourceRefs)) return 'PLUGIN_SOURCE_REFS_REQUIRED';
+  const external = proposal.externalProof;
+  if (external !== undefined
+    && (external === null || typeof external !== 'object' || typeof external.kind !== 'string'
+      || !/^[a-z][a-z0-9.-]{0,63}$/u.test(external.kind))) {
+    return 'PLUGIN_EXTERNAL_PROOF_INVALID';
+  }
+  if (proposal.sourceRefs.length === 0 && external === undefined) {
     return 'PLUGIN_SOURCE_REFS_REQUIRED';
   }
   return null;
+}
+
+/** Ask the host-owned verifier for one external proof; any failure is a hold, never an allow. */
+async function checkExternalProof(
+  verifiers: ConversationExternalProofVerifiers | undefined,
+  context: TrustedTurnContext,
+  proof: ConversationExternalProof,
+  transport: ConversationPluginWorkTransport | undefined,
+): Promise<'allow' | string> {
+  const verifier = verifiers?.get(proof.kind);
+  if (verifier === undefined) return 'PLUGIN_EXTERNAL_VERIFIER_UNAVAILABLE';
+  try {
+    const verdict = await verifier.verify(context, proof.evidence, transport);
+    return verdict.allowed ? 'allow' : (verdict.code ?? 'EXTERNAL_SOURCE_NOT_AUTHORIZED');
+  } catch {
+    context.signal.throwIfAborted();
+    return 'EXTERNAL_PROOF_UNAVAILABLE';
+  }
+}
+
+/**
+ * Recheck every external proof an accepted contribution carried, immediately before delivery.
+ * Returns `allow` or the first typed hold code.
+ */
+export async function recheckExternalProofs(
+  verifiers: ConversationExternalProofVerifiers | undefined,
+  context: TrustedTurnContext,
+  proofs: readonly ConversationExternalProof[],
+  transport: ConversationPluginWorkTransport | undefined,
+): Promise<'allow' | string> {
+  for (const proof of proofs) {
+    const verdict = await checkExternalProof(verifiers, context, proof, transport);
+    if (verdict !== 'allow') return verdict;
+  }
+  return 'allow';
 }
