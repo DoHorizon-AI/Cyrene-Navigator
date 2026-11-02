@@ -3,14 +3,25 @@
 from __future__ import annotations
 
 import copy
+import json
+from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
+from cyrene_navigator.persistence import create_persistence_app
 from cyrene_navigator.persistence.store import PersistencePrincipal
+from cyrene_navigator.work.conversation_capabilities.runtime import DirectPluginPool
 from cyrene_navigator.work.conversation_knowledge import build_conversation_knowledge_router
+from cyrene_navigator.work.conversation_knowledge.config import (
+    ConversationKnowledgeWiring,
+    KnowledgeConfigurationError,
+    StaticKnowledgeSelectionResolver,
+    StaticPrincipalRefResolver,
+    load_conversation_knowledge,
+)
 from cyrene_navigator.work.conversation_knowledge.ports import (
     KnowledgePackageSelection,
     KnowledgePortError,
@@ -357,3 +368,165 @@ def test_port_error_is_redacted_and_typed() -> None:
     error = KnowledgePortError("CATALYST_PRODUCT_UNAVAILABLE", status_code=503, retryable=True)
     assert error.code == "CATALYST_PRODUCT_UNAVAILABLE"
     assert error.retryable is True
+
+
+TOKEN = "knowledge-host-test-token"
+
+
+def _host(tmp_path: Path, *, mapped: bool = True) -> TestClient:
+    """Mount the knowledge routes through the real persistence app and its authentication."""
+
+    service = ConversationKnowledgeService(
+        _FakeCatalyst(),  # type: ignore[arg-type]
+        _FakeToolProvider(),
+        StaticPrincipalRefResolver({"actor-a": (PRINCIPAL_REF,)} if mapped else {}),
+    )
+    wiring = ConversationKnowledgeWiring(
+        service, StaticKnowledgeSelectionResolver({"actor-a": _selection()})
+    )
+    app = create_persistence_app(
+        tmp_path / "persistence.sqlite3",
+        {TOKEN: PRINCIPAL},
+        conversation_knowledge=wiring,
+    )
+    return TestClient(app)
+
+
+def test_routes_are_mounted_behind_the_workspace_authentication(tmp_path: Path) -> None:
+    client = _host(tmp_path)
+    anonymous = client.post(f"{BASE}/search", json={"query": "restart gateway"})
+    assert anonymous.status_code in {401, 403}
+    allowed = client.post(
+        f"{BASE}/search",
+        json={"query": "restart gateway"},
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+    assert allowed.status_code == 200
+    assert allowed.json()["hits"][0]["citation"]["blockId"] == "block-1"
+    other_workspace = client.post(
+        "/api/v1/workspaces/workspace-b/work/knowledge/search",
+        json={"query": "restart gateway"},
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+    assert other_workspace.status_code in {401, 403}
+
+
+def test_an_unmapped_actor_is_held_through_the_real_host(tmp_path: Path) -> None:
+    response = _host(tmp_path, mapped=False).post(
+        f"{BASE}/search",
+        json={"query": "restart gateway"},
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+    assert response.status_code == 403
+    assert response.json()["code"] == "KNOWLEDGE_PRINCIPAL_UNMAPPED"
+
+
+def test_knowledge_routes_do_not_exist_unless_configured(tmp_path: Path) -> None:
+    app = create_persistence_app(tmp_path / "plain.sqlite3", {TOKEN: PRINCIPAL})
+    assert not any(route.path.endswith("/work/knowledge/search") for route in app.routes)  # type: ignore[attr-defined]
+
+
+def _config(**changes: Any) -> dict[str, Any]:
+    document: dict[str, Any] = {
+        "catalyst": {
+            "baseUrl": "http://127.0.0.1:9",
+            "bearerEnv": "KNOWLEDGE_TEST_CATALYST_BEARER",
+            "organizationId": "org-a",
+            "workspaceId": WORKSPACE,
+        },
+        "tool": {
+            "connectionRef": "grpc://127.0.0.1:51030",
+            "bindingId": "knowledge-binding",
+            "callerWorkload": "navigator-knowledge",
+            "audience": "cyrene.plugins.knowledge-retrieval",
+            "issuer": "cyrene://navigator-test",
+            "signingKeyEnv": "KNOWLEDGE_TEST_SIGNING_KEY",
+        },
+        "selections": [
+            {
+                "actorId": "actor-a",
+                "librarySelector": "handbook",
+                "datasetId": DATASET,
+                "datasetVersionId": VERSION,
+            }
+        ],
+        "principalRefs": {"actor-a": [PRINCIPAL_REF]},
+    }
+    document.update(changes)
+    return document
+
+
+_ENVIRONMENT = {
+    "KNOWLEDGE_TEST_CATALYST_BEARER": "b" * 32,
+    "KNOWLEDGE_TEST_SIGNING_KEY": bytes(range(32)).hex(),
+}
+
+
+def _load(tmp_path: Path, document: Any, environment: dict[str, str] | None = None):  # type: ignore[no-untyped-def]
+    path = tmp_path / "knowledge.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    pool = DirectPluginPool(lambda reference: object())  # type: ignore[arg-type,return-value]
+    return load_conversation_knowledge(
+        path, pool=pool, environment=_ENVIRONMENT if environment is None else environment
+    )
+
+
+def test_operator_file_builds_wiring_with_static_selection_and_refs(tmp_path: Path) -> None:
+    wiring = _load(tmp_path, _config())
+    selection = wiring.selection_resolver.resolve(
+        None,  # type: ignore[arg-type]
+        principal=PRINCIPAL,
+        workspace_id=WORKSPACE,
+    )
+    assert selection is not None
+    assert selection.dataset_version_id == VERSION
+    stranger = PersistencePrincipal(
+        actor_id="actor-z", workspace_ids=frozenset({WORKSPACE}), organization_id="org-a"
+    )
+    assert (
+        wiring.selection_resolver.resolve(None, principal=stranger, workspace_id=WORKSPACE)  # type: ignore[arg-type]
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"selections": []},
+        {"principalRefs": {}},
+        {"principalRefs": {"actor-a": []}},
+        {
+            "catalyst": {
+                "baseUrl": "http://example.com",
+                "bearerEnv": "KNOWLEDGE_TEST_CATALYST_BEARER",
+                "organizationId": "o",
+                "workspaceId": "w",
+            }
+        },
+        {
+            "catalyst": {
+                "baseUrl": "https://c.example",
+                "bearerEnv": "lower-case",
+                "organizationId": "o",
+                "workspaceId": "w",
+            }
+        },
+    ],
+)
+def test_unusable_configuration_stops_startup(tmp_path: Path, change: dict[str, Any]) -> None:
+    with pytest.raises(KnowledgeConfigurationError):
+        _load(tmp_path, _config(**change))
+
+
+def test_missing_secrets_and_bad_files_stop_startup(tmp_path: Path) -> None:
+    with pytest.raises(KnowledgeConfigurationError):
+        _load(tmp_path, _config(), environment={})
+    with pytest.raises(KnowledgeConfigurationError):
+        _load(tmp_path, _config(), environment={"KNOWLEDGE_TEST_CATALYST_BEARER": "b" * 32})
+    with pytest.raises(KnowledgeConfigurationError):
+        _load(tmp_path, ["not", "an", "object"])
+    with pytest.raises(KnowledgeConfigurationError):
+        load_conversation_knowledge(
+            tmp_path / "absent.json",
+            pool=DirectPluginPool(lambda reference: object()),  # type: ignore[arg-type,return-value]
+        )

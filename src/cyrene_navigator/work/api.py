@@ -28,6 +28,8 @@ from fastapi.responses import FileResponse
 
 from cyrene_navigator.persistence.errors import WORKSPACE_FORBIDDEN, PersistenceError
 from cyrene_navigator.persistence.store import PersistencePrincipal
+from cyrene_navigator.work.conversation_knowledge import build_conversation_knowledge_router
+from cyrene_navigator.work.conversation_knowledge.config import ConversationKnowledgeWiring
 from cyrene_navigator.work.conversation_memory import ConversationMemoryStore
 from cyrene_navigator.work.conversation_memory.domain_api import mount_domain_routes
 from cyrene_navigator.work.conversation_memory.domain_models import ActorBackupReceipt, EmptyRequest
@@ -311,6 +313,7 @@ def mount_work_routes(
     memory_provider: MemoryProvider | None = None,
     graph_provider: KnowledgeGraphProvider | None = None,
     summarizer_available: bool = False,
+    conversation_knowledge: ConversationKnowledgeWiring | None = None,
 ) -> WorkStore:
     """Mount authenticated Work routes on an existing persistence app.
 
@@ -471,6 +474,15 @@ def mount_work_routes(
                 409,
                 "A derived record source is revoked, stale, or outside its authorized scope.",
             )
+
+    if conversation_knowledge is not None:
+        app.include_router(
+            build_conversation_knowledge_router(
+                principal_for=principal_for,
+                service=conversation_knowledge.service,
+                selection_resolver=conversation_knowledge.selection_resolver,
+            )
+        )
 
     mount_domain_routes(
         app,

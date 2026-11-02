@@ -47,6 +47,7 @@ from cyrene_navigator.work.api import (
     TeamsPrivateConversationPolicy,
     mount_work_routes,
 )
+from cyrene_navigator.work.conversation_knowledge.config import ConversationKnowledgeWiring
 from cyrene_navigator.work.conversation_memory.providers import (
     EmbeddingClient,
     KnowledgeGraphProvider,
@@ -70,6 +71,7 @@ def create_persistence_app(
     conversation_memory_provider: MemoryProvider | None = None,
     conversation_graph_provider: KnowledgeGraphProvider | None = None,
     conversation_memory_summarizer_available: bool = False,
+    conversation_knowledge: ConversationKnowledgeWiring | None = None,
 ) -> FastAPI:
     """Build the authoritative Harness persistence HTTP service. | 创建持久化 HTTP 服务。"""
 
@@ -441,5 +443,6 @@ def create_persistence_app(
         memory_provider=conversation_memory_provider,
         graph_provider=conversation_graph_provider,
         summarizer_available=conversation_memory_summarizer_available,
+        conversation_knowledge=conversation_knowledge,
     )
     return app
