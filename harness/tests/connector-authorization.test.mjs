@@ -110,7 +110,7 @@ function providerGrantFor(input) {
   };
 }
 
-async function withGrantExchange(claimOrganizationId, run) {
+async function withGrantExchange(claimOrganizationId, run, clientOrganization = { organizationId: 'org-1' }) {
   const directory = await mkdtemp(join(tmpdir(), 'navigator-grant-organization-'));
   const hmacKeyFile = join(directory, 'exchange-hmac.key');
   await writeFile(hmacKeyFile, Buffer.alloc(32, 0x6d), { mode: 0o600 });
@@ -119,8 +119,13 @@ async function withGrantExchange(claimOrganizationId, run) {
     const chunks = [];
     request.on('data', chunk => chunks.push(chunk));
     request.on('end', () => {
-      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-      received.push(body);
+      const raw = Buffer.concat(chunks);
+      const body = JSON.parse(raw.toString('utf8'));
+      const signature = createHmac('sha256', Buffer.alloc(32, 0x6d))
+        .update(`POST\n${request.url}\n${request.headers['x-cyrene-navigator-timestamp']}\n`, 'utf8')
+        .update(raw)
+        .digest('hex');
+      received.push({ body, signatureCoversBody: signature === request.headers['x-cyrene-navigator-signature'] });
       const { arguments: _arguments, ...claims } = body;
       const now = Math.floor(Date.now() / 1_000);
       response.writeHead(200, { 'content-type': 'application/json' });
@@ -138,8 +143,7 @@ async function withGrantExchange(claimOrganizationId, run) {
       hmacKeyFile,
       hmacKeyId: 'test-key',
       audience: 'exchange',
-      organizationId: 'org-1',
-      organizationId: 'org-1',
+      ...clientOrganization,
     });
     await run(client, received);
   } finally {
@@ -190,7 +194,6 @@ async function withHttpResponse(status, headers, responseBody, run) {
       hmacKeyFile: '/unused-for-provider-grant-fixture',
       hmacKeyId: 'test-key',
       audience: 'exchange',
-      organizationId: 'org-1',
     });
     await run(client, received);
   } finally {
@@ -204,7 +207,8 @@ test('grant requests name the configured organization without changing the grant
       organizationGrantRequest('organization-match:1'), new AbortController().signal,
     );
     assert.equal(received.length, 1);
-    assert.equal(received[0].organizationId, 'org-1');
+    assert.equal(received[0].body.organizationId, 'org-1');
+    assert.equal(received[0].signatureCoversBody, true);
     assert.equal(grant.organizationId, 'org-1');
     assert.equal(Object.hasOwn(grant.request, 'organizationId'), false);
   });
@@ -219,23 +223,22 @@ test('a grant for another organization is rejected', async () => {
   });
 });
 
-test('the client requires an organization and reads it from CYRENE_ORGANIZATION_ID', () => {
-  const config = {
-    baseUrl: 'http://127.0.0.1:1',
-    hmacKeyFile: '/unused-for-organization-fixture',
-    hmacKeyId: 'test-key',
-    audience: 'exchange',
-  };
+test('a grant needs an organization, which defaults to CYRENE_ORGANIZATION_ID', async () => {
   const saved = process.env.CYRENE_ORGANIZATION_ID;
   try {
-    delete process.env.CYRENE_ORGANIZATION_ID;
-    assert.throws(() => new ExchangeConnectorAuthorizationClient(config), /CYRENE_ORGANIZATION_ID/u);
-    for (const value of ['', ' org-1']) {
-      process.env.CYRENE_ORGANIZATION_ID = value;
-      assert.throws(() => new ExchangeConnectorAuthorizationClient(config), /CYRENE_ORGANIZATION_ID/u);
-    }
-    process.env.CYRENE_ORGANIZATION_ID = 'org-1';
-    assert.ok(new ExchangeConnectorAuthorizationClient(config));
+    await withGrantExchange('org-1', async (client, received) => {
+      const signal = new AbortController().signal;
+      delete process.env.CYRENE_ORGANIZATION_ID;
+      await assert.rejects(client.mintGrant(organizationGrantRequest('organization-missing:1'), signal), /CYRENE_ORGANIZATION_ID/u);
+      for (const value of ['', ' org-1', 'x'.repeat(201)]) {
+        process.env.CYRENE_ORGANIZATION_ID = value;
+        await assert.rejects(client.mintGrant(organizationGrantRequest('organization-invalid:1'), signal), /CYRENE_ORGANIZATION_ID/u);
+      }
+      assert.equal(received.length, 0, 'nothing reaches Exchange without a valid organization');
+      process.env.CYRENE_ORGANIZATION_ID = 'org-1';
+      await client.mintGrant(organizationGrantRequest('organization-environment:1'), signal);
+      assert.equal(received[0].body.organizationId, 'org-1');
+    }, {});
   } finally {
     if (saved === undefined) delete process.env.CYRENE_ORGANIZATION_ID;
     else process.env.CYRENE_ORGANIZATION_ID = saved;
@@ -550,7 +553,6 @@ test('owner-private response body deadline is uncertain and never causes a secon
       hmacKeyFile: '/unused-for-provider-grant-fixture',
       hmacKeyId: 'test-key',
       audience: 'exchange',
-      organizationId: 'org-1',
       requestTimeoutMs: 500,
       privateTeamsMessageTimeoutMs: 100,
     });
@@ -615,7 +617,6 @@ test('private Teams timeout is longer only for private sends; channel sends keep
       hmacKeyFile: '/unused-for-provider-grant-fixture',
       hmacKeyId: 'test-key',
       audience: 'exchange',
-      organizationId: 'org-1',
       requestTimeoutMs: 100,
       privateTeamsMessageTimeoutMs: 400,
     });
@@ -688,7 +689,6 @@ test('owner-private HTTP 408 body timeout keeps its uncertain classification and
       hmacKeyFile: '/unused-for-provider-grant-fixture',
       hmacKeyId: 'test-key',
       audience: 'exchange',
-      organizationId: 'org-1',
       requestTimeoutMs: 500,
       privateTeamsMessageTimeoutMs: 100,
     });
@@ -797,7 +797,6 @@ test('reads only the fixed signed Exchange authorization snapshot projection', a
       hmacKeyFile: keyFile,
       hmacKeyId: 'health-key-1',
       audience: 'exchange',
-      organizationId: 'org-1',
     });
     const snapshots = await client.getAuthorizationHealthSnapshots({
       requestId: 'health-request-1',

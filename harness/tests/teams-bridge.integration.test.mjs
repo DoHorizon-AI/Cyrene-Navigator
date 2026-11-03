@@ -162,7 +162,6 @@ test('signed Teams intake stores member context but only the mapped owner trigge
     hmacKeyFile: '/does-not-exist-in-this-test',
     hmacKeyId: 'teams-test',
     audience: 'exchange',
-    organizationId: 'org-1',
   });
   const app = await createExecutorApp({
     testMode: true,
@@ -701,7 +700,6 @@ test('Teams message text preserves LF, CRLF, TAB and content-part boundaries', a
     hmacKeyFile: '/does-not-exist-in-this-test',
     hmacKeyId: 'teams-test',
     audience: 'exchange',
-    organizationId: 'org-1',
   });
   const app = await createExecutorApp({
     testMode: true,
@@ -830,7 +828,6 @@ test('Teams task actor projection reloads per admission and binds issuer plus wo
     hmacKeyFile: '/does-not-exist-in-this-test',
     hmacKeyId: 'teams-test',
     audience: 'exchange',
-    organizationId: 'org-1',
   });
   const writeActors = async (subjects, fileWorkspaceId = workspaceId) => writeFile(actorFile, JSON.stringify({
     schemaVersion: 1, workspaceId: fileWorkspaceId, issuer, subjects,

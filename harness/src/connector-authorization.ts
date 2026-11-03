@@ -138,7 +138,6 @@ export interface ExchangeConnectorAuthorizationConfig {
 /** Narrow, fail-closed client for Navigator's private Exchange integration facade. */
 export class ExchangeConnectorAuthorizationClient {
   private readonly origin: string;
-  private readonly organizationId: string;
   private readonly timeoutMs: number;
   private readonly githubProviderOperationTimeoutMs: number;
   private readonly privateTeamsMessageTimeoutMs: number;
@@ -161,11 +160,6 @@ export class ExchangeConnectorAuthorizationClient {
     safeText(config.hmacKeyId, 'Exchange HMAC key id', 128);
     safeText(config.hmacKeyFile, 'Exchange HMAC key file', 2_000);
     safeText(config.audience, 'Exchange Authority audience', 256);
-    this.organizationId = safeText(
-      config.organizationId ?? process.env.CYRENE_ORGANIZATION_ID,
-      'CYRENE_ORGANIZATION_ID',
-      512,
-    );
     if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs < 100 || this.timeoutMs > 120_000) {
       throw new TypeError('Invalid Exchange connector request timeout');
     }
@@ -182,11 +176,18 @@ export class ExchangeConnectorAuthorizationClient {
   /** Obtain a fresh Platform grant for one exact actor, target, operation and argument set. */
   async mintGrant(input: ConnectorGrantRequest, signal: AbortSignal): Promise<ConnectorGrant> {
     const normalized = normalizeGrantRequest(input);
+    // Checked here, not at construction: serve-local.py starts Teams in a closed environment
+    // without this variable, and only a grant needs it. Exchange allows at most 200 characters.
+    const expectedOrganizationId = safeText(
+      this.config.organizationId ?? process.env.CYRENE_ORGANIZATION_ID,
+      'CYRENE_ORGANIZATION_ID',
+      200,
+    );
     const digest = sha256(canonicalJson(normalized.arguments));
     if (digest !== normalized.argumentsDigestSha256) {
       throw new TypeError('Connector grant arguments do not match their canonical digest');
     }
-    const body = JSON.stringify({ ...normalized, organizationId: this.organizationId });
+    const body = JSON.stringify({ ...normalized, organizationId: expectedOrganizationId });
     const response = await this.postSigned('/internal/v1/connector-operation-grants', body, signal);
     const row = object(await readJson(response), 'Exchange connector grant');
     const connectorGrantBin = base64Field(row.connectorGrantBin, 'connectorGrantBin');
@@ -196,7 +197,7 @@ export class ExchangeConnectorAuthorizationClient {
     const expiresAt = unixSeconds(row.expiresAt, 'expiresAt');
     const claims = object(row.claims, 'Exchange grant claims echo');
     const organizationId = assertGrantClaims(claims, normalized);
-    if (organizationId !== this.organizationId) throw new TypeError('Exchange returned a grant for a different organization');
+    if (organizationId !== expectedOrganizationId) throw new TypeError('Exchange returned a grant for a different organization');
     if (audience !== this.config.audience) throw new TypeError('Exchange returned a grant for a different Authority audience');
     const now = Math.floor(Date.now() / 1_000);
     if (issuedAt > now + 5 || issuedAt < now - 30 || expiresAt <= now
