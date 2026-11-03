@@ -988,6 +988,7 @@ test('Navigator cold boots launcher-authorized tools from a private catalog file
           hmacKeyFile: join(directory, 'unused-exchange-key'),
           hmacKeyId: 'coldboot-test',
           audience: 'exchange',
+          organizationId: 'synthetic-org',
         }),
       },
     });

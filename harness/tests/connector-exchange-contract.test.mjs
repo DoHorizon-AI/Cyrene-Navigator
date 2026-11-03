@@ -58,6 +58,7 @@ before(async () => {
     hmacKeyFile: fixture.hmacKeyFile,
     hmacKeyId: fixture.hmacKeyId,
     audience: fixture.audience,
+    organizationId: fixture.organizationId,
     requestTimeoutMs: 5_000,
   });
   mintedGrants = new Map();
@@ -784,6 +785,7 @@ contractTest('wrong HMAC, signed-request replay, grant receipt replay, and ambig
     hmacKeyFile: fixture.wrongHmacKeyFile,
     hmacKeyId: fixture.hmacKeyId,
     audience: fixture.audience,
+    organizationId: fixture.organizationId,
     requestTimeoutMs: 5_000,
   });
   await assert.rejects(

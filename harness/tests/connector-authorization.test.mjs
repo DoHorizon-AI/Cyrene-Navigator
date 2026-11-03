@@ -110,6 +110,61 @@ function providerGrantFor(input) {
   };
 }
 
+async function withGrantExchange(claimOrganizationId, run) {
+  const directory = await mkdtemp(join(tmpdir(), 'navigator-grant-organization-'));
+  const hmacKeyFile = join(directory, 'exchange-hmac.key');
+  await writeFile(hmacKeyFile, Buffer.alloc(32, 0x6d), { mode: 0o600 });
+  const received = [];
+  const server = createServer((request, response) => {
+    const chunks = [];
+    request.on('data', chunk => chunks.push(chunk));
+    request.on('end', () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      received.push(body);
+      const { arguments: _arguments, ...claims } = body;
+      const now = Math.floor(Date.now() / 1_000);
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({
+        connectorGrantBin: 'AQ==', grantRef: 'organization-fixture', audience: 'exchange',
+        issuedAt: now, expiresAt: now + 10,
+        claims: { ...claims, organizationId: claimOrganizationId },
+      }));
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const client = new ExchangeConnectorAuthorizationClient({
+      baseUrl: `http://127.0.0.1:${server.address().port}`,
+      hmacKeyFile,
+      hmacKeyId: 'test-key',
+      audience: 'exchange',
+      organizationId: 'org-1',
+      organizationId: 'org-1',
+    });
+    await run(client, received);
+  } finally {
+    await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+function organizationGrantRequest(requestId) {
+  const argumentsValue = { conversation: route, text: 'The task completed.' };
+  return {
+    requestId,
+    workspaceId: 'workspace-1',
+    principalIssuer: `https://login.microsoftonline.com/${route.tenantId}/v2.0`,
+    principalSubject: '11111111-1111-4111-8111-111111111111',
+    connectionRef,
+    providerId: 'msteams',
+    profileRef,
+    operationId: 'msteams.message.reply',
+    resourceRef: teamsThreadResourceRef(route),
+    argumentsDigestSha256: sha256(canonicalJson(argumentsValue)),
+    arguments: argumentsValue,
+  };
+}
+
 async function withHttpResponse(status, headers, responseBody, run) {
   const received = [];
   const server = createServer((request, response) => {
@@ -135,12 +190,57 @@ async function withHttpResponse(status, headers, responseBody, run) {
       hmacKeyFile: '/unused-for-provider-grant-fixture',
       hmacKeyId: 'test-key',
       audience: 'exchange',
+      organizationId: 'org-1',
     });
     await run(client, received);
   } finally {
     await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
   }
 }
+
+test('grant requests name the configured organization without changing the grant binding', async () => {
+  await withGrantExchange('org-1', async (client, received) => {
+    const grant = await client.mintGrant(
+      organizationGrantRequest('organization-match:1'), new AbortController().signal,
+    );
+    assert.equal(received.length, 1);
+    assert.equal(received[0].organizationId, 'org-1');
+    assert.equal(grant.organizationId, 'org-1');
+    assert.equal(Object.hasOwn(grant.request, 'organizationId'), false);
+  });
+});
+
+test('a grant for another organization is rejected', async () => {
+  await withGrantExchange('org-2', async client => {
+    await assert.rejects(
+      client.mintGrant(organizationGrantRequest('organization-mismatch:1'), new AbortController().signal),
+      /different organization/u,
+    );
+  });
+});
+
+test('the client requires an organization and reads it from CYRENE_ORGANIZATION_ID', () => {
+  const config = {
+    baseUrl: 'http://127.0.0.1:1',
+    hmacKeyFile: '/unused-for-organization-fixture',
+    hmacKeyId: 'test-key',
+    audience: 'exchange',
+  };
+  const saved = process.env.CYRENE_ORGANIZATION_ID;
+  try {
+    delete process.env.CYRENE_ORGANIZATION_ID;
+    assert.throws(() => new ExchangeConnectorAuthorizationClient(config), /CYRENE_ORGANIZATION_ID/u);
+    for (const value of ['', ' org-1']) {
+      process.env.CYRENE_ORGANIZATION_ID = value;
+      assert.throws(() => new ExchangeConnectorAuthorizationClient(config), /CYRENE_ORGANIZATION_ID/u);
+    }
+    process.env.CYRENE_ORGANIZATION_ID = 'org-1';
+    assert.ok(new ExchangeConnectorAuthorizationClient(config));
+  } finally {
+    if (saved === undefined) delete process.env.CYRENE_ORGANIZATION_ID;
+    else process.env.CYRENE_ORGANIZATION_ID = saved;
+  }
+});
 
 test('GitHub provider operation timeout covers headers and body without extending grant or other provider calls', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'navigator-github-operation-budget-'));
@@ -198,6 +298,7 @@ test('GitHub provider operation timeout covers headers and body without extendin
       hmacKeyFile,
       hmacKeyId: 'test-key',
       audience: 'exchange',
+      organizationId: 'org-1',
       requestTimeoutMs: 100,
       githubProviderOperationTimeoutMs: 400,
     });
@@ -449,6 +550,7 @@ test('owner-private response body deadline is uncertain and never causes a secon
       hmacKeyFile: '/unused-for-provider-grant-fixture',
       hmacKeyId: 'test-key',
       audience: 'exchange',
+      organizationId: 'org-1',
       requestTimeoutMs: 500,
       privateTeamsMessageTimeoutMs: 100,
     });
@@ -513,6 +615,7 @@ test('private Teams timeout is longer only for private sends; channel sends keep
       hmacKeyFile: '/unused-for-provider-grant-fixture',
       hmacKeyId: 'test-key',
       audience: 'exchange',
+      organizationId: 'org-1',
       requestTimeoutMs: 100,
       privateTeamsMessageTimeoutMs: 400,
     });
@@ -585,6 +688,7 @@ test('owner-private HTTP 408 body timeout keeps its uncertain classification and
       hmacKeyFile: '/unused-for-provider-grant-fixture',
       hmacKeyId: 'test-key',
       audience: 'exchange',
+      organizationId: 'org-1',
       requestTimeoutMs: 500,
       privateTeamsMessageTimeoutMs: 100,
     });
@@ -693,6 +797,7 @@ test('reads only the fixed signed Exchange authorization snapshot projection', a
       hmacKeyFile: keyFile,
       hmacKeyId: 'health-key-1',
       audience: 'exchange',
+      organizationId: 'org-1',
     });
     const snapshots = await client.getAuthorizationHealthSnapshots({
       requestId: 'health-request-1',

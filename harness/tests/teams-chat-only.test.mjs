@@ -27,7 +27,8 @@ const ENVIRONMENT_KEYS = [
   'TEAMS_BOT_APP_ID', 'TEAMS_ALLOWED_TEAM_IDS', 'TEAMS_TASK_ACTOR_SUBJECTS',
   'CYRENE_EXCHANGE_CONNECTOR_INTERNAL_URL', 'NAVIGATOR_EXCHANGE_HMAC_KEY_FILE',
   'NAVIGATOR_EXCHANGE_HMAC_KEY_ID', 'TEAMS_EXCHANGE_CONNECTION_REF', 'TEAMS_EXCHANGE_PROFILE_REF',
-  'CYRENE_WORKSPACE_ID', 'CYRENE_PERSISTENCE_URL', 'CYRENE_SESSION_TOKEN', 'CYRENE_EXECUTOR_TOKEN',
+  'CYRENE_ORGANIZATION_ID', 'CYRENE_WORKSPACE_ID', 'CYRENE_PERSISTENCE_URL', 'CYRENE_SESSION_TOKEN',
+  'CYRENE_EXECUTOR_TOKEN',
   'CYRENE_HARNESS_MODEL_SOURCE', 'CYRENE_HARNESS_MODEL', 'CYRENE_WORKFLOWS_ENABLED',
   'CYRENE_CONNECTOR_BINDINGS_FILE', 'CYRENE_CONNECTOR_TOOL_CATALOG_FILE',
   'CYRENE_EXCHANGE_INTEGRATION_URL', 'CYRENE_CLOUD_PROFILE_CONFIG', 'CYRENE_SUBAGENT_CONFIG',
@@ -90,6 +91,7 @@ function productionEnvironment(fixture, overrides = {}) {
     NAVIGATOR_EXCHANGE_HMAC_KEY_ID: 'teams-chat-only-test',
     TEAMS_EXCHANGE_CONNECTION_REF: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
     TEAMS_EXCHANGE_PROFILE_REF: 'teams-chat-only-profile',
+    CYRENE_ORGANIZATION_ID: 'org-1',
     CYRENE_WORKSPACE_ID: 'teams-chat-only-test',
     CYRENE_PERSISTENCE_URL: 'http://127.0.0.1:9',
     CYRENE_SESSION_TOKEN: 'teams-chat-only-session-token',
@@ -194,6 +196,7 @@ test('chat-only mode keeps the authenticated Teams owner admission path', async 
     hmacKeyFile: '/not-used-without-connector-tools',
     hmacKeyId: 'teams-chat-only-test',
     audience: 'exchange',
+    organizationId: 'org-1',
   });
   await withEnvironment({
     NODE_ENV: 'test',
