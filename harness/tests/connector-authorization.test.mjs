@@ -110,6 +110,65 @@ function providerGrantFor(input) {
   };
 }
 
+async function withGrantExchange(claimOrganizationId, run, clientOrganization = { organizationId: 'org-1' }) {
+  const directory = await mkdtemp(join(tmpdir(), 'navigator-grant-organization-'));
+  const hmacKeyFile = join(directory, 'exchange-hmac.key');
+  await writeFile(hmacKeyFile, Buffer.alloc(32, 0x6d), { mode: 0o600 });
+  const received = [];
+  const server = createServer((request, response) => {
+    const chunks = [];
+    request.on('data', chunk => chunks.push(chunk));
+    request.on('end', () => {
+      const raw = Buffer.concat(chunks);
+      const body = JSON.parse(raw.toString('utf8'));
+      const signature = createHmac('sha256', Buffer.alloc(32, 0x6d))
+        .update(`POST\n${request.url}\n${request.headers['x-cyrene-navigator-timestamp']}\n`, 'utf8')
+        .update(raw)
+        .digest('hex');
+      received.push({ body, signatureCoversBody: signature === request.headers['x-cyrene-navigator-signature'] });
+      const { arguments: _arguments, ...claims } = body;
+      const now = Math.floor(Date.now() / 1_000);
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({
+        connectorGrantBin: 'AQ==', grantRef: 'organization-fixture', audience: 'exchange',
+        issuedAt: now, expiresAt: now + 10,
+        claims: { ...claims, organizationId: claimOrganizationId },
+      }));
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const client = new ExchangeConnectorAuthorizationClient({
+      baseUrl: `http://127.0.0.1:${server.address().port}`,
+      hmacKeyFile,
+      hmacKeyId: 'test-key',
+      audience: 'exchange',
+      ...clientOrganization,
+    });
+    await run(client, received);
+  } finally {
+    await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+function organizationGrantRequest(requestId) {
+  const argumentsValue = { conversation: route, text: 'The task completed.' };
+  return {
+    requestId,
+    workspaceId: 'workspace-1',
+    principalIssuer: `https://login.microsoftonline.com/${route.tenantId}/v2.0`,
+    principalSubject: '11111111-1111-4111-8111-111111111111',
+    connectionRef,
+    providerId: 'msteams',
+    profileRef,
+    operationId: 'msteams.message.reply',
+    resourceRef: teamsThreadResourceRef(route),
+    argumentsDigestSha256: sha256(canonicalJson(argumentsValue)),
+    arguments: argumentsValue,
+  };
+}
+
 async function withHttpResponse(status, headers, responseBody, run) {
   const received = [];
   const server = createServer((request, response) => {
@@ -141,6 +200,50 @@ async function withHttpResponse(status, headers, responseBody, run) {
     await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
   }
 }
+
+test('grant requests name the configured organization without changing the grant binding', async () => {
+  await withGrantExchange('org-1', async (client, received) => {
+    const grant = await client.mintGrant(
+      organizationGrantRequest('organization-match:1'), new AbortController().signal,
+    );
+    assert.equal(received.length, 1);
+    assert.equal(received[0].body.organizationId, 'org-1');
+    assert.equal(received[0].signatureCoversBody, true);
+    assert.equal(grant.organizationId, 'org-1');
+    assert.equal(Object.hasOwn(grant.request, 'organizationId'), false);
+  });
+});
+
+test('a grant for another organization is rejected', async () => {
+  await withGrantExchange('org-2', async client => {
+    await assert.rejects(
+      client.mintGrant(organizationGrantRequest('organization-mismatch:1'), new AbortController().signal),
+      /different organization/u,
+    );
+  });
+});
+
+test('a grant needs an organization, which defaults to CYRENE_ORGANIZATION_ID', async () => {
+  const saved = process.env.CYRENE_ORGANIZATION_ID;
+  try {
+    await withGrantExchange('org-1', async (client, received) => {
+      const signal = new AbortController().signal;
+      delete process.env.CYRENE_ORGANIZATION_ID;
+      await assert.rejects(client.mintGrant(organizationGrantRequest('organization-missing:1'), signal), /CYRENE_ORGANIZATION_ID/u);
+      for (const value of ['', ' org-1', 'x'.repeat(201)]) {
+        process.env.CYRENE_ORGANIZATION_ID = value;
+        await assert.rejects(client.mintGrant(organizationGrantRequest('organization-invalid:1'), signal), /CYRENE_ORGANIZATION_ID/u);
+      }
+      assert.equal(received.length, 0, 'nothing reaches Exchange without a valid organization');
+      process.env.CYRENE_ORGANIZATION_ID = 'org-1';
+      await client.mintGrant(organizationGrantRequest('organization-environment:1'), signal);
+      assert.equal(received[0].body.organizationId, 'org-1');
+    }, {});
+  } finally {
+    if (saved === undefined) delete process.env.CYRENE_ORGANIZATION_ID;
+    else process.env.CYRENE_ORGANIZATION_ID = saved;
+  }
+});
 
 test('GitHub provider operation timeout covers headers and body without extending grant or other provider calls', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'navigator-github-operation-budget-'));
@@ -198,6 +301,7 @@ test('GitHub provider operation timeout covers headers and body without extendin
       hmacKeyFile,
       hmacKeyId: 'test-key',
       audience: 'exchange',
+      organizationId: 'org-1',
       requestTimeoutMs: 100,
       githubProviderOperationTimeoutMs: 400,
     });

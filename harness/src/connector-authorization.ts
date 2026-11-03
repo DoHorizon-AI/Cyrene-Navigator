@@ -126,6 +126,8 @@ export interface ExchangeConnectorAuthorizationConfig {
   readonly hmacKeyFile: string;
   readonly hmacKeyId: string;
   readonly audience: string;
+  /** Organization named on every grant request; defaults to CYRENE_ORGANIZATION_ID. */
+  readonly organizationId?: string;
   readonly requestTimeoutMs?: number;
   /** GitHub provider operation POST+body cap; grants and other providers keep requestTimeoutMs. */
   readonly githubProviderOperationTimeoutMs?: number;
@@ -174,11 +176,18 @@ export class ExchangeConnectorAuthorizationClient {
   /** Obtain a fresh Platform grant for one exact actor, target, operation and argument set. */
   async mintGrant(input: ConnectorGrantRequest, signal: AbortSignal): Promise<ConnectorGrant> {
     const normalized = normalizeGrantRequest(input);
+    // Checked here, not at construction: serve-local.py starts Teams in a closed environment
+    // without this variable, and only a grant needs it. Exchange allows at most 200 characters.
+    const expectedOrganizationId = safeText(
+      this.config.organizationId ?? process.env.CYRENE_ORGANIZATION_ID,
+      'CYRENE_ORGANIZATION_ID',
+      200,
+    );
     const digest = sha256(canonicalJson(normalized.arguments));
     if (digest !== normalized.argumentsDigestSha256) {
       throw new TypeError('Connector grant arguments do not match their canonical digest');
     }
-    const body = JSON.stringify(normalized);
+    const body = JSON.stringify({ ...normalized, organizationId: expectedOrganizationId });
     const response = await this.postSigned('/internal/v1/connector-operation-grants', body, signal);
     const row = object(await readJson(response), 'Exchange connector grant');
     const connectorGrantBin = base64Field(row.connectorGrantBin, 'connectorGrantBin');
@@ -188,6 +197,7 @@ export class ExchangeConnectorAuthorizationClient {
     const expiresAt = unixSeconds(row.expiresAt, 'expiresAt');
     const claims = object(row.claims, 'Exchange grant claims echo');
     const organizationId = assertGrantClaims(claims, normalized);
+    if (organizationId !== expectedOrganizationId) throw new TypeError('Exchange returned a grant for a different organization');
     if (audience !== this.config.audience) throw new TypeError('Exchange returned a grant for a different Authority audience');
     const now = Math.floor(Date.now() / 1_000);
     if (issuedAt > now + 5 || issuedAt < now - 30 || expiresAt <= now

@@ -1090,6 +1090,7 @@ test('NavigatorExecutor boot wires the fixed owner-private Exchange sender and p
     hmacKeyFile: exchangeKeyPath,
     hmacKeyId: 'private-boot-test',
     audience: 'exchange',
+    organizationId: 'private-org',
     requestTimeoutMs: 500,
     privateTeamsMessageTimeoutMs: 300,
   });
